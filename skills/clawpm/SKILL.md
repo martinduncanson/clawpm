@@ -141,11 +141,20 @@ clawpm project init                     # Initialize project in current dir
 ```bash
 clawpm tasks                            # List tasks (default: open+progress+blocked)
 clawpm tasks list [-s open|done|blocked|progress|all] [--flat]
-clawpm tasks show <id>                  # Task details
-clawpm tasks add -t "Title" [--priority 3] [--complexity m] [--parent <id>] [-b "body"]
-clawpm tasks edit <id> [--title "..."] [--priority N] [--complexity s|m|l|xl] [--body "..."]
+clawpm tasks show <id>                  # Task details (includes scope)
+clawpm tasks add -t "Title" [--priority 3] [--complexity m] [--parent <id>] [-b "body"] [--scope "glob/**"]
+clawpm tasks edit <id> [--title "..."] [--priority N] [--complexity s|m|l|xl] [--body "..."] [--scope "glob/**"]
 clawpm tasks state <id> open|progress|done|blocked [--note "..."] [--force]
 clawpm tasks split <id>                 # Convert to parent directory for subtasks
+```
+
+### Scope Conflicts
+```bash
+clawpm conflicts --scope "src/auth/**" --scope "tests/auth/**"
+                                        # Check for in-flight tasks claiming overlapping files
+clawpm conflicts --task CLAWP-042       # Same but reads scope from an existing task
+clawpm conflicts --task 42 --project myproj
+                                        # Explicit project for task lookup
 ```
 
 ### Work Log
@@ -214,6 +223,65 @@ clawpm use --clear         # Clear context
 - **One command per call**: Don't chain clawpm commands with `&&` — run each separately
 - **Portfolio root**: Default `~/clawpm`
 - **Work log**: Append-only at `<portfolio>/work_log.jsonl`
+
+## Scope-Aware Dispatch
+
+ClawPM can act as a file-claim registry for parallel agent runs. When multiple
+Claude Code subagents operate in parallel (e.g. in separate git worktrees), they
+can collide on shared files. Use `scope` to prevent this.
+
+### Workflow
+
+**1. Declare scope when creating or updating a task:**
+```bash
+clawpm tasks add -t "Refactor auth layer" \
+    --scope "src/auth/**" --scope "tests/auth/**"
+
+clawpm tasks edit CLAWP-042 --scope "src/auth/**" --scope "tests/auth/**"
+```
+
+**2. When a task transitions to `progress` its scope becomes "claimed".** Any
+`progress`-state task with a non-empty `scope` is considered in-flight.
+
+**3. Pre-flight check — run `clawpm conflicts` before dispatching a new agent:**
+```bash
+clawpm conflicts --scope "src/auth/login.py"
+# → {"conflicts": [], "queried_scope": ["src/auth/login.py"]}  ← safe to dispatch
+
+clawpm conflicts --task CLAWP-099   # read scope from the queued task
+# → {"conflicts": [{"task_id": "CLAWP-042", "overlapping_globs": [...], ...}]}
+```
+
+An empty `conflicts` array means no in-flight task claims overlapping files —
+safe to dispatch. Exit code is always 0; read the JSON array.
+
+### Glob-overlap heuristic
+
+The check uses a prefix-based heuristic:
+- Strip `**`/`*`/`?` to get the literal prefix of each pattern.
+- Two patterns overlap if either prefix starts with the other.
+- Examples: `src/auth/**` ∩ `src/auth/handlers/**` → overlap; `src/auth/**` ∩ `src/billing/**` → no overlap.
+- May produce false positives (safe: errs toward flagging rather than missing collisions).
+- Does not handle character classes or negation patterns.
+
+### Output format
+
+```json
+{
+  "conflicts": [
+    {
+      "project_id": "polymarket-arb",
+      "task_id": "POLYM-007",
+      "title": "Fix auth flow",
+      "scope": ["src/auth/**"],
+      "state": "progress",
+      "started_at": "2026-05-05T12:00:00+00:00",
+      "overlapping_globs": ["src/auth/**"]
+    }
+  ],
+  "queried_scope": ["src/auth/**", "tests/auth/**"]
+}
+```
 
 ## Troubleshooting
 

@@ -154,6 +154,7 @@ class Task:
     priority: int = 5
     complexity: TaskComplexity | None = None
     depends: list[str] = field(default_factory=list)
+    scope: list[str] = field(default_factory=list)
     parent: str | None = None
     children: list[str] = field(default_factory=list)  # Populated by discovery
     created: str | None = None
@@ -221,6 +222,7 @@ class Task:
             priority=frontmatter.get("priority", 5),
             complexity=complexity,
             depends=frontmatter.get("depends", []),
+            scope=frontmatter.get("scope", []),
             parent=frontmatter.get("parent"),
             created=frontmatter.get("created"),
             content=content,
@@ -257,6 +259,7 @@ class Task:
             "priority": self.priority,
             "complexity": self.complexity.value if self.complexity else None,
             "depends": self.depends,
+            "scope": self.scope,
             "parent": self.parent,
             "children": self.children,
             "is_parent": self.is_parent,
