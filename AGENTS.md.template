@@ -1,0 +1,74 @@
+# AGENTS.md — clawpm task tracking
+
+> **For agent runtimes that read `AGENTS.md` (Codex, etc.) — copy this file into your project root and customize the project ID and portfolio path. For Claude Code projects, the canonical equivalent is `CLAUDE.md` and the `clawpm` skill auto-loads.**
+
+This project uses [`clawpm`](https://github.com/malphas-gh/clawpm) for task tracking and work-log persistence across agent sessions. Use it preferentially over session-scoped TODO lists.
+
+## Why
+
+Session-scoped task tools (whatever your runtime calls them) disappear when the session ends. clawpm persists tasks, work logs, research notes, and issues to the filesystem — they survive session boundaries, agent handoffs, and subagent dispatch.
+
+## Project context
+
+- **Project ID:** `<REPLACE-WITH-PROJECT-ID>` (matches `.project/settings.toml` `id` field)
+- **Portfolio:** `~/clawpm/` (override with `CLAWPM_PORTFOLIO` env var)
+- **Settings file:** `<repo-root>/.project/settings.toml`
+
+## Invocation patterns
+
+```bash
+# Resume work — read this first when starting any session
+clawpm context --project <REPLACE-WITH-PROJECT-ID>
+
+# Add a task
+clawpm tasks add --project <REPLACE-WITH-PROJECT-ID> -t "Title" -b "Description" \
+    --predict-duration 60 --predict-complexity m \
+    --predict-scope "src/foo/**" --hypothesis "if X then Y"
+
+# Start working
+clawpm start <task-id> --project <REPLACE-WITH-PROJECT-ID>
+
+# Pre-flight check before dispatching parallel agents
+clawpm conflicts --task <task-id> --project <REPLACE-WITH-PROJECT-ID>
+
+# Complete with reflection
+clawpm done <task-id> --project <REPLACE-WITH-PROJECT-ID> \
+    --note "what shipped" \
+    --reflect-note "what surprised me" \
+    --meta-reflect "what could have been anticipated that wasn't"
+
+# Block on dependency
+clawpm block <task-id> --project <REPLACE-WITH-PROJECT-ID> --note "Waiting on credentials"
+
+# Log progress without state change
+clawpm log add --task <task-id> --action progress --summary "What I did" --project <REPLACE-WITH-PROJECT-ID>
+```
+
+## When to invoke
+
+| Lifecycle moment | clawpm action |
+|---|---|
+| Session start | `clawpm context` to resume |
+| Before any meaningful work unit (≥15 min) | `clawpm tasks add` with predictions, then `clawpm start` |
+| Before dispatching subagents | `clawpm conflicts --task` to verify safe scope |
+| On completion | `clawpm done` with `--reflect-note` |
+| On blocker | `clawpm block --note` |
+| Before commit | `clawpm log add --action progress --summary "what's about to commit"` |
+| After commit | `clawpm log commit` to record the SHA against the task |
+| Session end | `clawpm log tail --limit 5` to verify the trail is captured |
+
+## Output format
+
+clawpm emits JSON by default (`-f json`, default). Use `-f text` for human-readable output. Agents should consume JSON; humans get text.
+
+## Failure modes
+
+- **`add_failed`**: Settings.toml has Windows backslashes — fix to forward slashes (the CLI now warns about this).
+- **`no_project`**: CWD walk found no `.project/settings.toml` — pass `--project <id>` explicitly or `cd` into the project root.
+- **`portfolio_not_found`**: First-time setup needed — run `clawpm setup`.
+
+## Reference
+
+- README: https://github.com/malphas-gh/clawpm
+- Skill (Claude Code): `<clawpm-repo>/skills/clawpm/SKILL.md`
+- This file: copy as `AGENTS.md` into the project root and replace placeholders.
