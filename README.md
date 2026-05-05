@@ -70,12 +70,30 @@ clawpm project context             # Full project context
 ```bash
 clawpm tasks                       # List open + in-progress + blocked
 clawpm tasks list [-s all]         # Filter by state
-clawpm tasks show <id>             # Full task details
-clawpm tasks add -t "Title" [-b "body"] [--parent <id>]
-clawpm tasks edit <id> [--title/--priority/--complexity/--body]
+clawpm tasks show <id>             # Full task details (includes scope)
+clawpm tasks add -t "Title" [-b "body"] [--parent <id>] [--scope "src/**"]
+clawpm tasks edit <id> [--title/--priority/--complexity/--body] [--scope "src/**"]
 clawpm tasks state <id> open|progress|done|blocked [--note]
 clawpm tasks split <id>            # Convert to parent directory
 ```
+
+### Scope-Aware Dispatch
+
+Declare file-glob scope on tasks so parallel agents don't collide:
+
+```bash
+# Declare scope when adding or editing a task
+clawpm tasks add -t "Refactor auth" --scope "src/auth/**" --scope "tests/auth/**"
+
+# Pre-flight check before dispatching a new agent
+clawpm conflicts --scope "src/auth/login.py"
+# → {"conflicts": [], "queried_scope": [...]}  ← safe to dispatch
+
+# Or check by task ID (reads its declared scope)
+clawpm conflicts --task CLAWP-042
+```
+
+Empty `conflicts` array = safe to dispatch. Exit code always 0.
 
 ### Work Log
 ```bash

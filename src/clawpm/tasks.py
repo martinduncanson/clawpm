@@ -273,6 +273,7 @@ def add_task(
     priority: int = 5,
     complexity: TaskComplexity | None = None,
     depends: list[str] | None = None,
+    scope: list[str] | None = None,
     description: str = "",
 ) -> Task | None:
     """Add a new task to a project."""
@@ -327,6 +328,9 @@ def add_task(
     if depends:
         frontmatter["depends"] = depends
 
+    if scope:
+        frontmatter["scope"] = scope
+
     # Build content
     content = f"""---
 {yaml.dump(frontmatter, default_flow_style=False).strip()}
@@ -357,6 +361,7 @@ def edit_task(
     title: str | None = None,
     priority: int | None = None,
     complexity: TaskComplexity | None = None,
+    scope: list[str] | None = None,
     body: str | None = None,
 ) -> Task | None:
     """Edit task metadata (frontmatter) and optionally title/body."""
@@ -384,6 +389,11 @@ def edit_task(
         frontmatter["priority"] = priority
     if complexity is not None:
         frontmatter["complexity"] = complexity.value
+    if scope is not None:
+        if scope:
+            frontmatter["scope"] = scope
+        else:
+            frontmatter.pop("scope", None)
 
     # Update title in content (first # heading)
     if title is not None:
