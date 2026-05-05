@@ -383,6 +383,38 @@ The check uses a prefix-based heuristic:
 }
 ```
 
+## Workflow Integrations
+
+clawpm is the task layer. Other skills/plugins handle specialised lifecycle moments. Suggest these to the operator at the matching points — don't force them, but don't stay silent either.
+
+### Skill suggestions by lifecycle moment
+
+| Moment | Suggest | Why |
+|---|---|---|
+| Task creation, before any code | **`feature-dev`** | 7-phase guided workflow (explore → ask → architect → plan → implement → review → reflect). Particularly valuable when complexity is `l`/`xl` or `predict-pitfalls` is non-empty. Seed clawpm subtasks per phase. |
+| Before commit | **`commit-commands /commit`** | Auto-drafts commit message from staged changes; we can add `Closes <task-id>` to the message and capture the SHA in `clawpm log commit` after. |
+| After commit, before PR | **`codex-review`** | Codex generalist review — first pass. Pull findings into `clawpm issues add` if anything substantive lands. |
+| Before merge (if PR is non-trivial) | **`pr-review-toolkit /review-pr`** | Six specialist agents (silent-failure-hunter, type-design-analyzer, comment-analyzer, pr-test-analyzer, code-reviewer, code-simplifier). Use selectively — silent-failure-hunter for any fix involving `try/except`, type-design-analyzer for new public types, etc. Findings → `clawpm issues add`. |
+| Confidence-scored second opinion | **`code-review`** | Multi-agent independent review with confidence scoring to filter false positives. Useful for high-stakes merges where Codex alone isn't enough. |
+| Branch cleanup | **`commit-commands /clean_gone`** | After PRs land — reaps branches whose remotes are gone. Worth running after `clawpm done` for tasks that resulted in merged PRs. |
+| Cowork session start | **`clawpm-cowork`** | Bootstraps the ephemeral Cowork VM with portfolio repo + clawpm install + context resume. |
+
+### How to invoke (ask the operator first)
+
+When suggesting, phrase as a question, not an action:
+
+> "This task has `complexity=l` and pitfalls noted. Want me to run it through the `feature-dev` workflow first? I'll seed the subtasks here in clawpm."
+
+> "Ready to commit? `/commit` will draft the message — I'll add `Closes CLAWP-042` and run `clawpm log commit` after."
+
+> "Before merging, want me to run `pr-review-toolkit /review-pr` with `silent-failure-hunter` and `pr-test-analyzer` enabled? Took us 3 hours of debug last week to catch a swallowed exception."
+
+The operator may decline — record the decline in the task body so future agents see prior context.
+
+### Hookpoint: work_log JSONL
+
+Every clawpm state transition writes a JSON line to `~/clawpm/work_log.jsonl`. Other plugins/skills can subscribe (file-watch or periodic poll) to fire their own logic — e.g., a `pre-commit` review trigger when a task transitions to `progress`. The schema is documented in the README. clawpm doesn't dispatch these subscriptions itself — it stays the data layer.
+
 ## Troubleshooting
 
 ```bash
@@ -390,3 +422,5 @@ clawpm doctor              # Check for issues
 clawpm setup --check       # Verify installation
 clawpm log tail            # See recent activity
 ```
+
+**`add_failed` after `project init`?** Check `.project/settings.toml` — `repo_path` must use forward slashes on Windows (`F:/Git/...` not `F:\Git\...`). The CLI now warns when this is suspected, but old settings.toml files written by earlier versions may still be broken.
