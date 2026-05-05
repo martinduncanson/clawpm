@@ -209,6 +209,25 @@ def output_task_detail(task: Any, fmt: OutputFormat = OutputFormat.JSON) -> None
         if task.file_path:
             console.print(f"[dim]File:[/dim] {task.file_path}")
 
+        # Show predictions section if any prediction was set
+        pred = getattr(task, "predictions", None)
+        if pred and not pred.is_empty():
+            console.print("\n[bold]Predictions[/bold]")
+            if pred.duration_min is not None:
+                console.print(f"  Duration:       {pred.duration_min} min")
+            if pred.complexity is not None:
+                console.print(f"  Complexity:     {pred.complexity.value}")
+            if pred.files_changed is not None:
+                console.print(f"  Files changed:  {pred.files_changed}")
+            if pred.files_scope:
+                console.print(f"  Files scope:    {', '.join(pred.files_scope)}")
+            if pred.frameworks:
+                console.print(f"  Frameworks:     {', '.join(pred.frameworks)}")
+            if pred.pitfalls:
+                console.print(f"  Pitfalls:       {pred.pitfalls}")
+            if pred.hypothesis:
+                console.print(f"  Hypothesis:     {pred.hypothesis}")
+
 
 def output_worklog_entries(entries: list[Any], fmt: OutputFormat = OutputFormat.JSON) -> None:
     """Output work log entries."""

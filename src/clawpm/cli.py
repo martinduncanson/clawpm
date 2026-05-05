@@ -17,6 +17,7 @@ from .models import (
     WorkLogAction,
     ResearchType,
     ResearchStatus,
+    Predictions,
 )
 from .output import (
     OutputFormat,
@@ -56,6 +57,7 @@ from .worklog import (
     tail_entries,
     get_last_entry,
     get_logged_commit_hashes,
+    read_entries,
 )
 from .research import (
     list_research,
@@ -556,6 +558,14 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
 @click.option("--complexity", "-c", type=click.Choice(["s", "m", "l", "xl"]), help="New complexity")
 @click.option("--body", "-b", help="New body content (replaces description before ## sections)")
 @click.option("--scope", "-s", "scope", multiple=True, help="File glob patterns claimed by this task (can specify multiple)")
+# --- Prediction flags (all optional) ---
+@click.option("--predict-duration", "predict_duration", type=int, default=None, help="Predicted duration in minutes")
+@click.option("--predict-complexity", "predict_complexity", type=click.Choice(["s", "m", "l", "xl"]), default=None, help="Predicted complexity")
+@click.option("--predict-files-changed", "predict_files_changed", type=int, default=None, help="Predicted number of files changed")
+@click.option("--predict-scope", "predict_scope", multiple=True, help="Predicted file glob scope (can specify multiple)")
+@click.option("--predict-frameworks", "predict_frameworks", multiple=True, help="Predicted frameworks/libraries to touch (can specify multiple)")
+@click.option("--predict-pitfalls", "predict_pitfalls", default=None, help="Anticipated problematic areas (free text)")
+@click.option("--hypothesis", "hypothesis", default=None, help="Goal/hypothesis: 'if I do X, then Y will improve'")
 @click.pass_context
 def tasks_edit(
     ctx: click.Context,
@@ -566,6 +576,13 @@ def tasks_edit(
     complexity: str | None,
     body: str | None,
     scope: tuple[str, ...],
+    predict_duration: int | None,
+    predict_complexity: str | None,
+    predict_files_changed: int | None,
+    predict_scope: tuple[str, ...],
+    predict_frameworks: tuple[str, ...],
+    predict_pitfalls: str | None,
+    hypothesis: str | None,
 ) -> None:
     """Edit task metadata (title, priority, complexity, body, scope)."""
     fmt = get_format(ctx)
@@ -574,12 +591,34 @@ def tasks_edit(
     project_id, _ = require_project(ctx, project_id)
     task_id = expand_task_id(task_id, project_id)
 
-    if not any([title, priority is not None, complexity, body, scope]):
-        output_error("no_changes", "Specify at least one field to edit (--title, --priority, --complexity, --body, --scope)", fmt=fmt)
+    has_predictions = any([
+        predict_duration is not None,
+        predict_complexity is not None,
+        predict_files_changed is not None,
+        predict_scope,
+        predict_frameworks,
+        predict_pitfalls is not None,
+        hypothesis is not None,
+    ])
+
+    if not any([title, priority is not None, complexity, body, scope, has_predictions]):
+        output_error("no_changes", "Specify at least one field to edit (--title, --priority, --complexity, --body, --scope, or --predict-*)", fmt=fmt)
         sys.exit(1)
 
     cmplx = TaskComplexity(complexity) if complexity else None
     scope_list = list(scope) if scope else None
+
+    predictions: Predictions | None = None
+    if has_predictions:
+        predictions = Predictions(
+            duration_min=predict_duration,
+            complexity=TaskComplexity(predict_complexity) if predict_complexity else None,
+            files_changed=predict_files_changed,
+            files_scope=list(predict_scope),
+            frameworks=list(predict_frameworks),
+            pitfalls=predict_pitfalls,
+            hypothesis=hypothesis,
+        )
 
     task = edit_task(
         config,
@@ -590,6 +629,7 @@ def tasks_edit(
         complexity=cmplx,
         scope=scope_list,
         body=body,
+        predictions=predictions,
     )
 
     if not task:
@@ -605,17 +645,19 @@ def tasks_edit(
 @click.argument("new_state", type=click.Choice(["open", "progress", "done", "blocked"]))
 @click.option("--note", "-n", help="Note about the state change")
 @click.option("--force", "-f", is_flag=True, help="Force completion even if subtasks incomplete")
+@click.option("--reflect-note", "reflect_note", default=None, help="What surprised you (stored in reflection event)")
+@click.option("--meta-reflect", "meta_reflect", default=None, help="What could have been anticipated that wasn't, and why? (stored in reflection event)")
 @click.pass_context
-def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_state: str, note: str | None, force: bool) -> None:
+def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_state: str, note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None) -> None:
     """Change task state."""
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
-    
+
     project_id, _ = require_project(ctx, project_id)
     task_id = expand_task_id(task_id, project_id)
 
     state = TaskState(new_state)
-    
+
     # Check for incomplete subtasks before attempting state change
     if state == TaskState.DONE and not force:
         task = get_task(config, project_id, task_id)
@@ -632,7 +674,10 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
                     fmt=fmt,
                 )
                 sys.exit(1)
-    
+
+    # Capture task predictions before state transition (needed for reflection)
+    pre_transition_task = get_task(config, project_id, task_id)
+
     task = change_task_state(config, project_id, task_id, state, note=note, force=force)
 
     if not task:
@@ -663,7 +708,7 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
                     files_changed = [f for f in result.stdout.strip().split('\n') if f]
             except Exception:
                 pass
-        
+
         summary = note if note else f"Task marked {new_state}"
         add_entry(
             config,
@@ -674,6 +719,31 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
             files_changed=files_changed,
             auto=True,
         )
+
+    # Write reflection event when task completes or is blocked
+    if state in (TaskState.DONE, TaskState.BLOCKED) and pre_transition_task:
+        try:
+            from .reflect import write_reflection_event, _compute_actuals
+            all_log_entries = read_entries(config, project=project_id)
+            actuals = _compute_actuals(
+                task_id,
+                pre_transition_task.complexity,
+                all_log_entries,
+            )
+            event_name = "task_done" if state == TaskState.DONE else "task_blocked"
+            write_reflection_event(
+                config.portfolio_root,
+                event=event_name,
+                task_id=task_id,
+                project_id=project_id,
+                predictions=pre_transition_task.predictions,
+                actuals=actuals,
+                note=reflect_note,
+                meta_reflection=meta_reflect,
+            )
+        except Exception:
+            # Never let reflection failure block the state change
+            pass
 
     output_success(f"Task {task_id} moved to {new_state}", data=task.to_dict(), fmt=fmt)
 
@@ -691,6 +761,14 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
 @click.option("--body", "-b", help="Task body content")
 @click.option("--body-file", type=click.Path(exists=True), help="Read body from file")
 @click.option("--stdin", "read_stdin", is_flag=True, help="Read body from stdin")
+# --- Prediction flags (all optional) ---
+@click.option("--predict-duration", "predict_duration", type=int, default=None, help="Predicted duration in minutes")
+@click.option("--predict-complexity", "predict_complexity", type=click.Choice(["s", "m", "l", "xl"]), default=None, help="Predicted complexity")
+@click.option("--predict-files-changed", "predict_files_changed", type=int, default=None, help="Predicted number of files changed")
+@click.option("--predict-scope", "predict_scope", multiple=True, help="Predicted file glob scope (can specify multiple)")
+@click.option("--predict-frameworks", "predict_frameworks", multiple=True, help="Predicted frameworks/libraries to touch (can specify multiple)")
+@click.option("--predict-pitfalls", "predict_pitfalls", default=None, help="Anticipated problematic areas (free text)")
+@click.option("--hypothesis", "hypothesis", default=None, help="Goal/hypothesis: 'if I do X, then Y will improve'")
 @click.pass_context
 def tasks_add(
     ctx: click.Context,
@@ -706,6 +784,13 @@ def tasks_add(
     body: str | None,
     body_file: str | None,
     read_stdin: bool,
+    predict_duration: int | None,
+    predict_complexity: str | None,
+    predict_files_changed: int | None,
+    predict_scope: tuple[str, ...],
+    predict_frameworks: tuple[str, ...],
+    predict_pitfalls: str | None,
+    hypothesis: str | None,
 ) -> None:
     """Add a new task (or subtask with --parent)."""
     fmt = get_format(ctx)
@@ -726,6 +811,17 @@ def tasks_add(
 
     cmplx = TaskComplexity(complexity) if complexity else None
     scope_list = list(scope) if scope else None
+
+    # Build predictions object from flags (all optional)
+    predictions = Predictions(
+        duration_min=predict_duration,
+        complexity=TaskComplexity(predict_complexity) if predict_complexity else None,
+        files_changed=predict_files_changed,
+        files_scope=list(predict_scope),
+        frameworks=list(predict_frameworks),
+        pitfalls=predict_pitfalls,
+        hypothesis=hypothesis,
+    )
 
     # Create subtask if parent specified
     if parent_id:
@@ -751,6 +847,7 @@ def tasks_add(
             depends=deps,
             scope=scope_list,
             description=task_body,
+            predictions=predictions,
         )
 
     if not task:
@@ -825,10 +922,12 @@ def quick_add(ctx: click.Context, project_id: str | None, title: str, priority: 
 @click.argument("task_id")
 @click.option("--note", "-n", help="Completion note")
 @click.option("--force", "-f", is_flag=True, help="Force completion even if subtasks incomplete")
+@click.option("--reflect-note", "reflect_note", default=None, help="What surprised you (stored in reflection event)")
+@click.option("--meta-reflect", "meta_reflect", default=None, help="What could have been anticipated that wasn't, and why?")
 @click.pass_context
-def quick_done(ctx: click.Context, project_id: str | None, task_id: str, note: str | None, force: bool) -> None:
+def quick_done(ctx: click.Context, project_id: str | None, task_id: str, note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None) -> None:
     """Mark a task as done (alias for 'tasks state <id> done')."""
-    ctx.invoke(tasks_state, project_id=project_id, task_id=task_id, new_state="done", note=note, force=force)
+    ctx.invoke(tasks_state, project_id=project_id, task_id=task_id, new_state="done", note=note, force=force, reflect_note=reflect_note, meta_reflect=meta_reflect)
 
 
 @main.command("start")
@@ -844,10 +943,12 @@ def quick_start(ctx: click.Context, project_id: str | None, task_id: str) -> Non
 @click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
 @click.argument("task_id")
 @click.option("--note", "-n", help="Blocker description")
+@click.option("--reflect-note", "reflect_note", default=None, help="What surprised you (stored in reflection event)")
+@click.option("--meta-reflect", "meta_reflect", default=None, help="What could have been anticipated that wasn't, and why?")
 @click.pass_context
-def quick_block(ctx: click.Context, project_id: str | None, task_id: str, note: str | None) -> None:
+def quick_block(ctx: click.Context, project_id: str | None, task_id: str, note: str | None, reflect_note: str | None, meta_reflect: str | None) -> None:
     """Mark a task as blocked (alias for 'tasks state <id> blocked')."""
-    ctx.invoke(tasks_state, project_id=project_id, task_id=task_id, new_state="blocked", note=note)
+    ctx.invoke(tasks_state, project_id=project_id, task_id=task_id, new_state="blocked", note=note, reflect_note=reflect_note, meta_reflect=meta_reflect)
 
 
 @main.command("next")
@@ -1960,6 +2061,96 @@ def conflicts(
                 f"    scope: {c['scope']}\n"
                 f"    overlapping: {overlap_str}"
             )
+
+
+# ============================================================================
+# Reflect command group — Phase 2 stubs
+# ============================================================================
+
+
+@main.group()
+def reflect() -> None:
+    """Reflection layer — query predictions vs actuals (Phase 2 stubs)."""
+    pass
+
+
+@reflect.command("summarize")
+@click.option("--project", "-p", "project_id", default=None, help="Project ID")
+@click.pass_context
+def reflect_summarize(ctx: click.Context, project_id: str | None) -> None:
+    """[Phase 2] Summarize prediction accuracy across completed tasks.
+
+    When implemented this will:
+    - Aggregate all reflection events for the project
+    - Compute distribution stats (duration ratio, files-changed ratio, complexity hit-rate)
+    - Surface systematic over/under-estimation patterns for operator review
+    """
+    import json as _json
+    click.echo(_json.dumps({
+        "status": "phase2_pending",
+        "message": "clawpm reflect summarize is not yet implemented (Phase 2)",
+    }, indent=2))
+
+
+@reflect.command("suggest")
+@click.argument("task_id")
+@click.option("--project", "-p", "project_id", default=None, help="Project ID")
+@click.pass_context
+def reflect_suggest(ctx: click.Context, task_id: str, project_id: str | None) -> None:
+    """[Phase 2] Suggest predictions for a task based on past reflection history.
+
+    When implemented this will:
+    - Load reflection events for the project
+    - Find tasks with similar title/scope/complexity to <task_id>
+    - Derive calibrated predictions (e.g. 'similar tasks took ~2x longer than predicted')
+    - Return suggested --predict-* values the operator can copy-paste
+    """
+    import json as _json
+    click.echo(_json.dumps({
+        "status": "phase2_pending",
+        "message": f"clawpm reflect suggest is not yet implemented (Phase 2). Task: {task_id}",
+    }, indent=2))
+
+
+@reflect.command("history-import")
+@click.option(
+    "--source", "source_dir", default=None,
+    envvar="CLAWPM_HISTORY_SOURCE",
+    help="Path to history source directory (or set CLAWPM_HISTORY_SOURCE).",
+)
+@click.pass_context
+def reflect_history_import(ctx: click.Context, source_dir: str | None) -> None:
+    """[Phase 2] Import historical session data as reflection events.
+
+    DESIGN CONSTRAINTS (do not violate in Phase 2 implementation):
+    - Source path MUST come from --source flag or CLAWPM_HISTORY_SOURCE env var.
+      NO hardcoded paths (e.g. ~/.openclaw/) — this was removed at commit a06a5b8
+      precisely because static references to agent-runtime paths raise VirusTotal
+      false positives and are an operational security smell.
+    - The importer module must be lazy-imported inside this function so the
+      clawpm binary does not statically reference suspicious path patterns.
+    - clawpm setup should optionally prompt for the history source path during
+      init (Phase 2 work) — add a 'history_source' key to portfolio.toml config,
+      not a hardcoded default.
+
+    When implemented this will:
+    - Walk <source_dir> for session transcripts / agent logs
+    - Extract task-ID references, timestamps, file changes
+    - Synthesise Actuals records and write reflection events for historical tasks
+    - Deduplicate by task_id + occurred_at to allow re-runs safely
+    """
+    import json as _json
+    if not source_dir:
+        click.echo(_json.dumps({
+            "status": "phase2_pending",
+            "message": "clawpm reflect history-import is not yet implemented (Phase 2). "
+                       "Provide --source <dir> or set CLAWPM_HISTORY_SOURCE.",
+        }, indent=2))
+        return
+    click.echo(_json.dumps({
+        "status": "phase2_pending",
+        "message": f"clawpm reflect history-import is not yet implemented (Phase 2). Source: {source_dir}",
+    }, indent=2))
 
 
 # ============================================================================

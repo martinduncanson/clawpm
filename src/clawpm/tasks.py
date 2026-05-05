@@ -8,7 +8,7 @@ from pathlib import Path
 
 import yaml
 
-from .models import Task, TaskState, TaskComplexity, PortfolioConfig
+from .models import Task, TaskState, TaskComplexity, Predictions, PortfolioConfig
 from .discovery import get_project_dir, find_project_dir_fallback
 
 
@@ -275,6 +275,7 @@ def add_task(
     depends: list[str] | None = None,
     scope: list[str] | None = None,
     description: str = "",
+    predictions: Predictions | None = None,
 ) -> Task | None:
     """Add a new task to a project."""
     tasks_dir = get_tasks_dir(config, project_id)
@@ -335,6 +336,14 @@ def add_task(
     if scope:
         frontmatter["scope"] = scope
 
+    if predictions and not predictions.is_empty():
+        pred_dict = predictions.to_dict()
+        # Strip None / empty-list values to keep the file clean
+        frontmatter["predictions"] = {
+            k: v for k, v in pred_dict.items()
+            if v is not None and v != []
+        }
+
     # Build content
     content = f"""---
 {yaml.dump(frontmatter, default_flow_style=False).strip()}
@@ -367,6 +376,7 @@ def edit_task(
     complexity: TaskComplexity | None = None,
     scope: list[str] | None = None,
     body: str | None = None,
+    predictions: Predictions | None = None,
 ) -> Task | None:
     """Edit task metadata (frontmatter) and optionally title/body."""
     task = get_task(config, project_id, task_id)
@@ -398,6 +408,15 @@ def edit_task(
             frontmatter["scope"] = scope
         else:
             frontmatter.pop("scope", None)
+    if predictions is not None:
+        if predictions.is_empty():
+            frontmatter.pop("predictions", None)
+        else:
+            pred_dict = predictions.to_dict()
+            frontmatter["predictions"] = {
+                k: v for k, v in pred_dict.items()
+                if v is not None and v != []
+            }
 
     # Update title in content (first # heading)
     if title is not None:

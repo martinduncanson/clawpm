@@ -115,6 +115,29 @@ clawpm issues add --type bug --severity high --actual "What happened"
 clawpm issues list [--open]
 ```
 
+## Reflection Layer (predictions vs actuals)
+
+Capture predictions at task creation and mine the delta when tasks complete:
+
+```bash
+# Predict when adding a task
+clawpm tasks add -t "Refactor auth" \
+    --predict-duration 90 --predict-complexity m \
+    --predict-scope "src/auth/**" \
+    --hypothesis "JWT will cut session table contention by 80%"
+
+# Reflect when done
+clawpm done CLAWP-042 \
+    --reflect-note "DB migration took 3x longer than expected" \
+    --meta-reflect "should have checked existing schema constraints"
+```
+
+Reflection events are written to `~/clawpm/reflections/<task-id>.jsonl` with
+predictions, actuals (computed from work log), and deltas (duration ratio,
+files-changed ratio, scope overrun/unused, complexity match).
+
+`clawpm reflect summarize/suggest/history-import` are Phase 2 stubs.
+
 ## Project Auto-Detection
 
 ClawPM resolves your project automatically (in priority order):

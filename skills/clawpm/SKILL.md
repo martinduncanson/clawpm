@@ -216,6 +216,106 @@ clawpm use --clear         # Clear context
 | done | `tasks/done/CLAWP-042.md` | Completed |
 | blocked | `tasks/blocked/CLAWP-042.md` | Waiting |
 
+## Reflection — predictions, actuals, deltas
+
+ClawPM captures operator predictions at task creation and computes actuals at
+completion, storing the delta as an append-only JSONL event in
+`~/clawpm/reflections/<task-id>.jsonl`. This lets the operator (and future LLMs)
+mine calibration data over time.
+
+### Setting predictions
+
+Add `--predict-*` flags when creating or editing a task:
+
+```bash
+clawpm tasks add -t "Refactor auth" \
+    --predict-duration 90 \
+    --predict-complexity m \
+    --predict-files-changed 5 \
+    --predict-scope "src/auth/**" --predict-scope "tests/auth/**" \
+    --predict-frameworks fastapi --predict-frameworks pyjwt \
+    --predict-pitfalls "session token storage may need DB migration" \
+    --hypothesis "moving to JWT will reduce session table contention by 80%"
+
+# Also available on tasks edit:
+clawpm tasks edit CLAWP-042 --predict-duration 120 --predict-complexity l
+```
+
+All `--predict-*` flags are optional. Tasks without predictions still work normally.
+
+### Completing with reflection notes
+
+When marking a task done or blocked, optionally add:
+
+- `--reflect-note` — what surprised you
+- `--meta-reflect` — what could have been anticipated that wasn't, and why
+
+```bash
+clawpm done CLAWP-042 \
+    --reflect-note "DB migration took 3x longer than expected" \
+    --meta-reflect "should have checked existing schema constraints first"
+
+# Also works on tasks state and clawpm block:
+clawpm block CLAWP-042 --reflect-note "hit API rate limit"
+```
+
+### Lifecycle example
+
+```bash
+# 1. Add task with predictions
+clawpm tasks add -t "Refactor auth layer" \
+    --predict-duration 90 --predict-complexity m \
+    --predict-scope "src/auth/**"
+
+# 2. Start working (auto-logged)
+clawpm start CLAWP-042
+
+# ... do work, git commits, etc. ...
+
+# 3. Complete with reflection
+clawpm done CLAWP-042 \
+    --reflect-note "JWT validation added 30 extra min" \
+    --meta-reflect "should have checked middleware chain first"
+
+# 4. Reflection event appears at:
+#    ~/clawpm/reflections/CLAWP-042.jsonl
+```
+
+The reflection JSONL schema:
+
+```json
+{
+  "event": "task_done",
+  "task_id": "CLAWP-042",
+  "project_id": "clawpm",
+  "occurred_at": "2026-05-05T18:00:00Z",
+  "predictions": { "duration_min": 90, "complexity": "m", ... },
+  "actuals":     { "duration_min": 167, "files_touched": [...], ... },
+  "deltas": {
+    "duration_ratio": 1.85,
+    "files_changed_ratio": 0.6,
+    "files_scope_overrun": ["unexpected/file.py"],
+    "files_scope_unused": ["predicted/but/not/touched.py"],
+    "complexity_match": false,
+    "complexity_predicted": "m",
+    "complexity_actual": "l"
+  },
+  "note": "...",
+  "meta_reflection": "..."
+}
+```
+
+### Phase 2 stubs
+
+The following commands are stubbed and return `{"status": "phase2_pending", ...}`:
+
+```bash
+clawpm reflect summarize        # aggregate accuracy stats across completed tasks
+clawpm reflect suggest <task>   # suggest calibrated predictions from history
+clawpm reflect history-import   # import historical sessions as reflection events
+                                #   (requires --source <dir> or CLAWPM_HISTORY_SOURCE)
+```
+
 ## Tips
 
 - **Flag order**: `clawpm [global flags] <command> [command flags]` — e.g. `clawpm -f text tasks list -s open`

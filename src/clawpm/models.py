@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -145,6 +146,86 @@ class ProjectSettings:
 
 
 @dataclass
+class Predictions:
+    """Operator predictions captured at task creation or edit time.
+
+    Stored under a ``predictions:`` block in YAML frontmatter so they don't
+    pollute the top-level keys.  All fields are optional — no prediction is fine.
+    """
+
+    duration_min: int | None = None
+    complexity: TaskComplexity | None = None
+    files_changed: int | None = None
+    files_scope: list[str] = field(default_factory=list)
+    frameworks: list[str] = field(default_factory=list)
+    pitfalls: str | None = None
+    hypothesis: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "duration_min": self.duration_min,
+            "complexity": self.complexity.value if self.complexity else None,
+            "files_changed": self.files_changed,
+            "files_scope": self.files_scope,
+            "frameworks": self.frameworks,
+            "pitfalls": self.pitfalls,
+            "hypothesis": self.hypothesis,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Predictions:
+        complexity = None
+        if c := data.get("complexity"):
+            try:
+                complexity = TaskComplexity(c)
+            except ValueError:
+                pass
+        return cls(
+            duration_min=data.get("duration_min"),
+            complexity=complexity,
+            files_changed=data.get("files_changed"),
+            files_scope=data.get("files_scope") or [],
+            frameworks=data.get("frameworks") or [],
+            pitfalls=data.get("pitfalls"),
+            hypothesis=data.get("hypothesis"),
+        )
+
+    def is_empty(self) -> bool:
+        """True when no predictions have been set."""
+        return (
+            self.duration_min is None
+            and self.complexity is None
+            and self.files_changed is None
+            and not self.files_scope
+            and not self.frameworks
+            and self.pitfalls is None
+            and self.hypothesis is None
+        )
+
+
+@dataclass
+class Actuals:
+    """Actual outcomes computed at task completion (done/blocked).
+
+    Derived from work_log entries for the task — not stored in the task file
+    itself, only in the reflection event JSONL.
+    """
+
+    duration_min: int | None = None
+    complexity: TaskComplexity | None = None
+    files_changed: int | None = None
+    files_touched: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "duration_min": self.duration_min,
+            "complexity": self.complexity.value if self.complexity else None,
+            "files_changed": self.files_changed,
+            "files_touched": self.files_touched,
+        }
+
+
+@dataclass
 class Task:
     """A task with frontmatter and content."""
 
@@ -160,6 +241,7 @@ class Task:
     created: str | None = None
     content: str = ""
     file_path: Path | None = None
+    predictions: Predictions = field(default_factory=Predictions)
 
     @property
     def is_parent(self) -> bool:
@@ -215,6 +297,11 @@ class Task:
             except ValueError:
                 pass
 
+        predictions = Predictions()
+        if pred_raw := frontmatter.get("predictions"):
+            if isinstance(pred_raw, dict):
+                predictions = Predictions.from_dict(pred_raw)
+
         return cls(
             id=frontmatter.get("id", path.stem.replace(".progress", "")),
             title=title,
@@ -227,6 +314,7 @@ class Task:
             created=frontmatter.get("created"),
             content=content,
             file_path=path,
+            predictions=predictions,
         )
 
     @property
@@ -269,6 +357,9 @@ class Task:
         body = self.body
         if body:
             result["body"] = body
+        # Always include predictions in output when any field is set;
+        # include the block even when empty so agents can see the schema.
+        result["predictions"] = self.predictions.to_dict()
         return result
 
 
