@@ -746,7 +746,28 @@ def tasks_add(
         )
 
     if not task:
-        output_error("add_failed", f"Failed to add task to project '{project_id}'", fmt=fmt)
+        # Give a more useful hint: check if the project exists locally but has
+        # a malformed settings.toml (e.g. Windows backslashes in repo_path).
+        from pathlib import Path as _Path
+        _current = _Path.cwd().resolve()
+        _settings_exists = False
+        while _current != _current.parent:
+            if (_current / ".project" / "settings.toml").exists():
+                _settings_exists = True
+                break
+            _current = _current.parent
+
+        if _settings_exists:
+            output_error(
+                "add_failed",
+                f"Failed to add task to project '{project_id}'. "
+                f"A .project/settings.toml exists locally but could not be loaded from the "
+                f"portfolio registry - the file may contain Windows backslashes in repo_path. "
+                f"Fix it by using forward slashes (e.g. F:/Git/...) then retry.",
+                fmt=fmt,
+            )
+        else:
+            output_error("add_failed", f"Failed to add task to project '{project_id}'", fmt=fmt)
         sys.exit(1)
 
     output_success(f"Task {task.id} created", data=task.to_dict(), fmt=fmt)

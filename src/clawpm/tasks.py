@@ -9,7 +9,7 @@ from pathlib import Path
 import yaml
 
 from .models import Task, TaskState, TaskComplexity, PortfolioConfig
-from .discovery import get_project_dir
+from .discovery import get_project_dir, find_project_dir_fallback
 
 
 def get_tasks_dir(config: PortfolioConfig, project_id: str) -> Path | None:
@@ -273,17 +273,22 @@ def add_task(
     priority: int = 5,
     complexity: TaskComplexity | None = None,
     depends: list[str] | None = None,
+    scope: list[str] | None = None,
     description: str = "",
 ) -> Task | None:
     """Add a new task to a project."""
     tasks_dir = get_tasks_dir(config, project_id)
     if not tasks_dir:
-        # Create tasks directory if project exists
-        from .discovery import get_project_dir
-        project_dir = get_project_dir(config, project_id)
-        if not project_dir:
+        # Registry lookup succeeded but tasks/ doesn't exist yet - or registry
+        # lookup failed entirely.  Try registry first, then CWD-walk fallback.
+        project_dot_dir = get_project_dir(config, project_id)
+        if not project_dot_dir:
+            # Registry failed (e.g. malformed settings.toml).  Fall back to CWD
+            # walk so operators don't get a silent failure when inside the repo.
+            project_dot_dir = find_project_dir_fallback(config, project_id)
+        if not project_dot_dir:
             return None
-        tasks_dir = project_dir / "tasks"
+        tasks_dir = project_dot_dir / "tasks"
         tasks_dir.mkdir(parents=True, exist_ok=True)
 
     # Generate task ID if not provided
@@ -327,6 +332,9 @@ def add_task(
     if depends:
         frontmatter["depends"] = depends
 
+    if scope:
+        frontmatter["scope"] = scope
+
     # Build content
     content = f"""---
 {yaml.dump(frontmatter, default_flow_style=False).strip()}
@@ -357,6 +365,7 @@ def edit_task(
     title: str | None = None,
     priority: int | None = None,
     complexity: TaskComplexity | None = None,
+    scope: list[str] | None = None,
     body: str | None = None,
 ) -> Task | None:
     """Edit task metadata (frontmatter) and optionally title/body."""
@@ -384,6 +393,11 @@ def edit_task(
         frontmatter["priority"] = priority
     if complexity is not None:
         frontmatter["complexity"] = complexity.value
+    if scope is not None:
+        if scope:
+            frontmatter["scope"] = scope
+        else:
+            frontmatter.pop("scope", None)
 
     # Update title in content (first # heading)
     if title is not None:
