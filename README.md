@@ -1,6 +1,8 @@
-# ClawPM
+# ClawPM (martinduncanson fork)
 
 Filesystem-first multi-project task manager for AI agents. JSON CLI for tasks, work logs, and research across projects with [OpenClaw](https://clawhub.ai) skill integration.
+
+> Forked from [`malphas-gh/clawpm`](https://github.com/malphas-gh/clawpm) and extended with: Windows TOML/backslash bug fix, `scope:` field + `clawpm conflicts` command, Phase 1 reflection layer (`--predict-*`, `--reflect-note`, `--meta-reflect`), Cowork bootstrap skill, AGENTS.md template for Codex, Workflow Integrations docs.
 
 [![ClawHub](https://img.shields.io/badge/ClawHub-clawpm-blue)](https://clawhub.ai/malphas-gh/clawpm)
 
@@ -17,12 +19,15 @@ Filesystem-first multi-project task manager for AI agents. JSON CLI for tasks, w
 ## Installation
 
 ```bash
-# From GitHub
-uv tool install git+https://github.com/malphas-gh/clawpm
+# From GitHub (this fork — has all the recent improvements)
+uv tool install git+https://github.com/martinduncanson/clawpm
 
 # For development
-git clone git@github.com:malphas-gh/clawpm.git ~/clawpm/projects/clawpm
+git clone git@github.com:martinduncanson/clawpm.git ~/clawpm/projects/clawpm
 uv tool install -e ~/clawpm/projects/clawpm
+
+# (To install the upstream version instead — without any of the recent improvements)
+# uv tool install git+https://github.com/malphas-gh/clawpm
 ```
 
 ## Quick Start

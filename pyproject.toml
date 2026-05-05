@@ -19,8 +19,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/malphas-gh/clawpm"
-Repository = "https://github.com/malphas-gh/clawpm"
+Homepage = "https://github.com/martinduncanson/clawpm"
+Repository = "https://github.com/martinduncanson/clawpm"
+Upstream = "https://github.com/malphas-gh/clawpm"
 
 [project.scripts]
 clawpm = "clawpm.cli:main"

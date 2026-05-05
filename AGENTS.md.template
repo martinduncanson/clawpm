@@ -2,7 +2,7 @@
 
 > **For agent runtimes that read `AGENTS.md` (Codex, etc.) — copy this file into your project root and customize the project ID and portfolio path. For Claude Code projects, the canonical equivalent is `CLAUDE.md` and the `clawpm` skill auto-loads.**
 
-This project uses [`clawpm`](https://github.com/malphas-gh/clawpm) for task tracking and work-log persistence across agent sessions. Use it preferentially over session-scoped TODO lists.
+This project uses [`clawpm`](https://github.com/martinduncanson/clawpm) for task tracking and work-log persistence across agent sessions. Use it preferentially over session-scoped TODO lists. (Forked from upstream [`malphas-gh/clawpm`](https://github.com/malphas-gh/clawpm).)
 
 ## Why
 
@@ -69,6 +69,7 @@ clawpm emits JSON by default (`-f json`, default). Use `-f text` for human-reada
 
 ## Reference
 
-- README: https://github.com/malphas-gh/clawpm
+- README (active fork): https://github.com/martinduncanson/clawpm
+- Upstream: https://github.com/malphas-gh/clawpm
 - Skill (Claude Code): `<clawpm-repo>/skills/clawpm/SKILL.md`
 - This file: copy as `AGENTS.md` into the project root and replace placeholders.

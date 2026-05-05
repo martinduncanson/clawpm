@@ -22,7 +22,7 @@ Codex sandboxes are typically ephemeral. If your sandbox is also fresh per-sessi
 # Clone operator's portfolio repo (URL via env var)
 git clone "$CLAWPM_PORTFOLIO_REPO" "$HOME/clawpm"
 # Install CLI
-uv tool install git+https://github.com/malphas-gh/clawpm
+uv tool install git+https://github.com/martinduncanson/clawpm
 # Resume context
 clawpm context
 ```
@@ -50,4 +50,4 @@ The operator's principle: "the team that owns the runtime owns the adapter." We 
 
 ## Contact
 
-This integration design originated at `martinduncanson@gmail.com` (operator). Pull requests and design questions welcome at https://github.com/malphas-gh/clawpm.
+This integration design originated at `martinduncanson@gmail.com` (operator). Pull requests and design questions welcome at https://github.com/martinduncanson/clawpm (active fork) or https://github.com/malphas-gh/clawpm (upstream).
