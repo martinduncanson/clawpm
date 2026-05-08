@@ -256,7 +256,7 @@ class Task:
     @classmethod
     def from_file(cls, path: Path) -> Task:
         """Load task from markdown file with YAML frontmatter."""
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
 
         # Determine state from filename/location
         # Check path components for done/blocked (handles both regular files and task directories)
@@ -442,7 +442,7 @@ class Research:
     @classmethod
     def from_file(cls, path: Path) -> Research:
         """Load research from markdown file with YAML frontmatter."""
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
 
         # Parse frontmatter
         frontmatter: dict[str, Any] = {}

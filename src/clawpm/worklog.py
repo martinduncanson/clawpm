@@ -50,9 +50,9 @@ def add_entry(
     # Ensure parent directory exists
     worklog_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Append to file
-    with open(worklog_path, "a") as f:
-        f.write(json.dumps(entry.to_dict()) + "\n")
+    # Append to file — utf-8 so summaries with non-Latin chars survive on Windows
+    with open(worklog_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry.to_dict(), ensure_ascii=False) + "\n")
 
     return entry
 
@@ -70,7 +70,7 @@ def read_entries(
 
     entries: list[WorkLogEntry] = []
 
-    with open(worklog_path) as f:
+    with open(worklog_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -118,7 +118,7 @@ def get_logged_commit_hashes(
         return set()
 
     hashes: set[str] = set()
-    with open(worklog_path) as f:
+    with open(worklog_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
