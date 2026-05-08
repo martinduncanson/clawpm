@@ -379,7 +379,7 @@ priority = 5
 repo_path = "{repo_path_str}"
 labels = []
 '''
-    (project_dir / "settings.toml").write_text(settings_content)
+    (project_dir / "settings.toml").write_text(settings_content, encoding="utf-8")
 
     # Create SPEC.md template
     spec_content = f"""# {project_name}
@@ -401,10 +401,10 @@ labels = []
 
 ...
 """
-    (project_dir / "SPEC.md").write_text(spec_content)
+    (project_dir / "SPEC.md").write_text(spec_content, encoding="utf-8")
 
     # Create learnings.md
-    (project_dir / "learnings.md").write_text(f"# {project_name} Learnings\n\n")
+    (project_dir / "learnings.md").write_text(f"# {project_name} Learnings\n\n", encoding="utf-8")
 
     output_success(f"Project initialized at {project_dir}", fmt=fmt)
 
@@ -803,7 +803,7 @@ def tasks_add(
     if body:
         task_body = body
     elif body_file:
-        task_body = Path(body_file).read_text()
+        task_body = Path(body_file).read_text(encoding="utf-8")
     elif read_stdin:
         task_body = sys.stdin.read()
     elif description:
@@ -1101,7 +1101,7 @@ def agent_context(ctx: click.Context, project_id: str | None, log_limit: int) ->
     if proj.project_dir:
         spec_file = proj.project_dir / ".project" / "SPEC.md"
         if spec_file.exists():
-            spec_content = spec_file.read_text()
+            spec_content = spec_file.read_text(encoding="utf-8")
             # Truncate if too long
             if len(spec_content) > 2000:
                 context["spec"] = spec_content[:2000] + "\n\n[...truncated...]"
@@ -1710,7 +1710,7 @@ project_roots = [
 
 [defaults]
 status = "active"
-''')
+''', encoding="utf-8")
         created.append(str(portfolio_toml))
 
         # Create empty work log

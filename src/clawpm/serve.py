@@ -27,7 +27,7 @@ def create_app() -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
         index_file = TEMPLATES_DIR / "index.html"
-        return index_file.read_text() if index_file.exists() else "<h1>ClawPM</h1>"
+        return index_file.read_text(encoding="utf-8") if index_file.exists() else "<h1>ClawPM</h1>"
 
     @app.get("/api/projects")
     def api_projects() -> list[dict]:
@@ -111,14 +111,14 @@ def create_app() -> FastAPI:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
             response_line = f"\n{timestamp} [Web UI]: {req.response}"
 
-            content = task.file_path.read_text()
+            content = task.file_path.read_text(encoding="utf-8")
 
             # Add Responses section if not exists
             if "## Responses" not in content:
                 content += "\n\n## Responses\n"
 
             content += response_line
-            task.file_path.write_text(content)
+            task.file_path.write_text(content, encoding="utf-8")
 
             # Optionally unblock
             if req.unblock and task.state == TaskState.BLOCKED:
@@ -190,9 +190,9 @@ def create_app() -> FastAPI:
                 return {"success": False, "error": "project_not_found"}
 
             settings_path = project.project_dir / ".project" / "settings.toml"
-            content = settings_path.read_text()
+            content = settings_path.read_text(encoding="utf-8")
             content = content.replace('status = "active"', 'status = "paused"')
-            settings_path.write_text(content)
+            settings_path.write_text(content, encoding="utf-8")
 
             return {"success": True, "status": "paused"}
         except Exception as e:
@@ -209,9 +209,9 @@ def create_app() -> FastAPI:
                 return {"success": False, "error": "project_not_found"}
 
             settings_path = project.project_dir / ".project" / "settings.toml"
-            content = settings_path.read_text()
+            content = settings_path.read_text(encoding="utf-8")
             content = content.replace('status = "paused"', 'status = "active"')
-            settings_path.write_text(content)
+            settings_path.write_text(content, encoding="utf-8")
 
             return {"success": True, "status": "active"}
         except Exception as e:
@@ -284,8 +284,8 @@ def create_app() -> FastAPI:
             }
             entry = {k: v for k, v in entry.items() if v is not None}
 
-            with open(issues_file, "a") as f:
-                f.write(json.dumps(entry) + "\n")
+            with open(issues_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
             return {"success": True}
         except Exception as e:

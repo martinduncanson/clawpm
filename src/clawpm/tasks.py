@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 from datetime import date
 from pathlib import Path
@@ -297,25 +298,32 @@ def add_task(
         # Get project prefix from ID (uppercase)
         prefix = project_id.upper()[:5]
 
-        # Find highest existing task number
-        existing_nums = []
-        for f in tasks_dir.glob(f"{prefix}-*.md"):
-            try:
-                num = int(f.stem.split("-")[1].replace(".progress", ""))
-                existing_nums.append(num)
-            except (IndexError, ValueError):
-                pass
+        # Find highest existing task number.
+        # We must check BOTH .md files and parent-task directories (e.g. OPENW-004/)
+        # because split tasks convert the file to a directory.  The *.md glob misses
+        # directories, so without this check add_task would re-issue the same number.
+        # Subtask files (OPENW-004-001.md) live *inside* parent dirs; they don't
+        # appear at the scan-dir level, so they won't pollute top-level numbering.
+        _dir_pat = re.compile(rf"^{re.escape(prefix)}-(\d+)$")
 
-        # Also check subdirectories
-        for subdir in ["done", "blocked"]:
-            sub = tasks_dir / subdir
-            if sub.exists():
-                for f in sub.glob(f"{prefix}-*.md"):
-                    try:
-                        num = int(f.stem.split("-")[1])
-                        existing_nums.append(num)
-                    except (IndexError, ValueError):
-                        pass
+        existing_nums = []
+
+        for scan_dir in [tasks_dir, tasks_dir / "done", tasks_dir / "blocked"]:
+            if not scan_dir.exists():
+                continue
+            # .md files at this level
+            for f in scan_dir.glob(f"{prefix}-*.md"):
+                try:
+                    num = int(f.stem.split("-")[1].replace(".progress", ""))
+                    existing_nums.append(num)
+                except (IndexError, ValueError):
+                    pass
+            # Parent-task directories at this level
+            for entry in scan_dir.iterdir():
+                if entry.is_dir():
+                    m = _dir_pat.match(entry.name)
+                    if m:
+                        existing_nums.append(int(m.group(1)))
 
         next_num = max(existing_nums, default=-1) + 1
         task_id = f"{prefix}-{next_num:03d}"
@@ -346,7 +354,7 @@ def add_task(
 
     # Build content
     content = f"""---
-{yaml.dump(frontmatter, default_flow_style=False).strip()}
+{yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True).strip()}
 ---
 # {title}
 
@@ -360,9 +368,16 @@ def add_task(
 
 """
 
-    # Write file
+    # Write file — explicit utf-8 so Unicode titles (e.g. →, –, emoji) don't
+    # raise UnicodeEncodeError on Windows where the default locale is cp1252.
     file_path = tasks_dir / f"{task_id}.md"
-    file_path.write_text(content)
+    tmp_path = file_path.with_suffix(".tmp")
+    try:
+        tmp_path.write_text(content, encoding="utf-8")
+        tmp_path.replace(file_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
     return Task.from_file(file_path)
 
@@ -383,7 +398,7 @@ def edit_task(
     if not task or not task.file_path:
         return None
 
-    text = task.file_path.read_text()
+    text = task.file_path.read_text(encoding="utf-8")
 
     # Parse frontmatter and content
     frontmatter: dict = {}
@@ -448,9 +463,15 @@ def edit_task(
             after = lines[section_idx:] if section_idx is not None else []
             content = "\n".join(before) + f"\n\n{body}\n\n" + "\n".join(after)
 
-    # Rebuild file
-    new_text = f"---\n{yaml.dump(frontmatter, default_flow_style=False).strip()}\n---\n{content}"
-    task.file_path.write_text(new_text)
+    # Rebuild file — utf-8 always so Unicode content survives on Windows
+    new_text = f"---\n{yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True).strip()}\n---\n{content}"
+    tmp_path = task.file_path.with_suffix(".tmp")
+    try:
+        tmp_path.write_text(new_text, encoding="utf-8")
+        tmp_path.replace(task.file_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
     return Task.from_file(task.file_path)
 
@@ -547,7 +568,7 @@ def add_subtask(
     
     # Build content
     content = f"""---
-{yaml.dump(frontmatter, default_flow_style=False).strip()}
+{yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True).strip()}
 ---
 # {title}
 
@@ -556,9 +577,15 @@ def add_subtask(
 ## Notes
 
 """
-    
-    # Write file
+
+    # Write file — utf-8 so Unicode in title/description survives on Windows
     file_path = parent_dir / f"{subtask_id}.md"
-    file_path.write_text(content)
-    
+    tmp_path = file_path.with_suffix(".tmp")
+    try:
+        tmp_path.write_text(content, encoding="utf-8")
+        tmp_path.replace(file_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
     return Task.from_file(file_path)

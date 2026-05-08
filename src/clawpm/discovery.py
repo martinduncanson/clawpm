@@ -414,7 +414,7 @@ status = "active"
 priority = 5
 repo_path = "{repo_path_str}"
 '''
-    (project_dir / "settings.toml").write_text(settings_content)
+    (project_dir / "settings.toml").write_text(settings_content, encoding="utf-8")
 
     # Create minimal SPEC.md
     spec_content = f'''# {project_name}
@@ -431,10 +431,10 @@ repo_path = "{repo_path_str}"
 
 Auto-initialized by clawpm from git repo.
 '''
-    (project_dir / "SPEC.md").write_text(spec_content)
+    (project_dir / "SPEC.md").write_text(spec_content, encoding="utf-8")
 
     # Create learnings.md
-    (project_dir / "learnings.md").write_text(f"# Learnings - {project_name}\n\n")
+    (project_dir / "learnings.md").write_text(f"# Learnings - {project_name}\n\n", encoding="utf-8")
 
     # Load and return the project
     return ProjectSettings.load(project_dir / "settings.toml")

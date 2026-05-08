@@ -116,7 +116,7 @@ def add_research(
 
     # Build content
     content = f"""---
-{yaml.dump(frontmatter, default_flow_style=False).strip()}
+{yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True).strip()}
 ---
 # {title}
 
@@ -148,7 +148,7 @@ def add_research(
         file_path = research_dir / filename
         counter += 1
 
-    file_path.write_text(content)
+    file_path.write_text(content, encoding="utf-8")
 
     return Research.from_file(file_path)
 
@@ -167,7 +167,7 @@ def link_research_session(
         return None
 
     # Read current content
-    text = item.file_path.read_text()
+    text = item.file_path.read_text(encoding="utf-8")
 
     # Parse and update frontmatter
     if text.startswith("---"):
@@ -191,10 +191,10 @@ def link_research_session(
 
                 # Rebuild content
                 new_content = f"""---
-{yaml.dump(frontmatter, default_flow_style=False).strip()}
+{yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True).strip()}
 ---{parts[2]}"""
 
-                item.file_path.write_text(new_content)
+                item.file_path.write_text(new_content, encoding="utf-8")
 
                 return Research.from_file(item.file_path)
             except yaml.YAMLError:

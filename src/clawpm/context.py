@@ -83,7 +83,7 @@ def get_context_project() -> str | None:
         return None
     
     try:
-        content = CONTEXT_FILE.read_text().strip()
+        content = CONTEXT_FILE.read_text(encoding="utf-8").strip()
         if content:
             return content
     except Exception:
@@ -98,7 +98,7 @@ def set_context_project(project_id: str | None) -> None:
         if CONTEXT_FILE.exists():
             CONTEXT_FILE.unlink()
     else:
-        CONTEXT_FILE.write_text(project_id)
+        CONTEXT_FILE.write_text(project_id, encoding="utf-8")
 
 
 def resolve_project(explicit: str | None = None) -> tuple[str | None, str]:
