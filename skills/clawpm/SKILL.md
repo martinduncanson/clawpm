@@ -9,6 +9,29 @@ metadata: { "openclaw": { "homepage": "https://github.com/martinduncanson/clawpm
 
 Multi-project task management. All commands emit JSON by default; use `-f text` for human-readable output.
 
+## When to use clawpm — defacto default
+
+clawpm is the defacto-default PM layer for every meaningful work session. Use it for any work unit that meets ANY of these:
+
+- Produces file changes
+- Takes more than ~5 minutes of focused effort
+- Spans more than one logical step
+- Will likely be resumed across sessions
+- Has a hypothesis worth testing or a goal worth tracking
+- Is dispatched to a subagent (subagent gets a subtask under the parent)
+
+**Skip clawpm only for:** pure Q&A / explanation / brainstorming with no deliverable; single-action lookups (`git status`, "show me X"); session orientation reads; or when the operator says "just do this quickly".
+
+If unsure, use clawpm. Under-used task entries cost nothing; lost calibration data and forgotten cross-session work compound.
+
+## How Claude fills predictions — "agent proposes, human reviews"
+
+When adding a task on the operator's behalf, **propose all predictions in a single block, then ask for confirmation/edits.** Don't silently file with bare flags; don't ask for every field individually. Single proposal, single review beat:
+
+> "Adding **CLAWP-099 Migrate auth to JWT** with: duration 4h (confidence 3), complexity m, approach 'drop-in JWT middleware', success criteria 'P95 <200ms; session writes drop ≥50%', pre-mortem 'mobile webview cookie edge case', reference task CLAWP-042. **Confirm or edit?**"
+
+The operator overrides only the fields where their gut conflicts with Claude's guess. The gut-vs-Claude delta is itself calibration signal. Always include `--confidence` honestly (1 = wild guess, 5 = done-this-exact-thing-before).
+
 ## First-Time Setup
 
 ```bash
@@ -517,6 +540,24 @@ The check uses a prefix-based heuristic:
   "queried_scope": ["src/auth/**", "tests/auth/**"]
 }
 ```
+
+## Project-level reflection (Phase 2 stub — planned)
+
+Tasks are micro-experiments. **Projects are macro-experiments.** Each project has a goal hypothesis in `.project/spec.md` at init time; tasks within the project are sub-predictions about HOW to achieve that goal.
+
+At project completion, pause, or major-milestone review, run a project-level reflection:
+- Did the goal hypothesis hold?
+- Which tasks served the goal? Which were noise?
+- Which sub-hypotheses turned out to be load-bearing?
+- What would I predict differently for the NEXT project of similar shape?
+
+**Phase 2 command (not yet implemented):**
+```bash
+clawpm project reflect                    # Aggregate task reflections, surface goal-trace
+clawpm project reflect --milestone "M1"   # Reflect on a milestone within a project
+```
+
+**For now (manual):** add a `## Reflection` section to `spec.md` at completion. Capture the four questions above. The aggregated reflection becomes the prior for the next similar project.
 
 ## Workflow Integrations
 
