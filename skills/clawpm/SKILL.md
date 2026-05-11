@@ -68,6 +68,7 @@ clawpm status              # Now uses my-project
 | `clawpm done 42` | `clawpm tasks state 42 done` | Mark task done |
 | `clawpm start 42` | `clawpm tasks state 42 progress` | Start working |
 | `clawpm block 42` | `clawpm tasks state 42 blocked` | Mark blocked |
+| `clawpm unblock 42` | `clawpm tasks state 42 open` | Unblock a task |
 | `clawpm next` | `clawpm projects next` | Get next task |
 | `clawpm status` | - | Project overview |
 | `clawpm context` | - | Full agent context |
@@ -125,7 +126,33 @@ clawpm log commit                        # Also log the git commits themselves
 Hit a blocker:
 ```bash
 clawpm block 42 --note "Need API credentials"
+# Later, when the blocker is resolved:
+clawpm unblock 42 --note "Credentials obtained"        # → open
+clawpm unblock 42 --note "Good to go" --start          # → in-progress immediately
 ```
+
+### Don't re-`start` an in-progress task to log midway updates
+
+**Re-starting a task that's already in-progress corrupts the duration anchor.**
+Actuals are computed from the *first* start event — a re-start makes elapsed time
+look shorter than it actually is, breaking the calibration signal.
+
+Instead, use `log add --action progress` for mid-task updates:
+
+```bash
+# WRONG — resets the duration anchor
+clawpm start 42
+
+# RIGHT — logs a progress note without touching the anchor
+clawpm log add --task 42 --action progress --summary "PR #125 opened, awaiting Codex review"
+```
+
+Use `start` only to transition `open` → `progress`. Use `done` / `block` / `unblock`
+for the corresponding terminal transitions. Use `log add --action progress` for
+everything in between.
+
+> The CLI will warn (but not block) if you `clawpm start` a task that's already
+> in-progress.
 
 ## Full Command Reference
 
@@ -199,9 +226,10 @@ clawpm use --clear         # Clear context
 ## Work Log Actions
 
 - `start` - Started working (auto-logged on `clawpm start`)
-- `progress` - Made progress
+- `progress` - Made progress (use `clawpm log add --action progress` for mid-task updates)
 - `done` - Completed (auto-logged on `clawpm done`)
 - `blocked` - Hit a blocker (auto-logged on `clawpm block`)
+- `unblock` - Blocker resolved (auto-logged on `clawpm unblock`)
 - `commit` - Git commit (logged via `clawpm log commit`)
 - `pause` - Switching tasks
 - `research` - Research note
@@ -223,13 +251,36 @@ completion, storing the delta as an append-only JSONL event in
 `~/clawpm/reflections/<task-id>.jsonl`. This lets the operator (and future LLMs)
 mine calibration data over time.
 
+### Claude's mandate: ALWAYS predict on add
+
+**When Claude adds a task on the operator's behalf, ALWAYS include predictions.**
+Estimate at minimum: `--predict-duration`, `--predict-complexity`. Add `--hypothesis`
+for any task with a non-trivial outcome ("if I do X, then Y will improve"). Add
+`--predict-pitfalls` when the task touches code Claude is uncertain about. Empty
+predictions defeat the reflection layer's purpose — they produce structurally-empty
+events that yield no calibration signal.
+
+The operator has specifically requested this: Claude's time estimates are
+systematically biased (often 10-100× over actual). Capturing predictions creates
+the calibration corpus needed to correct that bias.
+
 ### Setting predictions
 
-Add `--predict-*` flags when creating or editing a task:
+Add `--predict-*` flags when creating or editing a task.
+
+`--predict-duration` accepts human-friendly unit suffixes (wall-clock, not 8-hour
+workday — calibration compares elapsed time, not scheduled hours):
+
+| Input | Stored as |
+|-------|-----------|
+| `90` or `90m` | 90 minutes |
+| `2h` | 120 minutes |
+| `3d` | 4 320 minutes (3 × 24 h) |
+| `1w` | 10 080 minutes (7 × 24 h) |
 
 ```bash
 clawpm tasks add -t "Refactor auth" \
-    --predict-duration 90 \
+    --predict-duration 2h \
     --predict-complexity m \
     --predict-files-changed 5 \
     --predict-scope "src/auth/**" --predict-scope "tests/auth/**" \
@@ -238,7 +289,7 @@ clawpm tasks add -t "Refactor auth" \
     --hypothesis "moving to JWT will reduce session table contention by 80%"
 
 # Also available on tasks edit:
-clawpm tasks edit CLAWP-042 --predict-duration 120 --predict-complexity l
+clawpm tasks edit CLAWP-042 --predict-duration 1d --predict-complexity l
 ```
 
 All `--predict-*` flags are optional. Tasks without predictions still work normally.

@@ -8,11 +8,43 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import click
+
 from .models import Actuals, Predictions, TaskComplexity, WorkLogAction, WorkLogEntry
+
+
+def parse_duration(value: "str | int | None") -> "int | None":
+    """Parse a human-friendly duration string into an integer number of minutes.
+
+    Accepted formats:
+      - ``45`` or ``45m``  → 45 minutes
+      - ``2h``             → 120 minutes
+      - ``3d``             → 4320 minutes  (24 h/day — wall-clock, not 8-hour workday)
+      - ``1w``             → 10080 minutes (7 × 24 h)
+
+    Wall-clock days/weeks are intentional: calibration compares predicted elapsed
+    time against actual elapsed time, not scheduled working hours.
+
+    Raises :class:`click.BadParameter` for unrecognised input.
+    """
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    s = str(value).strip().lower()
+    match = re.fullmatch(r"(\d+)([mhdw]?)", s)
+    if not match:
+        raise click.BadParameter(
+            f"Bad duration: {value!r}. Use 90, 90m, 2h, 1d, or 1w."
+        )
+    n, unit = int(match.group(1)), match.group(2) or "m"
+    multiplier = {"m": 1, "h": 60, "d": 60 * 24, "w": 60 * 24 * 7}[unit]
+    return n * multiplier
 
 
 def _reflections_dir(portfolio_root: Path) -> Path:
@@ -33,8 +65,13 @@ def _compute_actuals(
     - complexity: the task's current complexity field (if set)
     - files_changed: deduplicated count of unique files across all log entries
     - files_touched: sorted deduplicated list of those files
+
+    IMPORTANT: filtering uses an EXACT ``task_id`` match.  A subtask
+    (``PROJ-042-003``) will NOT inherit ``start`` events logged against its
+    parent (``PROJ-042``).  If no ``start`` event exists for the subtask's own
+    ID, ``duration_min`` is ``None`` rather than a nonsensical inherited value.
     """
-    task_entries = [e for e in log_entries if e.task == task_id]
+    task_entries = [e for e in log_entries if e.task == task_id]  # exact match only
 
     # Duration: first start → now
     start_entries = sorted(

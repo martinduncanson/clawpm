@@ -54,6 +54,7 @@ from .tasks import (
 )
 from .worklog import (
     add_entry,
+    filter_files_changed,
     tail_entries,
     get_last_entry,
     get_logged_commit_hashes,
@@ -559,7 +560,7 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
 @click.option("--body", "-b", help="New body content (replaces description before ## sections)")
 @click.option("--scope", "-s", "scope", multiple=True, help="File glob patterns claimed by this task (can specify multiple)")
 # --- Prediction flags (all optional) ---
-@click.option("--predict-duration", "predict_duration", type=int, default=None, help="Predicted duration in minutes")
+@click.option("--predict-duration", "predict_duration", default=None, help="Predicted duration: 90, 90m, 2h, 3d, 1w")
 @click.option("--predict-complexity", "predict_complexity", type=click.Choice(["s", "m", "l", "xl"]), default=None, help="Predicted complexity")
 @click.option("--predict-files-changed", "predict_files_changed", type=int, default=None, help="Predicted number of files changed")
 @click.option("--predict-scope", "predict_scope", multiple=True, help="Predicted file glob scope (can specify multiple)")
@@ -576,7 +577,7 @@ def tasks_edit(
     complexity: str | None,
     body: str | None,
     scope: tuple[str, ...],
-    predict_duration: int | None,
+    predict_duration: str | None,
     predict_complexity: str | None,
     predict_files_changed: int | None,
     predict_scope: tuple[str, ...],
@@ -610,8 +611,14 @@ def tasks_edit(
 
     predictions: Predictions | None = None
     if has_predictions:
+        from .reflect import parse_duration as _parse_duration
+        try:
+            parsed_duration = _parse_duration(predict_duration)
+        except Exception as exc:
+            output_error("bad_duration", str(exc), fmt=fmt)
+            sys.exit(1)
         predictions = Predictions(
-            duration_min=predict_duration,
+            duration_min=parsed_duration,
             complexity=TaskComplexity(predict_complexity) if predict_complexity else None,
             files_changed=predict_files_changed,
             files_scope=list(predict_scope),
@@ -705,7 +712,8 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
                     timeout=5,
                 )
                 if result.returncode == 0 and result.stdout.strip():
-                    files_changed = [f for f in result.stdout.strip().split('\n') if f]
+                    raw_files = [f for f in result.stdout.strip().split('\n') if f]
+                    files_changed = filter_files_changed(raw_files, project.repo_path)
             except Exception:
                 pass
 
@@ -762,7 +770,7 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
 @click.option("--body-file", type=click.Path(exists=True), help="Read body from file")
 @click.option("--stdin", "read_stdin", is_flag=True, help="Read body from stdin")
 # --- Prediction flags (all optional) ---
-@click.option("--predict-duration", "predict_duration", type=int, default=None, help="Predicted duration in minutes")
+@click.option("--predict-duration", "predict_duration", default=None, help="Predicted duration: 90, 90m, 2h, 3d, 1w")
 @click.option("--predict-complexity", "predict_complexity", type=click.Choice(["s", "m", "l", "xl"]), default=None, help="Predicted complexity")
 @click.option("--predict-files-changed", "predict_files_changed", type=int, default=None, help="Predicted number of files changed")
 @click.option("--predict-scope", "predict_scope", multiple=True, help="Predicted file glob scope (can specify multiple)")
@@ -784,7 +792,7 @@ def tasks_add(
     body: str | None,
     body_file: str | None,
     read_stdin: bool,
-    predict_duration: int | None,
+    predict_duration: str | None,
     predict_complexity: str | None,
     predict_files_changed: int | None,
     predict_scope: tuple[str, ...],
@@ -812,9 +820,17 @@ def tasks_add(
     cmplx = TaskComplexity(complexity) if complexity else None
     scope_list = list(scope) if scope else None
 
+    # Parse human-friendly duration (e.g. "2h", "3d") → minutes
+    from .reflect import parse_duration as _parse_duration
+    try:
+        parsed_predict_duration = _parse_duration(predict_duration)
+    except Exception as exc:
+        output_error("bad_duration", str(exc), fmt=fmt)
+        sys.exit(1)
+
     # Build predictions object from flags (all optional)
     predictions = Predictions(
-        duration_min=predict_duration,
+        duration_min=parsed_predict_duration,
         complexity=TaskComplexity(predict_complexity) if predict_complexity else None,
         files_changed=predict_files_changed,
         files_scope=list(predict_scope),
@@ -935,7 +951,33 @@ def quick_done(ctx: click.Context, project_id: str | None, task_id: str, note: s
 @click.argument("task_id")
 @click.pass_context
 def quick_start(ctx: click.Context, project_id: str | None, task_id: str) -> None:
-    """Start working on a task (alias for 'tasks state <id> progress')."""
+    """Start working on a task (alias for 'tasks state <id> progress').
+
+    Note: if the task is already in progress, prefer 'clawpm log add --action progress'
+    to avoid resetting the duration anchor.
+    """
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+
+    # Warn (but don't block) if the task is already in progress.
+    # Re-starting corrupts the duration anchor — the reflection layer computes
+    # actuals from the *first* start event, so a re-start under-counts elapsed time.
+    resolved_project_id, _ = require_project(ctx, project_id, required=False)
+    if resolved_project_id:
+        try:
+            _expanded = expand_task_id(task_id, resolved_project_id)
+            _task = get_task(config, resolved_project_id, _expanded)
+            if _task and _task.state and _task.state.value == "progress":
+                click.echo(
+                    f"Warning: {_expanded} is already in progress. "
+                    "Re-starting resets the duration anchor and under-counts elapsed time. "
+                    "Use 'clawpm log add --task <id> --action progress --summary \"...\"' "
+                    "to log midway updates instead.",
+                    err=True,
+                )
+        except Exception:
+            pass  # Never let the guard break the start command
+
     ctx.invoke(tasks_state, project_id=project_id, task_id=task_id, new_state="progress", note=None)
 
 
@@ -949,6 +991,56 @@ def quick_start(ctx: click.Context, project_id: str | None, task_id: str) -> Non
 def quick_block(ctx: click.Context, project_id: str | None, task_id: str, note: str | None, reflect_note: str | None, meta_reflect: str | None) -> None:
     """Mark a task as blocked (alias for 'tasks state <id> blocked')."""
     ctx.invoke(tasks_state, project_id=project_id, task_id=task_id, new_state="blocked", note=note, reflect_note=reflect_note, meta_reflect=meta_reflect)
+
+
+@main.command("unblock")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
+@click.argument("task_id")
+@click.option("--note", "-n", help="Reason the blocker was resolved")
+@click.option("--start", "also_start", is_flag=True, help="Also transition to in-progress (blocked → progress)")
+@click.pass_context
+def quick_unblock(ctx: click.Context, project_id: str | None, task_id: str, note: str | None, also_start: bool) -> None:
+    """Move a blocked task back to open (or --start to go straight to in-progress).
+
+    Shortcut for:
+        clawpm tasks state <id> open   (default)
+        clawpm tasks state <id> progress  (with --start)
+
+    An 'unblock' action is logged in the work log with the provided note.
+    """
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+
+    project_id, _ = require_project(ctx, project_id)
+    full_task_id = expand_task_id(task_id, project_id)
+
+    # Verify the task is actually blocked
+    task = get_task(config, project_id, full_task_id)
+    if not task:
+        output_error("task_not_found", f"No task with id '{full_task_id}' in project '{project_id}'", fmt=fmt)
+        sys.exit(1)
+    if task.state != TaskState.BLOCKED:
+        output_error(
+            "not_blocked",
+            f"Task {full_task_id} is in state '{task.state.value}', not 'blocked'. "
+            "Use 'clawpm tasks state <id> open' to change state directly.",
+            fmt=fmt,
+        )
+        sys.exit(1)
+
+    # Transition to open (or progress if --start)
+    new_state_str = "progress" if also_start else "open"
+    ctx.invoke(tasks_state, project_id=project_id, task_id=task_id, new_state=new_state_str, note=note)
+
+    # Log the explicit unblock action
+    add_entry(
+        config,
+        project=project_id,
+        action=WorkLogAction.UNBLOCK,
+        task=full_task_id,
+        summary=note or "Blocker resolved",
+        auto=True,
+    )
 
 
 @main.command("next")
