@@ -43,6 +43,7 @@ class WorkLogAction(str, Enum):
     PROGRESS = "progress"
     DONE = "done"
     BLOCKED = "blocked"
+    UNBLOCK = "unblock"
     PAUSE = "pause"
     RESEARCH = "research"
     NOTE = "note"

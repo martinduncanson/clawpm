@@ -2,11 +2,112 @@
 
 from __future__ import annotations
 
+import fnmatch
 import json
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .models import PortfolioConfig, WorkLogEntry, WorkLogAction
+
+
+# ---------------------------------------------------------------------------
+# Build-artifact / noise filtering for files_changed
+# ---------------------------------------------------------------------------
+
+#: Always-on deny-list — patterns matched against each filename (basename only)
+#: or the full relative path.  These are never meaningful to the task log.
+_ARTIFACT_PATTERNS: tuple[str, ...] = (
+    # Python bytecode & caches
+    "__pycache__/*",
+    "*.pyc",
+    "*.pyo",
+    # macOS / Windows desktop cruft
+    ".DS_Store",
+    "Thumbs.db",
+    "desktop.ini",
+    # Editor temporaries
+    "*.tmp",
+    "*.bak",
+    "*.swp",
+    "*.swo",
+    "*~",
+    # VCS internals
+    ".git/*",
+    # JS dependencies
+    "node_modules/*",
+    # Tool caches
+    ".pytest_cache/*",
+    ".mypy_cache/*",
+    ".ruff_cache/*",
+)
+
+
+def _is_artifact(path_str: str) -> bool:
+    """Return True if *path_str* matches any entry in the deny-list.
+
+    Both the full path and the basename are tested so patterns like ``*.pyc``
+    catch ``src/foo/bar.pyc`` as well as bare ``bar.pyc``.
+    """
+    basename = Path(path_str).name
+    for pattern in _ARTIFACT_PATTERNS:
+        if fnmatch.fnmatch(path_str, pattern) or fnmatch.fnmatch(basename, pattern):
+            return True
+        # Also catch paths that contain a deny-list component as a directory segment
+        # e.g. "src/__pycache__/foo.cpython-311.pyc"
+        if "__pycache__" in path_str or "node_modules" in path_str:
+            return True
+    return False
+
+
+def _git_check_ignore(files: list[str], cwd: Path) -> set[str]:
+    """Ask git which files are gitignored.  Returns set of ignored paths.
+
+    Falls back to empty set if git is unavailable or the cwd is not a repo.
+    """
+    if not files:
+        return set()
+    try:
+        result = subprocess.run(
+            ["git", "check-ignore", "--stdin", "-z"],
+            input="\0".join(files),
+            capture_output=True,
+            text=True,
+            cwd=str(cwd),
+            timeout=5,
+        )
+        if result.returncode in (0, 1):  # 1 = no matches, which is fine
+            ignored = {p for p in result.stdout.split("\0") if p}
+            return ignored
+    except Exception:
+        pass
+    return set()
+
+
+def filter_files_changed(
+    files: list[str] | None,
+    repo_path: Path | None = None,
+) -> list[str] | None:
+    """Remove build artifacts and gitignored files from *files*.
+
+    Always applies the built-in deny-list.  If *repo_path* is provided and is a
+    valid git repository, also asks ``git check-ignore`` for per-project rules.
+
+    Returns ``None`` when the input is ``None``; returns an empty list when all
+    files were filtered out.
+    """
+    if files is None:
+        return None
+
+    # Step 1: deny-list filter
+    clean = [f for f in files if not _is_artifact(f)]
+
+    # Step 2: gitignore filter (best-effort)
+    if clean and repo_path and repo_path.exists():
+        ignored = _git_check_ignore(clean, repo_path)
+        clean = [f for f in clean if f not in ignored]
+
+    return clean
 
 
 def get_worklog_path(config: PortfolioConfig) -> Path:
