@@ -244,12 +244,42 @@ clawpm use --clear         # Clear context
 | done | `tasks/done/CLAWP-042.md` | Completed |
 | blocked | `tasks/blocked/CLAWP-042.md` | Waiting |
 
-## Reflection — predictions, actuals, deltas
+## Reflection — tasks as micro-experiments
 
-ClawPM captures operator predictions at task creation and computes actuals at
-completion, storing the delta as an append-only JSONL event in
-`~/clawpm/reflections/<task-id>.jsonl`. This lets the operator (and future LLMs)
-mine calibration data over time.
+Each task is a small applied-science loop:
+- **BEFORE**: hypothesis, success contracts, predicted approach, known unknowns, pre-mortem, confidence
+- **DURING**: work happens
+- **AFTER**: actuals computed, deltas surfaced, process lesson extracted
+
+The point isn't bureaucracy — it's calibration. Predictions you never check are
+fantasy. Predictions you check and revise are skill.
+
+ClawPM stores predictions at task creation and computes actuals at completion,
+writing an append-only JSONL event to `~/clawpm/reflections/<task-id>.jsonl`.
+
+### The two-layer reflection loop
+
+**LAYER 1 — descriptive**: what happened vs what you predicted?
+- predictions vs actuals, deltas computed automatically
+- `--reflect-note "what surprised you"` for freeform capture
+
+**LAYER 2 — prescriptive**: what update to your prediction PROCESS would have caught this?
+- `--process-lesson "what rule of thumb does this teach for next time"`
+- These accumulate. Over 20+ tasks they become your personal calibration manual.
+
+> **The recursive loop matters more than any single prediction.** A single missed
+> prediction teaches one thing. A `process_lesson` that says "I always underestimate X"
+> teaches *future predictions*. Over time, the lessons compound into calibration.
+> **Always fill in `--process-lesson` on done events — it's the rung that lets you climb.**
+>
+> **Confidence is data.** A confident wrong prediction is worse than an uncertain wrong
+> prediction. Mark confidence honestly. 1 = "I made it up", 5 = "I have done this exact
+> thing before and know the actuals". Most predictions are 2-3. Be honest.
+>
+> **Reference class > intuition.** Before predicting, look at 1-3 prior similar tasks.
+> Pass them via `--reference-task`. Empty `reference_tasks` = "I used the inside view
+> only" — that's signal too. Phase 2 will surface reference candidates automatically;
+> for now do it manually.
 
 ### Claude's mandate: ALWAYS predict on add
 
@@ -263,6 +293,10 @@ events that yield no calibration signal.
 The operator has specifically requested this: Claude's time estimates are
 systematically biased (often 10-100× over actual). Capturing predictions creates
 the calibration corpus needed to correct that bias.
+
+For high-stakes or complex tasks, also include the Phase 1.5 fields:
+`--success-criteria`, `--predict-approach`, `--confidence`, `--reference-task`,
+`--pre-mortem`, `--unknowns`.
 
 ### Setting predictions
 
@@ -278,45 +312,89 @@ workday — calibration compares elapsed time, not scheduled hours):
 | `3d` | 4 320 minutes (3 × 24 h) |
 | `1w` | 10 080 minutes (7 × 24 h) |
 
-```bash
-clawpm tasks add -t "Refactor auth" \
-    --predict-duration 2h \
-    --predict-complexity m \
-    --predict-files-changed 5 \
-    --predict-scope "src/auth/**" --predict-scope "tests/auth/**" \
-    --predict-frameworks fastapi --predict-frameworks pyjwt \
-    --predict-pitfalls "session token storage may need DB migration" \
-    --hypothesis "moving to JWT will reduce session table contention by 80%"
-
-# Also available on tasks edit:
-clawpm tasks edit CLAWP-042 --predict-duration 1d --predict-complexity l
+**Phase 1 prediction flags** (on `tasks add` and `tasks edit`):
+```
+--predict-duration      Predicted duration: 90, 90m, 2h, 3d, 1w
+--predict-complexity    s|m|l|xl
+--predict-files-changed Number of files expected to change
+--predict-scope         File glob scope (repeatable)
+--predict-frameworks    Frameworks/libs to touch (repeatable)
+--predict-pitfalls      Anticipated problem areas (free text)
+--hypothesis            Causal hypothesis: "if X then Y"
 ```
 
-All `--predict-*` flags are optional. Tasks without predictions still work normally.
+**Phase 1.5 prediction flags** (on `tasks add` and `tasks edit`):
+```
+--success-criteria      Measurable performance contract (repeatable)
+                        Example: "P95 latency <200ms"
+--predict-approach      Architectural choice / solution pattern (1-2 sentences)
+--unknowns              What you do NOT know going in (meta-curiosity)
+--confidence            Operator confidence 1-5 (1=wild guess, 5=done this before)
+--reference-task        Prior task ID used as reference class (repeatable)
+--pre-mortem            "If this fails, the most likely cause is..."
+```
+
+All flags are optional. Tasks without predictions still work normally.
 
 ### Completing with reflection notes
 
 When marking a task done or blocked, optionally add:
 
+**Phase 1 completion flags**:
 - `--reflect-note` — what surprised you
 - `--meta-reflect` — what could have been anticipated that wasn't, and why
+
+**Phase 1.5 completion flags**:
+- `--process-lesson` — what update to your prediction PROCESS would have caught this?
+- `--surprise` — multi-pick taxonomy tag (repeatable): `unknown_unknown`, `scope_drift`,
+  `dependency`, `tooling_friction`, `complexity_misread`, `assumption_broke`, `external_blocker`
 
 ```bash
 clawpm done CLAWP-042 \
     --reflect-note "DB migration took 3x longer than expected" \
-    --meta-reflect "should have checked existing schema constraints first"
+    --meta-reflect "should have checked existing schema constraints first" \
+    --process-lesson "always run migration dry-run before estimating; add 2x for constraint work" \
+    --surprise scope_drift --surprise tooling_friction
 
 # Also works on tasks state and clawpm block:
-clawpm block CLAWP-042 --reflect-note "hit API rate limit"
+clawpm block CLAWP-042 --reflect-note "hit API rate limit" --surprise external_blocker
 ```
 
-### Lifecycle example
+### Worked example — full applied-science framing
+
+```bash
+# Adding a task with full applied-science framing:
+clawpm tasks add -t "Migrate auth from sessions to JWT" \
+  --predict-duration 4h \
+  --predict-complexity m \
+  --hypothesis "JWT cuts session-table contention by >=50% under 100 RPS load" \
+  --success-criteria "P95 login latency <200ms" \
+  --success-criteria "Session table writes drop >=50% in prod logs over 7 days" \
+  --predict-approach "Drop-in JWT middleware, keep session table for refresh tokens" \
+  --predict-frameworks pyjwt fastapi \
+  --predict-pitfalls "Constraint conflict on existing session_id column" \
+  --pre-mortem "If this fails, most likely cause: cookie domain edge case in mobile webview" \
+  --unknowns "Whether refresh-token rotation gives audit-grade traceability or we still need sessions" \
+  --confidence 3 \
+  --reference-task CLAWP-042 --reference-task ARB-P-013
+
+# Completing it — the meta-loop:
+clawpm done CLAWP-099 \
+  --note "Shipped; PR #128 merged" \
+  --reflect-note "constraint conflict didn't materialize but mobile webview cookie issue did" \
+  --meta-reflect "I should have read the mobile auth tests before predicting" \
+  --process-lesson "When auth touches mobile, ALWAYS read the mobile test suite before predicting duration" \
+  --surprise tooling_friction --surprise assumption_broke
+```
+
+### Lifecycle example (minimal)
 
 ```bash
 # 1. Add task with predictions
 clawpm tasks add -t "Refactor auth layer" \
     --predict-duration 90 --predict-complexity m \
-    --predict-scope "src/auth/**"
+    --predict-scope "src/auth/**" \
+    --confidence 2
 
 # 2. Start working (auto-logged)
 clawpm start CLAWP-042
@@ -326,13 +404,14 @@ clawpm start CLAWP-042
 # 3. Complete with reflection
 clawpm done CLAWP-042 \
     --reflect-note "JWT validation added 30 extra min" \
-    --meta-reflect "should have checked middleware chain first"
+    --meta-reflect "should have checked middleware chain first" \
+    --process-lesson "JWT tasks always run 1.5x; use that as default multiplier"
 
 # 4. Reflection event appears at:
 #    ~/clawpm/reflections/CLAWP-042.jsonl
 ```
 
-The reflection JSONL schema:
+The reflection JSONL schema (Phase 1.5):
 
 ```json
 {
@@ -340,19 +419,24 @@ The reflection JSONL schema:
   "task_id": "CLAWP-042",
   "project_id": "clawpm",
   "occurred_at": "2026-05-05T18:00:00Z",
-  "predictions": { "duration_min": 90, "complexity": "m", ... },
-  "actuals":     { "duration_min": 167, "files_touched": [...], ... },
+  "predictions": {
+    "duration_min": 90, "complexity": "m",
+    "success_criteria": ["P95 latency <200ms"],
+    "approach": "Drop-in JWT middleware",
+    "unknowns": "Whether rotation gives audit traceability",
+    "confidence": 3,
+    "reference_tasks": ["CLAWP-042"],
+    "pre_mortem": "cookie domain edge case in mobile webview"
+  },
+  "actuals":     { "duration_min": 167, "files_touched": [...] },
   "deltas": {
     "duration_ratio": 1.85,
-    "files_changed_ratio": 0.6,
-    "files_scope_overrun": ["unexpected/file.py"],
-    "files_scope_unused": ["predicted/but/not/touched.py"],
-    "complexity_match": false,
-    "complexity_predicted": "m",
-    "complexity_actual": "l"
+    "complexity_match": false
   },
   "note": "...",
-  "meta_reflection": "..."
+  "meta_reflection": "...",
+  "process_lesson": "JWT tasks always run 1.5x; use that as default multiplier",
+  "surprise_taxonomy": ["tooling_friction", "assumption_broke"]
 }
 ```
 

@@ -142,6 +142,8 @@ clawpm done CLAWP-042 \
 
 clawpm computes the deltas (duration ratio, scope overrun, complexity match, etc.) and writes a structured reflection event to `~/clawpm/reflections/<task-id>.jsonl`. Over weeks, you build a corpus you can mine: "tasks I labeled `m` complexity actually averaged 1.8× duration." Phase 2 (`clawpm reflect summarize/suggest/history-import`) will surface these patterns automatically — currently stub commands.
 
+v1.5 extends this with **applied-science framing**: `--success-criteria` (measurable performance contracts), `--predict-approach` (architectural choice), `--unknowns` (meta-curiosity), `--confidence` (1-5), `--reference-task` (outside-view anchoring), and `--pre-mortem` (Klein's pre-mortem). At completion, `--process-lesson` and `--surprise` (fixed taxonomy) close the recursive meta-loop. See `skills/clawpm/SKILL.md` for the full picture.
+
 > **Agent discipline:** when an AI agent (e.g. Claude) adds a task on your behalf, it must always include `--predict-duration` and `--predict-complexity`. Empty predictions produce structurally-empty events with no calibration signal. Unit suffixes are accepted: `2h`, `3d`, `1w` (wall-clock, not 8-hour workday).
 
 ### Workflow 5 — Resuming after context loss
