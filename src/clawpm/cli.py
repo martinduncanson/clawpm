@@ -18,6 +18,7 @@ from .models import (
     ResearchType,
     ResearchStatus,
     Predictions,
+    SURPRISE_TAXONOMY,
 )
 from .output import (
     OutputFormat,
@@ -567,6 +568,13 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
 @click.option("--predict-frameworks", "predict_frameworks", multiple=True, help="Predicted frameworks/libraries to touch (can specify multiple)")
 @click.option("--predict-pitfalls", "predict_pitfalls", default=None, help="Anticipated problematic areas (free text)")
 @click.option("--hypothesis", "hypothesis", default=None, help="Goal/hypothesis: 'if I do X, then Y will improve'")
+# --- Phase 1.5 prediction flags ---
+@click.option("--success-criteria", "success_criteria", multiple=True, help="Measurable success contract (repeatable, e.g. 'P95 latency <200ms')")
+@click.option("--predict-approach", "predict_approach", default=None, help="Predicted architectural approach / solution pattern (1-2 sentences)")
+@click.option("--unknowns", "unknowns", default=None, help="What you do NOT know going in (meta-curiosity capture)")
+@click.option("--confidence", "confidence", type=int, default=None, help="Operator confidence 1-5 (1=wild guess, 5=done this before)")
+@click.option("--reference-task", "reference_tasks", multiple=True, help="Prior task IDs used as reference class (repeatable)")
+@click.option("--pre-mortem", "pre_mortem", default=None, help="'If this task fails, the most likely cause is...'")
 @click.pass_context
 def tasks_edit(
     ctx: click.Context,
@@ -584,6 +592,12 @@ def tasks_edit(
     predict_frameworks: tuple[str, ...],
     predict_pitfalls: str | None,
     hypothesis: str | None,
+    success_criteria: tuple[str, ...],
+    predict_approach: str | None,
+    unknowns: str | None,
+    confidence: int | None,
+    reference_tasks: tuple[str, ...],
+    pre_mortem: str | None,
 ) -> None:
     """Edit task metadata (title, priority, complexity, body, scope)."""
     fmt = get_format(ctx)
@@ -591,6 +605,11 @@ def tasks_edit(
 
     project_id, _ = require_project(ctx, project_id)
     task_id = expand_task_id(task_id, project_id)
+
+    # Validate confidence range
+    if confidence is not None and not (1 <= confidence <= 5):
+        output_error("bad_confidence", f"--confidence must be 1-5, got {confidence}", fmt=fmt)
+        sys.exit(1)
 
     has_predictions = any([
         predict_duration is not None,
@@ -600,6 +619,12 @@ def tasks_edit(
         predict_frameworks,
         predict_pitfalls is not None,
         hypothesis is not None,
+        success_criteria,
+        predict_approach is not None,
+        unknowns is not None,
+        confidence is not None,
+        reference_tasks,
+        pre_mortem is not None,
     ])
 
     if not any([title, priority is not None, complexity, body, scope, has_predictions]):
@@ -625,6 +650,12 @@ def tasks_edit(
             frameworks=list(predict_frameworks),
             pitfalls=predict_pitfalls,
             hypothesis=hypothesis,
+            success_criteria=list(success_criteria),
+            approach=predict_approach,
+            unknowns=unknowns,
+            confidence=confidence,
+            reference_tasks=list(reference_tasks),
+            pre_mortem=pre_mortem,
         )
 
     task = edit_task(
@@ -654,11 +685,24 @@ def tasks_edit(
 @click.option("--force", "-f", is_flag=True, help="Force completion even if subtasks incomplete")
 @click.option("--reflect-note", "reflect_note", default=None, help="What surprised you (stored in reflection event)")
 @click.option("--meta-reflect", "meta_reflect", default=None, help="What could have been anticipated that wasn't, and why? (stored in reflection event)")
+@click.option("--process-lesson", "process_lesson", default=None, help="What update to your prediction PROCESS would have caught this? (recursive meta-loop)")
+@click.option("--surprise", "surprise_tags", multiple=True, help=f"Surprise taxonomy tag (repeatable): {', '.join(sorted(['unknown_unknown', 'scope_drift', 'dependency', 'tooling_friction', 'complexity_misread', 'assumption_broke', 'external_blocker']))}")
 @click.pass_context
-def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_state: str, note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None) -> None:
+def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_state: str, note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...]) -> None:
     """Change task state."""
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
+
+    # Validate surprise taxonomy tags early (before any state mutation)
+    invalid_tags = [t for t in surprise_tags if t not in SURPRISE_TAXONOMY]
+    if invalid_tags:
+        output_error(
+            "bad_surprise_tag",
+            f"Unknown surprise tag(s): {invalid_tags}. "
+            f"Valid values: {sorted(SURPRISE_TAXONOMY)}",
+            fmt=fmt,
+        )
+        sys.exit(1)
 
     project_id, _ = require_project(ctx, project_id)
     task_id = expand_task_id(task_id, project_id)
@@ -748,6 +792,8 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
                 actuals=actuals,
                 note=reflect_note,
                 meta_reflection=meta_reflect,
+                process_lesson=process_lesson,
+                surprise_taxonomy=list(surprise_tags) if surprise_tags else [],
             )
         except Exception:
             # Never let reflection failure block the state change
@@ -777,6 +823,13 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
 @click.option("--predict-frameworks", "predict_frameworks", multiple=True, help="Predicted frameworks/libraries to touch (can specify multiple)")
 @click.option("--predict-pitfalls", "predict_pitfalls", default=None, help="Anticipated problematic areas (free text)")
 @click.option("--hypothesis", "hypothesis", default=None, help="Goal/hypothesis: 'if I do X, then Y will improve'")
+# --- Phase 1.5 prediction flags ---
+@click.option("--success-criteria", "success_criteria", multiple=True, help="Measurable success contract (repeatable, e.g. 'P95 latency <200ms')")
+@click.option("--predict-approach", "predict_approach", default=None, help="Predicted architectural approach / solution pattern (1-2 sentences)")
+@click.option("--unknowns", "unknowns", default=None, help="What you do NOT know going in (meta-curiosity capture)")
+@click.option("--confidence", "confidence", type=int, default=None, help="Operator confidence 1-5 (1=wild guess, 5=done this before)")
+@click.option("--reference-task", "reference_tasks", multiple=True, help="Prior task IDs used as reference class (repeatable)")
+@click.option("--pre-mortem", "pre_mortem", default=None, help="'If this task fails, the most likely cause is...'")
 @click.pass_context
 def tasks_add(
     ctx: click.Context,
@@ -799,10 +852,21 @@ def tasks_add(
     predict_frameworks: tuple[str, ...],
     predict_pitfalls: str | None,
     hypothesis: str | None,
+    success_criteria: tuple[str, ...],
+    predict_approach: str | None,
+    unknowns: str | None,
+    confidence: int | None,
+    reference_tasks: tuple[str, ...],
+    pre_mortem: str | None,
 ) -> None:
     """Add a new task (or subtask with --parent)."""
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
+
+    # Validate confidence range
+    if confidence is not None and not (1 <= confidence <= 5):
+        output_error("bad_confidence", f"--confidence must be 1-5, got {confidence}", fmt=fmt)
+        sys.exit(1)
 
     project_id, _ = require_project(ctx, project_id)
 
@@ -837,6 +901,12 @@ def tasks_add(
         frameworks=list(predict_frameworks),
         pitfalls=predict_pitfalls,
         hypothesis=hypothesis,
+        success_criteria=list(success_criteria),
+        approach=predict_approach,
+        unknowns=unknowns,
+        confidence=confidence,
+        reference_tasks=list(reference_tasks),
+        pre_mortem=pre_mortem,
     )
 
     # Create subtask if parent specified
@@ -940,10 +1010,12 @@ def quick_add(ctx: click.Context, project_id: str | None, title: str, priority: 
 @click.option("--force", "-f", is_flag=True, help="Force completion even if subtasks incomplete")
 @click.option("--reflect-note", "reflect_note", default=None, help="What surprised you (stored in reflection event)")
 @click.option("--meta-reflect", "meta_reflect", default=None, help="What could have been anticipated that wasn't, and why?")
+@click.option("--process-lesson", "process_lesson", default=None, help="What update to your prediction PROCESS would have caught this?")
+@click.option("--surprise", "surprise_tags", multiple=True, help="Surprise taxonomy tag (repeatable): unknown_unknown, scope_drift, dependency, tooling_friction, complexity_misread, assumption_broke, external_blocker")
 @click.pass_context
-def quick_done(ctx: click.Context, project_id: str | None, task_id: str, note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None) -> None:
+def quick_done(ctx: click.Context, project_id: str | None, task_id: str, note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...]) -> None:
     """Mark a task as done (alias for 'tasks state <id> done')."""
-    ctx.invoke(tasks_state, project_id=project_id, task_id=task_id, new_state="done", note=note, force=force, reflect_note=reflect_note, meta_reflect=meta_reflect)
+    ctx.invoke(tasks_state, project_id=project_id, task_id=task_id, new_state="done", note=note, force=force, reflect_note=reflect_note, meta_reflect=meta_reflect, process_lesson=process_lesson, surprise_tags=surprise_tags)
 
 
 @main.command("start")
@@ -987,10 +1059,12 @@ def quick_start(ctx: click.Context, project_id: str | None, task_id: str) -> Non
 @click.option("--note", "-n", help="Blocker description")
 @click.option("--reflect-note", "reflect_note", default=None, help="What surprised you (stored in reflection event)")
 @click.option("--meta-reflect", "meta_reflect", default=None, help="What could have been anticipated that wasn't, and why?")
+@click.option("--process-lesson", "process_lesson", default=None, help="What update to your prediction PROCESS would have caught this?")
+@click.option("--surprise", "surprise_tags", multiple=True, help="Surprise taxonomy tag (repeatable): unknown_unknown, scope_drift, dependency, tooling_friction, complexity_misread, assumption_broke, external_blocker")
 @click.pass_context
-def quick_block(ctx: click.Context, project_id: str | None, task_id: str, note: str | None, reflect_note: str | None, meta_reflect: str | None) -> None:
+def quick_block(ctx: click.Context, project_id: str | None, task_id: str, note: str | None, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...]) -> None:
     """Mark a task as blocked (alias for 'tasks state <id> blocked')."""
-    ctx.invoke(tasks_state, project_id=project_id, task_id=task_id, new_state="blocked", note=note, reflect_note=reflect_note, meta_reflect=meta_reflect)
+    ctx.invoke(tasks_state, project_id=project_id, task_id=task_id, new_state="blocked", note=note, reflect_note=reflect_note, meta_reflect=meta_reflect, process_lesson=process_lesson, surprise_tags=surprise_tags)
 
 
 @main.command("unblock")

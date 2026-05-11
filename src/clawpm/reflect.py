@@ -181,10 +181,19 @@ def write_reflection_event(
     actuals: Actuals,
     note: str | None = None,
     meta_reflection: str | None = None,
+    process_lesson: str | None = None,
+    surprise_taxonomy: list[str] | None = None,
 ) -> Path:
     """Compute deltas and append one JSON line to ~/clawpm/reflections/<task-id>.jsonl.
 
     Returns the path of the reflection file written.
+
+    Phase 1.5 adds two recursive meta-reflection fields:
+    - ``process_lesson``: what update to the prediction *process* would have
+      caught the surprise?  Accumulates into a personal calibration manual.
+    - ``surprise_taxonomy``: multi-pick tags from the fixed vocabulary in
+      ``SURPRISE_TAXONOMY`` (models.py).  Validated before calling this function
+      — pass an empty list rather than None when no surprise is provided.
     """
     deltas = _compute_deltas(predictions, actuals)
 
@@ -198,6 +207,8 @@ def write_reflection_event(
         "deltas": deltas,
         "note": note,
         "meta_reflection": meta_reflection,
+        "process_lesson": process_lesson,
+        "surprise_taxonomy": surprise_taxonomy if surprise_taxonomy is not None else [],
     }
 
     ref_dir = _reflections_dir(portfolio_root)

@@ -50,6 +50,19 @@ class WorkLogAction(str, Enum):
     COMMIT = "commit"
 
 
+# Fixed vocabulary for surprise taxonomy — one source of truth.
+# Used by CLI validation and test assertions.
+SURPRISE_TAXONOMY: frozenset[str] = frozenset({
+    "unknown_unknown",
+    "scope_drift",
+    "dependency",
+    "tooling_friction",
+    "complexity_misread",
+    "assumption_broke",
+    "external_blocker",
+})
+
+
 class ResearchType(str, Enum):
     INVESTIGATION = "investigation"
     SPIKE = "spike"
@@ -161,6 +174,13 @@ class Predictions:
     frameworks: list[str] = field(default_factory=list)
     pitfalls: str | None = None
     hypothesis: str | None = None
+    # Phase 1.5 — applied-science framing
+    success_criteria: list[str] = field(default_factory=list)
+    approach: str | None = None
+    unknowns: str | None = None
+    confidence: int | None = None  # 1–5; None = not set
+    reference_tasks: list[str] = field(default_factory=list)
+    pre_mortem: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -171,6 +191,12 @@ class Predictions:
             "frameworks": self.frameworks,
             "pitfalls": self.pitfalls,
             "hypothesis": self.hypothesis,
+            "success_criteria": self.success_criteria,
+            "approach": self.approach,
+            "unknowns": self.unknowns,
+            "confidence": self.confidence,
+            "reference_tasks": self.reference_tasks,
+            "pre_mortem": self.pre_mortem,
         }
 
     @classmethod
@@ -189,6 +215,12 @@ class Predictions:
             frameworks=data.get("frameworks") or [],
             pitfalls=data.get("pitfalls"),
             hypothesis=data.get("hypothesis"),
+            success_criteria=data.get("success_criteria") or [],
+            approach=data.get("approach"),
+            unknowns=data.get("unknowns"),
+            confidence=data.get("confidence"),
+            reference_tasks=data.get("reference_tasks") or [],
+            pre_mortem=data.get("pre_mortem"),
         )
 
     def is_empty(self) -> bool:
@@ -201,6 +233,12 @@ class Predictions:
             and not self.frameworks
             and self.pitfalls is None
             and self.hypothesis is None
+            and not self.success_criteria
+            and self.approach is None
+            and self.unknowns is None
+            and self.confidence is None
+            and not self.reference_tasks
+            and self.pre_mortem is None
         )
 
 
