@@ -559,6 +559,42 @@ clawpm project reflect --milestone "M1"   # Reflect on a milestone within a proj
 
 **For now (manual):** add a `## Reflection` section to `spec.md` at completion. Capture the four questions above. The aggregated reflection becomes the prior for the next similar project.
 
+## Inter-agent messaging — clawpm inbox
+
+Filesystem-first, append-only, no-daemon messaging between agents. Each agent has its own
+JSONL file at `~/clawpm/inbox/<agent-id>.jsonl`. Events are never rewritten or deleted —
+acks are events too. Survives compaction and reboots; no polling daemon required.
+
+Storage: `~/clawpm/inbox/<agent-id>.jsonl` (created on first send).
+
+| Command | Description |
+|---------|-------------|
+| `clawpm inbox send --to <id> --message "..."` | Send a message to an agent's inbox |
+| `clawpm inbox read --agent <id> [--unacked\|--all]` | Read messages (default: unacked only) |
+| `clawpm inbox ack <msg-id> [<msg-id>...] [--agent <id>]` | Acknowledge messages |
+| `clawpm inbox thread <msg-id>` | Show full thread (walks in_reply_to chain across all inboxes) |
+
+Optional send flags: `--from <id>` (default `main`), `--in-reply-to <msg-id>`, `--project <id>`, `--task <id>`.
+Read filters: `--since <YYYY-MM-DD or ISO>`, `--from <sender>`.
+
+**Worked example — parent dispatches subagent, receives results:**
+
+```bash
+# 1. Parent sends pre-context to subagent at dispatch
+clawpm inbox send --to researcher --message "Find pricing data for POLYM-007" \
+    --project polymarket-arb --task POLYM-007
+# → {"msg_id": "INBOX-20260508-a3f9", "to": "researcher", "ts": "..."}
+
+# 2. Subagent reads inbox, acks, does work, sends results back
+clawpm inbox read --agent researcher          # returns the message
+clawpm inbox ack INBOX-20260508-a3f9 --agent researcher
+clawpm inbox send --to main --message "Pricing data: BTC-USD spread 0.3%" \
+    --in-reply-to INBOX-20260508-a3f9 --project polymarket-arb
+
+# 3. Parent reads results (unacked by default)
+clawpm inbox read --agent main
+```
+
 ## Workflow Integrations
 
 clawpm is the task layer. Other skills/plugins handle specialised lifecycle moments. Suggest these to the operator at the matching points — don't force them, but don't stay silent either.
