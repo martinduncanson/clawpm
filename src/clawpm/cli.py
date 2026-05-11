@@ -413,13 +413,27 @@ labels = []
 
 @project.command("doctor")
 @click.option("--project", "-p", "project_id", help="Check specific project")
+@click.option("--strict", is_flag=True, help="Exit non-zero if any warning is present (useful for CI)")
 @click.pass_context
-def project_doctor(ctx: click.Context, project_id: str | None) -> None:
-    """Check for issues with projects and portfolio."""
+def project_doctor(ctx: click.Context, project_id: str | None, strict: bool = False) -> None:
+    """Check for issues with projects and portfolio.
+
+    Phase 1.6 checks added:
+    - Stale tasks (progress state, not touched in >7 days)
+    - Filesystem-vs-state drift (file location vs frontmatter state field)
+    - Cross-project prefix collisions (two projects sharing first-5 chars of ID)
+    """
+    import json as _json_doc
+    from datetime import datetime, timezone, timedelta
+
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
 
     issues: list[dict] = []
+    stale_tasks: list[dict] = []
+    drift_tasks: list[dict] = []
+
+    STALE_DAYS = 7
 
     # Validate portfolio
     portfolio_issues = validate_portfolio(config)
@@ -466,6 +480,7 @@ def project_doctor(ctx: click.Context, project_id: str | None) -> None:
                 "project": proj.id,
                 "message": "Missing tasks directory",
             })
+            continue
 
         # Check for broken repo_path
         if proj.repo_path and not proj.repo_path.exists():
@@ -476,16 +491,172 @@ def project_doctor(ctx: click.Context, project_id: str | None) -> None:
                 "message": f"repo_path does not exist: {proj.repo_path}",
             })
 
+        # --- Phase 1.6 Check a: Stale tasks ---
+        # Scan .progress.md files; flag if mtime > STALE_DAYS ago
+        now_utc = datetime.now(timezone.utc)
+        cutoff = now_utc - timedelta(days=STALE_DAYS)
+        for progress_file in tasks_dir.glob("*.progress.md"):
+            try:
+                mtime = datetime.fromtimestamp(
+                    progress_file.stat().st_mtime, tz=timezone.utc
+                )
+            except OSError:
+                continue
+            # Also check work_log for the most recent entry for this task
+            task_id_stem = progress_file.name.replace(".progress.md", "")
+            last_touched = mtime
+            # Read work_log entries for this task to find more recent touch
+            work_log_path = config.portfolio_root / "work_log.jsonl"
+            if work_log_path.exists():
+                for line in work_log_path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = _json_doc.loads(line)
+                        if entry.get("task") == task_id_stem:
+                            ts_str = entry.get("ts", "")
+                            try:
+                                ts = datetime.fromisoformat(ts_str.rstrip("Z"))
+                                if ts.tzinfo is None:
+                                    ts = ts.replace(tzinfo=timezone.utc)
+                                if ts > last_touched:
+                                    last_touched = ts
+                            except (ValueError, AttributeError):
+                                pass
+                    except _json_doc.JSONDecodeError:
+                        pass
+            if last_touched < cutoff:
+                days_stale = (now_utc - last_touched).days
+                stale_tasks.append({
+                    "task_id": task_id_stem,
+                    "project_id": proj.id,
+                    "last_touched": last_touched.isoformat().replace("+00:00", "Z"),
+                    "days_stale": days_stale,
+                    "suggested_action": (
+                        "Move to blocked with reason, or done if work was abandoned, "
+                        "or update if still active"
+                    ),
+                })
+
+        # --- Phase 1.6 Check b: Filesystem-vs-state drift ---
+        # Walk tasks/, tasks/done/, tasks/blocked/ and compare location-derived
+        # state against frontmatter 'state' field (if present).
+        # Also flag progress.md without matching base file OR base file without progress.
+        all_md_files: list[Path] = []
+        for md_file in tasks_dir.glob("*.md"):
+            all_md_files.append(md_file)
+        for md_file in (tasks_dir / "done").glob("*.md"):
+            all_md_files.append(md_file)
+        for md_file in (tasks_dir / "blocked").glob("*.md"):
+            all_md_files.append(md_file)
+
+        for md_file in all_md_files:
+            # Derive expected state from location
+            parts = md_file.parts
+            if "done" in parts:
+                location_state = "done"
+            elif "blocked" in parts:
+                location_state = "blocked"
+            elif ".progress" in md_file.name:
+                location_state = "progress"
+            else:
+                location_state = "open"
+
+            # Read frontmatter state (if present)
+            try:
+                text = md_file.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            fm_state: str | None = None
+            if text.startswith("---"):
+                import yaml as _yaml
+                parts_split = text.split("---", 2)
+                if len(parts_split) >= 3:
+                    try:
+                        fm = _yaml.safe_load(parts_split[1]) or {}
+                        fm_state = fm.get("state")
+                    except Exception:
+                        pass
+
+            if fm_state and fm_state != location_state:
+                drift_tasks.append({
+                    "file": md_file.as_posix(),
+                    "project_id": proj.id,
+                    "location_state": location_state,
+                    "frontmatter_state": fm_state,
+                    "issue": "state_mismatch",
+                })
+
+        # Check for half-renames: .progress.md without matching base .md (and vice versa)
+        # A .progress.md at tasks/ root should have a corresponding task file
+        # (but the .progress.md IS the task file for in-progress tasks — no dual file needed).
+        # The real half-rename is: tasks/PROJ-001.md AND tasks/PROJ-001.progress.md both exist.
+        base_names = {
+            f.name for f in tasks_dir.glob("*.md")
+            if ".progress" not in f.name
+        }
+        progress_names = {
+            f.name.replace(".progress.md", "") for f in tasks_dir.glob("*.progress.md")
+        }
+        half_renamed = base_names & {p + ".md" for p in progress_names}
+        for half in sorted(half_renamed):
+            stem = half.replace(".md", "")
+            drift_tasks.append({
+                "file": (tasks_dir / half).as_posix(),
+                "project_id": proj.id,
+                "issue": "half_rename",
+                "detail": f"Both {stem}.md and {stem}.progress.md exist — likely incomplete git mv",
+            })
+
+    # --- Phase 1.6 Check c: Cross-project prefix collisions ---
+    # Prefix = project_id.upper()[:5] (mirrors add_task logic)
+    prefix_map: dict[str, list[str]] = {}
+    all_projects = discover_projects(config)
+    for proj in all_projects:
+        prefix = proj.id.upper()[:5]
+        prefix_map.setdefault(prefix, []).append(proj.id)
+    prefix_collisions = [
+        {"prefix": pfx, "projects": pids}
+        for pfx, pids in prefix_map.items()
+        if len(pids) > 1
+    ]
+
+    # Build final output
+    has_warnings = bool(stale_tasks or drift_tasks or prefix_collisions or any(
+        i["level"] == "warning" for i in issues
+    ))
+
     if fmt == OutputFormat.JSON:
-        output_json({"issues": issues, "count": len(issues)})
+        output_json({
+            "issues": issues,
+            "count": len(issues),
+            "stale_tasks": stale_tasks,
+            "drift_tasks": drift_tasks,
+            "prefix_collisions": prefix_collisions,
+        })
     else:
-        if not issues:
+        if not issues and not stale_tasks and not drift_tasks and not prefix_collisions:
             click.echo("✓ No issues found")
         else:
             for issue in issues:
-                level_color = {"error": "red", "warning": "yellow"}.get(issue["level"], "white")
                 scope = issue.get("project", issue["scope"])
                 click.echo(f"[{issue['level'].upper()}] [{scope}] {issue['message']}")
+            for st in stale_tasks:
+                click.echo(
+                    f"[WARNING] [stale] {st['task_id']} ({st['project_id']}) "
+                    f"— {st['days_stale']} days stale. {st['suggested_action']}"
+                )
+            for dt in drift_tasks:
+                click.echo(f"[WARNING] [drift] {dt['file']} — {dt['issue']}")
+            for pc in prefix_collisions:
+                click.echo(
+                    f"[WARNING] [prefix] prefix '{pc['prefix']}' shared by: "
+                    + ", ".join(pc["projects"])
+                )
+
+    if strict and has_warnings:
+        sys.exit(1)
 
 
 # ============================================================================
@@ -549,7 +720,31 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
         output_error("task_not_found", f"No task with id '{task_id}' in project '{project_id}'", fmt=fmt)
         sys.exit(1)
 
-    output_task_detail(task, fmt=fmt)
+    # Phase 1.6: surface void tag if any reflection has been voided
+    import json as _json_show
+    reflections_voided = False
+    ref_file = config.portfolio_root / "reflections" / f"{task_id}.jsonl"
+    if ref_file.exists():
+        for _line in ref_file.read_text(encoding="utf-8").splitlines():
+            _line = _line.strip()
+            if not _line:
+                continue
+            try:
+                _rec = _json_show.loads(_line)
+                if _rec.get("event") == "void":
+                    reflections_voided = True
+                    break
+            except _json_show.JSONDecodeError:
+                pass
+
+    if fmt == OutputFormat.JSON:
+        task_dict = task.to_dict()
+        task_dict["reflections_voided"] = reflections_voided
+        output_json(task_dict)
+    else:
+        output_task_detail(task, fmt=fmt)
+        if reflections_voided:
+            click.echo("[reflections_voided: true]")
 
 
 @tasks.command("edit")
@@ -830,6 +1025,13 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
 @click.option("--confidence", "confidence", type=int, default=None, help="Operator confidence 1-5 (1=wild guess, 5=done this before)")
 @click.option("--reference-task", "reference_tasks", multiple=True, help="Prior task IDs used as reference class (repeatable)")
 @click.option("--pre-mortem", "pre_mortem", default=None, help="'If this task fails, the most likely cause is...'")
+# --- Phase 1.6 attribution flag ---
+@click.option(
+    "--predicted-by", "predicted_by",
+    type=click.Choice(["agent", "operator", "operator-edited", "retroactive"]),
+    default=None,
+    help="Who filled in these predictions (default: operator). Use 'operator-edited' when agent proposed and human reviewed.",
+)
 @click.pass_context
 def tasks_add(
     ctx: click.Context,
@@ -858,6 +1060,7 @@ def tasks_add(
     confidence: int | None,
     reference_tasks: tuple[str, ...],
     pre_mortem: str | None,
+    predicted_by: str | None,
 ) -> None:
     """Add a new task (or subtask with --parent)."""
     fmt = get_format(ctx)
@@ -892,6 +1095,27 @@ def tasks_add(
         output_error("bad_duration", str(exc), fmt=fmt)
         sys.exit(1)
 
+    # Resolve filled_by: default to "operator" when any prediction flag is set,
+    # None when no predictions at all (nothing to attribute).
+    _has_predictions = any([
+        parsed_predict_duration is not None,
+        predict_complexity is not None,
+        predict_files_changed is not None,
+        predict_scope,
+        predict_frameworks,
+        predict_pitfalls is not None,
+        hypothesis is not None,
+        success_criteria,
+        predict_approach is not None,
+        unknowns is not None,
+        confidence is not None,
+        reference_tasks,
+        pre_mortem is not None,
+    ])
+    filled_by: str | None = predicted_by if predicted_by is not None else (
+        "operator" if _has_predictions else None
+    )
+
     # Build predictions object from flags (all optional)
     predictions = Predictions(
         duration_min=parsed_predict_duration,
@@ -907,6 +1131,7 @@ def tasks_add(
         confidence=confidence,
         reference_tasks=list(reference_tasks),
         pre_mortem=pre_mortem,
+        filled_by=filled_by,
     )
 
     # Create subtask if parent specified
@@ -1911,11 +2136,12 @@ def version(ctx: click.Context) -> None:
 
 
 @main.command("doctor")
+@click.option("--strict", is_flag=True, help="Exit non-zero if any warning is present (useful for CI)")
 @click.pass_context
-def doctor(ctx: click.Context) -> None:
+def doctor(ctx: click.Context, strict: bool) -> None:
     """Run full health check."""
     # Delegate to project doctor with no specific project
-    ctx.invoke(project_doctor, project_id=None)
+    ctx.invoke(project_doctor, project_id=None, strict=strict)
 
 
 # ============================================================================
@@ -2317,6 +2543,231 @@ def reflect_history_import(ctx: click.Context, source_dir: str | None) -> None:
         "status": "phase2_pending",
         "message": f"clawpm reflect history-import is not yet implemented (Phase 2). Source: {source_dir}",
     }, indent=2))
+
+
+@reflect.command("void")
+@click.argument("task_id", required=False, default=None)
+@click.option("--reason", required=True, help="Why this reflection is bad data (required)")
+@click.option(
+    "--all-empty-actuals", "all_empty_actuals", is_flag=True,
+    help="Void all reflections across the corpus where actuals.duration_min is null",
+)
+@click.pass_context
+def reflect_void(
+    ctx: click.Context,
+    task_id: str | None,
+    reason: str,
+    all_empty_actuals: bool,
+) -> None:
+    """Mark a reflection event void without deleting it (event-source discipline).
+
+    Appends a void event to the task's .jsonl file.  Does NOT modify or delete
+    the original event — consumers skip events with a matching void entry.
+
+    Examples::
+
+        clawpm reflect void PROJ-007 --reason "actuals were wrong — pre-bugfix"
+        clawpm reflect void --all-empty-actuals --reason "Phase 1 corpus cleanup"
+    """
+    import json as _json
+    from datetime import datetime, timezone
+
+    config = require_portfolio(ctx)
+    fmt = get_format(ctx)
+    ref_dir = config.portfolio_root / "reflections"
+
+    voided: list[dict] = []
+    errors: list[dict] = []
+
+    def _void_task_reflection(tid: str) -> None:
+        ref_file = ref_dir / f"{tid}.jsonl"
+        if not ref_file.exists():
+            errors.append({"task_id": tid, "error": "no_reflection_file"})
+            return
+
+        # Read existing events to check whether void already applied
+        lines = [l for l in ref_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+        existing_records = []
+        for line in lines:
+            try:
+                existing_records.append(_json.loads(line))
+            except _json.JSONDecodeError:
+                pass
+
+        # Build the void entry
+        void_entry: dict = {
+            "event": "void",
+            "task_id": tid,
+            "reason": reason,
+            "voided_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+
+        # Append (atomic: write to .tmp then replace)
+        tmp_file = ref_file.with_suffix(".jsonl.tmp")
+        try:
+            # Copy existing content + new void line
+            existing_text = ref_file.read_text(encoding="utf-8")
+            tmp_file.write_text(
+                existing_text.rstrip("\n") + "\n" + _json.dumps(void_entry) + "\n",
+                encoding="utf-8",
+            )
+            tmp_file.replace(ref_file)
+            voided.append({"task_id": tid, "voided_at": void_entry["voided_at"]})
+        except OSError as exc:
+            errors.append({"task_id": tid, "error": str(exc)})
+
+    if all_empty_actuals:
+        if not ref_dir.exists():
+            output_json({"voided": [], "errors": [], "message": "No reflections directory found"})
+            return
+        for ref_file in sorted(ref_dir.glob("*.jsonl")):
+            derived_tid = ref_file.stem
+            lines = [l for l in ref_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+            has_empty_actuals = False
+            for line in lines:
+                try:
+                    rec = _json.loads(line)
+                    if rec.get("event") in ("task_done", "task_blocked"):
+                        actuals = rec.get("actuals", {})
+                        if actuals.get("duration_min") is None:
+                            has_empty_actuals = True
+                            break
+                except _json.JSONDecodeError:
+                    pass
+            if has_empty_actuals:
+                _void_task_reflection(derived_tid)
+    elif task_id:
+        _void_task_reflection(task_id)
+    else:
+        output_error(
+            "missing_target",
+            "Provide a TASK_ID or use --all-empty-actuals",
+            fmt=fmt,
+        )
+        sys.exit(1)
+
+    output_json({
+        "voided": voided,
+        "errors": errors,
+        "count": len(voided),
+    })
+
+
+# ============================================================================
+# Inbox commands
+# ============================================================================
+
+from .inbox import (  # noqa: E402 — local import to keep group self-contained
+    send_message as _inbox_send,
+    read_inbox as _inbox_read,
+    ack_messages as _inbox_ack,
+    get_thread as _inbox_thread,
+)
+
+
+@main.group("inbox")
+def inbox_group() -> None:
+    """Inter-agent messaging. Filesystem-first, append-only, no daemons."""
+    pass
+
+
+@inbox_group.command("send")
+@click.option("--to", "to_agent", required=True, help="Recipient agent ID")
+@click.option("--message", "message", default=None, help="Message text (or '-' to read from stdin)")
+@click.option("--stdin", "read_stdin", is_flag=True, default=False, help="Read message from stdin")
+@click.option("--from", "from_agent", default="main", help="Sender agent ID (default: main)")
+@click.option("--in-reply-to", "in_reply_to", default=None, help="msg_id this message replies to")
+@click.option("--project", "project_id", default=None, help="Project context for the message")
+@click.option("--task", "task_id", default=None, help="Task context for the message")
+@click.pass_context
+def inbox_send(
+    ctx: click.Context,
+    to_agent: str,
+    message: str | None,
+    read_stdin: bool,
+    from_agent: str,
+    in_reply_to: str | None,
+    project_id: str | None,
+    task_id: str | None,
+) -> None:
+    """Send a message to an agent's inbox."""
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+
+    if message == "-" or read_stdin:
+        message = sys.stdin.read()
+    if not message:
+        output_error("missing_message", "Provide --message text or pass --stdin / --message -", fmt=fmt)
+        sys.exit(1)
+
+    event = _inbox_send(
+        portfolio_root=config.portfolio_root,
+        to=to_agent,
+        message=message,
+        from_agent=from_agent,
+        in_reply_to=in_reply_to,
+        project=project_id,
+        task=task_id,
+    )
+    output_json({"msg_id": event["msg_id"], "to": event["to"], "ts": event["ts"]})
+
+
+@inbox_group.command("read")
+@click.option("--agent", "agent_id", required=True, help="Whose inbox to read")
+@click.option("--unacked", "filter_mode", flag_value="unacked", default=True, help="Show only unacked messages (default)")
+@click.option("--all", "filter_mode", flag_value="all", help="Show all messages including acked")
+@click.option("--since", "since", default=None, help="Filter messages at or after this date/timestamp (YYYY-MM-DD or ISO)")
+@click.option("--from", "from_filter", default=None, help="Filter messages from this sender")
+@click.pass_context
+def inbox_read(
+    ctx: click.Context,
+    agent_id: str,
+    filter_mode: str,
+    since: str | None,
+    from_filter: str | None,
+) -> None:
+    """Read messages from an agent's inbox."""
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+
+    unacked_only = filter_mode == "unacked"
+    messages = _inbox_read(
+        portfolio_root=config.portfolio_root,
+        agent_id=agent_id,
+        unacked_only=unacked_only,
+        since=since,
+        from_filter=from_filter,
+    )
+    output_json(messages)
+
+
+@inbox_group.command("ack")
+@click.argument("msg_ids", nargs=-1, required=True)
+@click.option("--agent", "acked_by", default="main", help="Agent performing the ack (default: main)")
+@click.pass_context
+def inbox_ack(ctx: click.Context, msg_ids: tuple[str, ...], acked_by: str) -> None:
+    """Acknowledge one or more messages (marks them as read)."""
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+
+    result = _inbox_ack(
+        portfolio_root=config.portfolio_root,
+        msg_ids=list(msg_ids),
+        acked_by=acked_by,
+    )
+    output_json(result)
+
+
+@inbox_group.command("thread")
+@click.argument("msg_id")
+@click.pass_context
+def inbox_thread(ctx: click.Context, msg_id: str) -> None:
+    """Show the full thread containing a message, sorted by timestamp."""
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+
+    thread = _inbox_thread(portfolio_root=config.portfolio_root, msg_id=msg_id)
+    output_json(thread)
 
 
 # ============================================================================

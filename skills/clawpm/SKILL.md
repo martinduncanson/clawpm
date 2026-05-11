@@ -242,9 +242,19 @@ clawpm setup --check       # Verify installation
 clawpm status              # Project overview
 clawpm context             # Full agent context
 clawpm doctor              # Health check
+clawpm doctor --strict     # Health check — exits non-zero if any warning (use in CI/pre-flight)
 clawpm use [project]       # Set/show project context
 clawpm use --clear         # Clear context
 ```
+
+#### Doctor checks (Phase 1.6)
+`clawpm doctor` now runs three additional diagnostic checks beyond basic file existence:
+
+- **Stale tasks** — any `.progress.md` file not touched (mtime or work_log entry) in >7 days surfaces in `stale_tasks[]` with `days_stale` and `suggested_action`.
+- **Filesystem-vs-state drift** — if a task file's frontmatter `state:` field disagrees with its location (`tasks/` = open, `tasks/done/` = done, etc.), it appears in `drift_tasks[]`.  Also flags half-renames (both `PROJ-001.md` and `PROJ-001.progress.md` exist simultaneously).
+- **Prefix collisions** — two projects whose IDs share the same first-5 uppercase chars (the task-ID prefix) appear in `prefix_collisions[]`.  Colliding prefixes cause silent task-ID aliasing.
+
+Doctor always exits 0; `--strict` exits 1 if any warning is present.
 
 ## Work Log Actions
 
@@ -357,6 +367,17 @@ workday — calibration compares elapsed time, not scheduled hours):
 --pre-mortem            "If this fails, the most likely cause is..."
 ```
 
+**Phase 1.6 attribution flag** (on `tasks add`):
+```
+--predicted-by          agent | operator | operator-edited | retroactive
+                        Default when predictions present: "operator"
+                        Default when no predictions: null
+                        Use "operator-edited" when agent proposed + human reviewed.
+                        Use "retroactive" for back-filled historical tasks.
+```
+`filled_by` is stored in `predictions.filled_by` and carried through to the reflection event.
+Phase 2 calibration weights: `operator-edited > operator > agent > retroactive`.
+
 All flags are optional. Tasks without predictions still work normally.
 
 ### Completing with reflection notes
@@ -463,6 +484,20 @@ The reflection JSONL schema (Phase 1.5):
 }
 ```
 
+### reflect void (Phase 1.6)
+
+Marks a reflection event as bad data without deleting it (event-source discipline — append-only).
+A `"void"` entry is appended to the task's `.jsonl`; Phase 2 calibration will skip voided events.
+
+```bash
+clawpm reflect void <task-id> --reason "<why this reflection is bad data>"
+clawpm reflect void --all-empty-actuals --reason "corpus cleanup — no actuals recorded"
+```
+
+- `--all-empty-actuals` bulk-voids any reflection where `actuals.duration_min` is null.
+- Original events are never modified; the void record is a separate appended line.
+- `clawpm tasks show <id>` includes `"reflections_voided": true` when any void entry exists.
+
 ### Phase 2 stubs
 
 The following commands are stubbed and return `{"status": "phase2_pending", ...}`:
@@ -558,6 +593,42 @@ clawpm project reflect --milestone "M1"   # Reflect on a milestone within a proj
 ```
 
 **For now (manual):** add a `## Reflection` section to `spec.md` at completion. Capture the four questions above. The aggregated reflection becomes the prior for the next similar project.
+
+## Inter-agent messaging — clawpm inbox
+
+Filesystem-first, append-only, no-daemon messaging between agents. Each agent has its own
+JSONL file at `~/clawpm/inbox/<agent-id>.jsonl`. Events are never rewritten or deleted —
+acks are events too. Survives compaction and reboots; no polling daemon required.
+
+Storage: `~/clawpm/inbox/<agent-id>.jsonl` (created on first send).
+
+| Command | Description |
+|---------|-------------|
+| `clawpm inbox send --to <id> --message "..."` | Send a message to an agent's inbox |
+| `clawpm inbox read --agent <id> [--unacked\|--all]` | Read messages (default: unacked only) |
+| `clawpm inbox ack <msg-id> [<msg-id>...] [--agent <id>]` | Acknowledge messages |
+| `clawpm inbox thread <msg-id>` | Show full thread (walks in_reply_to chain across all inboxes) |
+
+Optional send flags: `--from <id>` (default `main`), `--in-reply-to <msg-id>`, `--project <id>`, `--task <id>`.
+Read filters: `--since <YYYY-MM-DD or ISO>`, `--from <sender>`.
+
+**Worked example — parent dispatches subagent, receives results:**
+
+```bash
+# 1. Parent sends pre-context to subagent at dispatch
+clawpm inbox send --to researcher --message "Find pricing data for POLYM-007" \
+    --project polymarket-arb --task POLYM-007
+# → {"msg_id": "INBOX-20260508-a3f9", "to": "researcher", "ts": "..."}
+
+# 2. Subagent reads inbox, acks, does work, sends results back
+clawpm inbox read --agent researcher          # returns the message
+clawpm inbox ack INBOX-20260508-a3f9 --agent researcher
+clawpm inbox send --to main --message "Pricing data: BTC-USD spread 0.3%" \
+    --in-reply-to INBOX-20260508-a3f9 --project polymarket-arb
+
+# 3. Parent reads results (unacked by default)
+clawpm inbox read --agent main
+```
 
 ## Workflow Integrations
 
