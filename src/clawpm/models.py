@@ -48,6 +48,7 @@ class WorkLogAction(str, Enum):
     RESEARCH = "research"
     NOTE = "note"
     COMMIT = "commit"
+    VOID = "void"
 
 
 # Fixed vocabulary for surprise taxonomy — one source of truth.
@@ -181,6 +182,8 @@ class Predictions:
     confidence: int | None = None  # 1–5; None = not set
     reference_tasks: list[str] = field(default_factory=list)
     pre_mortem: str | None = None
+    # Phase 1.6 — attribution: who filled in these predictions?
+    filled_by: str | None = None  # "agent" | "operator" | "operator-edited" | "retroactive" | None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -197,6 +200,7 @@ class Predictions:
             "confidence": self.confidence,
             "reference_tasks": self.reference_tasks,
             "pre_mortem": self.pre_mortem,
+            "filled_by": self.filled_by,
         }
 
     @classmethod
@@ -221,6 +225,7 @@ class Predictions:
             confidence=data.get("confidence"),
             reference_tasks=data.get("reference_tasks") or [],
             pre_mortem=data.get("pre_mortem"),
+            filled_by=data.get("filled_by"),
         )
 
     def is_empty(self) -> bool:
