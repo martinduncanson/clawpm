@@ -86,8 +86,13 @@ Items observed in red-team but not yet built. Each is ~30-80 LOC.
 **Sketch:** prompt agent (or operator) to retroactively estimate what the prediction WOULD have been, store with `filled_by: "retroactive"`. Weighted lower than real-time predictions but still better than null.
 
 ### SessionStart drift report
-**Trigger:** Have a `repo-pipeline` skill that fires on session start.
-**Sketch:** at session start in a project dir, automatically run `clawpm doctor` + `clawpm inbox read --unacked` + `clawpm review-check --all` and surface a single 3-5 line summary. The "what changed since I last looked at this" digest.
+**Trigger:** Have a `repo-pipeline` skill that fires on session start. **OR third observation of stale-worktree leakage** (see `feedback-agent-worktree-leakage.md` — already 2 occurrences).
+**Sketch:** at session start in a project dir, automatically run `clawpm doctor` + `clawpm inbox read --unacked` + `clawpm review-check --all` + `git fetch && check-HEAD-recency`, surface a single 3-5 line summary. The "what changed since I last looked at this" digest. The stale-worktree check is the highest-value piece — code subagents have lost wall-clock time twice now starting on weeks-old commits.
+
+### "Already done?" check before task add
+**Trigger:** Repeated instances of tasks describing work that's already partially or fully implemented (FT-22-1 / FT-22-13 was the canonical example: "implement run_sweep_loop" was described as new work but was prior-implementation + just needed wiring).
+**Sketch:** before `clawpm tasks add` for substantive code work, grep the codebase for named functions/systems in the title. If hits, narrow the task description to the actually-missing piece (wiring, flag, doc, test) rather than "implement". Could be enforced via SKILL.md guidance OR a `clawpm add --check-prior` flag that surfaces matches.
+**Inspiration:** discovery before delivery — the Phase 1.5 predictions ask "what do you know going in?"; this would extend to "what already exists in the repo?".
 
 ---
 
