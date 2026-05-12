@@ -96,6 +96,29 @@ Items observed in red-team but not yet built. Each is ~30-80 LOC.
 
 ---
 
+## Skill-ecosystem ideas (from Garry Tan / GBrain article, 2026-05-11)
+
+The article is heavy on personal-brand framing but three patterns are genuinely useful. Captured here without committing to build.
+
+### Skillify meta-skill
+**Trigger:** Operator notices doing the same workflow 3+ times manually and says "skillify this". Or reflection-data shows a repeating pattern of similar tasks.
+**Sketch:** new skill at `~/.claude/skills/skillify/`. Reads recent session transcript + clawpm work_log for the last completed task or workflow. Identifies the repeatable pattern (commands run, files touched, decision points). Drafts a SKILL.md with triggers + steps. Uses existing `skill-creator` for the SKILL.md scaffolding; registers via `skill-graph`.
+**Inspiration:** Garry Tan's `/skillify` meta-skill in GBrain.
+**Honest concern:** hard to do well without conversational context that survives. Would need session-state introspection (which `session-state-logger` hook produces). Worth prototyping when a clearly-recurring workflow emerges.
+
+### Cross-modal evaluation for high-stakes outputs
+**Trigger:** Phase 2 calibration analytics (`clawpm reflect summarize`, etc.) lands and we need quality grading. Or any single high-stakes output worth checking.
+**Sketch:** routing layer — call N models on the same input (Opus / Sonnet / Haiku, or via different providers), aggregate scores, surface disagreement. The existing codex-review pattern is one model; cross-modal would generalize. The 1.6 subagent's self-skepticism ("which of these would you drop?") is a poor-man's version already in use.
+**Inspiration:** Garry Tan's cross-modal eval; Tetlock-style ensemble forecasting.
+
+### Entity propagation on task done
+**Trigger:** Eligible to build now. High leverage for multi-project work. Cheap.
+**Sketch:** when a task transitions to done (or blocked / unblocked), scan its body + note + reflection-event for: other task IDs (e.g. `CLAWP-042` referenced in a note), project IDs, PR / commit refs, person names if person pages ever exist. Cross-link automatically — add the source task as a back-reference on each mentioned entity. ~80 LOC, would live in `tasks.py` or a new `propagate.py`.
+**Inspiration:** Garry Tan's entity propagation after meetings. The "nervous system not filing cabinet" framing.
+**Doctrine concern:** propagation must be additive only — never modify the referenced entity's compiled-truth, only append back-references. Event-source discipline applies.
+
+---
+
 ## Frameworks worth studying (not adopting)
 
 Reference points for ideas, NOT candidates for direct adoption.
