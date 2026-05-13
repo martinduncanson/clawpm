@@ -273,7 +273,9 @@ def projects_list(ctx: click.Context, status_filter: str | None, show_all: bool)
             click.echo("\nUntracked git repos (use 'clawpm project init' to add):")
             for repo in untracked:
                 remote_hint = f" ({repo.remote.split('/')[-1].replace('.git', '')})" if repo.remote else ""
-                click.echo(f"  ○ {repo.name}{remote_hint}")
+                # ASCII bullet only — Windows cp1252 stdout cannot encode U+25CB
+                # and crashes the run mid-render.
+                click.echo(f"  - {repo.name}{remote_hint}")
 
 
 @projects.command("next")
@@ -476,7 +478,7 @@ def project_doctor(ctx: click.Context, project_id: str | None) -> None:
         output_json({"issues": issues, "count": len(issues)})
     else:
         if not issues:
-            click.echo("✓ No issues found")
+            click.echo("[OK] No issues found")
         else:
             for issue in issues:
                 level_color = {"error": "red", "warning": "yellow"}.get(issue["level"], "white")
@@ -941,12 +943,12 @@ def quick_status(ctx: click.Context, project_id: str | None) -> None:
             if in_progress:
                 click.echo("\nIn Progress:")
                 for t in in_progress:
-                    click.echo(f"  → {t.id}: {t.title}")
-            
+                    click.echo(f"  -> {t.id}: {t.title}")
+
             if blocked:
                 click.echo("\nBlocked:")
                 for t in blocked:
-                    click.echo(f"  ✗ {t.id}: {t.title}")
+                    click.echo(f"  x {t.id}: {t.title}")
             
             if next_task and next_task not in in_progress:
                 click.echo(f"\nNext up: {next_task.id}: {next_task.title}")
@@ -1561,7 +1563,7 @@ def setup(ctx: click.Context, check: bool) -> None:
                 for issue in issues:
                     click.echo(f"  - {issue}")
             else:
-                click.echo("✓ ClawPM is properly configured")
+                click.echo("[OK] ClawPM is properly configured")
                 if portfolio_path:
                     click.echo(f"  Portfolio: {portfolio_path}")
     else:
@@ -1757,7 +1759,7 @@ def issues_list(ctx: click.Context, project_id: str | None, open_only: bool) -> 
             click.echo("No issues found.")
             return
         for i, issue in enumerate(issues, 1):
-            status = "✓" if issue.get("fixed") else "○"
+            status = "[OK]" if issue.get("fixed") else "[ ] "
             sev = issue.get("severity", "?")[0].upper()
             typ = issue.get("type", "?")
             click.echo(f"{status} [{sev}] {typ}: {issue.get('actual', issue.get('context', 'No description'))}")
