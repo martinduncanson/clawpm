@@ -43,6 +43,11 @@ from .discovery import (
     is_git_repo,
     path_for_config,
 )
+from .announce import (
+    find_existing_marker_file,
+    select_target_file,
+    write_or_replace_stanza,
+)
 from .tasks import (
     list_tasks,
     get_task,
@@ -409,20 +414,88 @@ labels = []
     # Create learnings.md
     (project_dir / "learnings.md").write_text(f"# {project_name} Learnings\n\n", encoding="utf-8")
 
-    output_success(f"Project initialized at {project_dir}", fmt=fmt)
+    # Phase 1.8: announce the project as a clawpm-tracked repo so future agents
+    # see "use clawpm" in the first agent-doc they read.
+    try:
+        target_file, action = write_or_replace_stanza(repo, project_id, project_name)
+        announce_msg = f"; announce {action} in {target_file.name}"
+    except OSError as exc:
+        announce_msg = f"; announce skipped ({exc})"
+
+    output_success(f"Project initialized at {project_dir}{announce_msg}", fmt=fmt)
+
+
+@project.command("announce")
+@click.option("-p", "--project", "project_id", help="Project ID (auto-detected if not specified)")
+@click.pass_context
+def project_announce(ctx: click.Context, project_id: str | None) -> None:
+    """Write or refresh the 'this project uses clawpm' stanza in the repo's
+    agent-facing docs (CLAUDE.md > AGENTS.md > README.md, first-found wins).
+
+    Idempotent — if the marker block already exists, it is replaced in place.
+    """
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+
+    resolved_id, _ = require_project(ctx, project_id, auto_init=False)
+    proj = get_project(config, resolved_id)
+    if proj is None:
+        output_error("project_not_found", f"Project '{resolved_id}' not found", fmt=fmt)
+        sys.exit(1)
+
+    repo = proj.repo_path or (proj.project_dir.parent if proj.project_dir else None)
+    if not repo or not repo.exists():
+        output_error(
+            "no_repo_path",
+            f"Project '{resolved_id}' has no usable repo_path. Set 'repo_path' in settings.toml.",
+            fmt=fmt,
+        )
+        sys.exit(1)
+
+    try:
+        target_file, action = write_or_replace_stanza(repo, proj.id, proj.name)
+    except OSError as exc:
+        output_error("announce_failed", f"Failed to write announce stanza: {exc}", fmt=fmt)
+        sys.exit(1)
+
+    if fmt == OutputFormat.JSON:
+        output_json({
+            "status": "ok",
+            "action": action,
+            "file": target_file.as_posix(),
+            "project_id": proj.id,
+        })
+    else:
+        click.echo(f"[OK] announce {action} in {target_file.as_posix()}")
 
 
 @project.command("doctor")
 @click.option("--project", "-p", "project_id", help="Check specific project")
 @click.option("--strict", is_flag=True, help="Exit non-zero if any warning is present (useful for CI)")
+@click.option(
+    "--commits-drift-threshold",
+    type=int,
+    default=5,
+    show_default=True,
+    help="Warn when project HEAD has >N commits authored after last work_log entry (Phase 1.8 Check d).",
+)
 @click.pass_context
-def project_doctor(ctx: click.Context, project_id: str | None, strict: bool = False) -> None:
+def project_doctor(
+    ctx: click.Context,
+    project_id: str | None,
+    strict: bool = False,
+    commits_drift_threshold: int = 5,
+) -> None:
     """Check for issues with projects and portfolio.
 
     Phase 1.6 checks added:
     - Stale tasks (progress state, not touched in >7 days)
     - Filesystem-vs-state drift (file location vs frontmatter state field)
     - Cross-project prefix collisions (two projects sharing first-5 chars of ID)
+
+    Phase 1.8 checks added:
+    - Code-vs-tracking drift (commits authored after the last work_log entry)
+    - Missing clawpm-requirement marker in repo agent docs (CLAUDE.md/AGENTS.md/README.md)
     """
     import json as _json_doc
     from datetime import datetime, timezone, timedelta
@@ -434,6 +507,8 @@ def project_doctor(ctx: click.Context, project_id: str | None, strict: bool = Fa
     stale_tasks: list[dict] = []
     drift_tasks: list[dict] = []
     unreadable_files: list[dict] = []
+    commit_drift: list[dict] = []
+    missing_markers: list[dict] = []
 
     STALE_DAYS = 7
 
@@ -625,6 +700,78 @@ def project_doctor(ctx: click.Context, project_id: str | None, strict: bool = Fa
                 "detail": f"Both {stem}.md and {stem}.progress.md exist — likely incomplete git mv",
             })
 
+    # --- Phase 1.8 Check d: Code-vs-tracking drift ---
+    # For each project with a repo_path, compare the timestamp of the latest
+    # work_log entry to commits authored after that time. >threshold = warn.
+    # Catches the pattern where code ships but `clawpm log` never gets called.
+    for proj in projects_to_check:
+        if not proj.repo_path or not proj.repo_path.exists():
+            continue
+        # Skip if not a git repo
+        if not (proj.repo_path / ".git").exists():
+            continue
+
+        last_entry = None
+        try:
+            last_entry = get_last_entry(config, project=proj.id)
+        except Exception:
+            pass
+
+        # Resolve `since` argument for git log
+        if last_entry is not None and getattr(last_entry, "ts", None):
+            since_arg = last_entry.ts.isoformat() if hasattr(last_entry.ts, "isoformat") else str(last_entry.ts)
+            log_status = "never_logged" if last_entry is None else "logged"
+        else:
+            # No work_log entries ever — count commits in the entire history.
+            since_arg = None
+            log_status = "never_logged"
+
+        try:
+            cmd = ["git", "log", "--oneline"]
+            if since_arg:
+                cmd.append(f"--since={since_arg}")
+            result = subprocess.run(
+                cmd,
+                cwd=proj.repo_path,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode != 0:
+            continue
+        commit_count = sum(1 for line in result.stdout.splitlines() if line.strip())
+        if commit_count > commits_drift_threshold:
+            commit_drift.append({
+                "project_id": proj.id,
+                "repo_path": proj.repo_path.as_posix(),
+                "commits_since_last_log": commit_count,
+                "last_log_ts": since_arg,
+                "log_status": log_status,
+                "suggested_action": (
+                    "Run 'clawpm log' to capture recent work, or close stale tasks "
+                    "in clawpm to acknowledge the drift."
+                ),
+            })
+
+    # --- Phase 1.8 Check e: Missing clawpm-requirement marker in agent docs ---
+    # Every clawpm-tracked repo should announce itself in CLAUDE.md/AGENTS.md/README.md
+    # so future agents see "use clawpm" before improvising. `clawpm project announce`
+    # writes the marker; this check surfaces repos where it was never run.
+    for proj in projects_to_check:
+        if not proj.repo_path or not proj.repo_path.exists():
+            continue
+        marker_file = find_existing_marker_file(proj.repo_path)
+        if marker_file is None:
+            missing_markers.append({
+                "project_id": proj.id,
+                "repo_path": proj.repo_path.as_posix(),
+                "suggested_action": f"Run 'clawpm project announce --project {proj.id}' from the repo.",
+            })
+
     # --- Phase 1.6 Check c: Cross-project prefix collisions ---
     # Prefix = project_id.upper()[:5] (mirrors add_task logic)
     prefix_map: dict[str, list[str]] = {}
@@ -641,6 +788,7 @@ def project_doctor(ctx: click.Context, project_id: str | None, strict: bool = Fa
     # Build final output
     has_warnings = bool(
         stale_tasks or drift_tasks or prefix_collisions or unreadable_files
+        or commit_drift or missing_markers
         or any(i["level"] == "warning" for i in issues)
     )
 
@@ -652,10 +800,13 @@ def project_doctor(ctx: click.Context, project_id: str | None, strict: bool = Fa
             "drift_tasks": drift_tasks,
             "prefix_collisions": prefix_collisions,
             "unreadable_files": unreadable_files,
+            "commit_drift": commit_drift,
+            "missing_markers": missing_markers,
         })
     else:
         if not (
             issues or stale_tasks or drift_tasks or prefix_collisions or unreadable_files
+            or commit_drift or missing_markers
         ):
             click.echo("[OK] No issues found")
         else:
@@ -678,6 +829,18 @@ def project_doctor(ctx: click.Context, project_id: str | None, strict: bool = Fa
                 click.echo(
                     f"[WARNING] [encoding] {uf['file']} ({uf['project_id']}) "
                     f"- {uf['error']}; read with errors='replace' to continue"
+                )
+            for cd in commit_drift:
+                click.echo(
+                    f"[WARNING] [commit-drift] {cd['project_id']} "
+                    f"- {cd['commits_since_last_log']} commits since last work_log entry "
+                    f"({cd['log_status']}). {cd['suggested_action']}"
+                )
+            for mm in missing_markers:
+                click.echo(
+                    f"[WARNING] [no-announce] {mm['project_id']} "
+                    f"- no clawpm-requirement marker in CLAUDE.md/AGENTS.md/README.md. "
+                    f"{mm['suggested_action']}"
                 )
 
     if strict and has_warnings:
@@ -2162,11 +2325,23 @@ def version(ctx: click.Context) -> None:
 
 @main.command("doctor")
 @click.option("--strict", is_flag=True, help="Exit non-zero if any warning is present (useful for CI)")
+@click.option(
+    "--commits-drift-threshold",
+    type=int,
+    default=5,
+    show_default=True,
+    help="Warn when project HEAD has >N commits authored after last work_log entry.",
+)
 @click.pass_context
-def doctor(ctx: click.Context, strict: bool) -> None:
+def doctor(ctx: click.Context, strict: bool, commits_drift_threshold: int) -> None:
     """Run full health check."""
     # Delegate to project doctor with no specific project
-    ctx.invoke(project_doctor, project_id=None, strict=strict)
+    ctx.invoke(
+        project_doctor,
+        project_id=None,
+        strict=strict,
+        commits_drift_threshold=commits_drift_threshold,
+    )
 
 
 # ============================================================================

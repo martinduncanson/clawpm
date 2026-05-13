@@ -164,4 +164,5 @@ These aren't features — they're constraints that should hold across all future
 | Defacto-default | Global CLAUDE.md + SKILL.md doctrine | 2026-05-08 |
 | 1.6 (in flight) | `clawpm doctor` checks, `clawpm reflect void`, `filled_by` field | 2026-05-08 |
 | 1.7 (in flight) | `clawpm inbox` — inter-agent messaging | 2026-05-08 |
+| 1.8 | `clawpm project announce` + auto-run on init; doctor Check d (commit-vs-work_log drift) + Check e (missing clawpm-requirement marker in CLAUDE.md/AGENTS.md/README.md) | 2026-05-13 |
 | 2 (gated) | Calibration analytics (lookup/calibration/process-lessons/field-usage/project reflect) | After 2026-06-05 review |
