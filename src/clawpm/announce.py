@@ -75,6 +75,17 @@ def select_target_file(repo_path: Path) -> Path:
     return repo_path / AGENT_DOCS_PRECEDENCE[0]
 
 
+class AnnounceEncodingError(RuntimeError):
+    """Raised when an existing target file cannot be safely round-tripped
+    because it contains non-UTF-8 bytes. We refuse to write rather than
+    silently replace those bytes with U+FFFD — that would corrupt content
+    unrelated to the marker block.
+
+    Operator-facing fix: re-save the source file as UTF-8 (or pick a
+    different target) before re-running announce.
+    """
+
+
 def write_or_replace_stanza(
     repo_path: Path,
     project_id: str,
@@ -89,6 +100,11 @@ def write_or_replace_stanza(
 
     Idempotent: re-running on a file that already has the marker block
     rewrites between markers, leaves surrounding content untouched.
+
+    Raises ``AnnounceEncodingError`` if the target exists but is not
+    valid UTF-8. Round-tripping a lossy decode would replace stray bytes
+    with U+FFFD and silently corrupt unrelated content, so we refuse
+    instead. The operator must re-save the file as UTF-8 first.
     """
     target = select_target_file(repo_path)
     stanza = generate_stanza(project_id, project_name)
@@ -97,7 +113,15 @@ def write_or_replace_stanza(
         target.write_text(stanza + "\n", encoding="utf-8")
         return target, "created"
 
-    content = target.read_text(encoding="utf-8", errors="replace")
+    # Strict UTF-8 read — refuse the round-trip if bytes won't decode.
+    try:
+        content = target.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise AnnounceEncodingError(
+            f"{target.as_posix()} contains non-UTF-8 bytes at offset "
+            f"{exc.start} ({exc.reason}). Re-save the file as UTF-8 "
+            f"before running announce."
+        ) from exc
 
     if MARKER_START in content and MARKER_END in content:
         start_idx = content.index(MARKER_START)

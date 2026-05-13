@@ -44,6 +44,7 @@ from .discovery import (
     path_for_config,
 )
 from .announce import (
+    AnnounceEncodingError,
     find_existing_marker_file,
     select_target_file,
     write_or_replace_stanza,
@@ -419,6 +420,8 @@ labels = []
     try:
         target_file, action = write_or_replace_stanza(repo, project_id, project_name)
         announce_msg = f"; announce {action} in {target_file.name}"
+    except AnnounceEncodingError as exc:
+        announce_msg = f"; announce skipped (target is not UTF-8: {exc})"
     except OSError as exc:
         announce_msg = f"; announce skipped ({exc})"
 
@@ -454,6 +457,15 @@ def project_announce(ctx: click.Context, project_id: str | None) -> None:
 
     try:
         target_file, action = write_or_replace_stanza(repo, proj.id, proj.name)
+    except AnnounceEncodingError as exc:
+        output_error(
+            "announce_target_not_utf8",
+            f"Refusing to rewrite a non-UTF-8 target. {exc} "
+            f"Re-save the file as UTF-8 (e.g. open in your editor, save with UTF-8 encoding), "
+            f"then re-run announce.",
+            fmt=fmt,
+        )
+        sys.exit(1)
     except OSError as exc:
         output_error("announce_failed", f"Failed to write announce stanza: {exc}", fmt=fmt)
         sys.exit(1)
@@ -717,10 +729,16 @@ def project_doctor(
         except Exception:
             pass
 
-        # Resolve `since` argument for git log
+        # Resolve `since` argument for git log. Always emit an explicit UTC
+        # offset: `git log --since=<iso>` interprets naive timestamps in the
+        # local timezone, which would shift the drift window by hours in
+        # non-UTC environments and mis-count commits at the boundary.
         if last_entry is not None and getattr(last_entry, "ts", None):
-            since_arg = last_entry.ts.isoformat() if hasattr(last_entry.ts, "isoformat") else str(last_entry.ts)
-            log_status = "never_logged" if last_entry is None else "logged"
+            ts = last_entry.ts
+            if hasattr(ts, "tzinfo") and ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            since_arg = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+            log_status = "logged"
         else:
             # No work_log entries ever — count commits in the entire history.
             since_arg = None

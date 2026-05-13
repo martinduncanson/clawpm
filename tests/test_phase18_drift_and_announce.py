@@ -23,6 +23,7 @@ import pytest
 from click.testing import CliRunner
 
 from clawpm.announce import (
+    AnnounceEncodingError,
     MARKER_START,
     MARKER_END,
     find_existing_marker_file,
@@ -123,6 +124,20 @@ class TestAnnounceModule:
         found = find_existing_marker_file(tmp_path)
         assert found is not None
         assert found.name == "CLAUDE.md"  # precedence order
+
+    def test_write_refuses_non_utf8_target(self, tmp_path):
+        """Codex P2 regression: if the target file has cp1252 bytes (em-dash,
+        smart quotes, etc.), we must refuse the round-trip rather than
+        silently replacing them with U+FFFD on write-back."""
+        target = tmp_path / "CLAUDE.md"
+        # Real cp1252 em-dash (0x97) — the same byte that crashed clawpm doctor.
+        target.write_bytes(b"# header\n\nAn em-dash \x97 like this.\n")
+
+        with pytest.raises(AnnounceEncodingError) as exc_info:
+            write_or_replace_stanza(tmp_path, "foo", "Foo")
+        assert "non-UTF-8" in str(exc_info.value)
+        # File contents must be untouched
+        assert target.read_bytes() == b"# header\n\nAn em-dash \x97 like this.\n"
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +290,52 @@ class TestDoctorCommitDriftCheck:
         data = json.loads(result.output)
         drift_ids = {d["project_id"] for d in data["commit_drift"]}
         assert "myrepo" not in drift_ids
+
+    def test_drift_since_arg_carries_utc_offset(self, git_repo, monkeypatch):
+        """Codex P1 regression: --since must be UTC-aware to avoid local-tz drift
+        on git log. Spy on subprocess.run and assert the --since argument has
+        an explicit offset suffix (+00:00 or Z)."""
+        repo = git_repo["repo"]
+        (repo / ".project").mkdir()
+        (repo / ".project" / "tasks").mkdir()
+        (repo / ".project" / "settings.toml").write_text(
+            f'id = "myrepo"\nname = "myrepo"\nstatus = "active"\npriority = 5\n'
+            f'repo_path = "{repo.as_posix()}"\nlabels = []\n',
+            encoding="utf-8",
+        )
+        # Write a work_log entry with a timezone-naive ISO timestamp (the
+        # parser elsewhere strips Z and may yield naive tz). Use a known-past
+        # timestamp.
+        wl = git_repo["portfolio"] / "work_log.jsonl"
+        wl.write_text(
+            '{"ts": "2026-04-01T00:00:00", "project": "myrepo", "task": null, '
+            '"action": "note", "agent": "main", "session_key": null, '
+            '"summary": "seed", "next": null, "files_changed": null, '
+            '"blockers": null, "auto": false}\n',
+            encoding="utf-8",
+        )
+
+        captured: list[list[str]] = []
+        real_run = subprocess.run
+
+        def spy_run(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and len(cmd) >= 2 and cmd[0] == "git" and cmd[1] == "log":
+                captured.append(list(cmd))
+            return real_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr("clawpm.cli.subprocess.run", spy_run)
+
+        runner = CliRunner()
+        runner.invoke(main, ["--format", "json", "doctor"])
+
+        # Find a `git log --since=...` call against our repo
+        since_calls = [c for c in captured if any(a.startswith("--since=") for a in c)]
+        assert since_calls, f"no git log --since= call captured: {captured}"
+        since_arg = next(a for c in since_calls for a in c if a.startswith("--since="))
+        # Must end with +HH:MM, +0000, or Z — not bare ISO with no offset
+        assert "+" in since_arg or since_arg.endswith("Z"), (
+            f"--since lacks timezone offset, will be interpreted in local tz: {since_arg!r}"
+        )
 
     def test_custom_threshold_respected(self, git_repo):
         repo = git_repo["repo"]
