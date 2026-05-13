@@ -139,8 +139,15 @@ def discover_projects(
     config: PortfolioConfig,
     status_filter: ProjectStatus | None = None,
 ) -> list[ProjectSettings]:
-    """Discover all projects in configured roots."""
-    projects: list[ProjectSettings] = []
+    """Discover all projects in configured roots.
+
+    A single project id can appear in multiple sibling directories — e.g. a worktree
+    or a parallel clone (``arb-prd``, ``arb-prd-pr-sprint``, ``arb-prd-tam-v2`` all
+    holding ``id="arb-prd"``). Return one row per id, preferring the entry whose
+    directory name matches the id (the canonical checkout) over worktrees, and
+    first-seen otherwise.
+    """
+    by_id: dict[str, ProjectSettings] = {}
 
     for root in config.project_roots:
         if not root.exists():
@@ -150,8 +157,11 @@ def discover_projects(
         if config.openclaw_workspace and root == config.openclaw_workspace:
             continue
 
-        # Look for .project/settings.toml in immediate subdirectories
-        for item in root.iterdir():
+        # Look for .project/settings.toml in immediate subdirectories.
+        # Sort by name so the first-seen fallback (used when no directory's
+        # name matches the project id) is deterministic across filesystems;
+        # Path.iterdir() ordering is not guaranteed.
+        for item in sorted(root.iterdir(), key=lambda p: p.name):
             if not item.is_dir():
                 continue
 
@@ -164,13 +174,21 @@ def discover_projects(
                     if status_filter is not None and project.status != status_filter:
                         continue
 
-                    projects.append(project)
+                    existing = by_id.get(project.id)
+                    if existing is None:
+                        by_id[project.id] = project
+                    else:
+                        # Prefer the canonical directory (name == id) over worktrees.
+                        existing_dir = existing.project_dir.name if existing.project_dir else ""
+                        new_dir = item.name
+                        if new_dir == project.id and existing_dir != project.id:
+                            by_id[project.id] = project
                 except Exception:
                     # Skip malformed projects
                     continue
 
     # Sort by priority (lower is higher priority), then by name
-    projects.sort(key=lambda p: (p.priority, p.name))
+    projects = sorted(by_id.values(), key=lambda p: (p.priority, p.name))
 
     return projects
 

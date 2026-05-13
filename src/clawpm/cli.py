@@ -277,7 +277,8 @@ def projects_list(ctx: click.Context, status_filter: str | None, show_all: bool)
             click.echo("\nUntracked git repos (use 'clawpm project init' to add):")
             for repo in untracked:
                 remote_hint = f" ({repo.remote.split('/')[-1].replace('.git', '')})" if repo.remote else ""
-                click.echo(f"  ○ {repo.name}{remote_hint}")
+                # ASCII bullet only — Windows cp1252 stdout cannot encode U+25CB and crashes the run.
+                click.echo(f"  - {repo.name}{remote_hint}")
 
 
 @projects.command("next")
@@ -432,6 +433,7 @@ def project_doctor(ctx: click.Context, project_id: str | None, strict: bool = Fa
     issues: list[dict] = []
     stale_tasks: list[dict] = []
     drift_tasks: list[dict] = []
+    unreadable_files: list[dict] = []
 
     STALE_DAYS = 7
 
@@ -508,7 +510,7 @@ def project_doctor(ctx: click.Context, project_id: str | None, strict: bool = Fa
             # Read work_log entries for this task to find more recent touch
             work_log_path = config.portfolio_root / "work_log.jsonl"
             if work_log_path.exists():
-                for line in work_log_path.read_text(encoding="utf-8").splitlines():
+                for line in work_log_path.read_text(encoding="utf-8", errors="replace").splitlines():
                     line = line.strip()
                     if not line:
                         continue
@@ -563,11 +565,25 @@ def project_doctor(ctx: click.Context, project_id: str | None, strict: bool = Fa
             else:
                 location_state = "open"
 
-            # Read frontmatter state (if present)
+            # Read frontmatter state (if present).
+            # Foreign-source markdown (other projects' notes) may contain non-UTF-8
+            # bytes (cp1252 smart-quotes/em-dashes are the common offender on Windows).
+            # Use errors="replace" so a stray byte doesn't abort the whole doctor run,
+            # and record the file in unreadable_files so the operator can clean it up.
             try:
-                text = md_file.read_text(encoding="utf-8")
+                raw = md_file.read_bytes()
             except OSError:
                 continue
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                unreadable_files.append({
+                    "file": md_file.as_posix(),
+                    "project_id": proj.id,
+                    "encoding_hint": "utf-8",
+                    "error": f"{exc.reason} at byte {exc.start}",
+                })
+                text = raw.decode("utf-8", errors="replace")
             fm_state: str | None = None
             if text.startswith("---"):
                 import yaml as _yaml
@@ -623,9 +639,10 @@ def project_doctor(ctx: click.Context, project_id: str | None, strict: bool = Fa
     ]
 
     # Build final output
-    has_warnings = bool(stale_tasks or drift_tasks or prefix_collisions or any(
-        i["level"] == "warning" for i in issues
-    ))
+    has_warnings = bool(
+        stale_tasks or drift_tasks or prefix_collisions or unreadable_files
+        or any(i["level"] == "warning" for i in issues)
+    )
 
     if fmt == OutputFormat.JSON:
         output_json({
@@ -634,10 +651,13 @@ def project_doctor(ctx: click.Context, project_id: str | None, strict: bool = Fa
             "stale_tasks": stale_tasks,
             "drift_tasks": drift_tasks,
             "prefix_collisions": prefix_collisions,
+            "unreadable_files": unreadable_files,
         })
     else:
-        if not issues and not stale_tasks and not drift_tasks and not prefix_collisions:
-            click.echo("✓ No issues found")
+        if not (
+            issues or stale_tasks or drift_tasks or prefix_collisions or unreadable_files
+        ):
+            click.echo("[OK] No issues found")
         else:
             for issue in issues:
                 scope = issue.get("project", issue["scope"])
@@ -645,14 +665,19 @@ def project_doctor(ctx: click.Context, project_id: str | None, strict: bool = Fa
             for st in stale_tasks:
                 click.echo(
                     f"[WARNING] [stale] {st['task_id']} ({st['project_id']}) "
-                    f"— {st['days_stale']} days stale. {st['suggested_action']}"
+                    f"- {st['days_stale']} days stale. {st['suggested_action']}"
                 )
             for dt in drift_tasks:
-                click.echo(f"[WARNING] [drift] {dt['file']} — {dt['issue']}")
+                click.echo(f"[WARNING] [drift] {dt['file']} - {dt['issue']}")
             for pc in prefix_collisions:
                 click.echo(
                     f"[WARNING] [prefix] prefix '{pc['prefix']}' shared by: "
                     + ", ".join(pc["projects"])
+                )
+            for uf in unreadable_files:
+                click.echo(
+                    f"[WARNING] [encoding] {uf['file']} ({uf['project_id']}) "
+                    f"- {uf['error']}; read with errors='replace' to continue"
                 )
 
     if strict and has_warnings:
@@ -1441,12 +1466,12 @@ def quick_status(ctx: click.Context, project_id: str | None) -> None:
             if in_progress:
                 click.echo("\nIn Progress:")
                 for t in in_progress:
-                    click.echo(f"  → {t.id}: {t.title}")
-            
+                    click.echo(f"  -> {t.id}: {t.title}")
+
             if blocked:
                 click.echo("\nBlocked:")
                 for t in blocked:
-                    click.echo(f"  ✗ {t.id}: {t.title}")
+                    click.echo(f"  x {t.id}: {t.title}")
             
             if next_task and next_task not in in_progress:
                 click.echo(f"\nNext up: {next_task.id}: {next_task.title}")
@@ -2061,7 +2086,7 @@ def setup(ctx: click.Context, check: bool) -> None:
                 for issue in issues:
                     click.echo(f"  - {issue}")
             else:
-                click.echo("✓ ClawPM is properly configured")
+                click.echo("[OK] ClawPM is properly configured")
                 if portfolio_path:
                     click.echo(f"  Portfolio: {portfolio_path}")
     else:
@@ -2258,7 +2283,7 @@ def issues_list(ctx: click.Context, project_id: str | None, open_only: bool) -> 
             click.echo("No issues found.")
             return
         for i, issue in enumerate(issues, 1):
-            status = "✓" if issue.get("fixed") else "○"
+            status = "[OK]" if issue.get("fixed") else "[ ] "
             sev = issue.get("severity", "?")[0].upper()
             typ = issue.get("type", "?")
             click.echo(f"{status} [{sev}] {typ}: {issue.get('actual', issue.get('context', 'No description'))}")
