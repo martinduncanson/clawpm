@@ -20,8 +20,8 @@ def temp_portfolio():
     
     # Create portfolio structure
     (portfolio_root / "portfolio.toml").write_text(f'''
-portfolio_root = "{portfolio_root}"
-project_roots = ["{portfolio_root}/projects"]
+portfolio_root = "{portfolio_root.as_posix()}"
+project_roots = ["{(portfolio_root / 'projects').as_posix()}"]
 
 [defaults]
 status = "active"
