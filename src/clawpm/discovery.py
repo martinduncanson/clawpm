@@ -157,8 +157,11 @@ def discover_projects(
         if config.openclaw_workspace and root == config.openclaw_workspace:
             continue
 
-        # Look for .project/settings.toml in immediate subdirectories
-        for item in root.iterdir():
+        # Look for .project/settings.toml in immediate subdirectories.
+        # Sort by name so the first-seen fallback (used when no directory's
+        # name matches the project id) is deterministic across filesystems;
+        # Path.iterdir() ordering is not guaranteed.
+        for item in sorted(root.iterdir(), key=lambda p: p.name):
             if not item.is_dir():
                 continue
 

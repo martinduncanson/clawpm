@@ -195,6 +195,45 @@ class TestProjectDedup:
             f"Expected canonical dir 'alpha' to win, got '{alpha.project_dir.name}'"
         )
 
+    def test_fallback_is_deterministic_when_no_canonical_dir(self, tmp_path):
+        """When no sibling dir's name matches the project id, the first-seen
+        winner must be deterministic across filesystems — sort by dir name."""
+        portfolio_root = tmp_path
+        (portfolio_root / "portfolio.toml").write_text(
+            f'portfolio_root = "{portfolio_root.as_posix()}"\n'
+            f'project_roots = ["{(portfolio_root / "projects").as_posix()}"]\n',
+            encoding="utf-8",
+        )
+        projects_dir = portfolio_root / "projects"
+        projects_dir.mkdir()
+
+        # Three worktree-style dirs, all with id="beta", NONE named "beta".
+        # Sorted order: beta-pr -> beta-tam -> beta-wip. First wins.
+        for dir_name in ("beta-wip", "beta-pr", "beta-tam"):
+            d = projects_dir / dir_name / ".project"
+            (d / "tasks").mkdir(parents=True)
+            (d / "settings.toml").write_text(
+                'id = "beta"\nname = "Beta"\nstatus = "active"\npriority = 3\n',
+                encoding="utf-8",
+            )
+
+        old_env = os.environ.get("CLAWPM_PORTFOLIO")
+        os.environ["CLAWPM_PORTFOLIO"] = str(portfolio_root)
+        try:
+            config = load_portfolio_config(portfolio_root)
+            projects = discover_projects(config)
+            beta = next(p for p in projects if p.id == "beta")
+            assert beta.project_dir is not None
+            assert beta.project_dir.name == "beta-pr", (
+                f"Expected sorted-first 'beta-pr' to win, got '{beta.project_dir.name}'. "
+                f"Path.iterdir() order is not guaranteed — discover_projects must sort."
+            )
+        finally:
+            if old_env:
+                os.environ["CLAWPM_PORTFOLIO"] = old_env
+            else:
+                os.environ.pop("CLAWPM_PORTFOLIO", None)
+
     def test_projects_list_text_has_no_duplicates(self, worktree_portfolio):
         runner = CliRunner()
         result = runner.invoke(main, ["--format", "text", "projects", "list", "--all"])
