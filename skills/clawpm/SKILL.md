@@ -232,8 +232,10 @@ clawpm research link --id <research_id> --session-key <key>
 ### Issues
 ```bash
 clawpm issues add --type bug --severity high --actual "What happened"
-clawpm issues list [--open]             # Open issues only
+clawpm issues add --type observation --severity low --tag depth-warning --summary "depth>2 subagent nesting"
+clawpm issues list [--open] [--type observation] [--tag depth-warning]
 ```
+Types: `bug | ux | docs | feature | observation`. `observation` is for neutral signals worth logging (depth warnings, ergonomic gaps, calibration deltas) that aren't bugs. `--tag` is repeatable; `issues list --tag` matches any.
 
 ### Admin
 ```bash
