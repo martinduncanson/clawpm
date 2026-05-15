@@ -642,11 +642,20 @@ clawpm is the task layer. Other skills/plugins handle specialised lifecycle mome
 |---|---|---|
 | Task creation, before any code | **`feature-dev`** | 7-phase guided workflow (explore → ask → architect → plan → implement → review → reflect). Particularly valuable when complexity is `l`/`xl` or `predict-pitfalls` is non-empty. Seed clawpm subtasks per phase. |
 | Before commit | **`commit-commands /commit`** | Auto-drafts commit message from staged changes; we can add `Closes <task-id>` to the message and capture the SHA in `clawpm log commit` after. |
-| After commit, before PR | **`codex-review`** | Codex generalist review — first pass. Pull findings into `clawpm issues add` if anything substantive lands. |
+| Between commit and push (non-trivial diff) | **PRE-REVIEW subagent** | Reviewer subagent on the diff with no other context — catches what the implementer missed in self-review. See `codex-review` §3 for the canonical rule (skip for pure docs/config or ≤50 LOC AND mechanical; never skip for auth/serialization/data-storage/silently-failing invariants). Eats ~50% of what Codex would catch, locally, for ~30-60 sec wall-clock. |
+| After commit, before PR | **`codex-review` + `coderabbit:code-review` in parallel** | Two reviewers, deliberately redundant — different optimisation surfaces catch different bug shapes. Run concurrently; total wait time is set by the slower of the two, not the sum. Codex's strength: cross-cutting correctness; CodeRabbit's strength: style/architecture consistency. Pull substantive findings into `clawpm issues add`. |
 | Before merge (if PR is non-trivial) | **`pr-review-toolkit /review-pr`** | Six specialist agents (silent-failure-hunter, type-design-analyzer, comment-analyzer, pr-test-analyzer, code-reviewer, code-simplifier). Use selectively — silent-failure-hunter for any fix involving `try/except`, type-design-analyzer for new public types, etc. Findings → `clawpm issues add`. |
 | Confidence-scored second opinion | **`code-review`** | Multi-agent independent review with confidence scoring to filter false positives. Useful for high-stakes merges where Codex alone isn't enough. |
 | Branch cleanup | **`commit-commands /clean_gone`** | After PRs land — reaps branches whose remotes are gone. Worth running after `clawpm done` for tasks that resulted in merged PRs. |
 | Cowork session start | **`clawpm-cowork`** | Bootstraps the ephemeral Cowork VM with portfolio repo + clawpm install + context resume. |
+
+### Doctrine: reviewer triangle + upstream layers
+
+The "After commit, before PR" gate runs **two bot reviewers in parallel** by design, not by accident. Codex and CodeRabbit have different optimisation surfaces — overlap is ~60-70%, so the remaining 30-40% is bugs only one reviewer catches. Don't collapse them to "pick one"; the marginal cost of the second invocation is negligible since they run concurrently.
+
+The "Between commit and push" gate (PRE-REVIEW) is **upstream of both bot reviewers**. The diff that arrives at codex-review/coderabbit is the diff that already survived a self-review pass, so the bot reviews shift from "find bugs" mode to "sanity-check the implementer's stated uncertainties" mode (provided the briefing carries 3-5 named concerns per the codex-review skill's template requirement). Round-1-clean reviews become the norm.
+
+Skip PRE-REVIEW for ≤50 LOC mechanical changes or pure docs/config — full skip rule lives in `codex-review` SKILL.md §3. Never skip for auth, serialization, data storage, or any invariant that fails silently.
 
 ### How to invoke (ask the operator first)
 
