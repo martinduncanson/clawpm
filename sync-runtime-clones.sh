@@ -41,18 +41,27 @@ for d in "${CLONES[@]}"; do
   echo "SYNC:  $d ($before -> $after)"
 done
 
-# Mirror nested SKILL.md to top-level for Claude Code's skill loader
-# (~/.claude/skills/clawpm/SKILL.md is what CC discovers; the OpenClaw layout
-#  buries it at skills/clawpm/skills/clawpm/SKILL.md.)
+# Mirror nested SKILL.md files to where Claude Code's skill loader discovers them.
+# The repo layout nests skills under skills/<name>/SKILL.md; CC expects them at
+# ~/.claude/skills/<name>/SKILL.md.
 CC_CLONE="/c/Users/Martin Workspace/.claude/skills/clawpm"
-INNER="$CC_CLONE/skills/clawpm/SKILL.md"
-OUTER="$CC_CLONE/SKILL.md"
-if [ -f "$INNER" ]; then
-  if ! cmp -s "$INNER" "$OUTER" 2>/dev/null; then
-    cp "$INNER" "$OUTER"
-    echo "MIRROR: $OUTER (refreshed for CC skill loader)"
+CC_SKILLS_ROOT="/c/Users/Martin Workspace/.claude/skills"
+
+mirror_skill () {
+  local inner="$1"
+  local outer="$2"
+  if [ ! -f "$inner" ]; then
+    return
   fi
-fi
+  mkdir -p "$(dirname "$outer")"
+  if ! cmp -s "$inner" "$outer" 2>/dev/null; then
+    cp "$inner" "$outer"
+    echo "MIRROR: $outer (refreshed for CC skill loader)"
+  fi
+}
+
+mirror_skill "$CC_CLONE/skills/clawpm/SKILL.md" "$CC_CLONE/SKILL.md"
+mirror_skill "$CC_CLONE/skills/clawpm-cowork/SKILL.md" "$CC_SKILLS_ROOT/clawpm-cowork/SKILL.md"
 
 echo
 echo "Done. Reminder: \`uv tool install -e F:/Git/clawpm\` is editable — CLI changes pick up automatically without reinstall."
