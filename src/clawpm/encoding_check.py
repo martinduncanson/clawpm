@@ -32,9 +32,15 @@ from pathlib import Path
 PRINT_LIKE_NAMES = {"print"}
 """Bare names that act as stdout-writers."""
 
-PRINT_LIKE_ATTRS = {"echo", "secho", "print"}
-"""Attribute names that act as stdout-writers (covers click.echo, click.secho,
-typer.echo, sys.stdout.print, etc.)."""
+PRINT_LIKE_ATTRS = {"echo", "secho", "print", "write"}
+"""Attribute names that act as stdout-writers when the receiver is one of
+PRINT_LIKE_RECEIVERS (covers click.echo, click.secho, typer.echo,
+sys.stdout.write, sys.stderr.write)."""
+
+PRINT_LIKE_RECEIVERS = {"click", "typer", "sys"}
+"""Receiver names whose .echo/.print/.secho calls actually hit stdout. Tightens
+the match so domain objects with .print/.echo methods (logger.echo, Rich's
+console.print, model.print) don't false-positive."""
 
 FILE_OP_ATTRS = {"read_text", "write_text", "open", "read_bytes", "write_bytes"}
 """Pathlib methods that take an encoding= kwarg (or bypass it for bytes)."""
@@ -67,12 +73,27 @@ def _string_literals_in_node(node: ast.AST) -> list[str]:
 
 
 def _is_print_like_call(node: ast.Call) -> bool:
-    """Return True if this Call is a print() or click.echo()-shaped call."""
+    """Return True if this Call is a print() or click.echo()-shaped call.
+
+    For attribute calls (foo.echo(...)), require the receiver to be a Name in
+    PRINT_LIKE_RECEIVERS, or an Attribute whose root is `sys` (e.g.
+    sys.stdout.write). This avoids false positives on domain objects with
+    their own .echo/.print/.secho methods (logger.echo, Rich's console.print,
+    SQLAlchemy's model.print, etc.).
+    """
     func = node.func
     if isinstance(func, ast.Name) and func.id in PRINT_LIKE_NAMES:
         return True
     if isinstance(func, ast.Attribute) and func.attr in PRINT_LIKE_ATTRS:
-        return True
+        receiver = func.value
+        if isinstance(receiver, ast.Name) and receiver.id in PRINT_LIKE_RECEIVERS:
+            return True
+        # sys.stdout.X / sys.stderr.X — walk down to the sys root
+        cursor = receiver
+        while isinstance(cursor, ast.Attribute):
+            cursor = cursor.value
+        if isinstance(cursor, ast.Name) and cursor.id == "sys":
+            return True
     return False
 
 
@@ -96,34 +117,67 @@ def _has_encoding_kwarg(node: ast.Call) -> bool:
     return any(kw.arg == "encoding" for kw in node.keywords)
 
 
+def _has_binary_mode(node: ast.Call) -> bool:
+    """For open()/Path.open() calls, return True if the mode string contains 'b'.
+
+    Binary-mode reads/writes don't take encoding=. Without this check, every
+    `open(path, "rb")` would false-positive on missing-encoding-kwarg.
+
+    Handles both call shapes:
+    - `open(path, mode, ...)` (Name call) — mode is positional arg index 1
+    - `Path(p).open(mode, ...)` (Attribute call) — self-bound, mode is index 0
+    """
+    if isinstance(node.func, ast.Name):
+        mode_index = 1  # builtin open: open(file, mode, ...)
+    else:
+        mode_index = 0  # Path.open / file.open: mode is first arg after receiver
+
+    if len(node.args) > mode_index:
+        mode_node = node.args[mode_index]
+        if isinstance(mode_node, ast.Constant) and isinstance(mode_node.value, str):
+            if "b" in mode_node.value:
+                return True
+    for kw in node.keywords:
+        if kw.arg == "mode" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+            if "b" in kw.value.value:
+                return True
+    return False
+
+
+def _is_stdout_reconfigure_call(stmt: ast.stmt) -> bool:
+    """Return True if stmt is an Expr wrapping `<...>.stdout.reconfigure(...)`."""
+    if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)):
+        return False
+    call = stmt.value
+    return (isinstance(call.func, ast.Attribute)
+            and call.func.attr == "reconfigure"
+            and isinstance(call.func.value, ast.Attribute)
+            and call.func.value.attr == "stdout")
+
+
 def _has_stdout_reconfigure(tree: ast.Module) -> bool:
     """Return True if the module's top-level statements include a
     sys.stdout.reconfigure(...) call.
 
-    Conservative: only looks at module-level statements (not nested in
-    conditionals, functions, classes). Anything more nuanced is a guard
-    the operator has made deliberately.
+    Conservative: only looks at module-level statements (and one-level-deep
+    inside `if hasattr(...)` or `try:` guards — the two common defensive
+    patterns). Anything more nuanced (nested in a function, class, or
+    deeper conditional) is a guard the operator has made deliberately, and
+    we still flag the module.
     """
     for stmt in tree.body:
-        # Match `sys.stdout.reconfigure(...)` or
-        # `if hasattr(sys.stdout, "reconfigure"): sys.stdout.reconfigure(...)`
-        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
-            call = stmt.value
-            if (isinstance(call.func, ast.Attribute)
-                    and call.func.attr == "reconfigure"
-                    and isinstance(call.func.value, ast.Attribute)
-                    and call.func.value.attr == "stdout"):
-                return True
-        # Allow the common `if hasattr(...): reconfigure(...)` guard
+        if _is_stdout_reconfigure_call(stmt):
+            return True
+        # Common guard: `if hasattr(sys.stdout, "reconfigure"): ...`
         if isinstance(stmt, ast.If):
             for body_stmt in stmt.body:
-                if isinstance(body_stmt, ast.Expr) and isinstance(body_stmt.value, ast.Call):
-                    call = body_stmt.value
-                    if (isinstance(call.func, ast.Attribute)
-                            and call.func.attr == "reconfigure"
-                            and isinstance(call.func.value, ast.Attribute)
-                            and call.func.value.attr == "stdout"):
-                        return True
+                if _is_stdout_reconfigure_call(body_stmt):
+                    return True
+        # Common guard: `try: sys.stdout.reconfigure(...) except AttributeError: pass`
+        if isinstance(stmt, ast.Try):
+            for body_stmt in stmt.body:
+                if _is_stdout_reconfigure_call(body_stmt):
+                    return True
     return False
 
 
@@ -146,17 +200,30 @@ def check_file(file_path: Path) -> list[dict]:
     }
     """
     findings: list[dict] = []
+    posix = file_path.as_posix()
     try:
         source = file_path.read_text(encoding="utf-8", errors="replace")
-    except (OSError, UnicodeDecodeError):
+    except OSError as exc:
+        # Surface (don't swallow): the scanner's animating principle is that
+        # the operator deserves to see files the tooling can't open.
+        findings.append({
+            "file": posix,
+            "line": 0,
+            "rule": "unreadable-source",
+            "evidence": f"could not read file: {exc}",
+        })
         return findings
     try:
         tree = ast.parse(source, filename=str(file_path))
-    except SyntaxError:
-        # File doesn't parse — skip, don't crash doctor
+    except SyntaxError as exc:
+        # A tracked .py file that won't parse is itself portfolio-health signal.
+        findings.append({
+            "file": posix,
+            "line": exc.lineno or 0,
+            "rule": "unparseable-source",
+            "evidence": f"syntax error: {exc.msg}",
+        })
         return findings
-
-    posix = file_path.as_posix()
 
     # Check 1: non-ASCII in print/click.echo calls
     for node in ast.walk(tree):
@@ -183,6 +250,9 @@ def check_file(file_path: Path) -> list[dict]:
             continue
         # bytes variants don't take encoding=; skip them
         if op_name in {"read_bytes", "write_bytes"}:
+            continue
+        # open(p, "rb") / Path(p).open("rb") — binary mode, no encoding= needed
+        if op_name == "open" and _has_binary_mode(node):
             continue
         if not _has_encoding_kwarg(node):
             findings.append({
@@ -226,15 +296,29 @@ def scan_path(root: Path, max_files: int = 500) -> list[dict]:
     skip_dirs = {
         ".venv", "venv", "__pycache__", ".pytest_cache", "build", "dist",
         ".tox", "node_modules", ".git", ".agent", ".project", "temp",
-        "htmlcov", ".mypy_cache",
+        "htmlcov", ".mypy_cache", "site-packages", ".eggs",
     }
     findings: list[dict] = []
     file_count = 0
+    truncated = False
     for path in root.rglob("*.py"):
         if any(part in skip_dirs for part in path.parts):
             continue
         file_count += 1
         if file_count > max_files:
+            truncated = True
             break
         findings.extend(check_file(path))
+    if truncated:
+        # Surface (don't swallow): operator deserves to know their portfolio
+        # outgrew the scan budget. Otherwise files past max_files vanish silently.
+        findings.append({
+            "file": root.as_posix(),
+            "line": 0,
+            "rule": "scan-truncated",
+            "evidence": (
+                f"scan stopped after {max_files} .py files; narrow scope or "
+                "raise scan_path(max_files=) to see remaining files"
+            ),
+        })
     return findings

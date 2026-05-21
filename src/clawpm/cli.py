@@ -969,7 +969,19 @@ def project_doctor(
         for proj in projects_to_check:
             if not proj.repo_path or not proj.repo_path.exists():
                 continue
-            findings = scan_path(proj.repo_path)
+            try:
+                findings = scan_path(proj.repo_path)
+            except Exception as exc:
+                # rglob can hit junctions / permission errors on Windows.
+                # Surface as a structured finding rather than aborting doctor.
+                encoding_risks.append({
+                    "project_id": proj.id,
+                    "file": proj.repo_path.as_posix(),
+                    "line": 0,
+                    "rule": "scan-failed",
+                    "evidence": f"{type(exc).__name__}: {exc}",
+                })
+                continue
             for finding in findings:
                 encoding_risks.append({"project_id": proj.id, **finding})
 
@@ -1108,6 +1120,12 @@ def project_doctor(
                     f"[ADVICE] [codegraph] {cg['project_id']} "
                     f"({cg['code_files']} code files, no .codegraph/) "
                     f"- {cg['suggested_action']}"
+                )
+            if encoding_risks:
+                files_with_risk = {er["file"] for er in encoding_risks}
+                click.echo(
+                    f"[WARNING] [encoding-risk] {len(encoding_risks)} findings "
+                    f"across {len(files_with_risk)} files"
                 )
             for er in encoding_risks:
                 click.echo(

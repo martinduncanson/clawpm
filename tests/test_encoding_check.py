@@ -20,6 +20,7 @@ from click.testing import CliRunner
 from clawpm.cli import main
 from clawpm.encoding_check import (
     _is_nonascii,
+    _is_print_like_call,
     check_file,
     scan_path,
 )
@@ -100,6 +101,73 @@ class TestRuleNonAsciiInPrint:
         rules = [r["rule"] for r in findings]
         assert "nonascii-in-print" in rules
 
+    def test_multiarg_print_second_arg_glyph_flagged(self, tmp_path):
+        # ast.walk traverses all node.args; lock this in.
+        f = _write_file(tmp_path, "x.py",
+            "import sys\n"
+            'sys.stdout.reconfigure(encoding="utf-8")\n'
+            'print("ok", "→ done")\n'
+        )
+        findings = check_file(f)
+        rules = [r["rule"] for r in findings]
+        assert "nonascii-in-print" in rules
+
+    def test_logger_echo_not_flagged_as_print_like(self, tmp_path):
+        # PRE-REVIEW P1: domain objects with .echo/.print methods must not
+        # false-positive. logger.echo is NOT stdout.
+        f = _write_file(tmp_path, "x.py",
+            "def f(logger):\n"
+            '    logger.echo("→ glyph in ascii-only-stdout-receiver")\n'
+        )
+        findings = check_file(f)
+        rules = [r["rule"] for r in findings]
+        # Neither rule 1 nor rule 3 should fire — logger isn't a stdout writer
+        assert "nonascii-in-print" not in rules
+        assert "unconfigured-stdout" not in rules
+
+    def test_rich_console_print_not_flagged(self, tmp_path):
+        # Rich's console.print handles its own encoding. The scanner should
+        # not flag it as print-like unless the receiver is click/typer/sys.
+        f = _write_file(tmp_path, "x.py",
+            "def f(console):\n"
+            '    console.print("→ Rich handles this")\n'
+        )
+        findings = check_file(f)
+        rules = [r["rule"] for r in findings]
+        assert "nonascii-in-print" not in rules
+        assert "unconfigured-stdout" not in rules
+
+    def test_click_secho_flagged(self, tmp_path):
+        f = _write_file(tmp_path, "x.py",
+            "import sys, click\n"
+            'sys.stdout.reconfigure(encoding="utf-8")\n'
+            'click.secho("✓ ok", fg="green")\n'
+        )
+        findings = check_file(f)
+        rules = [r["rule"] for r in findings]
+        assert "nonascii-in-print" in rules
+
+    def test_typer_echo_flagged(self, tmp_path):
+        f = _write_file(tmp_path, "x.py",
+            "import sys, typer\n"
+            'sys.stdout.reconfigure(encoding="utf-8")\n'
+            'typer.echo("→ task")\n'
+        )
+        findings = check_file(f)
+        rules = [r["rule"] for r in findings]
+        assert "nonascii-in-print" in rules
+
+    def test_sys_stdout_write_with_glyph_flagged(self, tmp_path):
+        # sys.stdout.write is the canonical low-level stdout-writer.
+        f = _write_file(tmp_path, "x.py",
+            "import sys\n"
+            'sys.stdout.reconfigure(encoding="utf-8")\n'
+            'sys.stdout.write("→ glyph")\n'
+        )
+        findings = check_file(f)
+        rules = [r["rule"] for r in findings]
+        assert "nonascii-in-print" in rules
+
 
 class TestRuleMissingEncodingKwarg:
     def test_open_without_encoding_flagged(self, tmp_path):
@@ -151,6 +219,56 @@ class TestRuleMissingEncodingKwarg:
         rules = [r["rule"] for r in findings]
         assert "missing-encoding-kwarg" not in rules
 
+    def test_open_binary_mode_positional_not_flagged(self, tmp_path):
+        # PRE-REVIEW P1: open(p, "rb") has no encoding by design.
+        f = _write_file(tmp_path, "x.py",
+            "def f(p):\n"
+            '    return open(p, "rb")\n'
+        )
+        findings = check_file(f)
+        rules = [r["rule"] for r in findings]
+        assert "missing-encoding-kwarg" not in rules
+
+    def test_open_binary_mode_kwarg_not_flagged(self, tmp_path):
+        f = _write_file(tmp_path, "x.py",
+            "def f(p):\n"
+            '    return open(p, mode="wb")\n'
+        )
+        findings = check_file(f)
+        rules = [r["rule"] for r in findings]
+        assert "missing-encoding-kwarg" not in rules
+
+    def test_open_text_mode_explicit_still_flagged_without_encoding(self, tmp_path):
+        # open(p, "r") is text mode → encoding= IS required
+        f = _write_file(tmp_path, "x.py",
+            "def f(p):\n"
+            '    return open(p, "r")\n'
+        )
+        findings = check_file(f)
+        rules = [r["rule"] for r in findings]
+        assert "missing-encoding-kwarg" in rules
+
+    def test_path_open_binary_mode_not_flagged(self, tmp_path):
+        f = _write_file(tmp_path, "x.py",
+            "from pathlib import Path\n"
+            "def f(p):\n"
+            '    return Path(p).open("rb")\n'
+        )
+        findings = check_file(f)
+        rules = [r["rule"] for r in findings]
+        assert "missing-encoding-kwarg" not in rules
+
+    def test_with_open_no_encoding_flagged(self, tmp_path):
+        # `with open(p) as f:` — ast.walk reaches the Call inside With.items
+        f = _write_file(tmp_path, "x.py",
+            "def f(p):\n"
+            "    with open(p) as h:\n"
+            "        return h.read()\n"
+        )
+        findings = check_file(f)
+        rules = [r["rule"] for r in findings]
+        assert "missing-encoding-kwarg" in rules
+
 
 class TestRuleUnconfiguredStdout:
     def test_module_with_print_no_reconfigure_flagged(self, tmp_path):
@@ -195,6 +313,50 @@ class TestRuleUnconfiguredStdout:
         rules = [r["rule"] for r in findings]
         assert "unconfigured-stdout" not in rules
 
+    def test_try_guarded_reconfigure_not_flagged(self, tmp_path):
+        # try: sys.stdout.reconfigure(...) except AttributeError: pass — common
+        # defensive pattern. Must be recognised, not flagged.
+        f = _write_file(tmp_path, "x.py",
+            "import sys\n"
+            "try:\n"
+            '    sys.stdout.reconfigure(encoding="utf-8")\n'
+            "except AttributeError:\n"
+            "    pass\n"
+            "def main():\n"
+            "    print('hello')\n"
+        )
+        findings = check_file(f)
+        rules = [r["rule"] for r in findings]
+        assert "unconfigured-stdout" not in rules
+
+    def test_reconfigure_inside_function_still_flagged(self, tmp_path):
+        # Lock in the conservative scope: reconfigure inside a function does
+        # not protect module-level prints. If someone "helpfully" walks the
+        # whole tree, this test catches the regression.
+        f = _write_file(tmp_path, "x.py",
+            "import sys\n"
+            "def setup():\n"
+            '    sys.stdout.reconfigure(encoding="utf-8")\n'
+            "def main():\n"
+            "    print('hello')\n"
+        )
+        findings = check_file(f)
+        rules = [r["rule"] for r in findings]
+        assert "unconfigured-stdout" in rules
+
+    def test_logger_only_module_not_flagged(self, tmp_path):
+        # logger.info / logger.echo is NOT stdout — module with only logging
+        # should not be flagged for missing reconfigure.
+        f = _write_file(tmp_path, "x.py",
+            "import logging\n"
+            "logger = logging.getLogger(__name__)\n"
+            "def f():\n"
+            '    logger.info("→ logged not printed")\n'
+        )
+        findings = check_file(f)
+        rules = [r["rule"] for r in findings]
+        assert "unconfigured-stdout" not in rules
+
 
 # ---------------------------------------------------------------------------
 # check_file edge cases
@@ -202,17 +364,26 @@ class TestRuleUnconfiguredStdout:
 
 
 class TestCheckFileEdgeCases:
-    def test_syntax_error_returns_empty(self, tmp_path):
-        f = _write_file(tmp_path, "x.py", "def broken(:\n")  # syntax error
-        assert check_file(f) == []
+    def test_syntax_error_surfaces_unparseable_finding(self, tmp_path):
+        # PRE-REVIEW P1: surface, don't swallow. A .py file that won't parse
+        # is itself signal worth a structured finding.
+        f = _write_file(tmp_path, "x.py", "def broken(:\n")
+        findings = check_file(f)
+        rules = [r["rule"] for r in findings]
+        assert "unparseable-source" in rules
+        # And only that rule fires (we don't try to scan the unparseable AST)
+        unparseable = next(r for r in findings if r["rule"] == "unparseable-source")
+        assert "syntax error" in unparseable["evidence"].lower()
 
     def test_empty_file_returns_empty(self, tmp_path):
         f = _write_file(tmp_path, "x.py", "")
         assert check_file(f) == []
 
-    def test_unreadable_file_returns_empty(self, tmp_path):
-        # Nonexistent file → graceful empty
-        assert check_file(tmp_path / "nonexistent.py") == []
+    def test_unreadable_file_surfaces_unreadable_finding(self, tmp_path):
+        # Nonexistent file → structured finding (not silent skip)
+        findings = check_file(tmp_path / "nonexistent.py")
+        rules = [r["rule"] for r in findings]
+        assert "unreadable-source" in rules
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +420,40 @@ class TestScanPath:
         f.write_text('print("→ glyph")\n', encoding="utf-8")
         findings = scan_path(f)
         assert findings == []
+
+    def test_site_packages_skipped(self, tmp_path):
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "site-packages").mkdir()
+        _write_file(tmp_path / "src" / "site-packages", "bad.py",
+            'print("→ should not be scanned")\n'
+        )
+        findings = scan_path(tmp_path)
+        files_with_findings = {f["file"] for f in findings}
+        assert not any("site-packages" in f for f in files_with_findings)
+
+    def test_scan_truncation_surfaces_finding(self, tmp_path):
+        # Create more files than max_files; expect truncation marker
+        for i in range(5):
+            _write_file(tmp_path, f"f{i}.py", "x = 1\n")
+        findings = scan_path(tmp_path, max_files=2)
+        rules = [r["rule"] for r in findings]
+        assert "scan-truncated" in rules
+
+    def test_two_sided_skip_assertion(self, tmp_path):
+        # Defends against "scanner broken entirely" regressions: a risky
+        # file in src/ MUST be found, a risky file in .venv/ MUST NOT.
+        (tmp_path / "src").mkdir()
+        _write_file(tmp_path / "src", "risky.py",
+            'print("→ glyph in real source")\n'
+        )
+        (tmp_path / ".venv").mkdir()
+        _write_file(tmp_path / ".venv", "bad.py",
+            'print("→ should not be scanned")\n'
+        )
+        findings = scan_path(tmp_path)
+        files = {f["file"] for f in findings}
+        assert any("src/risky.py" in f for f in files), files
+        assert not any(".venv" in f for f in files), files
 
 
 # ---------------------------------------------------------------------------
@@ -292,3 +497,83 @@ class TestDoctorCheckEncodingFlag:
         assert result.exit_code == 0, result.output
         data = json.loads(result.output)
         assert "encoding_risks" in data
+
+    def test_exit_code_zero_when_only_encoding_findings(self, tmp_path, monkeypatch):
+        # PRE-REVIEW P1: lock contract — encoding findings are advisory,
+        # not failures. Without --strict, doctor must exit 0 even with risks.
+        # Set up a project with a risky .py file.
+        proj_root = tmp_path / "projects"
+        proj_root.mkdir()
+        proj = proj_root / "demo"
+        proj.mkdir()
+        (proj / ".project").mkdir()
+        (proj / ".project" / "settings.toml").write_text(
+            'id = "demo"\n'
+            'name = "demo"\n'
+            f'repo_path = "{proj.as_posix()}"\n'
+            'status = "active"\n',
+            encoding="utf-8",
+        )
+        (proj / "risky.py").write_text(
+            'print("→ glyph")\n',
+            encoding="utf-8",
+        )
+        (tmp_path / "portfolio.toml").write_text(
+            f'portfolio_root = "{tmp_path.as_posix()}"\n'
+            f'project_roots = ["{proj_root.as_posix()}"]\n'
+            "[defaults]\nstatus = \"active\"\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "work_log.jsonl").touch()
+        monkeypatch.setenv("CLAWPM_PORTFOLIO", str(tmp_path))
+
+        runner = CliRunner()
+        result = runner.invoke(main, ["doctor", "--check-encoding"])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert len(data["encoding_risks"]) > 0
+        # Every finding has the documented shape
+        for er in data["encoding_risks"]:
+            assert {"project_id", "file", "line", "rule", "evidence"} <= set(er.keys())
+
+
+# ---------------------------------------------------------------------------
+# _is_print_like_call discrimination (PRE-REVIEW P1)
+# ---------------------------------------------------------------------------
+
+
+class TestIsPrintLikeCallDiscrimination:
+    """Locks in the receiver-tightening: only click/typer/sys roots trigger."""
+
+    def _call_from(self, code: str):
+        import ast as _ast
+        tree = _ast.parse(code)
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.Call):
+                return node
+        raise AssertionError("no Call in code")
+
+    def test_bare_print_is_print_like(self):
+        assert _is_print_like_call(self._call_from('print("x")')) is True
+
+    def test_click_echo_is_print_like(self):
+        assert _is_print_like_call(self._call_from('click.echo("x")')) is True
+
+    def test_typer_echo_is_print_like(self):
+        assert _is_print_like_call(self._call_from('typer.echo("x")')) is True
+
+    def test_sys_stdout_write_is_print_like(self):
+        assert _is_print_like_call(self._call_from('sys.stdout.write("x")')) is True
+
+    def test_logger_echo_not_print_like(self):
+        assert _is_print_like_call(self._call_from('logger.echo("x")')) is False
+
+    def test_console_print_not_print_like(self):
+        assert _is_print_like_call(self._call_from('console.print("x")')) is False
+
+    def test_file_write_not_print_like(self):
+        assert _is_print_like_call(self._call_from('f.write("x")')) is False
+
+    def test_unrelated_method_not_print_like(self):
+        # `.send()`, `.put()`, etc. — totally outside the rule
+        assert _is_print_like_call(self._call_from('queue.put("x")')) is False
