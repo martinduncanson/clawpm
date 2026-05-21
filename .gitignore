@@ -16,3 +16,4 @@ uv.lock
 .project/
 .agent/
 .claude/
+temp/
