@@ -545,6 +545,11 @@ def project_announce(ctx: click.Context, project_id: str | None) -> None:
     is_flag=True,
     help="Disable the drift half-rename arm of --apply.",
 )
+@click.option(
+    "--check-encoding",
+    is_flag=True,
+    help="AST-scan tracked .py files for cp1252-risk patterns: non-ASCII literals in print/click.echo, file ops without encoding= kwarg, modules with print/echo but no stdout reconfigure. Off by default — opt-in for Windows-targeting codebases (CLAWP-011).",
+)
 @click.pass_context
 def project_doctor(
     ctx: click.Context,
@@ -559,6 +564,7 @@ def project_doctor(
     no_apply_cascade: bool = False,
     no_apply_stale_blocked: bool = False,
     no_apply_half_rename: bool = False,
+    check_encoding: bool = False,
 ) -> None:
     """Check for issues with projects and portfolio.
 
@@ -586,6 +592,7 @@ def project_doctor(
     missing_markers: list[dict] = []
     codex_availability: list[dict] = []
     codegraph_advice: list[dict] = []
+    encoding_risks: list[dict] = []
 
     STALE_DAYS = 7
     CODEGRAPH_FILE_THRESHOLD = 50  # below this we don't bother advising
@@ -952,6 +959,20 @@ def project_doctor(
                 ),
             })
 
+    # --- Phase 1.9 Check g (CLAWP-011): Encoding-risk AST scan ---
+    # Off by default (--check-encoding flag). AST-scans each project's .py files
+    # for the three cp1252-risk patterns documented in
+    # feedback-windows-cp1252-write-text.md. Tooling-rule escalation after 6
+    # confirmed incidents in 4 weeks.
+    if check_encoding:
+        from clawpm.encoding_check import scan_path
+        for proj in projects_to_check:
+            if not proj.repo_path or not proj.repo_path.exists():
+                continue
+            findings = scan_path(proj.repo_path)
+            for finding in findings:
+                encoding_risks.append({"project_id": proj.id, **finding})
+
     # --- Phase 1.6 Check c: Cross-project prefix collisions ---
     # Prefix = project_id.upper()[:5] (mirrors add_task logic)
     prefix_map: dict[str, list[str]] = {}
@@ -968,7 +989,7 @@ def project_doctor(
     # Build final output
     has_warnings = bool(
         stale_tasks or stale_blocked or drift_tasks or prefix_collisions or unreadable_files
-        or commit_drift or missing_markers or codex_availability
+        or commit_drift or missing_markers or codex_availability or encoding_risks
         or any(i["level"] == "warning" for i in issues)
     )
 
@@ -1021,6 +1042,7 @@ def project_doctor(
             "missing_markers": missing_markers,
             "codex_availability": codex_availability,
             "codegraph_advice": codegraph_advice,
+            "encoding_risks": encoding_risks,
         }
         if apply_mode:
             payload["applied"] = applied
@@ -1035,7 +1057,7 @@ def project_doctor(
         # --strict / has_warnings), but they ARE worth printing.
         if not (
             issues or stale_tasks or stale_blocked or drift_tasks or prefix_collisions or unreadable_files
-            or commit_drift or missing_markers or codex_availability or codegraph_advice
+            or commit_drift or missing_markers or codex_availability or codegraph_advice or encoding_risks
         ):
             click.echo("[OK] No issues found")
         else:
@@ -1086,6 +1108,11 @@ def project_doctor(
                     f"[ADVICE] [codegraph] {cg['project_id']} "
                     f"({cg['code_files']} code files, no .codegraph/) "
                     f"- {cg['suggested_action']}"
+                )
+            for er in encoding_risks:
+                click.echo(
+                    f"[WARNING] [encoding-risk:{er['rule']}] {er['project_id']} "
+                    f"{er['file']}:{er['line']} - {er['evidence']}"
                 )
 
         if apply_mode:
@@ -3700,6 +3727,11 @@ def version(ctx: click.Context) -> None:
 @click.option("--no-apply-cascade", "no_apply_cascade", is_flag=True, help="Disable stale-blocked cascade arm.")
 @click.option("--no-apply-stale-blocked", "no_apply_stale_blocked", is_flag=True, help="Alias for --no-apply-cascade.")
 @click.option("--no-apply-half-rename", "no_apply_half_rename", is_flag=True, help="Disable drift half-rename arm.")
+@click.option(
+    "--check-encoding",
+    is_flag=True,
+    help="AST-scan tracked .py files for cp1252-risk patterns (non-ASCII in print/echo, file ops without encoding=, modules with print but no stdout reconfigure). Off by default.",
+)
 @click.pass_context
 def doctor(
     ctx: click.Context,
@@ -3713,6 +3745,7 @@ def doctor(
     no_apply_cascade: bool = False,
     no_apply_stale_blocked: bool = False,
     no_apply_half_rename: bool = False,
+    check_encoding: bool = False,
 ) -> None:
     """Run full health check."""
     # Delegate to project doctor with no specific project
@@ -3729,6 +3762,7 @@ def doctor(
         no_apply_cascade=no_apply_cascade,
         no_apply_stale_blocked=no_apply_stale_blocked,
         no_apply_half_rename=no_apply_half_rename,
+        check_encoding=check_encoding,
     )
 
 
@@ -4045,7 +4079,7 @@ def conflicts(
             if fmt == OutputFormat.JSON:
                 output_json(result)
             else:
-                click.echo(f"Task {task_id} has no scope declared — no conflicts possible.")
+                click.echo(f"Task {task_id} has no scope declared - no conflicts possible.")
             return
     else:
         query_scope = list(scope_globs)
@@ -4063,7 +4097,7 @@ def conflicts(
         for c in conflict_list:
             overlap_str = ", ".join(c["overlapping_globs"])
             click.echo(
-                f"  [{c['project_id']}] {c['task_id']} — {c['title']}\n"
+                f"  [{c['project_id']}] {c['task_id']} - {c['title']}\n"
                 f"    scope: {c['scope']}\n"
                 f"    overlapping: {overlap_str}"
             )
