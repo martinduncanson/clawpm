@@ -256,6 +256,138 @@ class TestCheckCodexAvailability:
         assert result["repo_path"] == repo.as_posix()
 
 
+class TestTransientFailureHandling:
+    """Codex's P1 finding: transient gh api failures must not produce false-positive warnings.
+
+    _scan_pr_for_codex now returns None for "couldn't query" vs False for "queried, no codex".
+    check_codex_availability requires successful_scans ≥ MIN_SAMPLE_SIZE before warning.
+    """
+
+    def test_all_per_pr_endpoints_fail_returns_no_warning(self, tmp_path):
+        """When every per-PR scan fails (None), we have no signal — no warning."""
+        repo = _make_github_repo(tmp_path)
+        prs = [{"number": n} for n in range(1, 6)]
+
+        def fake_gh(endpoint, timeout=10):
+            if "pulls?" in endpoint:
+                return prs
+            # All per-PR endpoints fail
+            return None
+
+        with patch("clawpm.codex_check._parse_github_remote", return_value=("o", "r")), \
+             patch("clawpm.codex_check._gh_api_json", side_effect=fake_gh):
+            assert check_codex_availability(repo) is None
+
+    def test_majority_per_pr_failures_returns_no_warning(self, tmp_path):
+        """Even if some PRs scan successfully, if successful_scans < MIN_SAMPLE_SIZE, no warning."""
+        repo = _make_github_repo(tmp_path)
+        prs = [{"number": n} for n in range(1, 6)]
+        # 2 successful (PRs 1, 2 — empty results = no codex but valid query)
+        # 3 transient failures (PRs 3, 4, 5 — None)
+        empty = []
+
+        def fake_gh(endpoint, timeout=10):
+            if "pulls?" in endpoint:
+                return prs
+            for n in (1, 2):
+                if f"/{n}/comments" in endpoint or f"/{n}/reviews" in endpoint:
+                    return empty
+            return None  # PRs 3-5 fail
+
+        with patch("clawpm.codex_check._parse_github_remote", return_value=("o", "r")), \
+             patch("clawpm.codex_check._gh_api_json", side_effect=fake_gh):
+            # 2 successful scans < MIN_SAMPLE_SIZE (3) → no signal → no warning
+            assert check_codex_availability(repo) is None
+
+    def test_one_endpoint_per_pr_failing_still_counts_as_successful_scan(self, tmp_path):
+        """If issue-comments succeeds but reviews fails (or vice versa), the PR was queried —
+        absence is real signal, not transient failure."""
+        repo = _make_github_repo(tmp_path)
+        prs = [{"number": n} for n in range(1, 6)]
+        empty = [{"user": {"login": "human"}}]
+
+        def fake_gh(endpoint, timeout=10):
+            if "pulls?" in endpoint:
+                return prs
+            if "/comments" in endpoint:
+                return empty  # comments endpoint succeeds with no codex
+            if "/reviews" in endpoint:
+                return None  # reviews endpoint fails — but comments was enough signal
+            return None
+
+        with patch("clawpm.codex_check._parse_github_remote", return_value=("o", "r")), \
+             patch("clawpm.codex_check._gh_api_json", side_effect=fake_gh):
+            # All 5 PRs scanned successfully (via comments endpoint), no codex found → warning
+            result = check_codex_availability(repo)
+        assert result is not None
+        assert result["successful_scans"] == 5
+
+    def test_warning_reports_successful_scans_count(self, tmp_path):
+        """The warning dict surfaces how many PRs were actually scanned successfully."""
+        repo = _make_github_repo(tmp_path)
+        prs = [{"number": n} for n in range(1, 6)]
+        comments = {n: [{"user": {"login": "human"}}] for n in range(1, 6)}
+        with patch("clawpm.codex_check._parse_github_remote", return_value=("o", "r")), \
+             patch("clawpm.codex_check._gh_api_json", side_effect=self._gh_api_mock(prs, comments) if False else None):
+            pass
+
+        # Use the existing helper directly
+        def fake_gh(endpoint, timeout=10):
+            if "pulls?" in endpoint:
+                return prs
+            return [{"user": {"login": "human"}}]
+
+        with patch("clawpm.codex_check._parse_github_remote", return_value=("o", "r")), \
+             patch("clawpm.codex_check._gh_api_json", side_effect=fake_gh):
+            result = check_codex_availability(repo)
+        assert result is not None
+        assert "successful_scans" in result
+        assert result["successful_scans"] == 5
+        # Suggested action mentions both successful_scans AND sample_size for clarity
+        assert "5 of 5" in result["suggested_action"]
+
+    # Helper for the test above and below
+    @staticmethod
+    def _gh_api_mock(prs: list[dict], comments_by_pr: dict | None = None):
+        comments_by_pr = comments_by_pr or {}
+
+        def fake_gh(endpoint, timeout=10):
+            if "pulls?" in endpoint:
+                return prs
+            for n, payload in comments_by_pr.items():
+                if f"/{n}/comments" in endpoint or f"/{n}/reviews" in endpoint:
+                    return payload
+            return []
+
+        return fake_gh
+
+
+class TestPagination:
+    """Codex's P2 finding: endpoints must use per_page=100 to avoid pagination-related
+    false negatives on busy PRs (default per_page is 30)."""
+
+    def test_per_pr_endpoints_request_per_page_100(self, tmp_path):
+        """_scan_pr_for_codex must call endpoints with per_page=100."""
+        repo = _make_github_repo(tmp_path)
+        prs = [{"number": n} for n in range(1, 6)]
+        seen_endpoints: list[str] = []
+
+        def fake_gh(endpoint, timeout=10):
+            seen_endpoints.append(endpoint)
+            if "pulls?" in endpoint:
+                return prs
+            return []
+
+        with patch("clawpm.codex_check._parse_github_remote", return_value=("o", "r")), \
+             patch("clawpm.codex_check._gh_api_json", side_effect=fake_gh):
+            check_codex_availability(repo)
+
+        per_pr_endpoints = [e for e in seen_endpoints if "/comments" in e or "/reviews" in e]
+        assert len(per_pr_endpoints) > 0
+        for endpoint in per_pr_endpoints:
+            assert "per_page=100" in endpoint, f"Endpoint missing pagination: {endpoint}"
+
+
 # ---------------------------------------------------------------------------
 # CLI flag wiring — `clawpm doctor --check-codex` end-to-end
 # ---------------------------------------------------------------------------

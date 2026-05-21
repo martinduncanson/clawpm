@@ -150,10 +150,17 @@ def _gh_api_json(endpoint: str, timeout: int = 10) -> list | dict | None:
         return None
 
 
-def _scan_pr_for_codex(owner: str, repo: str, pr_number: int) -> bool:
-    """Return True if any comment or review on the PR was authored by a codex-* login.
+def _scan_pr_for_codex(owner: str, repo: str, pr_number: int) -> bool | None:
+    """Return True if Codex authored ≥1 comment/review on the PR, False if confirmed absent,
+    or None if we couldn't query (transient API failure — no signal).
 
-    Probes two endpoints:
+    Distinguishes three states deliberately:
+      - True  → Codex confirmed present on this PR
+      - False → both endpoints returned successfully AND no codex login appeared
+      - None  → both endpoints failed; the call gave no usable signal
+
+    Probes two endpoints with `per_page=100` to avoid pagination-related false negatives
+    on busy PRs (default per_page is 30):
       - issue comments  → repos/{o}/{r}/issues/{n}/comments  (the PR conversation)
       - pull reviews    → repos/{o}/{r}/pulls/{n}/reviews    (where Codex's review verdicts land)
 
@@ -163,18 +170,22 @@ def _scan_pr_for_codex(owner: str, repo: str, pr_number: int) -> bool:
     investigation. See `reference-codex-review-wait-script.md` for the rationale.
     """
     endpoints = [
-        f"repos/{owner}/{repo}/issues/{pr_number}/comments",
-        f"repos/{owner}/{repo}/pulls/{pr_number}/reviews",
+        f"repos/{owner}/{repo}/issues/{pr_number}/comments?per_page=100",
+        f"repos/{owner}/{repo}/pulls/{pr_number}/reviews?per_page=100",
     ]
+    any_success = False
     for endpoint in endpoints:
         payload = _gh_api_json(endpoint)
         if not isinstance(payload, list):
-            continue
+            continue  # this endpoint failed; the other may still succeed
+        any_success = True
         for entry in payload:
             user = entry.get("user") if isinstance(entry, dict) else None
             login = (user or {}).get("login", "") if isinstance(user, dict) else ""
             if "codex" in login.lower():
                 return True
+    if not any_success:
+        return None  # both endpoints failed — no usable signal
     return False
 
 
@@ -213,18 +224,34 @@ def check_codex_availability(
     if len(pr_numbers) < MIN_SAMPLE_SIZE:
         return None
 
+    # Track successful vs. failed per-PR scans separately. A warning requires both:
+    # (a) enough PRs in the sample (already checked above), AND
+    # (b) enough SUCCESSFUL scans confirming Codex's absence — not transient failures.
+    successful_scans = 0
     for pr_number in pr_numbers:
-        if _scan_pr_for_codex(owner, repo, pr_number):
-            return None
+        result = _scan_pr_for_codex(owner, repo, pr_number)
+        if result is True:
+            return None  # confirmed presence — no warning
+        if result is False:
+            successful_scans += 1
+        # result is None → couldn't query; skip without counting against absence
+
+    # If we couldn't reliably query enough PRs to confirm absence, there's no signal.
+    # Use the same MIN_SAMPLE_SIZE floor that gated the PR-count check above so the
+    # two "insufficient signal" thresholds are consistent.
+    if successful_scans < MIN_SAMPLE_SIZE:
+        return None
 
     return {
         "repo": f"{owner}/{repo}",
         "repo_path": repo_path.as_posix(),
         "sample_size": len(pr_numbers),
+        "successful_scans": successful_scans,
         "sampled_prs": pr_numbers,
         "suggested_action": (
-            f"Codex bot not found on the last {len(pr_numbers)} closed PRs of "
-            f"{owner}/{repo}. Codex may not be installed on this repo, or may "
-            f"not be configured to auto-review. Install / configure at {INSTALL_URL}."
+            f"Codex bot not found on {successful_scans} of {len(pr_numbers)} sampled "
+            f"closed PRs of {owner}/{repo}. Codex may not be installed on this repo, "
+            f"or may not be configured to auto-review. Install / configure at "
+            f"{INSTALL_URL}."
         ),
     }
