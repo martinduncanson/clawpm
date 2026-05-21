@@ -491,12 +491,18 @@ def project_announce(ctx: click.Context, project_id: str | None) -> None:
     show_default=True,
     help="Warn when project HEAD has >N commits authored after last work_log entry (Phase 1.8 Check d).",
 )
+@click.option(
+    "--check-codex",
+    is_flag=True,
+    help="Network-backed check: for each project with a github.com remote, scan the last 5 closed PRs for Codex-bot appearances. Off by default to keep doctor offline-fast.",
+)
 @click.pass_context
 def project_doctor(
     ctx: click.Context,
     project_id: str | None,
     strict: bool = False,
     commits_drift_threshold: int = 5,
+    check_codex: bool = False,
 ) -> None:
     """Check for issues with projects and portfolio.
 
@@ -521,6 +527,7 @@ def project_doctor(
     unreadable_files: list[dict] = []
     commit_drift: list[dict] = []
     missing_markers: list[dict] = []
+    codex_availability: list[dict] = []
 
     STALE_DAYS = 7
 
@@ -790,6 +797,20 @@ def project_doctor(
                 "suggested_action": f"Run 'clawpm project announce --project {proj.id}' from the repo.",
             })
 
+    # --- Phase 1.9 Check f (CLAWP-008): Codex availability heuristic ---
+    # Off by default (--check-codex flag) — it makes network calls to the GitHub API
+    # and would otherwise slow doctor down + require gh auth in every environment.
+    # Walks the last 5 closed PRs per project with a github.com remote, looks for
+    # any author login containing 'codex' (case-insensitive). Surfaces missing.
+    if check_codex:
+        from clawpm.codex_check import check_codex_availability
+        for proj in projects_to_check:
+            if not proj.repo_path:
+                continue
+            warning = check_codex_availability(proj.repo_path)
+            if warning is not None:
+                codex_availability.append({"project_id": proj.id, **warning})
+
     # --- Phase 1.6 Check c: Cross-project prefix collisions ---
     # Prefix = project_id.upper()[:5] (mirrors add_task logic)
     prefix_map: dict[str, list[str]] = {}
@@ -806,7 +827,7 @@ def project_doctor(
     # Build final output
     has_warnings = bool(
         stale_tasks or drift_tasks or prefix_collisions or unreadable_files
-        or commit_drift or missing_markers
+        or commit_drift or missing_markers or codex_availability
         or any(i["level"] == "warning" for i in issues)
     )
 
@@ -820,11 +841,12 @@ def project_doctor(
             "unreadable_files": unreadable_files,
             "commit_drift": commit_drift,
             "missing_markers": missing_markers,
+            "codex_availability": codex_availability,
         })
     else:
         if not (
             issues or stale_tasks or drift_tasks or prefix_collisions or unreadable_files
-            or commit_drift or missing_markers
+            or commit_drift or missing_markers or codex_availability
         ):
             click.echo("[OK] No issues found")
         else:
@@ -859,6 +881,11 @@ def project_doctor(
                     f"[WARNING] [no-announce] {mm['project_id']} "
                     f"- no clawpm-requirement marker in CLAUDE.md/AGENTS.md/README.md. "
                     f"{mm['suggested_action']}"
+                )
+            for ca in codex_availability:
+                click.echo(
+                    f"[WARNING] [codex-availability] {ca['project_id']} ({ca['repo']}) "
+                    f"- {ca['suggested_action']}"
                 )
 
     if strict and has_warnings:
@@ -2350,8 +2377,13 @@ def version(ctx: click.Context) -> None:
     show_default=True,
     help="Warn when project HEAD has >N commits authored after last work_log entry.",
 )
+@click.option(
+    "--check-codex",
+    is_flag=True,
+    help="Network-backed check: scan last 5 closed PRs per github-remote project for Codex-bot presence. Off by default.",
+)
 @click.pass_context
-def doctor(ctx: click.Context, strict: bool, commits_drift_threshold: int) -> None:
+def doctor(ctx: click.Context, strict: bool, commits_drift_threshold: int, check_codex: bool) -> None:
     """Run full health check."""
     # Delegate to project doctor with no specific project
     ctx.invoke(
@@ -2359,6 +2391,7 @@ def doctor(ctx: click.Context, strict: bool, commits_drift_threshold: int) -> No
         project_id=None,
         strict=strict,
         commits_drift_threshold=commits_drift_threshold,
+        check_codex=check_codex,
     )
 
 
