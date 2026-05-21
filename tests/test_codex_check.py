@@ -13,7 +13,9 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
+from click.testing import CliRunner
 
+from clawpm.cli import main
 from clawpm.codex_check import (
     _extract_github_owner_repo,
     _parse_github_remote,
@@ -59,6 +61,36 @@ class TestExtractGithubOwnerRepo:
             "https://github.com/org/repo/tree/main/subdir"
         ) == ("org", "repo")
 
+    def test_lookalike_hostnames_rejected(self):
+        # Substring-style guards would admit these; strict hostname check rejects.
+        assert _extract_github_owner_repo("https://evilgithub.com/foo/bar.git") is None
+        assert _extract_github_owner_repo("https://github.com.example.com/foo/bar.git") is None
+        assert _extract_github_owner_repo("https://notgithub.com/foo/bar.git") is None
+
+    def test_ssh_scheme_url(self):
+        # ssh://git@github.com/owner/repo.git
+        assert _extract_github_owner_repo("ssh://git@github.com/owner/repo.git") == (
+            "owner", "repo"
+        )
+
+    def test_ssh_scheme_with_port(self):
+        # The port-in-URL parse bug PRE-REVIEW caught — must not consume "22" as owner.
+        assert _extract_github_owner_repo("ssh://git@github.com:22/owner/repo.git") == (
+            "owner", "repo"
+        )
+
+    def test_https_with_credentials(self):
+        # user:token@ prefix in URL — common for CI/PAT-based clones
+        assert _extract_github_owner_repo(
+            "https://user:token@github.com/foo/bar.git"
+        ) == ("foo", "bar")
+
+    def test_git_plus_https_scheme(self):
+        # pip-style git+https URLs
+        assert _extract_github_owner_repo(
+            "git+https://github.com/foo/bar.git"
+        ) == ("foo", "bar")
+
 
 # ---------------------------------------------------------------------------
 # Remote parsing from a real git repo — _parse_github_remote
@@ -94,6 +126,19 @@ class TestParseGithubRemote:
             cwd=tmp_path, capture_output=True, check=True,
         )
         assert _parse_github_remote(tmp_path) is None
+
+    def test_origin_non_github_but_upstream_github(self, tmp_path):
+        # Multi-remote: origin is gitlab, upstream is github. Should find the github one.
+        subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "remote", "add", "origin", "https://gitlab.com/foo/bar.git"],
+            cwd=tmp_path, capture_output=True, check=True,
+        )
+        subprocess.run(
+            ["git", "remote", "add", "upstream", "https://github.com/realowner/realrepo.git"],
+            cwd=tmp_path, capture_output=True, check=True,
+        )
+        assert _parse_github_remote(tmp_path) == ("realowner", "realrepo")
 
 
 # ---------------------------------------------------------------------------
@@ -195,3 +240,75 @@ class TestCheckCodexAvailability:
         with patch("clawpm.codex_check._parse_github_remote", return_value=("owner", "repo")), \
              patch("clawpm.codex_check._gh_api_json", side_effect=self._gh_api_mock(prs, comments)):
             assert check_codex_availability(repo) is None
+
+    def test_warning_includes_repo_path_alongside_repo(self, tmp_path):
+        """Sibling-check consistency: warning carries both repo (owner/repo) AND repo_path (posix)."""
+        repo = _make_github_repo(tmp_path)
+        prs = [{"number": n} for n in range(1, 6)]
+        comments = {n: [{"user": {"login": "human"}}] for n in range(1, 6)}
+        with patch("clawpm.codex_check._parse_github_remote", return_value=("o", "r")), \
+             patch("clawpm.codex_check._gh_api_json", side_effect=self._gh_api_mock(prs, comments)):
+            result = check_codex_availability(repo)
+        assert result is not None
+        assert result["repo"] == "o/r"
+        # repo_path must match the input (posix-normalized) for consumer parity with
+        # commit_drift and missing_markers warnings.
+        assert result["repo_path"] == repo.as_posix()
+
+
+# ---------------------------------------------------------------------------
+# CLI flag wiring — `clawpm doctor --check-codex` end-to-end
+# ---------------------------------------------------------------------------
+
+
+class TestDoctorCheckCodexFlag:
+    def test_flag_default_off_skips_codex_check(self, tmp_path, monkeypatch):
+        """Without --check-codex, no network calls are made and no codex_availability key
+        appears in the JSON output (or if it does, it's an empty list)."""
+        # Set up a minimal portfolio so doctor has something to walk
+        (tmp_path / "portfolio.toml").write_text(
+            f'portfolio_root = "{tmp_path.as_posix()}"\n'
+            f'project_roots = ["{(tmp_path / "projects").as_posix()}"]\n'
+            "[defaults]\nstatus = \"active\"\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "projects").mkdir()
+        (tmp_path / "work_log.jsonl").touch()
+        monkeypatch.setenv("CLAWPM_PORTFOLIO", str(tmp_path))
+
+        called = {"check_codex_availability": 0}
+
+        def fake_check(*args, **kwargs):
+            called["check_codex_availability"] += 1
+            return None
+
+        runner = CliRunner()
+        with patch("clawpm.codex_check.check_codex_availability", side_effect=fake_check):
+            result = runner.invoke(main, ["doctor"])
+
+        assert result.exit_code == 0, result.output
+        # Without flag, check shouldn't fire
+        assert called["check_codex_availability"] == 0
+        data = json.loads(result.output)
+        # codex_availability list present in output but empty (additive shape)
+        assert data.get("codex_availability") == []
+
+    def test_flag_on_fires_codex_check_per_project(self, tmp_path, monkeypatch):
+        """With --check-codex, the check fires once per project (here: zero projects, so zero calls)."""
+        (tmp_path / "portfolio.toml").write_text(
+            f'portfolio_root = "{tmp_path.as_posix()}"\n'
+            f'project_roots = ["{(tmp_path / "projects").as_posix()}"]\n'
+            "[defaults]\nstatus = \"active\"\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "projects").mkdir()
+        (tmp_path / "work_log.jsonl").touch()
+        monkeypatch.setenv("CLAWPM_PORTFOLIO", str(tmp_path))
+
+        runner = CliRunner()
+        # With no projects in portfolio, the check loop doesn't iterate — but the flag
+        # is recognized and the JSON shape is right. Smoke that the wiring exists.
+        result = runner.invoke(main, ["doctor", "--check-codex"])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert "codex_availability" in data

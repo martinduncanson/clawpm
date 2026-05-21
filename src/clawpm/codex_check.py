@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 MIN_SAMPLE_SIZE = 3
@@ -80,19 +81,37 @@ def _parse_github_remote(repo_path: Path) -> tuple[str, str] | None:
 def _extract_github_owner_repo(url: str) -> tuple[str, str] | None:
     """Extract (owner, repo) from a github.com remote URL, or None if not GitHub.
 
+    Authoritative host check: parses the URL and requires hostname == "github.com"
+    (not a substring match — defeats look-alikes like evilgithub.com.example.com).
+
     Examples:
       git@github.com:martinduncanson/clawpm.git → (martinduncanson, clawpm)
       https://github.com/martinduncanson/clawpm.git → (martinduncanson, clawpm)
+      ssh://git@github.com:22/foo/bar.git → (foo, bar)  (port stripped)
+      https://user:token@github.com/foo/bar.git → (foo, bar)
+      https://evilgithub.com/foo/bar.git → None  (hostname mismatch)
       https://gitlab.com/foo/bar.git → None
     """
-    if "github.com" not in url:
+    if not url:
         return None
 
-    path_part: str | None = None
+    # SSH-shorthand form `git@github.com:owner/repo.git` is not URL-parseable;
+    # handle it explicitly via prefix match (strict — won't match look-alikes).
     if url.startswith("git@github.com:"):
         path_part = url[len("git@github.com:"):]
-    elif "github.com/" in url:
-        path_part = url.split("github.com/", 1)[1]
+    else:
+        # All other forms (https://, http://, ssh://, git://, git+https://, etc.)
+        # parse through urlparse. Strip a leading `git+` scheme prefix to
+        # accommodate pip-style URLs.
+        normalized = url.removeprefix("git+")
+        try:
+            parsed = urlparse(normalized)
+        except ValueError:
+            return None
+        if (parsed.hostname or "").lower() != "github.com":
+            return None
+        path_part = parsed.path.lstrip("/")
+
     if not path_part:
         return None
 
@@ -134,12 +153,20 @@ def _gh_api_json(endpoint: str, timeout: int = 10) -> list | dict | None:
 def _scan_pr_for_codex(owner: str, repo: str, pr_number: int) -> bool:
     """Return True if any comment or review on the PR was authored by a codex-* login.
 
-    Probes both the comments endpoint (issue comments + PR conversation) and the
-    reviews endpoint (where Codex's actual review verdicts land per
-    `reference-codex-review-wait-script.md`).
+    Probes two endpoints:
+      - issue comments  → repos/{o}/{r}/issues/{n}/comments  (the PR conversation)
+      - pull reviews    → repos/{o}/{r}/pulls/{n}/reviews    (where Codex's review verdicts land)
+
+    Deliberately does NOT scan inline review-thread reply comments
+    (`pulls/{n}/comments`) — Codex always posts as a review or issue comment,
+    never as an inline reply, per the wait-for-codex script's source-of-truth
+    investigation. See `reference-codex-review-wait-script.md` for the rationale.
     """
-    for kind in ("comments", "reviews"):
-        endpoint = f"repos/{owner}/{repo}/issues/{pr_number}/{kind}" if kind == "comments" else f"repos/{owner}/{repo}/pulls/{pr_number}/{kind}"
+    endpoints = [
+        f"repos/{owner}/{repo}/issues/{pr_number}/comments",
+        f"repos/{owner}/{repo}/pulls/{pr_number}/reviews",
+    ]
+    for endpoint in endpoints:
         payload = _gh_api_json(endpoint)
         if not isinstance(payload, list):
             continue
@@ -192,6 +219,7 @@ def check_codex_availability(
 
     return {
         "repo": f"{owner}/{repo}",
+        "repo_path": repo_path.as_posix(),
         "sample_size": len(pr_numbers),
         "sampled_prs": pr_numbers,
         "suggested_action": (
