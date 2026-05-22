@@ -246,13 +246,36 @@ class TestCLIParallelGroupFlag:
         assert json.loads(r2.output)["parallel_group"] == 2
 
     def test_tasks_edit_clear_parallel_group(self, temp_portfolio):
+        """Use the explicit --clear-parallel-group flag. 0 is a valid group."""
         config = temp_portfolio["config"]
         task = add_task(config, "test", title="A", parallel_group=5)
-        # Pass 0 to clear
+        r = CliRunner().invoke(
+            main,
+            ["-p", "test", "tasks", "edit", task.id, "--clear-parallel-group"],
+        )
+        assert r.exit_code == 0, r.output
+        r2 = CliRunner().invoke(main, ["-p", "test", "tasks", "show", task.id])
+        assert json.loads(r2.output)["parallel_group"] is None
+
+    def test_tasks_edit_zero_is_valid_group_not_clear(self, temp_portfolio):
+        """parallel_group=0 is now a valid ordinal, NOT a clear sentinel."""
+        config = temp_portfolio["config"]
+        task = add_task(config, "test", title="A", parallel_group=5)
         r = CliRunner().invoke(
             main,
             ["-p", "test", "tasks", "edit", task.id, "--parallel-group", "0"],
         )
         assert r.exit_code == 0, r.output
         r2 = CliRunner().invoke(main, ["-p", "test", "tasks", "show", task.id])
-        assert json.loads(r2.output)["parallel_group"] is None
+        assert json.loads(r2.output)["parallel_group"] == 0
+
+    def test_conflicting_flags_errors(self, temp_portfolio):
+        config = temp_portfolio["config"]
+        task = add_task(config, "test", title="A", parallel_group=5)
+        r = CliRunner().invoke(
+            main,
+            ["-p", "test", "tasks", "edit", task.id,
+             "--parallel-group", "3", "--clear-parallel-group"],
+        )
+        assert r.exit_code == 1
+        assert "conflicting" in r.output.lower()

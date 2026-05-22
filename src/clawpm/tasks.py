@@ -367,26 +367,25 @@ def cascade_unblock_dependents(
     emitting work_log entries — keeping log I/O at the CLI boundary matches
     the rest of the module.
 
-    Cycle protection: a visited-set bounds the traversal so a malformed
-    ``A -> B -> A`` dep graph cannot loop. The cascade is shallow by design
-    — only direct dependents of ``completed_task_id`` are re-evaluated.
-    Their own dependents will cascade when *they* hit DONE later, via the
-    next ``done`` call.
+    The cascade is **shallow by design**: only direct dependents of
+    ``completed_task_id`` are re-evaluated. Their own dependents cascade
+    when *they* hit DONE later via the next ``done`` call. This is
+    sufficient because the outer for-loop visits each task at most once
+    and only acts on direct-dependent edges — there is no recursive
+    descent that could loop on a malformed ``A -> B -> A`` graph. If a
+    future iteration makes the cascade recursive, reintroduce a visited
+    set.
     """
     all_tasks = list_tasks(config, project_id)
     by_id = {t.id: t for t in all_tasks}
 
     transitions: list[dict] = []
-    visited: set[str] = set()
 
     for task in all_tasks:
         if task.state != TaskState.BLOCKED:
             continue
         if completed_task_id not in (task.depends or []):
             continue
-        if task.id in visited:
-            continue
-        visited.add(task.id)
 
         # All deps done?
         all_deps_done = True

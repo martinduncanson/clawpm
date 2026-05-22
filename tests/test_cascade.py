@@ -144,8 +144,15 @@ class TestCascadeFunction:
         # Child was already OPEN, still OPEN
         assert get_task(config, "test", child.id).state == TaskState.OPEN
 
-    def test_cycle_does_not_loop(self, temp_portfolio):
-        """A malformed graph where A.deps=[B] and B.deps=[A] must not loop."""
+    def test_shallow_cascade_with_malformed_dep_graph(self, temp_portfolio):
+        """Cascade is shallow: a cycle in the dep graph still terminates.
+
+        The cascade visits each task at most once via the outer for-loop
+        and only acts on direct-dependent edges of the completed task.
+        There is no recursive descent. This test exercises a malformed
+        ``A -> B -> A`` graph and asserts the call terminates with the
+        expected single direct-dependent transition.
+        """
         config = temp_portfolio["config"]
         a = add_task(config, "test", title="A")
         # b's depends references a; we then manually edit a to depend on b
@@ -162,14 +169,32 @@ class TestCascadeFunction:
         change_task_state(config, "test", b.id, TaskState.BLOCKED)
         change_task_state(config, "test", a.id, TaskState.BLOCKED)
 
-        # Completing a (somehow — only possible via --force in practice) should
-        # not lock the cascade up. The cascade itself uses a visited set; we
-        # verify by ensuring the call returns within the test timeout.
         change_task_state(config, "test", a.id, TaskState.DONE, force=True)
         trans = cascade_unblock_dependents(config, "test", a.id)
-        # b had only a as dep, a is now done → b cascades
+        # Direct dependent of A (= B) is examined; B's only dep is A which
+        # is now done, so B cascades. The cycle on A's side is irrelevant
+        # because cascade is shallow.
         assert len(trans) == 1
         assert trans[0]["task_id"] == b.id
+
+    def test_indirect_dependent_does_not_cascade(self, temp_portfolio):
+        """Shallow cascade: an indirect dependent (C deps on B deps on A) is
+        NOT promoted when A is completed — only B's direct cascade gets it
+        on the next done. This pins down the shallow-by-design contract."""
+        config = temp_portfolio["config"]
+        a = add_task(config, "test", title="A")
+        b = _add_with_depends(config, "test", "B", depends=[a.id])
+        c = _add_with_depends(config, "test", "C", depends=[b.id])
+        change_task_state(config, "test", b.id, TaskState.BLOCKED)
+        change_task_state(config, "test", c.id, TaskState.BLOCKED)
+
+        change_task_state(config, "test", a.id, TaskState.DONE)
+        trans = cascade_unblock_dependents(config, "test", a.id)
+        # B (direct dep) cascades; C (indirect) does NOT — c.depends is [b]
+        # not [a], so c is not a direct dependent of a.
+        ids = {t["task_id"] for t in trans}
+        assert ids == {b.id}
+        assert get_task(config, "test", c.id).state == TaskState.BLOCKED
 
 
 # ---------------------------------------------------------------------------

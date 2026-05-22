@@ -143,6 +143,36 @@ class TestSuccessCriterion:
 # ---------------------------------------------------------------------------
 
 
+class TestSuccessCriterionHashContract:
+    """Codex-review hardening: __eq__ vs __hash__ must obey Python data
+    model. a == b → hash(a) == hash(b). A bare-criterion SC equals plain
+    str 'foo' → hash(SC('foo')) must equal hash('foo')."""
+
+    def test_hash_consistent_with_str_equality(self):
+        sc = SuccessCriterion(criterion="foo")
+        assert sc == "foo"
+        assert hash(sc) == hash("foo")
+
+    def test_set_membership_works_with_str_lookup(self):
+        s = {SuccessCriterion(criterion="foo")}
+        assert "foo" in s  # would silently miss with broken hash
+
+    def test_dict_lookup_works_with_str_key(self):
+        d = {SuccessCriterion(criterion="foo"): 1}
+        # Direct str lookup must hit the SC key
+        assert d.get("foo") == 1
+
+    def test_structured_variants_collide_on_criterion(self):
+        """Documented tradeoff: structured variants sharing the same
+        criterion text collide in dicts/sets. Equality on structured form
+        still disambiguates by signal + comparator so set semantics
+        remain correct, but hash bucket is shared."""
+        a = SuccessCriterion(criterion="x", gradeable_signal="alpha")
+        b = SuccessCriterion(criterion="x", gradeable_signal="beta")
+        assert hash(a) == hash(b)
+        assert a != b
+
+
 class TestPredictionsBackCompat:
     def test_predictions_accepts_list_of_strings(self):
         """Existing call sites passing list[str] must still work."""

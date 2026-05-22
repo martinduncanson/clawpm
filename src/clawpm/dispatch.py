@@ -22,10 +22,10 @@ Design tradeoffs:
 
   - **Single-task per target-dir.** A ``.claude/settings.local.json``
     can only carry one set of clawpm-managed hooks at a time without
-    introducing per-hook tagging. v1 enforces this: re-dispatching with
-    a different task in the same dir errors unless ``--force``. For
-    parallel dispatch, use ``--worktree`` (creates a git worktree per
-    task) or ``--target-dir`` to scope to a different directory.
+    introducing per-hook tagging. Re-dispatching with a different task
+    in the same dir errors unless ``--force``. For parallel dispatch,
+    use ``--worktree`` (creates a git worktree per task) or
+    ``--target-dir`` to scope to a different directory.
 
   - **Cleanup via teardown.** Each successful ``tasks state … done``
     transitions a task auto-tears down any dispatch settings that
@@ -65,8 +65,15 @@ def settings_path(target_dir: Path) -> Path:
 def _command_for_dispatch(task_id: str, project_id: str, action: str) -> str:
     """Build the shell command for a hook entry.
 
-    Path forms are POSIX-style — Claude Code on Windows accepts forward
-    slashes here, and they avoid YAML/JSON escaping headaches.
+    Commands MUST be portable across cmd.exe (Windows default for Claude
+    Code) and POSIX shells. The rules followed here:
+
+      - No single quotes (cmd.exe treats them as literal characters, not
+        quote delimiters).
+      - No embedded shell metacharacters (``$``, backticks, redirection).
+      - Summary text uses no whitespace so no quoting is needed at all —
+        ``subagent-tool-use`` not ``"subagent tool use"``. This keeps the
+        command parseable identically on every supported shell.
 
     The ``action`` is encoded directly so the same builder produces all
     hook command strings without per-call branches.
@@ -74,13 +81,15 @@ def _command_for_dispatch(task_id: str, project_id: str, action: str) -> str:
     if action == "eval-stop":
         return f"clawpm hook eval-stop --project {project_id} --task {task_id}"
     if action == "log-progress":
-        # We rely on the Bash hook input format (JSON on stdin) being
-        # available via a tiny inline jq-free read; keep it simple by
-        # writing a heredoc-free summary.
+        # Whitespace-free summary keeps the command shell-portable without
+        # any quoting at all. The hook is a coarse-grained signal anyway
+        # — file-level changes get captured by `clawpm log commit` later.
         return (
             f"clawpm log add --project {project_id} --task {task_id} "
-            f"--action progress --summary 'subagent tool use'"
+            f"--action progress --summary subagent-tool-use"
         )
+    if action == "session-start":
+        return f"clawpm hook session-start --project {project_id} --task {task_id}"
     raise ValueError(f"unknown action: {action!r}")
 
 
@@ -135,16 +144,20 @@ def build_settings_payload(
         },
     }
     if rubric_markdown:
-        # SessionStart hook with `additionalContext` injects the rubric
-        # into the subagent's first turn. The output JSON has to follow
-        # Claude Code's hookSpecificOutput.additionalContext shape, which
-        # a command hook produces by printing the JSON to stdout.
+        # SessionStart additionalContext is too large + escape-prone to
+        # embed in a shell command string portably. Instead we write the
+        # JSON payload to a sidecar file at dispatch time and the hook
+        # invokes `clawpm hook session-start` which just prints it.
+        # Cross-platform safe (no shell-embedded JSON, no printf, no
+        # quoting headaches on cmd.exe).
         payload["hooks"]["SessionStart"] = [
             {
                 "hooks": [
                     {
                         "type": "command",
-                        "command": _session_start_command(rubric_markdown),
+                        "command": _command_for_dispatch(
+                            task_id, project_id, "session-start"
+                        ),
                         "timeout": 10,
                     }
                 ]
@@ -153,14 +166,19 @@ def build_settings_payload(
     return payload
 
 
-def _session_start_command(rubric_markdown: str) -> str:
-    """Build a SessionStart command that prints additionalContext JSON.
+def session_start_payload_path(target_dir: Path) -> Path:
+    """Sidecar path where the SessionStart JSON payload lives.
 
-    We embed the rubric markdown as a heredoc-safe JSON-escaped string,
-    so the resulting command is self-contained — no temp files, no
-    auxiliary state. The hook output schema requires
-    ``hookSpecificOutput.additionalContext``.
+    Co-located with settings.local.json so teardown removes both with a
+    single ``.claude/`` cleanup pass.
     """
+    return target_dir / ".claude" / "clawpm-session-start.json"
+
+
+def write_session_start_sidecar(
+    target_dir: Path, rubric_markdown: str
+) -> Path:
+    """Write the SessionStart additionalContext JSON to a sidecar file."""
     payload = {
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
@@ -173,13 +191,13 @@ def _session_start_command(rubric_markdown: str) -> str:
             ),
         }
     }
-    # `printf '%s'` is more portable than echo for arbitrary JSON; we
-    # rely on shell-quoting via json.dumps with default ensure_ascii=True
-    # so the embedded string has no shell-meta characters.
-    json_payload = json.dumps(payload, ensure_ascii=True)
-    # Single-quoted in shell — safe because ensure_ascii prevents
-    # embedded single quotes. (json.dumps escapes quotes inside strings.)
-    return f"printf '%s' {json.dumps(json_payload)}"
+    path = session_start_payload_path(target_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return path
 
 
 def write_dispatch_settings(
@@ -233,11 +251,17 @@ def write_dispatch_settings(
             shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
 
     payload = build_settings_payload(task_id, project_id, rubric_markdown)
-    # Indent for human review — these files often end up in PR diffs.
+    # Pretty-print so dispatch settings are review-friendly when they
+    # land in PR diffs.
     path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
+    if rubric_markdown:
+        # Side-car file holds the additionalContext JSON; the hook reads
+        # it via `clawpm hook session-start`. See module docstring for
+        # the cross-platform reasoning.
+        write_session_start_sidecar(target_dir, rubric_markdown)
     return path
 
 
@@ -258,26 +282,44 @@ def teardown_dispatch_settings(
     task_id: Optional[str] = None,
     force: bool = False,
 ) -> bool:
-    """Remove a clawpm-managed dispatch settings file.
+    """Remove a clawpm-managed dispatch settings file (and sidecar).
 
-    Returns True iff a file was actually removed. If ``task_id`` is given,
-    only removes when the marker matches; otherwise removes any
-    clawpm-managed dispatch.
+    Returns True iff settings.local.json was actually removed.
 
-    Refuses to remove operator-authored settings unless ``force=True``.
+    Behaviour:
+      - Operator-authored file (no clawpm marker): returns False without
+        modifying anything, unless ``force=True`` (in which case the file
+        is removed without backup — caller is asserting they know what
+        they're doing).
+      - Marker present, ``task_id`` given but mismatches: returns False;
+        the dispatch belongs to a different task.
+      - Marker present, matches (or ``task_id`` not given): removes
+        settings.local.json AND the SessionStart sidecar if present.
+
+    No exception is raised in the not-removed paths — the caller reads
+    the bool to decide what to surface.
     """
     path = settings_path(target_dir)
+    sidecar = session_start_payload_path(target_dir)
     if not path.exists():
+        # Sidecar without settings is an orphan from a partial earlier
+        # failure; clean it up so doctor doesn't surface it forever.
+        if sidecar.exists():
+            sidecar.unlink()
         return False
     marker = read_dispatch_marker(target_dir)
     if marker is None:
         if not force:
             return False
         path.unlink()
+        if sidecar.exists():
+            sidecar.unlink()
         return True
     if task_id is not None and marker.get("task_id") != task_id:
         return False
     path.unlink()
+    if sidecar.exists():
+        sidecar.unlink()
     return True
 
 
@@ -296,7 +338,10 @@ def create_worktree(repo_path: Path, task_id: str) -> Path:
     if worktree_root.exists():
         return worktree_root
 
-    branch_name = f"clawpm/{task_id.lower()}"
+    # Keep the branch and directory names in the SAME case so case-
+    # sensitive filesystems (Linux ext4, git refnames everywhere) don't
+    # cause re-dispatch to miss the existing branch.
+    branch_name = f"clawpm/{task_id}"
 
     # Check if branch already exists
     branch_check = subprocess.run(

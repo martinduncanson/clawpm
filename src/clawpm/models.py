@@ -196,7 +196,14 @@ class SuccessCriterion:
         return NotImplemented
 
     def __hash__(self) -> int:
-        return hash((self.criterion, self.gradeable_signal, self.comparator))
+        # MUST be consistent with __eq__ which can match a plain str on
+        # the criterion alone. Hashing on `criterion` only preserves the
+        # Python data-model invariant (a == b → hash(a) == hash(b)) for
+        # the str-equality bridge. Structured variants sharing the same
+        # criterion text will collide in dicts/sets — acceptable because
+        # equality on structured form already disambiguates by signal +
+        # comparator, so set/dict semantics remain correct.
+        return hash(self.criterion)
 
     def is_structured(self) -> bool:
         return self.gradeable_signal is not None or self.comparator is not None

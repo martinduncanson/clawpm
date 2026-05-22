@@ -1,9 +1,10 @@
 """Stop-condition evaluator — the killer feature.
 
-Adapts the Anthropic Claude Code 2.1.143 ``/goal`` Stop-hook condition
-evaluator to clawpm. A small LLM judge reads a subagent's transcript +
-the task's rubric, then returns the exact JSON shape used by the official
-evaluator (reverse-engineered by Piebald-AI):
+Adapts the Anthropic Claude Code ``/goal`` Stop-hook condition evaluator
+to clawpm. A small LLM judge reads a subagent's transcript + the task's
+rubric, then returns the JSON shape used by the official evaluator
+(reverse-engineered by Piebald-AI, vintage 2026-Q1; verify against
+current docs at ``docs.anthropic.com`` if the contract shape changes):
 
 - ``{"ok": true,  "reason": "<quoted evidence>"}``
 - ``{"ok": false, "reason": "<what is missing>"}``
@@ -40,11 +41,27 @@ DEFAULT_JUDGE_CMD = ["claude", "--print", "--model", "claude-haiku-4-5"]
 
 @dataclass
 class JudgeVerdict:
-    """Parsed judge output, in the official Anthropic Stop-hook shape."""
+    """Parsed judge output, in the Anthropic Stop-hook shape (reverse-
+    engineered by Piebald-AI; verify against current docs if the hook
+    contract changes).
+
+    Invariant: ``ok=True`` and ``impossible=True`` is contradictory and
+    rejected at construction. This is structural — every code path that
+    creates a JudgeVerdict (parser, tests, future callers) is protected,
+    not just the parser.
+    """
 
     ok: bool
     reason: str
     impossible: bool = False
+
+    def __post_init__(self) -> None:
+        if self.ok and self.impossible:
+            raise ValueError(
+                "JudgeVerdict cannot be both ok=True and impossible=True; "
+                "use parse() if you need to coerce contradictory judge "
+                "output into a safe not-ok verdict."
+            )
 
     def to_dict(self) -> dict:
         d: dict = {"ok": self.ok, "reason": self.reason}
@@ -101,11 +118,19 @@ class JudgeVerdict:
             reason = str(reason)
         impossible = bool(data.get("impossible", False))
         if impossible and ok:
-            # Self-contradictory — treat as not-ok to be safe.
+            # Self-contradictory output is a JUDGE QUALITY BUG, not an
+            # impossibility signal. We must NOT route this to the same
+            # "let agent stop" path as a genuine impossibility — that
+            # gives the agent a free escape via inducing contradiction.
+            # Return ok=False, impossible=False, reason flagging the
+            # contradiction so map_verdict_to_hook_output blocks the stop.
             return cls(
                 ok=False,
-                impossible=True,
-                reason=f"judge returned ok=true AND impossible=true (contradiction); raw reason: {reason}",
+                impossible=False,
+                reason=(
+                    f"JUDGE_CONTRADICTION: judge returned ok=true AND "
+                    f"impossible=true. Original reason: {reason}"
+                ),
             )
         return cls(ok=ok, reason=reason, impossible=impossible)
 
@@ -129,8 +154,9 @@ def _default_judge_invoker(prompt: str) -> str:
 
     # Some judge CLIs read the prompt from a positional argument when stdin is
     # empty, others from stdin. claude --print accepts stdin, so this is the
-    # path of least surprise. Timeout matches a generous human-perceptible
-    # ceiling — Haiku usually returns in <5s; 30s is a wide safety margin.
+    # path of least surprise. 60s ceiling — Haiku usually returns in <5s;
+    # this is the generous human-perceptible bound before the operator
+    # would assume the hook is broken.
     try:
         result = subprocess.run(
             cmd,

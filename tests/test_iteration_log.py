@@ -299,6 +299,100 @@ class TestDoneWithIterationsActual:
 # ---------------------------------------------------------------------------
 
 
+class TestEndToEndDispatchSpine:
+    """Codex-review hardening: the headline integration loop —
+    dispatch → eval-stop fires N times → done → auto-teardown + correct
+    iterations_actual in reflection — exercised as one continuous flow."""
+
+    def test_full_dispatch_spine(self, temp_portfolio, monkeypatch, tmp_path):
+        from clawpm.judges import stop_condition as sc_mod
+        from clawpm.dispatch import settings_path
+
+        # Need a project with a real repo_path for dispatch to work
+        # idiomatically; bolt it on via settings.toml edit.
+        config = temp_portfolio["config"]
+        project_dir = config.project_roots[0] / "test-project"
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        (project_dir / ".project" / "settings.toml").write_text(
+            f'id = "test"\nname = "Test"\nstatus = "active"\npriority = 3\n'
+            f'repo_path = "{repo_dir.as_posix()}"\n'
+        )
+
+        verdicts = iter([
+            '{"ok": false, "reason": "iter 1 - not yet"}',
+            '{"ok": false, "reason": "iter 2 - still working"}',
+            '{"ok": true, "reason": "iter 3 - rubric satisfied"}',
+        ])
+        def fake_invoker(prompt: str) -> str:
+            return next(verdicts)
+
+        monkeypatch.setattr(sc_mod, "_default_judge_invoker", fake_invoker)
+
+        # 1. Add a task with predicted_iterations=1 (we'll observe 3)
+        task = add_task(
+            config, "test", title="Spine",
+            predictions=Predictions(
+                success_criteria=[SuccessCriterion(
+                    criterion="lands cleanly",
+                    gradeable_signal="judge ok",
+                )],
+                predicted_iterations=1,
+            ),
+        )
+
+        # 2. Dispatch into repo dir
+        r = CliRunner().invoke(
+            main,
+            ["-p", "test", "tasks", "dispatch", task.id,
+             "--target-dir", str(repo_dir)],
+        )
+        assert r.exit_code == 0, r.output
+        assert settings_path(repo_dir).exists()
+
+        # Pre-condition for done: a start log entry so duration is computed
+        add_entry(config, project="test", action=WorkLogAction.START, task=task.id, auto=True)
+
+        # 3. Simulate 3 Stop-hook fires
+        transcript = tmp_path / "transcript.txt"
+        transcript.write_text("subagent transcript", encoding="utf-8")
+        for _ in range(3):
+            r = CliRunner().invoke(
+                main,
+                ["-p", "test", "hook", "eval-stop",
+                 "--task", task.id,
+                 "--transcript-file", str(transcript)],
+            )
+            assert r.exit_code == 0, r.output
+
+        # 4. Operator marks done — auto-teardown + iteration count appear
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "state", task.id, "done"]
+        )
+        assert r.exit_code == 0, r.output
+        data = json.loads(r.output)["data"]
+
+        # Settings file teardown happened
+        assert "dispatch_teardowns" in data
+        assert not settings_path(repo_dir).exists()
+
+        # Reflection JSONL has 3 iteration_events + 1 task_done with
+        # iterations_actual=3
+        ref_file = temp_portfolio["root"] / "reflections" / f"{task.id}.jsonl"
+        events = [
+            json.loads(line)
+            for line in ref_file.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        iter_events = [e for e in events if e["event"] == "iteration_event"]
+        done_events = [e for e in events if e["event"] == "task_done"]
+        assert len(iter_events) == 3
+        assert len(done_events) == 1
+        assert done_events[0]["deltas"]["iterations_actual"] == 3
+        assert done_events[0]["deltas"]["iterations_predicted"] == 1
+        assert done_events[0]["deltas"]["iterations_ratio"] == 3.0
+
+
 class TestPredictIterationsFlag:
     def test_tasks_add_predict_iterations(self, temp_portfolio):
         r = CliRunner().invoke(

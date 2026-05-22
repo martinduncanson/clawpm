@@ -127,8 +127,11 @@ class TestSettingsPayload:
         assert "SessionStart" in p["hooks"]
         ss = p["hooks"]["SessionStart"][0]["hooks"][0]
         assert ss["type"] == "command"
-        # The rubric text is JSON-encoded inside the command
-        assert "Rubric" in ss["command"]
+        # Cross-platform fix: command no longer embeds rubric content;
+        # instead invokes `clawpm hook session-start` which reads a
+        # sidecar JSON file at runtime. This avoids cmd.exe quoting
+        # issues with embedded markdown / JSON.
+        assert ss["command"] == "clawpm hook session-start --project test --task TEST-001"
 
     def test_payload_without_rubric_omits_session_start(self):
         p = build_settings_payload("TEST-001", "test")
@@ -330,6 +333,78 @@ class TestCLITeardown:
 # ---------------------------------------------------------------------------
 # Auto-teardown on done
 # ---------------------------------------------------------------------------
+
+
+class TestSessionStartSidecar:
+    def test_dispatch_writes_sidecar(self, temp_portfolio_with_repo, tmp_path):
+        from clawpm.dispatch import session_start_payload_path
+        config = temp_portfolio_with_repo["config"]
+        task = add_task(
+            config, "test", title="Sidecar",
+            predictions=Predictions(success_criteria=["c1"]),
+        )
+        CliRunner().invoke(
+            main,
+            ["-p", "test", "tasks", "dispatch", task.id,
+             "--target-dir", str(tmp_path)],
+        )
+        sidecar = session_start_payload_path(tmp_path)
+        assert sidecar.exists()
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        assert payload["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+        assert "Rubric" in payload["hookSpecificOutput"]["additionalContext"]
+
+    def test_teardown_removes_sidecar_too(self, temp_portfolio_with_repo, tmp_path):
+        from clawpm.dispatch import session_start_payload_path
+        config = temp_portfolio_with_repo["config"]
+        task = add_task(
+            config, "test", title="Sidecar",
+            predictions=Predictions(success_criteria=["c1"]),
+        )
+        CliRunner().invoke(
+            main,
+            ["-p", "test", "tasks", "dispatch", task.id,
+             "--target-dir", str(tmp_path)],
+        )
+        sidecar = session_start_payload_path(tmp_path)
+        assert sidecar.exists()
+
+        CliRunner().invoke(
+            main,
+            ["-p", "test", "tasks", "teardown-dispatch", task.id,
+             "--target-dir", str(tmp_path)],
+        )
+        assert not sidecar.exists()
+
+
+class TestPortableHookCommands:
+    """Codex-review hardening: hook commands must be portable across
+    cmd.exe (Windows default for Claude Code) and POSIX shells.
+
+    Verifies no single quotes, no embedded shell-meta characters."""
+
+    def test_post_tool_use_command_no_quoting_required(self):
+        from clawpm.dispatch import build_settings_payload
+        p = build_settings_payload("TEST-001", "test")
+        cmd = p["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
+        assert "'" not in cmd  # no single quotes
+        assert '"' not in cmd  # no double quotes either — whitespace-free
+        assert "$" not in cmd  # no shell variable expansion
+        assert "`" not in cmd  # no backticks
+        assert "subagent-tool-use" in cmd  # hyphenated, no whitespace
+
+    def test_session_start_command_no_embedded_json(self):
+        from clawpm.dispatch import build_settings_payload
+        p = build_settings_payload(
+            "TEST-001", "test",
+            rubric_markdown="# Rubric\n\nC1 with 'quotes' and \"doubles\"",
+        )
+        cmd = p["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        # No embedded JSON — should be a clean clawpm subcommand
+        assert "{" not in cmd
+        assert "}" not in cmd
+        assert "printf" not in cmd
+        assert cmd.startswith("clawpm hook session-start")
 
 
 class TestAutoTeardownOnDone:

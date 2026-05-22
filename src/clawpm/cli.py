@@ -734,7 +734,14 @@ def project_doctor(
             for blocked_file in blocked_dir.glob("*.md"):
                 try:
                     bt = Task.from_file(blocked_file)
-                except Exception:
+                except (OSError, UnicodeDecodeError) as exc:
+                    # Surface unreadable files via the existing doctor
+                    # channel rather than silently skipping them.
+                    unreadable_files.append({
+                        "file": blocked_file.as_posix(),
+                        "project_id": proj.id,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    })
                     continue
                 if not bt.depends:
                     continue
@@ -1046,7 +1053,8 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
 @click.option("--complexity", "-c", type=click.Choice(["s", "m", "l", "xl"]), help="New complexity")
 @click.option("--body", "-b", help="New body content (replaces description before ## sections)")
 @click.option("--scope", "-s", "scope", multiple=True, help="File glob patterns claimed by this task (can specify multiple)")
-@click.option("--parallel-group", "parallel_group", type=int, default=None, help="Batch ordinal for parallel dispatch (CLAWP-021). Set 0 to clear.")
+@click.option("--parallel-group", "parallel_group", type=int, default=None, help="Batch ordinal for parallel dispatch (CLAWP-021). Use --clear-parallel-group to remove.")
+@click.option("--clear-parallel-group", "clear_parallel_group", is_flag=True, default=False, help="Remove parallel_group from the task — opts out of batch dispatch.")
 # --- Prediction flags (all optional) ---
 @click.option("--predict-duration", "predict_duration", default=None, help="Predicted duration: 90, 90m, 2h, 3d, 1w")
 @click.option("--predict-complexity", "predict_complexity", type=click.Choice(["s", "m", "l", "xl"]), default=None, help="Predicted complexity")
@@ -1074,6 +1082,7 @@ def tasks_edit(
     body: str | None,
     scope: tuple[str, ...],
     parallel_group: int | None,
+    clear_parallel_group: bool,
     predict_duration: str | None,
     predict_complexity: str | None,
     predict_files_changed: int | None,
@@ -1118,8 +1127,12 @@ def tasks_edit(
         predict_iterations is not None,
     ])
 
-    if not any([title, priority is not None, complexity, body, scope, has_predictions, parallel_group is not None]):
-        output_error("no_changes", "Specify at least one field to edit (--title, --priority, --complexity, --body, --scope, --parallel-group, or --predict-*)", fmt=fmt)
+    if not any([title, priority is not None, complexity, body, scope, has_predictions, parallel_group is not None, clear_parallel_group]):
+        output_error("no_changes", "Specify at least one field to edit (--title, --priority, --complexity, --body, --scope, --parallel-group, --clear-parallel-group, or --predict-*)", fmt=fmt)
+        sys.exit(1)
+
+    if parallel_group is not None and clear_parallel_group:
+        output_error("conflicting_flags", "Cannot use both --parallel-group and --clear-parallel-group", fmt=fmt)
         sys.exit(1)
 
     cmplx = TaskComplexity(complexity) if complexity else None
@@ -1150,11 +1163,8 @@ def tasks_edit(
             predicted_iterations=predict_iterations,
         )
 
-    # parallel_group: int value sets the field; explicit 0 clears (semantically
-    # "remove batch eligibility") so the operator can take a task out of the
-    # batch queue without rewriting the file by hand.
-    clear_pg = parallel_group == 0
-    pg_value = parallel_group if (parallel_group is not None and not clear_pg) else None
+    # --clear-parallel-group: explicit removal. --parallel-group N: set.
+    # 0 is now a valid group ordinal (sorts first); use --clear- to remove.
     task = edit_task(
         config,
         project_id,
@@ -1165,8 +1175,8 @@ def tasks_edit(
         scope=scope_list,
         body=body,
         predictions=predictions,
-        parallel_group=pg_value,
-        clear_parallel_group=clear_pg,
+        parallel_group=parallel_group,
+        clear_parallel_group=clear_parallel_group,
     )
 
     if not task:
@@ -1275,14 +1285,18 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
     # tasks whose dep list is now satisfied. Emit one work_log entry per
     # cascaded transition so the trigger is auditable.
     cascade_results: list[dict] = []
+    cascade_errors: list[dict] = []
     teardowns: list[dict] = []
+    teardown_errors: list[dict] = []
     if state == TaskState.DONE:
         from .tasks import cascade_unblock_dependents
         try:
             cascade_results = cascade_unblock_dependents(config, project_id, task_id)
-        except Exception:
-            # A buggy cascade must never block the user's done.
-            cascade_results = []
+        except (OSError, KeyError) as exc:
+            # Filesystem or graph errors leave the cascade in a partial
+            # state but must NOT block the user's done. Surface the
+            # error in the response so it's visible — don't silently drop.
+            cascade_errors.append({"error_class": type(exc).__name__, "message": str(exc)})
 
         for cr in cascade_results:
             add_entry(
@@ -1316,9 +1330,16 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
                         "target_dir": cand.as_posix(),
                         "task_id": task_id,
                     })
-                except Exception:
-                    # Auto-teardown is best-effort; never block done.
-                    pass
+                except (OSError, PermissionError) as exc:
+                    # Filesystem failure is the only realistic class here.
+                    # Surface to the response — silent leftover settings.json
+                    # is exactly the "stale dispatch" failure mode this
+                    # entire feature exists to prevent.
+                    teardown_errors.append({
+                        "target_dir": cand.as_posix(),
+                        "error_class": type(exc).__name__,
+                        "message": str(exc),
+                    })
 
     # Write reflection event when task completes or is blocked
     if state in (TaskState.DONE, TaskState.BLOCKED) and pre_transition_task:
@@ -1351,8 +1372,12 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
     data = task.to_dict()
     if cascade_results:
         data["cascade_unblocks"] = cascade_results
+    if cascade_errors:
+        data["cascade_errors"] = cascade_errors
     if teardowns:
         data["dispatch_teardowns"] = teardowns
+    if teardown_errors:
+        data["dispatch_teardown_errors"] = teardown_errors
     output_success(f"Task {task_id} moved to {new_state}", data=data, fmt=fmt)
 
 
@@ -2568,6 +2593,57 @@ def hook() -> None:
     pass
 
 
+@hook.command("session-start")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
+@click.option("--task", "task_id", required=True, help="Task ID whose SessionStart sidecar to emit")
+@click.pass_context
+def hook_session_start(
+    ctx: click.Context,
+    project_id: str | None,
+    task_id: str,
+) -> None:
+    """Print the SessionStart additionalContext sidecar to stdout.
+
+    Wired into Claude Code as a SessionStart command hook by
+    `clawpm tasks dispatch`. Reads the sidecar JSON file co-located with
+    settings.local.json and prints it verbatim — Claude Code's hook
+    output schema accepts JSON on stdout. Cross-platform safe (no shell
+    quoting, no embedded JSON in command strings).
+    """
+    import json as _json_ss
+    from .dispatch import session_start_payload_path
+
+    fmt = get_format(ctx)
+    project_id, _ = require_project(ctx, project_id)
+    task_id = expand_task_id(task_id, project_id)
+
+    sidecar = session_start_payload_path(Path.cwd())
+    if not sidecar.exists():
+        # No sidecar = SessionStart was not configured for this dispatch
+        # (or was torn down). Emit an empty hookSpecificOutput so the
+        # hook is a no-op rather than a crash.
+        click.echo(_json_ss.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": "",
+            }
+        }))
+        return
+    try:
+        click.echo(sidecar.read_text(encoding="utf-8"))
+    except OSError as exc:
+        # Read failure must not crash the session start; emit a degraded
+        # but valid hook output with the error surfaced.
+        click.echo(_json_ss.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": (
+                    f"(clawpm: failed to read SessionStart sidecar: {exc})"
+                ),
+            }
+        }))
+
+
 @hook.command("eval-stop")
 @click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
 @click.option("--task", "task_id", required=True, help="Task ID whose rubric to evaluate against")
@@ -2615,13 +2691,19 @@ def hook_eval_stop(
     else:
         task = get_task(config, project_id, task_id)
         if not task:
-            # Hook stdin closed at this point; we must still emit a valid
-            # hook-output JSON or Claude Code will treat us as a no-op.
-            # Returning continue=true with an alarming systemMessage is the
-            # least-surprising failure mode.
+            # Task-not-found is a dispatch-config bug, NOT a soft fail.
+            # Block the stop so the operator sees the problem in the
+            # transcript rather than discovering it after the subagent
+            # has already finished gated work.
             click.echo(_json_hook.dumps({
-                "continue": True,
-                "systemMessage": f"clawpm eval-stop: task {task_id} not found; cannot enforce rubric",
+                "continue": False,
+                "decision": "block",
+                "stopReason": (
+                    f"clawpm eval-stop: task {task_id} not found in "
+                    f"project {project_id} — fix dispatch config "
+                    f"(check `clawpm tasks dispatch --task-id`) before "
+                    f"continuing."
+                ),
             }))
             return
         rubric = render_rubric_markdown(task)
@@ -2634,7 +2716,7 @@ def hook_eval_stop(
         # Stop-hook input comes in on stdin.
         try:
             stdin_raw = sys.stdin.read()
-        except Exception:
+        except OSError:
             stdin_raw = ""
         if stdin_raw.strip():
             try:
@@ -2658,19 +2740,43 @@ def hook_eval_stop(
             }))
             return
 
-    # 3. Dispatch the judge. Errors here are unexpected — surface them.
+    # 3. Dispatch the judge. Errors here are unexpected — surface them
+    # in a way that's visible to doctor, not silently swallowed.
     try:
         verdict = evaluate_stop_condition(rubric=rubric, transcript=transcript)
     except RuntimeError as exc:
+        # Judge error = enforcement-layer down. Fail-open (continue=true)
+        # is defensible because blocking forever on a broken judge is
+        # worse, but we MUST leave a doctor signal so repeated judge
+        # errors don't silently degrade clawpm to no-enforcement.
+        try:
+            from .reflect import write_iteration_event
+            write_iteration_event(
+                portfolio_root=config.portfolio_root,
+                task_id=task_id,
+                project_id=project_id,
+                verdict_ok=False,
+                verdict_reason=f"JUDGE_ERROR: {exc}",
+                verdict_impossible=False,
+            )
+        except OSError:
+            # Writing the doctor signal failed too — last resort is the
+            # systemMessage. Don't pile silent failures.
+            pass
         click.echo(_json_hook.dumps({
             "continue": True,
-            "systemMessage": f"clawpm eval-stop: judge error ({exc}); rubric not enforced",
+            "systemMessage": (
+                f"clawpm eval-stop: judge error ({exc}); rubric not "
+                f"enforced. Consecutive judge errors will be flagged by "
+                f"clawpm doctor — set CLAWPM_JUDGE_CMD or install Claude "
+                f"Code if this keeps happening."
+            ),
         }))
         return
 
-    # CLAWP-019: capture the iteration event before mapping output. Errors
-    # writing the event must not block the hook response — calibration
-    # data is nice-to-have at this seam.
+    # CLAWP-019: capture the iteration event. This IS the calibration
+    # spine — narrow exception so a real filesystem failure surfaces in
+    # the systemMessage instead of silently nuking the iteration count.
     try:
         from .reflect import write_iteration_event
         write_iteration_event(
@@ -2681,8 +2787,19 @@ def hook_eval_stop(
             verdict_reason=verdict.reason,
             verdict_impossible=verdict.impossible,
         )
-    except Exception:
-        pass
+    except OSError as exc:
+        # Disk full / permission / encoding errors. Surface in the
+        # hook output's systemMessage so the operator sees it in the
+        # next transcript update.
+        output = map_verdict_to_hook_output(verdict)
+        # Preserve continue/block decision; just decorate systemMessage.
+        existing_msg = output.get("systemMessage", "")
+        output["systemMessage"] = (
+            f"clawpm eval-stop: iteration event WRITE FAILED ({exc}); "
+            f"calibration data lost for this cycle. {existing_msg}".strip()
+        )
+        click.echo(_json_hook.dumps(output))
+        return
 
     output = map_verdict_to_hook_output(verdict)
     click.echo(_json_hook.dumps(output))

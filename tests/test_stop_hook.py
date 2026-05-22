@@ -121,13 +121,24 @@ class TestVerdictParse:
         assert v.ok is False
 
     def test_contradiction_ok_true_and_impossible(self):
-        """If judge returns both ok=true AND impossible=true, treat as not-ok."""
+        """Judge contradiction is a JUDGE QUALITY BUG, not impossibility.
+
+        Must route to ok=False with impossible=False (so the hook
+        BLOCKS the stop) — otherwise a flaky judge gives the agent a
+        free escape via inducing contradiction.
+        """
         v = JudgeVerdict.parse(
             '{"ok": true, "impossible": true, "reason": "weird"}'
         )
         assert v.ok is False
-        assert v.impossible is True
-        assert "contradiction" in v.reason.lower()
+        assert v.impossible is False  # NOT routed to "let agent stop"
+        assert "judge_contradiction" in v.reason.lower()
+
+    def test_direct_construction_rejects_contradiction(self):
+        """Structural invariant: cannot construct ok=True AND impossible=True."""
+        import pytest
+        with pytest.raises(ValueError, match="cannot be both"):
+            JudgeVerdict(ok=True, impossible=True, reason="bad")
 
     def test_no_braces_returns_not_ok(self):
         """No `{` present at all — array, scalar, prose."""
@@ -306,8 +317,14 @@ class TestCLIEvalStop:
         assert out["decision"] == "block"
         assert "tests failing" in out["stopReason"]
 
-    def test_cli_handles_missing_task_gracefully(self, temp_portfolio):
-        """Unknown task must not crash the hook — emit safe continue=true."""
+    def test_cli_blocks_when_task_not_found(self, temp_portfolio):
+        """Task-not-found is a DISPATCH-CONFIG BUG, not a soft fail.
+
+        Must block the stop so the operator sees the bad task ID in the
+        transcript, not after gated work has finished. Previously this
+        returned continue=true (silent degradation); fixed in
+        codex-review batch.
+        """
         r = CliRunner().invoke(
             main,
             ["-p", "test", "hook", "eval-stop",
@@ -318,8 +335,9 @@ class TestCLIEvalStop:
         # exit 0 because we MUST emit a hook-shaped JSON, not an error envelope
         assert r.exit_code == 0
         out = json.loads(r.output)
-        assert out["continue"] is True
-        assert "not found" in out["systemMessage"]
+        assert out["continue"] is False
+        assert out["decision"] == "block"
+        assert "not found" in out["stopReason"]
 
     def test_cli_handles_missing_transcript_gracefully(
         self, temp_portfolio, monkeypatch
@@ -354,3 +372,63 @@ class TestPromptBuilding:
         assert "evidence, not proof" in prompt
         assert "Return ONLY the JSON object" in prompt
         assert "R" in prompt and "T" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Judge subprocess failure paths (post-codex-review hardening)
+# ---------------------------------------------------------------------------
+
+
+class TestJudgeSubprocessFailures:
+    def test_judge_filenotfound_writes_doctor_signal_and_fails_open(
+        self, temp_portfolio, monkeypatch
+    ):
+        """When the judge binary is missing (CLAWPM_JUDGE_CMD wrong / claude
+        not on PATH), the hook must (a) emit a JUDGE_ERROR iteration_event
+        so doctor can flag consecutive failures, AND (b) fail open with a
+        clear systemMessage instructing the operator how to fix it."""
+        from clawpm.judges import stop_condition as sc_mod
+
+        def raise_filenotfound(prompt: str) -> str:
+            raise RuntimeError(
+                "Judge command not found: 'nonexistent'. Install Claude "
+                "Code or set CLAWPM_JUDGE_CMD"
+            )
+
+        monkeypatch.setattr(sc_mod, "_default_judge_invoker", raise_filenotfound)
+
+        config = temp_portfolio["config"]
+        task = add_task(
+            config, "test", title="JudgeFail",
+            predictions=Predictions(success_criteria=["c1"]),
+        )
+
+        transcript = temp_portfolio["root"] / "transcript.txt"
+        transcript.write_text("data", encoding="utf-8")
+
+        r = CliRunner().invoke(
+            main,
+            ["-p", "test", "hook", "eval-stop",
+             "--task", task.id,
+             "--transcript-file", str(transcript)],
+        )
+        assert r.exit_code == 0
+        out = json.loads(r.output)
+        assert out["continue"] is True
+        assert "judge error" in out["systemMessage"].lower()
+        assert "CLAWPM_JUDGE_CMD" in out["systemMessage"]
+
+        # Doctor signal written to the reflection JSONL
+        ref_file = temp_portfolio["root"] / "reflections" / f"{task.id}.jsonl"
+        assert ref_file.exists()
+        lines = [
+            json.loads(line)
+            for line in ref_file.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        judge_errors = [
+            l for l in lines
+            if l.get("event") == "iteration_event"
+            and "JUDGE_ERROR" in l["verdict"]["reason"]
+        ]
+        assert len(judge_errors) == 1
