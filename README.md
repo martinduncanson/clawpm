@@ -140,7 +140,7 @@ clawpm done CLAWP-042 \
     --meta-reflect "should have run a dry-run dump first to surface the conflicts; will do that next time"
 ```
 
-clawpm computes the deltas (duration ratio, scope overrun, complexity match, etc.) and writes a structured reflection event to `~/clawpm/reflections/<task-id>.jsonl`. Over weeks, you build a corpus you can mine: "tasks I labeled `m` complexity actually averaged 1.8× duration." Phase 2 (`clawpm reflect summarize/suggest/history-import`) will surface these patterns automatically — currently stub commands.
+clawpm computes the deltas (duration ratio, scope overrun, complexity match, etc.) and writes a structured reflection event to `~/clawpm/reflections/<task-id>.jsonl`. Over weeks, you build a corpus you can mine: "tasks I labeled `m` complexity actually averaged 1.8× duration." `clawpm reflect summarize` and `clawpm reflect suggest` (Phase 2) will surface these patterns automatically — currently stub commands. `clawpm reflect history-import --source <dir>` scans historical agent log files for task-ID mentions and is implemented.
 
 v1.5 extends this with **applied-science framing**: `--success-criteria` (measurable performance contracts), `--predict-approach` (architectural choice), `--unknowns` (meta-curiosity), `--confidence` (1-5), `--reference-task` (outside-view anchoring), and `--pre-mortem` (Klein's pre-mortem). At completion, `--process-lesson` and `--surprise` (fixed taxonomy) close the recursive meta-loop. See `skills/clawpm/SKILL.md` for the full picture.
 
@@ -223,6 +223,8 @@ clawpm log commit [-n 10]          # Pull recent git commits into work log
 
 State changes (`start`/`done`/`block`) auto-log with files changed.
 
+For hands-off logging of *every* `clawpm` CLI invocation plus session boundaries, install the `hooks/clawpm-sync/` Claude Code hook — it fires on `PostToolUse` / `Stop` / `SessionStart` events and appends structured entries to `work_log.jsonl`. See `hooks/clawpm-sync/HOOK.md` for the JSON-config snippet.
+
 ### Research & issues
 
 ```bash
@@ -253,7 +255,7 @@ clawpm done <id> \
 
 A reflection event is written to `~/clawpm/reflections/<task-id>.jsonl` with predictions, actuals (computed from work log), and deltas (duration ratio, files-changed ratio, scope overrun/unused, complexity match).
 
-`clawpm reflect summarize/suggest/history-import` are Phase 2 stubs.
+`clawpm reflect summarize/suggest` are Phase 2 stubs. `clawpm reflect history-import --source <dir>` (or `CLAWPM_HISTORY_SOURCE` env var) scans agent log files for task-ID mentions and emits an aggregate report — useful for back-filling reflections from session transcripts.
 
 ### Web dashboard
 
@@ -270,8 +272,12 @@ Real-time view of blockers, in-flight tasks, projects. Quick-add forms. Pause/re
 clawpm setup                       # First-time portfolio creation
 clawpm setup --check               # Verify installation
 clawpm doctor                      # Health check (settings.toml, paths, etc.)
+clawpm doctor --check-codex        # Warn on projects without Codex GitHub app
+clawpm doctor --check-encoding     # AST-scan .py for cp1252-risk patterns
 clawpm version
 ```
+
+Looking for a worked example portfolio to copy as a seed? See `examples/portfolio/` — drop-in fixtures with sample projects (alpha / beta / _inbox), tasks across all states, and a populated `work_log.jsonl`. Edit the absolute paths in `portfolio.toml` to match your machine before pointing `CLAWPM_PORTFOLIO` at it.
 
 ## How it works (architecture in 30 seconds)
 
@@ -373,7 +379,9 @@ The fork ships a Claude Code skill (`skills/clawpm/SKILL.md`). When clawpm is on
 
 A complementary `clawpm-cowork` skill at `~/.claude/skills/clawpm-cowork/` handles the bootstrap dance for Cowork's ephemeral VMs.
 
-For Codex (and other AGENTS.md runtimes), copy `AGENTS.md.template` from the repo root into your project, replace `<REPLACE-WITH-PROJECT-ID>` with your real project ID, and Codex picks up the integration automatically. See `codex-instructions.md` for deeper Codex adapter notes.
+For Codex (and other AGENTS.md runtimes), copy `AGENTS.md.template` from the repo root into your project, replace `<REPLACE-WITH-PROJECT-ID>` with your real project ID, and Codex picks up the integration automatically. See `codex-instructions.md` for deeper Codex adapter notes. The repo's own `AGENTS.md` (dogfooded) shows the instantiated shape.
+
+For hands-off work-log capture, install `hooks/clawpm-sync/handler.py` as a Claude Code hook (see `hooks/clawpm-sync/HOOK.md`). Fires on every `clawpm` CLI invocation plus session boundaries; appends structured entries to `work_log.jsonl` without manual `clawpm log` discipline.
 
 ## Optimal use cases
 
