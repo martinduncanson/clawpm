@@ -12,6 +12,7 @@ import click
 from . import __version__
 from .models import (
     ProjectStatus,
+    Task,
     TaskState,
     TaskComplexity,
     WorkLogAction,
@@ -523,6 +524,7 @@ def project_doctor(
 
     issues: list[dict] = []
     stale_tasks: list[dict] = []
+    stale_blocked: list[dict] = []
     drift_tasks: list[dict] = []
     unreadable_files: list[dict] = []
     commit_drift: list[dict] = []
@@ -719,6 +721,55 @@ def project_doctor(
                 "detail": f"Both {stem}.md and {stem}.progress.md exist — likely incomplete git mv",
             })
 
+        # --- Cascade health check: stale-blocked tasks whose deps are all done.
+        # The auto-cascade in tasks_state catches new transitions; this check
+        # catches the historical backlog of tasks blocked before cascade landed.
+        STALE_BLOCKED_HOURS = 24
+        blocked_dir = tasks_dir / "blocked"
+        if blocked_dir.exists():
+            tasks_for_lookup = list_tasks(config, proj.id)
+            by_id = {t.id: t for t in tasks_for_lookup}
+            cutoff_blocked = now_utc - timedelta(hours=STALE_BLOCKED_HOURS)
+            for blocked_file in blocked_dir.glob("*.md"):
+                try:
+                    bt = Task.from_file(blocked_file)
+                except Exception:
+                    continue
+                if not bt.depends:
+                    continue
+                # All deps resolved to done?
+                deps_resolved = True
+                missing_deps: list[str] = []
+                for dep_id in bt.depends:
+                    dep = by_id.get(dep_id)
+                    if dep is None:
+                        missing_deps.append(dep_id)
+                        continue
+                    if dep.state != TaskState.DONE:
+                        deps_resolved = False
+                        break
+                if not deps_resolved:
+                    continue
+                try:
+                    btime = datetime.fromtimestamp(
+                        blocked_file.stat().st_mtime, tz=timezone.utc
+                    )
+                except OSError:
+                    continue
+                if btime > cutoff_blocked:
+                    continue
+                stale_blocked.append({
+                    "task_id": bt.id,
+                    "project_id": proj.id,
+                    "blocked_since": btime.isoformat().replace("+00:00", "Z"),
+                    "deps": bt.depends,
+                    "missing_deps": missing_deps,
+                    "suggested_action": (
+                        "All deps are done — run `clawpm unblock` to promote, "
+                        "or remove stale dep refs"
+                    ),
+                })
+
     # --- Phase 1.8 Check d: Code-vs-tracking drift ---
     # For each project with a repo_path, compare the timestamp of the latest
     # work_log entry to commits authored after that time. >threshold = warn.
@@ -826,7 +877,7 @@ def project_doctor(
 
     # Build final output
     has_warnings = bool(
-        stale_tasks or drift_tasks or prefix_collisions or unreadable_files
+        stale_tasks or stale_blocked or drift_tasks or prefix_collisions or unreadable_files
         or commit_drift or missing_markers or codex_availability
         or any(i["level"] == "warning" for i in issues)
     )
@@ -836,6 +887,7 @@ def project_doctor(
             "issues": issues,
             "count": len(issues),
             "stale_tasks": stale_tasks,
+            "stale_blocked": stale_blocked,
             "drift_tasks": drift_tasks,
             "prefix_collisions": prefix_collisions,
             "unreadable_files": unreadable_files,
@@ -845,7 +897,7 @@ def project_doctor(
         })
     else:
         if not (
-            issues or stale_tasks or drift_tasks or prefix_collisions or unreadable_files
+            issues or stale_tasks or stale_blocked or drift_tasks or prefix_collisions or unreadable_files
             or commit_drift or missing_markers or codex_availability
         ):
             click.echo("[OK] No issues found")
@@ -857,6 +909,11 @@ def project_doctor(
                 click.echo(
                     f"[WARNING] [stale] {st['task_id']} ({st['project_id']}) "
                     f"- {st['days_stale']} days stale. {st['suggested_action']}"
+                )
+            for sb in stale_blocked:
+                click.echo(
+                    f"[WARNING] [stale-blocked] {sb['task_id']} ({sb['project_id']}) "
+                    f"- all deps done but still in blocked/. {sb['suggested_action']}"
                 )
             for dt in drift_tasks:
                 click.echo(f"[WARNING] [drift] {dt['file']} - {dt['issue']}")
@@ -1200,6 +1257,28 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
             auto=True,
         )
 
+    # Dependency cascade: when a task hits DONE, auto-promote any blocked
+    # tasks whose dep list is now satisfied. Emit one work_log entry per
+    # cascaded transition so the trigger is auditable.
+    cascade_results: list[dict] = []
+    if state == TaskState.DONE:
+        from .tasks import cascade_unblock_dependents
+        try:
+            cascade_results = cascade_unblock_dependents(config, project_id, task_id)
+        except Exception:
+            # A buggy cascade must never block the user's done.
+            cascade_results = []
+
+        for cr in cascade_results:
+            add_entry(
+                config,
+                project=project_id,
+                action=WorkLogAction.CASCADE_UNBLOCK,
+                task=cr["task_id"],
+                summary=f"Auto-unblocked by completion of {cr['trigger']}",
+                auto=True,
+            )
+
     # Write reflection event when task completes or is blocked
     if state in (TaskState.DONE, TaskState.BLOCKED) and pre_transition_task:
         try:
@@ -1227,7 +1306,10 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
             # Never let reflection failure block the state change
             pass
 
-    output_success(f"Task {task_id} moved to {new_state}", data=task.to_dict(), fmt=fmt)
+    data = task.to_dict()
+    if cascade_results:
+        data["cascade_unblocks"] = cascade_results
+    output_success(f"Task {task_id} moved to {new_state}", data=data, fmt=fmt)
 
 
 @tasks.command("add")

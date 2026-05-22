@@ -49,6 +49,7 @@ class WorkLogAction(str, Enum):
     NOTE = "note"
     COMMIT = "commit"
     VOID = "void"
+    CASCADE_UNBLOCK = "cascade_unblock"
 
 
 # Fixed vocabulary for surprise taxonomy — one source of truth.

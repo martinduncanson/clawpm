@@ -266,6 +266,72 @@ def change_task_state(
     return Task.from_file(new_path)
 
 
+def cascade_unblock_dependents(
+    config: PortfolioConfig,
+    project_id: str,
+    completed_task_id: str,
+) -> list[dict]:
+    """Auto-promote blocked tasks whose deps are now all done.
+
+    Walks blocked tasks; for each whose ``depends`` list includes
+    ``completed_task_id`` AND whose entire ``depends`` set is now in DONE,
+    transitions the task BLOCKED → OPEN.
+
+    Returns one record per cascaded transition:
+    ``{task_id, from_state, to_state, trigger}``. Caller is responsible for
+    emitting work_log entries — keeping log I/O at the CLI boundary matches
+    the rest of the module.
+
+    Cycle protection: a visited-set bounds the traversal so a malformed
+    ``A -> B -> A`` dep graph cannot loop. The cascade is shallow by design
+    — only direct dependents of ``completed_task_id`` are re-evaluated.
+    Their own dependents will cascade when *they* hit DONE later, via the
+    next ``done`` call.
+    """
+    all_tasks = list_tasks(config, project_id)
+    by_id = {t.id: t for t in all_tasks}
+
+    transitions: list[dict] = []
+    visited: set[str] = set()
+
+    for task in all_tasks:
+        if task.state != TaskState.BLOCKED:
+            continue
+        if completed_task_id not in (task.depends or []):
+            continue
+        if task.id in visited:
+            continue
+        visited.add(task.id)
+
+        # All deps done?
+        all_deps_done = True
+        for dep_id in task.depends:
+            dep = by_id.get(dep_id)
+            # An absent dep is a soft error — log it but don't block the cascade.
+            # The doctor check on the same axis will surface dangling refs.
+            if dep is None:
+                continue
+            if dep.state != TaskState.DONE:
+                all_deps_done = False
+                break
+
+        if not all_deps_done:
+            continue
+
+        moved = change_task_state(
+            config, project_id, task.id, TaskState.OPEN
+        )
+        if moved is not None:
+            transitions.append({
+                "task_id": task.id,
+                "from_state": "blocked",
+                "to_state": "open",
+                "trigger": completed_task_id,
+            })
+
+    return transitions
+
+
 def add_task(
     config: PortfolioConfig,
     project_id: str,
