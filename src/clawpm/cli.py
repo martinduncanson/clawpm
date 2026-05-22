@@ -12,6 +12,7 @@ import click
 from . import __version__
 from .models import (
     ProjectStatus,
+    SuccessCriterion,
     Task,
     TaskState,
     TaskComplexity,
@@ -1135,7 +1136,7 @@ def tasks_edit(
             frameworks=list(predict_frameworks),
             pitfalls=predict_pitfalls,
             hypothesis=hypothesis,
-            success_criteria=list(success_criteria),
+            success_criteria=[SuccessCriterion.from_cli(s) for s in success_criteria],
             approach=predict_approach,
             unknowns=unknowns,
             confidence=confidence,
@@ -1440,7 +1441,7 @@ def tasks_add(
         frameworks=list(predict_frameworks),
         pitfalls=predict_pitfalls,
         hypothesis=hypothesis,
-        success_criteria=list(success_criteria),
+        success_criteria=[SuccessCriterion.from_cli(s) for s in success_criteria],
         approach=predict_approach,
         unknowns=unknowns,
         confidence=confidence,
@@ -1502,6 +1503,76 @@ def tasks_add(
         sys.exit(1)
 
     output_success(f"Task {task.id} created", data=task.to_dict(), fmt=fmt)
+
+
+@tasks.command("emit-rubric")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
+@click.argument("task_id")
+@click.option(
+    "--format", "rubric_format",
+    type=click.Choice(["markdown", "outcome-payload"]),
+    default="markdown",
+    help=(
+        "markdown: print the rubric for piping into a Stop-hook prompt or "
+        "human review. outcome-payload: JSON shaped for Anthropic's "
+        "user.define_outcome event."
+    ),
+)
+@click.pass_context
+def tasks_emit_rubric(
+    ctx: click.Context,
+    project_id: str | None,
+    task_id: str,
+    rubric_format: str,
+) -> None:
+    """Render a task's success-criteria as a graded-criteria rubric.
+
+    The same rubric drives both clawpm's local Stop-hook condition evaluator
+    (CLAWP-017) and an Anthropic Managed Agents ``user.define_outcome``
+    event — clawpm is the persistence layer, the rubric is the contract.
+    """
+    import json as _json_rub
+    from .rubric import render_rubric_markdown, render_rubric_json_payload
+
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+
+    project_id, _ = require_project(ctx, project_id)
+    task_id = expand_task_id(task_id, project_id)
+
+    task = get_task(config, project_id, task_id)
+    if not task:
+        output_error(
+            "task_not_found",
+            f"No task with id '{task_id}' in project '{project_id}'",
+            fmt=fmt,
+        )
+        sys.exit(1)
+
+    if rubric_format == "markdown":
+        # The rubric IS the output — bypass output_success because the
+        # consumer (a hook command, or pipe to file) usually wants the raw
+        # markdown without a JSON envelope.
+        if fmt == OutputFormat.JSON:
+            output_json({
+                "status": "ok",
+                "task_id": task.id,
+                "format": "markdown",
+                "rubric": render_rubric_markdown(task),
+            })
+        else:
+            click.echo(render_rubric_markdown(task))
+    else:
+        payload = render_rubric_json_payload(task)
+        if fmt == OutputFormat.JSON:
+            output_json({
+                "status": "ok",
+                "task_id": task.id,
+                "format": "outcome-payload",
+                "payload": payload,
+            })
+        else:
+            click.echo(_json_rub.dumps(payload, indent=2))
 
 
 @tasks.command("split")

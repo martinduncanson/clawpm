@@ -161,6 +161,100 @@ class ProjectSettings:
         }
 
 
+@dataclass(eq=False)
+class SuccessCriterion:
+    """A structured success criterion suitable for both clawpm reflection
+    and an Anthropic `user.define_outcome` rubric.
+
+    A bare-string criterion (``"P95 latency <200ms"``) parses into
+    ``SuccessCriterion(criterion="P95 latency <200ms")`` with no signal or
+    comparator. Structured form adds:
+
+    - ``gradeable_signal`` — what evidence proves the criterion held
+    - ``comparator`` — a parseable pass-condition (free text; future Phase 2
+      may add a tiny DSL for ``lt:200ms`` / ``gte:0.95`` etc.)
+
+    Equality is intentionally loose: an SC equals a plain string when their
+    criterion texts match. This preserves the existing assertion style
+    ``predictions.success_criteria == ["P95 latency <200ms"]`` from the
+    pre-structured-criteria test corpus.
+    """
+
+    criterion: str
+    gradeable_signal: str | None = None
+    comparator: str | None = None
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, str):
+            return self.criterion == other
+        if isinstance(other, SuccessCriterion):
+            return (
+                self.criterion == other.criterion
+                and self.gradeable_signal == other.gradeable_signal
+                and self.comparator == other.comparator
+            )
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash((self.criterion, self.gradeable_signal, self.comparator))
+
+    def is_structured(self) -> bool:
+        return self.gradeable_signal is not None or self.comparator is not None
+
+    def to_yaml(self) -> str | dict[str, str]:
+        """Serialize back to YAML — bare string when no structure is set."""
+        if not self.is_structured():
+            return self.criterion
+        d: dict[str, str] = {"criterion": self.criterion}
+        if self.gradeable_signal:
+            d["gradeable_signal"] = self.gradeable_signal
+        if self.comparator:
+            d["comparator"] = self.comparator
+        return d
+
+    @classmethod
+    def from_cli(cls, value: str) -> SuccessCriterion:
+        """Parse a value from the ``--success-criteria`` CLI flag.
+
+        Accepts either a plain string (treated as ``criterion`` only) or a
+        JSON object string of shape ``{"criterion": "...", "gradeable_signal":
+        "...", "comparator": "..."}``. JSON detection is conservative — only
+        triggered when the string starts with ``{`` to keep ``--success-criteria
+        '{count} > 0'`` working as a plain string for plausible-but-unusual
+        criteria phrasings.
+        """
+        import json as _json
+        stripped = value.strip()
+        if stripped.startswith("{"):
+            try:
+                parsed = _json.loads(stripped)
+            except _json.JSONDecodeError:
+                # Wasn't actually JSON; treat as plain string.
+                return cls(criterion=value)
+            if isinstance(parsed, dict):
+                return cls.from_yaml(parsed)
+        return cls(criterion=value)
+
+    @classmethod
+    def from_yaml(cls, value: Any) -> SuccessCriterion:
+        if isinstance(value, str):
+            return cls(criterion=value)
+        if isinstance(value, dict):
+            crit = value.get("criterion")
+            if not crit:
+                raise ValueError(
+                    f"success_criterion dict missing 'criterion' key: {value!r}"
+                )
+            return cls(
+                criterion=crit,
+                gradeable_signal=value.get("gradeable_signal"),
+                comparator=value.get("comparator"),
+            )
+        if isinstance(value, cls):
+            return value
+        raise ValueError(f"Bad success_criterion: {value!r}")
+
+
 @dataclass
 class Predictions:
     """Operator predictions captured at task creation or edit time.
@@ -177,7 +271,11 @@ class Predictions:
     pitfalls: str | None = None
     hypothesis: str | None = None
     # Phase 1.5 — applied-science framing
-    success_criteria: list[str] = field(default_factory=list)
+    # Each entry is a SuccessCriterion. Bare strings (legacy) and dicts (new
+    # structured form) are both accepted at construction and normalised via
+    # ``__post_init__``. SuccessCriterion equality matches plain strings on
+    # the ``criterion`` field so existing assertions keep working.
+    success_criteria: list[SuccessCriterion] = field(default_factory=list)
     approach: str | None = None
     unknowns: str | None = None
     confidence: int | None = None  # 1–5; None = not set
@@ -185,6 +283,17 @@ class Predictions:
     pre_mortem: str | None = None
     # Phase 1.6 — attribution: who filled in these predictions?
     filled_by: str | None = None  # "agent" | "operator" | "operator-edited" | "retroactive" | None
+
+    def __post_init__(self) -> None:
+        # Normalise success_criteria — accept str | dict | SuccessCriterion
+        # so callers passing the legacy ``list[str]`` form Just Work.
+        normalised: list[SuccessCriterion] = []
+        for item in self.success_criteria:
+            if isinstance(item, SuccessCriterion):
+                normalised.append(item)
+            else:
+                normalised.append(SuccessCriterion.from_yaml(item))
+        self.success_criteria = normalised
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -195,7 +304,7 @@ class Predictions:
             "frameworks": self.frameworks,
             "pitfalls": self.pitfalls,
             "hypothesis": self.hypothesis,
-            "success_criteria": self.success_criteria,
+            "success_criteria": [sc.to_yaml() for sc in self.success_criteria],
             "approach": self.approach,
             "unknowns": self.unknowns,
             "confidence": self.confidence,
@@ -220,7 +329,10 @@ class Predictions:
             frameworks=data.get("frameworks") or [],
             pitfalls=data.get("pitfalls"),
             hypothesis=data.get("hypothesis"),
-            success_criteria=data.get("success_criteria") or [],
+            success_criteria=[
+                SuccessCriterion.from_yaml(v)
+                for v in (data.get("success_criteria") or [])
+            ],
             approach=data.get("approach"),
             unknowns=data.get("unknowns"),
             confidence=data.get("confidence"),
