@@ -1309,23 +1309,50 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
             )
 
         # Auto-teardown dispatch settings that reference the just-done task.
-        # Look in known locations: project repo root + per-task worktrees.
+        # Codex round-4 fix: use the portfolio dispatch registry so we
+        # find EVERY target_dir the operator dispatched to (custom
+        # --target-dir, CWD-at-time-of-dispatch, repo subdirs, etc.) —
+        # not just the hardcoded repo_path + worktree pair. Falls back
+        # to the legacy locations as a belt-and-braces second pass for
+        # dispatches that pre-date the registry.
         from .dispatch import (
+            active_dispatch_dirs,
             read_dispatch_marker,
             teardown_dispatch_settings,
         )
         project = get_project(config, project_id)
-        candidate_dirs: list[Path] = []
+        candidate_dirs: list[Path] = list(
+            active_dispatch_dirs(config.portfolio_root, task_id)
+        )
+        # Legacy fallback: dispatches written before the registry was
+        # introduced won't appear in active_dispatch_dirs. Probe the
+        # canonical locations so existing in-flight dispatches still
+        # get torn down on their next done.
         if project and project.repo_path and project.repo_path.exists():
-            candidate_dirs.append(project.repo_path)
+            if project.repo_path not in candidate_dirs:
+                candidate_dirs.append(project.repo_path)
             wt_dir = project.repo_path / ".clawpm-worktrees" / task_id
-            if wt_dir.exists():
+            if wt_dir.exists() and wt_dir not in candidate_dirs:
                 candidate_dirs.append(wt_dir)
+        seen_dirs: set[str] = set()
         for cand in candidate_dirs:
+            # Dedup by resolved path so registry + legacy probes don't
+            # double-fire on the same directory.
+            try:
+                key = str(cand.resolve())
+            except OSError:
+                key = str(cand)
+            if key in seen_dirs:
+                continue
+            seen_dirs.add(key)
             marker = read_dispatch_marker(cand)
             if marker and marker.get("task_id") == task_id:
                 try:
-                    teardown_dispatch_settings(cand, task_id=task_id)
+                    teardown_dispatch_settings(
+                        cand,
+                        task_id=task_id,
+                        portfolio_root=config.portfolio_root,
+                    )
                     teardowns.append({
                         "target_dir": cand.as_posix(),
                         "task_id": task_id,
@@ -1742,6 +1769,7 @@ def tasks_dispatch(
             project_id=project_id,
             rubric_markdown=rubric,
             force=force,
+            portfolio_root=config.portfolio_root,
         )
     except (FileExistsError, ValueError) as exc:
         output_error("dispatch_blocked", str(exc), fmt=fmt)
@@ -1798,7 +1826,10 @@ def tasks_teardown_dispatch(
     marker = read_dispatch_marker(resolved_dir)
 
     removed = teardown_dispatch_settings(
-        resolved_dir, task_id=task_id, force=force
+        resolved_dir,
+        task_id=task_id,
+        force=force,
+        portfolio_root=config.portfolio_root,
     )
 
     output_success(

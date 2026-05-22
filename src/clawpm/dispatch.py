@@ -96,6 +96,91 @@ overwrite without ``--force``.
 """
 
 
+# Codex round-4 P2 fix: dispatches to custom --target-dir were not being
+# torn down on done because the auto-teardown only checked repo_path +
+# .clawpm-worktrees/. Solved via a portfolio-level append-only registry:
+# every dispatch appends a "dispatched" event, every teardown appends a
+# "torn_down" event, and `active_dispatch_dirs` replays the log to find
+# dirs that are dispatched-but-not-torn-down. Matches clawpm's existing
+# filesystem-first / no-daemon / append-only doctrine (mirrors work_log).
+DISPATCH_REGISTRY_FILENAME = "dispatches.jsonl"
+
+
+def _dispatch_registry_path(portfolio_root: Path) -> Path:
+    return portfolio_root / DISPATCH_REGISTRY_FILENAME
+
+
+def register_dispatch(
+    portfolio_root: Path,
+    task_id: str,
+    project_id: str,
+    target_dir: Path,
+) -> None:
+    """Append a ``dispatched`` event to the portfolio dispatch registry."""
+    path = _dispatch_registry_path(portfolio_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    event = {
+        "action": "dispatched",
+        "task_id": task_id,
+        "project_id": project_id,
+        "target_dir": str(target_dir.resolve()),
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def register_teardown(
+    portfolio_root: Path,
+    task_id: str,
+    target_dir: Path,
+) -> None:
+    """Append a ``torn_down`` event to the registry."""
+    path = _dispatch_registry_path(portfolio_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    event = {
+        "action": "torn_down",
+        "task_id": task_id,
+        "target_dir": str(target_dir.resolve()),
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def active_dispatch_dirs(portfolio_root: Path, task_id: str) -> list[Path]:
+    """Return target_dirs currently dispatched (not yet torn down) for a task.
+
+    Replays the registry: a directory is "active" if its most recent event
+    for this task_id is ``dispatched``. Returns absolute paths.
+    """
+    path = _dispatch_registry_path(portfolio_root)
+    if not path.exists():
+        return []
+    # Map abs-target-dir -> latest action for THIS task_id
+    latest: dict[str, str] = {}
+    try:
+        for line in path.read_text(encoding="utf-8", errors="strict").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("task_id") != task_id:
+                continue
+            td = ev.get("target_dir")
+            action = ev.get("action")
+            if td and action in ("dispatched", "torn_down"):
+                latest[td] = action
+    except UnicodeDecodeError:
+        # Corrupted registry — return empty rather than guess. Doctor
+        # check on the registry would be a v2 addition.
+        return []
+    return [Path(td) for td, action in latest.items() if action == "dispatched"]
+
+
 def settings_path(target_dir: Path) -> Path:
     """Path to the per-target dispatch settings file."""
     return target_dir / ".claude" / "settings.local.json"
@@ -255,6 +340,7 @@ def write_dispatch_settings(
     project_id: str,
     rubric_markdown: Optional[str] = None,
     force: bool = False,
+    portfolio_root: Optional[Path] = None,
 ) -> Path:
     """Emit settings.local.json for the dispatched task.
 
@@ -311,6 +397,10 @@ def write_dispatch_settings(
         # it via `clawpm hook session-start`. See module docstring for
         # the cross-platform reasoning.
         write_session_start_sidecar(target_dir, rubric_markdown)
+    # Codex round-4: register the dispatch so on-done teardown can find
+    # ALL target_dirs, not just the legacy repo_path + worktree pair.
+    if portfolio_root is not None:
+        register_dispatch(portfolio_root, task_id, project_id, target_dir)
     return path
 
 
@@ -330,6 +420,7 @@ def teardown_dispatch_settings(
     target_dir: Path,
     task_id: Optional[str] = None,
     force: bool = False,
+    portfolio_root: Optional[Path] = None,
 ) -> bool:
     """Remove a clawpm-managed dispatch settings file (and sidecar).
 
@@ -369,6 +460,12 @@ def teardown_dispatch_settings(
     path.unlink()
     if sidecar.exists():
         sidecar.unlink()
+    # Codex round-4: append a torn_down event to the registry so
+    # active_dispatch_dirs reflects reality.
+    if portfolio_root is not None:
+        resolved_task = task_id or marker.get("task_id")
+        if resolved_task:
+            register_teardown(portfolio_root, resolved_task, target_dir)
     return True
 
 

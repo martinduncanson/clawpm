@@ -463,6 +463,96 @@ class TestPortableHookCommands:
         assert cmd.startswith("clawpm hook session-start")
 
 
+class TestDispatchRegistry:
+    """Codex round-4 P2: portfolio-level registry tracks every dispatch
+    target_dir so done-time teardown finds them all (not just the
+    hardcoded repo_path + worktree pair)."""
+
+    def test_registry_appends_dispatch_event(
+        self, temp_portfolio_with_repo, tmp_path
+    ):
+        from clawpm.dispatch import active_dispatch_dirs
+        config = temp_portfolio_with_repo["config"]
+        task = add_task(
+            config, "test", title="Reg",
+            predictions=Predictions(success_criteria=["c1"]),
+        )
+
+        # Dispatch to a custom dir that has no relation to repo_path
+        custom_dir = tmp_path / "custom-target"
+        custom_dir.mkdir()
+        CliRunner().invoke(
+            main,
+            ["-p", "test", "tasks", "dispatch", task.id,
+             "--target-dir", str(custom_dir)],
+        )
+
+        dirs = active_dispatch_dirs(config.portfolio_root, task.id)
+        assert any(
+            Path(str(d)).resolve() == custom_dir.resolve() for d in dirs
+        )
+
+    def test_done_tears_down_custom_target_dir(
+        self, temp_portfolio_with_repo, tmp_path
+    ):
+        """The original bug Codex flagged: a dispatch to a custom
+        --target-dir was NOT torn down on done. Verify the registry-
+        backed teardown now finds it."""
+        config = temp_portfolio_with_repo["config"]
+        task = add_task(
+            config, "test", title="CustomDir",
+            predictions=Predictions(success_criteria=["c1"]),
+        )
+        # Custom dir lives nowhere near repo_path or .clawpm-worktrees/
+        custom_dir = tmp_path / "elsewhere"
+        custom_dir.mkdir()
+
+        CliRunner().invoke(
+            main,
+            ["-p", "test", "tasks", "dispatch", task.id,
+             "--target-dir", str(custom_dir)],
+        )
+        assert settings_path(custom_dir).exists()
+
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "state", task.id, "done"]
+        )
+        assert r.exit_code == 0
+        payload = json.loads(r.output)["data"]
+        assert "dispatch_teardowns" in payload
+        # The custom dir IS in the teardowns list
+        teardown_dirs = {
+            Path(t["target_dir"]).resolve()
+            for t in payload["dispatch_teardowns"]
+        }
+        assert custom_dir.resolve() in teardown_dirs
+        # And the file is actually gone
+        assert not settings_path(custom_dir).exists()
+
+    def test_registry_torn_down_event_removes_from_active(
+        self, temp_portfolio_with_repo, tmp_path
+    ):
+        from clawpm.dispatch import active_dispatch_dirs
+        config = temp_portfolio_with_repo["config"]
+        task = add_task(
+            config, "test", title="TT",
+            predictions=Predictions(success_criteria=["c1"]),
+        )
+        d = tmp_path / "td"
+        d.mkdir()
+        CliRunner().invoke(
+            main,
+            ["-p", "test", "tasks", "dispatch", task.id, "--target-dir", str(d)],
+        )
+        assert active_dispatch_dirs(config.portfolio_root, task.id)
+
+        CliRunner().invoke(
+            main,
+            ["-p", "test", "tasks", "teardown-dispatch", task.id, "--target-dir", str(d)],
+        )
+        assert not active_dispatch_dirs(config.portfolio_root, task.id)
+
+
 class TestAutoTeardownOnDone:
     def test_done_auto_tears_down_repo_dispatch(self, temp_portfolio_with_repo):
         config = temp_portfolio_with_repo["config"]
