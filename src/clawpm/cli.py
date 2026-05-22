@@ -2295,6 +2295,126 @@ def log_commit(ctx: click.Context, project_id: str | None, limit: int, task_id: 
 
 
 # ============================================================================
+# Hook subcommands (called by Claude Code hooks; not for direct human use)
+# ============================================================================
+
+
+@main.group()
+def hook() -> None:
+    """Hook-callable subcommands for Claude Code integration.
+
+    These commands are designed to be wired into ``.claude/settings.json``
+    (or ``.claude/settings.local.json``) Stop / PostToolUse hooks. They
+    read the standard hook stdin JSON and emit hook output JSON on stdout.
+    """
+    pass
+
+
+@hook.command("eval-stop")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
+@click.option("--task", "task_id", required=True, help="Task ID whose rubric to evaluate against")
+@click.option("--transcript-file", "transcript_file", type=click.Path(), default=None,
+              help="Path to the transcript file. Overrides hook stdin's transcript_path.")
+@click.option("--rubric-file", "rubric_file", type=click.Path(), default=None,
+              help="Path to a pre-rendered rubric markdown file. Default: render from the task.")
+@click.pass_context
+def hook_eval_stop(
+    ctx: click.Context,
+    project_id: str | None,
+    task_id: str,
+    transcript_file: str | None,
+    rubric_file: str | None,
+) -> None:
+    """Stop-hook condition evaluator (CLAWP-017).
+
+    Reads the Claude Code Stop-hook input from stdin (JSON), extracts the
+    transcript path, renders the task's success-criteria rubric, dispatches
+    a Haiku-class judge, and emits a hook-output JSON deciding whether the
+    subagent may stop.
+
+    Local emulation of Anthropic Managed Agents' Outcomes evaluator — no
+    paid API required; uses the operator's existing Claude Code subscription
+    via subprocess to ``claude --print``. Override the judge with
+    ``CLAWPM_JUDGE_CMD`` env var.
+    """
+    import json as _json_hook
+    from .judges.stop_condition import (
+        evaluate_stop_condition,
+        load_transcript_from_hook_input,
+        map_verdict_to_hook_output,
+    )
+    from .rubric import render_rubric_markdown
+
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+    project_id, _ = require_project(ctx, project_id)
+    task_id = expand_task_id(task_id, project_id)
+
+    # 1. Load the rubric — from file if given, else render from the task.
+    rubric: str
+    if rubric_file:
+        rubric = Path(rubric_file).read_text(encoding="utf-8")
+    else:
+        task = get_task(config, project_id, task_id)
+        if not task:
+            # Hook stdin closed at this point; we must still emit a valid
+            # hook-output JSON or Claude Code will treat us as a no-op.
+            # Returning continue=true with an alarming systemMessage is the
+            # least-surprising failure mode.
+            click.echo(_json_hook.dumps({
+                "continue": True,
+                "systemMessage": f"clawpm eval-stop: task {task_id} not found; cannot enforce rubric",
+            }))
+            return
+        rubric = render_rubric_markdown(task)
+
+    # 2. Load the transcript — from --transcript-file, or from hook stdin.
+    transcript: str
+    if transcript_file:
+        transcript = Path(transcript_file).read_text(encoding="utf-8", errors="replace")
+    else:
+        # Stop-hook input comes in on stdin.
+        try:
+            stdin_raw = sys.stdin.read()
+        except Exception:
+            stdin_raw = ""
+        if stdin_raw.strip():
+            try:
+                hook_input = _json_hook.loads(stdin_raw)
+            except _json_hook.JSONDecodeError:
+                hook_input = {}
+            try:
+                transcript = load_transcript_from_hook_input(hook_input)
+            except (ValueError, FileNotFoundError) as exc:
+                # Can't find the transcript — surface to operator but don't
+                # block the stop (would loop forever).
+                click.echo(_json_hook.dumps({
+                    "continue": True,
+                    "systemMessage": f"clawpm eval-stop: transcript unavailable ({exc}); rubric not enforced",
+                }))
+                return
+        else:
+            click.echo(_json_hook.dumps({
+                "continue": True,
+                "systemMessage": "clawpm eval-stop: no stdin and no --transcript-file; rubric not enforced",
+            }))
+            return
+
+    # 3. Dispatch the judge. Errors here are unexpected — surface them.
+    try:
+        verdict = evaluate_stop_condition(rubric=rubric, transcript=transcript)
+    except RuntimeError as exc:
+        click.echo(_json_hook.dumps({
+            "continue": True,
+            "systemMessage": f"clawpm eval-stop: judge error ({exc}); rubric not enforced",
+        }))
+        return
+
+    output = map_verdict_to_hook_output(verdict)
+    click.echo(_json_hook.dumps(output))
+
+
+# ============================================================================
 # Research commands
 # ============================================================================
 
