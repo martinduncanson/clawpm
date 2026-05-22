@@ -1262,6 +1262,7 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
     # tasks whose dep list is now satisfied. Emit one work_log entry per
     # cascaded transition so the trigger is auditable.
     cascade_results: list[dict] = []
+    teardowns: list[dict] = []
     if state == TaskState.DONE:
         from .tasks import cascade_unblock_dependents
         try:
@@ -1279,6 +1280,32 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
                 summary=f"Auto-unblocked by completion of {cr['trigger']}",
                 auto=True,
             )
+
+        # Auto-teardown dispatch settings that reference the just-done task.
+        # Look in known locations: project repo root + per-task worktrees.
+        from .dispatch import (
+            read_dispatch_marker,
+            teardown_dispatch_settings,
+        )
+        project = get_project(config, project_id)
+        candidate_dirs: list[Path] = []
+        if project and project.repo_path and project.repo_path.exists():
+            candidate_dirs.append(project.repo_path)
+            wt_dir = project.repo_path / ".clawpm-worktrees" / task_id
+            if wt_dir.exists():
+                candidate_dirs.append(wt_dir)
+        for cand in candidate_dirs:
+            marker = read_dispatch_marker(cand)
+            if marker and marker.get("task_id") == task_id:
+                try:
+                    teardown_dispatch_settings(cand, task_id=task_id)
+                    teardowns.append({
+                        "target_dir": cand.as_posix(),
+                        "task_id": task_id,
+                    })
+                except Exception:
+                    # Auto-teardown is best-effort; never block done.
+                    pass
 
     # Write reflection event when task completes or is blocked
     if state in (TaskState.DONE, TaskState.BLOCKED) and pre_transition_task:
@@ -1310,6 +1337,8 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
     data = task.to_dict()
     if cascade_results:
         data["cascade_unblocks"] = cascade_results
+    if teardowns:
+        data["dispatch_teardowns"] = teardowns
     output_success(f"Task {task_id} moved to {new_state}", data=data, fmt=fmt)
 
 
@@ -1573,6 +1602,168 @@ def tasks_emit_rubric(
             })
         else:
             click.echo(_json_rub.dumps(payload, indent=2))
+
+
+@tasks.command("dispatch")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
+@click.argument("task_id")
+@click.option(
+    "--target-dir", "target_dir", type=click.Path(), default=None,
+    help="Directory to write .claude/settings.local.json into. Default: current directory."
+)
+@click.option(
+    "--worktree", is_flag=True, default=False,
+    help="Create a git worktree at .clawpm-worktrees/<task-id>/ and dispatch there."
+)
+@click.option(
+    "--no-session-context", is_flag=True, default=False,
+    help="Skip SessionStart rubric injection (default: inject)."
+)
+@click.option(
+    "--force", "-f", is_flag=True, default=False,
+    help="Back up + overwrite an existing settings.local.json."
+)
+@click.pass_context
+def tasks_dispatch(
+    ctx: click.Context,
+    project_id: str | None,
+    task_id: str,
+    target_dir: str | None,
+    worktree: bool,
+    no_session_context: bool,
+    force: bool,
+) -> None:
+    """Emit hook-wired .claude/settings.local.json for a dispatched subagent (CLAWP-018).
+
+    The subagent uses Claude Code as normal; clawpm gets state updates and
+    success-criteria enforcement at the dispatch boundary. The Stop hook
+    blocks termination until the task's rubric (CLAWP-016) is satisfied,
+    via the local condition evaluator (CLAWP-017).
+
+    With --worktree, creates a git worktree under .clawpm-worktrees/<id>/
+    so multiple subagents can be dispatched in parallel without colliding
+    on a single .claude/settings.local.json.
+    """
+    from .dispatch import (
+        create_worktree,
+        settings_path,
+        write_dispatch_settings,
+    )
+    from .rubric import render_rubric_markdown
+
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+    project_id, _source = require_project(ctx, project_id)
+    task_id = expand_task_id(task_id, project_id)
+
+    task = get_task(config, project_id, task_id)
+    if not task:
+        output_error("task_not_found", f"No task with id '{task_id}'", fmt=fmt)
+        sys.exit(1)
+
+    project = get_project(config, project_id)
+    # Resolve target directory
+    if worktree:
+        if not project or not project.repo_path or not project.repo_path.exists():
+            output_error(
+                "no_repo",
+                "--worktree requires the project to have a valid repo_path "
+                f"(got {(project.repo_path if project else None)!r})",
+                fmt=fmt,
+            )
+            sys.exit(1)
+        try:
+            resolved_dir = create_worktree(project.repo_path, task_id)
+        except subprocess.CalledProcessError as exc:
+            output_error(
+                "worktree_failed",
+                f"git worktree add failed: {exc.stderr or exc.stdout}",
+                fmt=fmt,
+            )
+            sys.exit(1)
+    elif target_dir:
+        resolved_dir = Path(target_dir)
+        resolved_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        resolved_dir = Path.cwd()
+
+    rubric = None if no_session_context else render_rubric_markdown(task)
+
+    try:
+        path = write_dispatch_settings(
+            target_dir=resolved_dir,
+            task_id=task_id,
+            project_id=project_id,
+            rubric_markdown=rubric,
+            force=force,
+        )
+    except (FileExistsError, ValueError) as exc:
+        output_error("dispatch_blocked", str(exc), fmt=fmt)
+        sys.exit(1)
+
+    invocation = f"cd {resolved_dir.as_posix()} && claude"
+    output_success(
+        f"Task {task_id} dispatched to {resolved_dir}",
+        data={
+            "task_id": task_id,
+            "target_dir": resolved_dir.as_posix(),
+            "settings_path": path.as_posix(),
+            "worktree": worktree,
+            "invocation": invocation,
+            "rubric_injected": rubric is not None,
+        },
+        fmt=fmt,
+    )
+
+
+@tasks.command("teardown-dispatch")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
+@click.argument("task_id", required=False)
+@click.option(
+    "--target-dir", "target_dir", type=click.Path(), default=None,
+    help="Directory containing .claude/settings.local.json. Default: current directory."
+)
+@click.option(
+    "--force", "-f", is_flag=True, default=False,
+    help="Remove the file even if it's not clawpm-managed (dangerous)."
+)
+@click.pass_context
+def tasks_teardown_dispatch(
+    ctx: click.Context,
+    project_id: str | None,
+    task_id: str | None,
+    target_dir: str | None,
+    force: bool,
+) -> None:
+    """Remove a dispatch .claude/settings.local.json.
+
+    By default, only removes files clawpm wrote (marker present) for the
+    given task_id. Without task_id, removes any clawpm-managed dispatch.
+    """
+    from .dispatch import read_dispatch_marker, teardown_dispatch_settings
+
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+    if task_id:
+        project_id, _ = require_project(ctx, project_id)
+        task_id = expand_task_id(task_id, project_id)
+
+    resolved_dir = Path(target_dir) if target_dir else Path.cwd()
+    marker = read_dispatch_marker(resolved_dir)
+
+    removed = teardown_dispatch_settings(
+        resolved_dir, task_id=task_id, force=force
+    )
+
+    output_success(
+        "Dispatch torn down" if removed else "Nothing to tear down",
+        data={
+            "removed": removed,
+            "target_dir": resolved_dir.as_posix(),
+            "previous_marker": marker,
+        },
+        fmt=fmt,
+    )
 
 
 @tasks.command("split")
