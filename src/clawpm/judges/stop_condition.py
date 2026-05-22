@@ -112,11 +112,35 @@ class JudgeVerdict:
             return cls(
                 ok=False, reason=f"judge returned non-object: {data!r}"
             )
-        ok = bool(data.get("ok"))
+        # Strict bool validation: an LLM that returns `{"ok": "false"}`
+        # (string instead of bool) would coerce to True via bool(...) and
+        # silently bypass the Stop hook. Treat any non-bool as malformed
+        # and return a blocking not-ok verdict.
+        raw_ok = data.get("ok")
+        raw_impossible = data.get("impossible", False)
+        if not isinstance(raw_ok, bool):
+            return cls(
+                ok=False,
+                reason=(
+                    f"judge output has non-boolean 'ok' field "
+                    f"({type(raw_ok).__name__}={raw_ok!r}); refusing to "
+                    f"coerce — schema drift could fail-open the Stop hook"
+                ),
+            )
+        if not isinstance(raw_impossible, bool):
+            return cls(
+                ok=False,
+                reason=(
+                    f"judge output has non-boolean 'impossible' field "
+                    f"({type(raw_impossible).__name__}={raw_impossible!r}); "
+                    f"refusing to coerce"
+                ),
+            )
+        ok = raw_ok
+        impossible = raw_impossible
         reason = data.get("reason", "")
         if not isinstance(reason, str):
             reason = str(reason)
-        impossible = bool(data.get("impossible", False))
         if impossible and ok:
             # Self-contradictory output is a JUDGE QUALITY BUG, not an
             # impossibility signal. We must NOT route this to the same

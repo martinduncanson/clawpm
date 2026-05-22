@@ -377,6 +377,53 @@ class TestSessionStartSidecar:
         assert not sidecar.exists()
 
 
+class TestIdentifierSafety:
+    """Codex P1 fix: task_id and project_id flow into shell commands.
+    Validate the safe-charset rejection at the dispatch boundary."""
+
+    def test_safe_id_passes(self):
+        from clawpm.dispatch import build_settings_payload
+        # Normal clawpm-generated IDs all pass
+        p = build_settings_payload("CLAWP-016", "clawpm")
+        assert "CLAWP-016" in p["hooks"]["Stop"][0]["hooks"][0]["command"]
+
+    def test_task_id_with_semicolon_rejected(self):
+        from clawpm.dispatch import build_settings_payload
+        with pytest.raises(ValueError, match="unsafe task_id"):
+            build_settings_payload("FOO; rm -rf /", "test")
+
+    def test_task_id_with_dollar_substitution_rejected(self):
+        from clawpm.dispatch import build_settings_payload
+        with pytest.raises(ValueError, match="unsafe task_id"):
+            build_settings_payload("FOO-$(cat /etc/passwd)", "test")
+
+    def test_task_id_with_backticks_rejected(self):
+        from clawpm.dispatch import build_settings_payload
+        with pytest.raises(ValueError, match="unsafe task_id"):
+            build_settings_payload("FOO-`whoami`", "test")
+
+    def test_task_id_path_traversal_rejected(self):
+        from clawpm.dispatch import build_settings_payload
+        with pytest.raises(ValueError, match="unsafe task_id"):
+            build_settings_payload("../etc-passwd", "test")
+
+    def test_task_id_with_space_rejected(self):
+        from clawpm.dispatch import build_settings_payload
+        with pytest.raises(ValueError, match="unsafe task_id"):
+            build_settings_payload("FOO BAR", "test")
+
+    def test_project_id_with_semicolon_rejected(self):
+        from clawpm.dispatch import build_settings_payload
+        with pytest.raises(ValueError, match="unsafe project_id"):
+            build_settings_payload("CLAWP-016", "test; rm")
+
+    def test_worktree_rejects_unsafe_id(self, temp_portfolio_with_repo):
+        from clawpm.dispatch import create_worktree
+        repo = temp_portfolio_with_repo["repo_dir"]
+        with pytest.raises(ValueError, match="unsafe task_id"):
+            create_worktree(repo, "FOO/../bar")
+
+
 class TestPortableHookCommands:
     """Codex-review hardening: hook commands must be portable across
     cmd.exe (Windows default for Claude Code) and POSIX shells.

@@ -177,6 +177,25 @@ class TestCascadeFunction:
         assert len(trans) == 1
         assert trans[0]["task_id"] == b.id
 
+    def test_missing_dep_prevents_cascade(self, temp_portfolio):
+        """Codex P1 fix: a missing dependency must NOT count as satisfied.
+
+        A blocked task depending on `A` and a typoed `B-NOTEXIST` must
+        stay blocked even when `A` is completed — dependency contract
+        cannot be silently weakened by typos.
+        """
+        config = temp_portfolio["config"]
+        a = add_task(config, "test", title="A")
+        child = add_task(
+            config, "test", title="Child", depends=[a.id, "TEST-9999"]
+        )
+        change_task_state(config, "test", child.id, TaskState.BLOCKED)
+
+        change_task_state(config, "test", a.id, TaskState.DONE)
+        trans = cascade_unblock_dependents(config, "test", a.id)
+        assert trans == []
+        assert get_task(config, "test", child.id).state == TaskState.BLOCKED
+
     def test_indirect_dependent_does_not_cascade(self, temp_portfolio):
         """Shallow cascade: an indirect dependent (C deps on B deps on A) is
         NOT promoted when A is completed — only B's direct cascade gets it

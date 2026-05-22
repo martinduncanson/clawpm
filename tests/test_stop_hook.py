@@ -146,6 +146,35 @@ class TestVerdictParse:
         assert v.ok is False
         assert "no json object" in v.reason.lower()
 
+    def test_string_false_for_ok_does_not_coerce_to_true(self):
+        """Codex P1 fix: bool('false') is True. Must reject non-bool 'ok'.
+
+        Without strict validation, an LLM returning `{"ok": "false"}`
+        (string instead of bool) would let the Stop hook fail-open. The
+        parser must treat this as malformed and return ok=False.
+        """
+        v = JudgeVerdict.parse('{"ok": "false", "reason": "x"}')
+        assert v.ok is False
+        assert "non-boolean" in v.reason.lower()
+
+    def test_string_true_for_ok_does_not_coerce(self):
+        v = JudgeVerdict.parse('{"ok": "true", "reason": "x"}')
+        assert v.ok is False
+        assert "non-boolean" in v.reason.lower()
+
+    def test_int_one_for_ok_does_not_coerce(self):
+        """`bool(1)` is True but 1 is not a bool — must reject."""
+        v = JudgeVerdict.parse('{"ok": 1, "reason": "x"}')
+        assert v.ok is False
+        assert "non-boolean" in v.reason.lower()
+
+    def test_string_impossible_does_not_coerce(self):
+        v = JudgeVerdict.parse(
+            '{"ok": false, "impossible": "true", "reason": "x"}'
+        )
+        assert v.ok is False
+        assert "non-boolean" in v.reason.lower()
+
 
 # ---------------------------------------------------------------------------
 # evaluate_stop_condition with injected invoker

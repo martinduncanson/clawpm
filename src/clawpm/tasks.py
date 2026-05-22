@@ -388,14 +388,15 @@ def cascade_unblock_dependents(
             continue
 
         # All deps done?
+        # Codex P1 fix: a MISSING dependency must be treated as
+        # UNSATISFIED — silently treating a typoed/nonexistent dep ref
+        # as "done" violates the dependency contract. The cascade will
+        # not promote tasks with dangling deps; `clawpm doctor` already
+        # surfaces these via its dangling-ref check.
         all_deps_done = True
         for dep_id in task.depends:
             dep = by_id.get(dep_id)
-            # An absent dep is a soft error — log it but don't block the cascade.
-            # The doctor check on the same axis will surface dangling refs.
-            if dep is None:
-                continue
-            if dep.state != TaskState.DONE:
+            if dep is None or dep.state != TaskState.DONE:
                 all_deps_done = False
                 break
 

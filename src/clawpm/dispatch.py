@@ -42,11 +42,50 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+# Codex P1 fix: task_id and project_id flow unchanged into shell commands.
+# Reject anything outside the safe charset BEFORE interpolating, so an
+# operator who runs `clawpm tasks add --id 'foo; rm -rf /'` cannot inject.
+# clawpm's auto-generated IDs are `PREFIX-NNN` (uppercase + hyphen + digits);
+# we widen slightly to accept lowercase + underscore + dot for project_ids
+# that come from filesystem-derived names.
+_SAFE_TASK_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_SAFE_PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def _assert_safe_identifier(value: str, kind: str) -> None:
+    """Raise ValueError if value contains shell-meta or path-traversal chars.
+
+    Called before any string interpolation into a hook command OR before
+    use as a path component / git ref name. The safe charset is narrow:
+    letters, digits, dot, hyphen, underscore. Additionally rejected:
+
+      - empty / over-64-chars
+      - leading ``.`` or ``-`` (git refnames hostile, path-traversal risk)
+      - ``..`` substring anywhere (path traversal)
+      - trailing ``.`` (Windows hostile)
+    """
+    pattern = _SAFE_TASK_ID_RE if kind == "task_id" else _SAFE_PROJECT_ID_RE
+    if (
+        not pattern.match(value)
+        or value.startswith(".")
+        or value.startswith("-")
+        or ".." in value
+        or value.endswith(".")
+    ):
+        raise ValueError(
+            f"Refusing to dispatch with unsafe {kind} {value!r} — "
+            f"only [A-Za-z0-9._-]{{1,64}} allowed; no leading dot/hyphen, "
+            f"no '..', no trailing dot (would risk shell injection or "
+            f"path traversal in hook commands / worktree paths)"
+        )
+
 
 CLAWPM_MARKER_KEY = "_clawpm_dispatch"
 """Top-level key that identifies a clawpm-managed dispatch settings file.
@@ -77,7 +116,13 @@ def _command_for_dispatch(task_id: str, project_id: str, action: str) -> str:
 
     The ``action`` is encoded directly so the same builder produces all
     hook command strings without per-call branches.
+
+    Identifier safety: ``task_id`` and ``project_id`` are validated via
+    ``_assert_safe_identifier`` to prevent shell injection — clawpm
+    auto-generates safe IDs, but the operator can override with --id.
     """
+    _assert_safe_identifier(task_id, "task_id")
+    _assert_safe_identifier(project_id, "project_id")
     if action == "eval-stop":
         return f"clawpm hook eval-stop --project {project_id} --task {task_id}"
     if action == "log-progress":
@@ -331,7 +376,11 @@ def create_worktree(repo_path: Path, task_id: str) -> Path:
     If the branch already exists, reuses it. If the worktree path already
     exists, reuses it (idempotent). Raises ``subprocess.CalledProcessError``
     if git is unavailable or the repo is in a state that blocks the worktree.
+
+    Identifier safety: ``task_id`` is validated to prevent path traversal
+    (``../foo``) or git ref name abuse (``..``, ``-`` prefix, etc.).
     """
+    _assert_safe_identifier(task_id, "task_id")
     worktree_root = repo_path / ".clawpm-worktrees" / task_id
     worktree_root.parent.mkdir(parents=True, exist_ok=True)
 
