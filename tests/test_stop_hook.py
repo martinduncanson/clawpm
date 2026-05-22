@@ -255,11 +255,19 @@ class TestHookOutputMapping:
         assert "satisfied" in out["systemMessage"]
 
     def test_ok_false_blocks_stop(self):
+        """Codex round-2 P1: unsatisfied rubric must use decision=block +
+        reason, NOT continue=false. continue=false halts the entire
+        pipeline (terminates the agent), defeating the Stop gate."""
         v = JudgeVerdict(ok=False, reason="missing X")
         out = map_verdict_to_hook_output(v)
-        assert out["continue"] is False
+        # `decision: "block"` + `reason` is the documented Stop-hook
+        # block signal — forces the agent to keep working.
         assert out["decision"] == "block"
-        assert "missing X" in out["stopReason"]
+        assert "missing X" in out["reason"]
+        # MUST NOT carry continue=false — that would halt the pipeline.
+        assert "continue" not in out or out.get("continue") is not False
+        # Old shape (stopReason) is gone — fail-loud if anyone regresses.
+        assert "stopReason" not in out
 
     def test_impossible_lets_agent_stop_but_flags_operator(self):
         """Impossibility must NOT loop forever — let the agent stop, surface to operator."""
@@ -342,9 +350,10 @@ class TestCLIEvalStop:
         )
         assert r.exit_code == 0
         out = json.loads(r.output)
-        assert out["continue"] is False
+        # Stop-hook block contract: decision=block + reason
         assert out["decision"] == "block"
-        assert "tests failing" in out["stopReason"]
+        assert "tests failing" in out["reason"]
+        assert "continue" not in out or out.get("continue") is not False
 
     def test_cli_blocks_when_task_not_found(self, temp_portfolio):
         """Task-not-found is a DISPATCH-CONFIG BUG, not a soft fail.
@@ -364,9 +373,10 @@ class TestCLIEvalStop:
         # exit 0 because we MUST emit a hook-shaped JSON, not an error envelope
         assert r.exit_code == 0
         out = json.loads(r.output)
-        assert out["continue"] is False
+        # Stop-hook block contract: decision=block + reason (forces
+        # agent to keep working). NOT continue=false (halts pipeline).
         assert out["decision"] == "block"
-        assert "not found" in out["stopReason"]
+        assert "not found" in out["reason"]
 
     def test_cli_handles_missing_transcript_gracefully(
         self, temp_portfolio, monkeypatch

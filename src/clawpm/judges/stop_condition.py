@@ -292,20 +292,26 @@ def load_transcript_from_hook_input(hook_input: dict) -> str:
 
 
 def map_verdict_to_hook_output(verdict: JudgeVerdict) -> dict:
-    """Translate a JudgeVerdict into the Claude Code hook output schema.
+    """Translate a JudgeVerdict into the Claude Code Stop-hook output.
 
-    Stop-hook output contract (from system-prompt-hooks-configuration.md):
-      - ``continue: false`` keeps Claude working (blocks the stop)
-      - ``stopReason`` is shown when blocking
-      - ``decision: "block"`` is the Stop-hook block signal
-      - ``systemMessage`` displays to the user
+    Stop-hook output contract (Codex round-2 P1 correction):
+      - ``decision: "block"`` + ``reason`` → blocks the *stop event*, the
+        agent must continue working. This is what we want for an
+        unsatisfied rubric — force another iterate→grade→revise cycle.
+      - ``continue: false`` → halts the entire processing pipeline
+        (terminates the agent). **Different semantics** — must NOT be
+        used to mean "the rubric is not yet satisfied", or a failed
+        rubric ends the session instead of forcing another loop, which
+        defeats the entire Stop-gate contract.
+      - ``continue: true`` + ``systemMessage`` → let the stop go through,
+        with a visible note to the operator.
 
     Mapping:
       - ok=true              → continue=true,  systemMessage="rubric ✓ ..."
       - ok=false impossible  → continue=true,  systemMessage="rubric impossible ..."
                                (let the agent stop; operator must triage)
-      - ok=false             → continue=false, decision="block",
-                               stopReason="rubric not yet satisfied: ..."
+      - ok=false             → decision="block", reason="rubric not yet
+                               satisfied: ..." (force another loop)
     """
     if verdict.ok:
         return {
@@ -323,8 +329,11 @@ def map_verdict_to_hook_output(verdict: JudgeVerdict) -> dict:
                 f"{verdict.reason}"
             ),
         }
+    # Unsatisfied rubric: block the Stop event so the agent keeps
+    # working. NOT `continue: false` — that would terminate the agent
+    # outright. `decision: "block"` + `reason` is the documented Stop-
+    # hook block signal.
     return {
-        "continue": False,
         "decision": "block",
-        "stopReason": f"clawpm rubric not satisfied: {verdict.reason}",
+        "reason": f"clawpm rubric not satisfied: {verdict.reason}",
     }

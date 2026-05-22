@@ -2692,13 +2692,15 @@ def hook_eval_stop(
         task = get_task(config, project_id, task_id)
         if not task:
             # Task-not-found is a dispatch-config bug, NOT a soft fail.
-            # Block the stop so the operator sees the problem in the
-            # transcript rather than discovering it after the subagent
-            # has already finished gated work.
+            # Block the Stop event so the operator sees the problem in
+            # the transcript rather than discovering it after the subagent
+            # has already finished gated work. Codex round-2 P1: use
+            # `decision: "block"` + `reason` (forces agent to keep
+            # working), NOT `continue: false` (which halts the entire
+            # pipeline / terminates the agent).
             click.echo(_json_hook.dumps({
-                "continue": False,
                 "decision": "block",
-                "stopReason": (
+                "reason": (
                     f"clawpm eval-stop: task {task_id} not found in "
                     f"project {project_id} — fix dispatch config "
                     f"(check `clawpm tasks dispatch --task-id`) before "
