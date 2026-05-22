@@ -463,6 +463,7 @@ def teardown_dispatch_settings(
     task_id: Optional[str] = None,
     force: bool = False,
     portfolio_root: Optional[Path] = None,
+    project_id: Optional[str] = None,
 ) -> bool:
     """Remove a clawpm-managed dispatch settings file (and sidecar).
 
@@ -475,7 +476,10 @@ def teardown_dispatch_settings(
         they're doing).
       - Marker present, ``task_id`` given but mismatches: returns False;
         the dispatch belongs to a different task.
-      - Marker present, matches (or ``task_id`` not given): removes
+      - Marker present, ``project_id`` given but mismatches: returns
+        False; the dispatch belongs to a different project (Codex
+        round-7 fix — cross-project isolation also enforced here).
+      - Marker present, matches (or filter not given): removes
         settings.local.json AND the SessionStart sidecar if present.
 
     No exception is raised in the not-removed paths — the caller reads
@@ -498,6 +502,17 @@ def teardown_dispatch_settings(
             sidecar.unlink()
         return True
     if task_id is not None and marker.get("task_id") != task_id:
+        return False
+    # Cross-project isolation: refuse to remove a dispatch that belongs
+    # to a different project than the caller's project context. The
+    # marker carries project_id (since CLAWP-018); if both sides specify
+    # it AND disagree, this is exactly the class of cross-project
+    # mistake the registry-filter fixes were meant to prevent.
+    if (
+        project_id is not None
+        and marker.get("project_id") is not None
+        and marker.get("project_id") != project_id
+    ):
         return False
     path.unlink()
     if sidecar.exists():

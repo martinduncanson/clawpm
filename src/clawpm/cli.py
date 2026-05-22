@@ -1018,7 +1018,11 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
         output_error("task_not_found", f"No task with id '{task_id}' in project '{project_id}'", fmt=fmt)
         sys.exit(1)
 
-    # Phase 1.6: surface void tag if any reflection has been voided
+    # Phase 1.6: surface void tag if any reflection has been voided.
+    # Cross-project isolation (round-7 audit follow-up): the reflection
+    # JSONL filename is keyed by task_id alone, so two projects sharing
+    # a task_id share a file. Filter by project_id so we don't surface
+    # the OTHER project's void events as our own.
     import json as _json_show
     reflections_voided = False
     ref_file = config.portfolio_root / "reflections" / f"{task_id}.jsonl"
@@ -1029,7 +1033,10 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
                 continue
             try:
                 _rec = _json_show.loads(_line)
-                if _rec.get("event") == "void":
+                if (
+                    _rec.get("event") == "void"
+                    and _rec.get("project_id") == project_id
+                ):
                     reflections_voided = True
                     break
             except _json_show.JSONDecodeError:
@@ -1363,6 +1370,7 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
                         cand,
                         task_id=task_id,
                         portfolio_root=config.portfolio_root,
+                        project_id=project_id,
                     )
                     teardowns.append({
                         "target_dir": cand.as_posix(),
@@ -1842,6 +1850,7 @@ def tasks_teardown_dispatch(
         task_id=task_id,
         force=force,
         portfolio_root=config.portfolio_root,
+        project_id=project_id,
     )
 
     output_success(
@@ -3565,7 +3574,7 @@ def reflect_void(
     voided: list[dict] = []
     errors: list[dict] = []
 
-    def _void_task_reflection(tid: str) -> None:
+    def _void_task_reflection(tid: str, project_hint: str | None = None) -> None:
         ref_file = ref_dir / f"{tid}.jsonl"
         if not ref_file.exists():
             errors.append({"task_id": tid, "error": "no_reflection_file"})
@@ -3580,6 +3589,21 @@ def reflect_void(
             except _json.JSONDecodeError:
                 pass
 
+        # Cross-project isolation (round-7 audit follow-up): the JSONL
+        # filename is keyed by task_id alone, so two projects sharing a
+        # task_id share a file. Stamp the void event with project_id so
+        # downstream consumers (e.g. tasks_show reflections_voided
+        # check) can filter correctly. Resolution priority:
+        #   1. explicit project_hint (from `--project` flag if given)
+        #   2. project_id field on any prior event in this file
+        #   3. None (legacy unscoped void — consumers should handle)
+        resolved_project: str | None = project_hint
+        if resolved_project is None:
+            for rec in existing_records:
+                if rec.get("project_id"):
+                    resolved_project = rec["project_id"]
+                    break
+
         # Build the void entry
         void_entry: dict = {
             "event": "void",
@@ -3587,6 +3611,8 @@ def reflect_void(
             "reason": reason,
             "voided_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
+        if resolved_project is not None:
+            void_entry["project_id"] = resolved_project
 
         # Append (atomic: write to .tmp then replace)
         tmp_file = ref_file.with_suffix(".jsonl.tmp")

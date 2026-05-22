@@ -198,6 +198,26 @@ class TestWriteReadTeardown:
         assert removed is False
         assert settings_path(tmp_path).exists()
 
+    def test_teardown_skips_when_project_id_mismatch(self, tmp_path):
+        """Codex round-7 P2: teardown must refuse to remove a dispatch
+        belonging to a different project (same task_id collision)."""
+        write_dispatch_settings(tmp_path, "SHARED-001", "project_a")
+        removed = teardown_dispatch_settings(
+            tmp_path, task_id="SHARED-001", project_id="project_b"
+        )
+        assert removed is False
+        assert settings_path(tmp_path).exists()
+        marker = read_dispatch_marker(tmp_path)
+        assert marker["project_id"] == "project_a"
+
+    def test_teardown_removes_when_project_id_matches(self, tmp_path):
+        write_dispatch_settings(tmp_path, "SHARED-001", "project_a")
+        removed = teardown_dispatch_settings(
+            tmp_path, task_id="SHARED-001", project_id="project_a"
+        )
+        assert removed is True
+        assert not settings_path(tmp_path).exists()
+
 
 # ---------------------------------------------------------------------------
 # Write safety: refuses to clobber
