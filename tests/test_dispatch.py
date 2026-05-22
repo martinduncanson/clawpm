@@ -487,7 +487,7 @@ class TestDispatchRegistry:
              "--target-dir", str(custom_dir)],
         )
 
-        dirs = active_dispatch_dirs(config.portfolio_root, task.id)
+        dirs = active_dispatch_dirs(config.portfolio_root, task.id, "test")
         assert any(
             Path(str(d)).resolve() == custom_dir.resolve() for d in dirs
         )
@@ -544,13 +544,61 @@ class TestDispatchRegistry:
             main,
             ["-p", "test", "tasks", "dispatch", task.id, "--target-dir", str(d)],
         )
-        assert active_dispatch_dirs(config.portfolio_root, task.id)
+        assert active_dispatch_dirs(config.portfolio_root, task.id, "test")
 
         CliRunner().invoke(
             main,
             ["-p", "test", "tasks", "teardown-dispatch", task.id, "--target-dir", str(d)],
         )
-        assert not active_dispatch_dirs(config.portfolio_root, task.id)
+        assert not active_dispatch_dirs(config.portfolio_root, task.id, "test")
+
+    def test_cross_project_isolation(
+        self, temp_portfolio_with_repo, tmp_path
+    ):
+        """Codex round-5 P1: same task_id in two different projects must
+        not collide. Completing task in project A does NOT tear down
+        dispatch hooks in project B even if both share the task ID."""
+        from clawpm.dispatch import (
+            active_dispatch_dirs,
+            register_dispatch,
+            register_teardown,
+        )
+        config = temp_portfolio_with_repo["config"]
+
+        # Directly seed the registry with two dispatches for the same
+        # task_id under different project_ids.
+        dir_a = tmp_path / "a"
+        dir_a.mkdir()
+        dir_b = tmp_path / "b"
+        dir_b.mkdir()
+        register_dispatch(config.portfolio_root, "SHARED-001", "proj_a", dir_a)
+        register_dispatch(config.portfolio_root, "SHARED-001", "proj_b", dir_b)
+
+        active_a = active_dispatch_dirs(
+            config.portfolio_root, "SHARED-001", "proj_a"
+        )
+        active_b = active_dispatch_dirs(
+            config.portfolio_root, "SHARED-001", "proj_b"
+        )
+
+        assert any(Path(str(d)).resolve() == dir_a.resolve() for d in active_a)
+        assert not any(Path(str(d)).resolve() == dir_b.resolve() for d in active_a)
+        assert any(Path(str(d)).resolve() == dir_b.resolve() for d in active_b)
+        assert not any(Path(str(d)).resolve() == dir_a.resolve() for d in active_b)
+
+        # Tearing down proj_a's dispatch does NOT remove proj_b's.
+        register_teardown(
+            config.portfolio_root, "SHARED-001", dir_a, project_id="proj_a"
+        )
+        active_a = active_dispatch_dirs(
+            config.portfolio_root, "SHARED-001", "proj_a"
+        )
+        active_b = active_dispatch_dirs(
+            config.portfolio_root, "SHARED-001", "proj_b"
+        )
+        assert not active_a
+        # proj_b's dispatch is still active
+        assert any(Path(str(d)).resolve() == dir_b.resolve() for d in active_b)
 
 
 class TestAutoTeardownOnDone:

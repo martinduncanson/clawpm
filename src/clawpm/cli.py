@@ -1322,7 +1322,9 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
         )
         project = get_project(config, project_id)
         candidate_dirs: list[Path] = list(
-            active_dispatch_dirs(config.portfolio_root, task_id)
+            active_dispatch_dirs(
+                config.portfolio_root, task_id, project_id
+            )
         )
         # Legacy fallback: dispatches written before the registry was
         # introduced won't appear in active_dispatch_dirs. Probe the

@@ -134,8 +134,14 @@ def register_teardown(
     portfolio_root: Path,
     task_id: str,
     target_dir: Path,
+    project_id: Optional[str] = None,
 ) -> None:
-    """Append a ``torn_down`` event to the registry."""
+    """Append a ``torn_down`` event to the registry.
+
+    ``project_id`` is optional only for backwards-compat with callers that
+    don't have it; future teardown events should always include it so
+    cross-project isolation in ``active_dispatch_dirs`` is exact.
+    """
     path = _dispatch_registry_path(portfolio_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     event = {
@@ -144,20 +150,35 @@ def register_teardown(
         "target_dir": str(target_dir.resolve()),
         "ts": datetime.now(timezone.utc).isoformat(),
     }
+    if project_id is not None:
+        event["project_id"] = project_id
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
-def active_dispatch_dirs(portfolio_root: Path, task_id: str) -> list[Path]:
+def active_dispatch_dirs(
+    portfolio_root: Path,
+    task_id: str,
+    project_id: str,
+) -> list[Path]:
     """Return target_dirs currently dispatched (not yet torn down) for a task.
 
-    Replays the registry: a directory is "active" if its most recent event
-    for this task_id is ``dispatched``. Returns absolute paths.
+    Replays the registry: a directory is "active" if its most recent
+    event for this (task_id, project_id) pair is ``dispatched``. Returns
+    absolute paths.
+
+    **Cross-project isolation** (Codex round-5 P1 fix): clawpm task IDs
+    are per-project (``PREFIX-NNN`` where PREFIX is the project's 5-char
+    uppercase ID). Two projects sharing a prefix can produce identical
+    task IDs — see the doctor prefix-collision check. Filtering on
+    task_id alone would let ``tasks state PROJ_A-CLAWP-001 done`` tear
+    down dispatch hooks in PROJ_B for its own CLAWP-001. Must filter on
+    BOTH fields.
     """
     path = _dispatch_registry_path(portfolio_root)
     if not path.exists():
         return []
-    # Map abs-target-dir -> latest action for THIS task_id
+    # Map abs-target-dir -> latest action for THIS (task_id, project_id)
     latest: dict[str, str] = {}
     try:
         for line in path.read_text(encoding="utf-8", errors="strict").splitlines():
@@ -170,8 +191,18 @@ def active_dispatch_dirs(portfolio_root: Path, task_id: str) -> list[Path]:
                 continue
             if ev.get("task_id") != task_id:
                 continue
-            td = ev.get("target_dir")
+            # Cross-project isolation: ignore events for a different
+            # project that happens to share the task_id. Teardown events
+            # historically omitted project_id; treat absent project_id
+            # on a teardown event as matching ANY dispatched event so
+            # legacy entries still close out correctly.
+            ev_project = ev.get("project_id")
             action = ev.get("action")
+            if action == "dispatched" and ev_project != project_id:
+                continue
+            if action == "torn_down" and ev_project not in (None, project_id):
+                continue
+            td = ev.get("target_dir")
             if td and action in ("dispatched", "torn_down"):
                 latest[td] = action
     except UnicodeDecodeError:
@@ -461,11 +492,18 @@ def teardown_dispatch_settings(
     if sidecar.exists():
         sidecar.unlink()
     # Codex round-4: append a torn_down event to the registry so
-    # active_dispatch_dirs reflects reality.
+    # active_dispatch_dirs reflects reality. Pass project_id from the
+    # marker (round-5 P1: cross-project isolation requires it).
     if portfolio_root is not None:
         resolved_task = task_id or marker.get("task_id")
+        resolved_project = marker.get("project_id")
         if resolved_task:
-            register_teardown(portfolio_root, resolved_task, target_dir)
+            register_teardown(
+                portfolio_root,
+                resolved_task,
+                target_dir,
+                project_id=resolved_project,
+            )
     return True
 
 
