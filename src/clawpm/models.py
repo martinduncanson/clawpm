@@ -412,6 +412,11 @@ class Task:
     content: str = ""
     file_path: Path | None = None
     predictions: Predictions = field(default_factory=Predictions)
+    # CLAWP-021 — batch dispatch ordinal. Tasks sharing a parallel_group are
+    # dispatchable together (provided scopes don't overlap). Group N+1 only
+    # becomes eligible once every group-N task is DONE. Absent field =
+    # excluded from --batch (sequential by default).
+    parallel_group: int | None = None
 
     @property
     def is_parent(self) -> bool:
@@ -472,6 +477,14 @@ class Task:
             if isinstance(pred_raw, dict):
                 predictions = Predictions.from_dict(pred_raw)
 
+        pg_raw = frontmatter.get("parallel_group")
+        parallel_group: int | None = None
+        if pg_raw is not None:
+            try:
+                parallel_group = int(pg_raw)
+            except (TypeError, ValueError):
+                parallel_group = None
+
         return cls(
             id=frontmatter.get("id", path.stem.replace(".progress", "")),
             title=title,
@@ -485,6 +498,7 @@ class Task:
             content=content,
             file_path=path,
             predictions=predictions,
+            parallel_group=parallel_group,
         )
 
     @property
@@ -523,6 +537,7 @@ class Task:
             "is_parent": self.is_parent,
             "created": self.created,
             "file_path": str(self.file_path) if self.file_path else None,
+            "parallel_group": self.parallel_group,
         }
         body = self.body
         if body:

@@ -1046,6 +1046,7 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
 @click.option("--complexity", "-c", type=click.Choice(["s", "m", "l", "xl"]), help="New complexity")
 @click.option("--body", "-b", help="New body content (replaces description before ## sections)")
 @click.option("--scope", "-s", "scope", multiple=True, help="File glob patterns claimed by this task (can specify multiple)")
+@click.option("--parallel-group", "parallel_group", type=int, default=None, help="Batch ordinal for parallel dispatch (CLAWP-021). Set 0 to clear.")
 # --- Prediction flags (all optional) ---
 @click.option("--predict-duration", "predict_duration", default=None, help="Predicted duration: 90, 90m, 2h, 3d, 1w")
 @click.option("--predict-complexity", "predict_complexity", type=click.Choice(["s", "m", "l", "xl"]), default=None, help="Predicted complexity")
@@ -1072,6 +1073,7 @@ def tasks_edit(
     complexity: str | None,
     body: str | None,
     scope: tuple[str, ...],
+    parallel_group: int | None,
     predict_duration: str | None,
     predict_complexity: str | None,
     predict_files_changed: int | None,
@@ -1116,8 +1118,8 @@ def tasks_edit(
         predict_iterations is not None,
     ])
 
-    if not any([title, priority is not None, complexity, body, scope, has_predictions]):
-        output_error("no_changes", "Specify at least one field to edit (--title, --priority, --complexity, --body, --scope, or --predict-*)", fmt=fmt)
+    if not any([title, priority is not None, complexity, body, scope, has_predictions, parallel_group is not None]):
+        output_error("no_changes", "Specify at least one field to edit (--title, --priority, --complexity, --body, --scope, --parallel-group, or --predict-*)", fmt=fmt)
         sys.exit(1)
 
     cmplx = TaskComplexity(complexity) if complexity else None
@@ -1148,6 +1150,11 @@ def tasks_edit(
             predicted_iterations=predict_iterations,
         )
 
+    # parallel_group: int value sets the field; explicit 0 clears (semantically
+    # "remove batch eligibility") so the operator can take a task out of the
+    # batch queue without rewriting the file by hand.
+    clear_pg = parallel_group == 0
+    pg_value = parallel_group if (parallel_group is not None and not clear_pg) else None
     task = edit_task(
         config,
         project_id,
@@ -1158,6 +1165,8 @@ def tasks_edit(
         scope=scope_list,
         body=body,
         predictions=predictions,
+        parallel_group=pg_value,
+        clear_parallel_group=clear_pg,
     )
 
     if not task:
@@ -1355,6 +1364,7 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
 @click.option("--complexity", "-c", type=click.Choice(["s", "m", "l", "xl"]), help="Complexity")
 @click.option("--depends", "-d", multiple=True, help="Dependencies (can specify multiple)")
 @click.option("--scope", multiple=True, help="File glob patterns claimed by this task (can specify multiple)")
+@click.option("--parallel-group", "parallel_group", type=int, default=None, help="Batch ordinal for parallel dispatch (CLAWP-021). Tasks sharing a group dispatch together; group N+1 waits for group N.")
 @click.option("--parent", "parent_id", help="Parent task ID (creates subtask)")
 @click.option("--description", help="Task description (deprecated, use --body)")
 @click.option("--body", "-b", help="Task body content")
@@ -1393,6 +1403,7 @@ def tasks_add(
     complexity: str | None,
     depends: tuple[str, ...],
     scope: tuple[str, ...],
+    parallel_group: int | None,
     parent_id: str | None,
     description: str | None,
     body: str | None,
@@ -1513,6 +1524,7 @@ def tasks_add(
             scope=scope_list,
             description=task_body,
             predictions=predictions,
+            parallel_group=parallel_group,
         )
 
     if not task:
@@ -1930,12 +1942,58 @@ def quick_unblock(ctx: click.Context, project_id: str | None, task_id: str, note
 
 @main.command("next")
 @click.option("--project", "-p", "project_id", help="Project ID (if not specified, searches all)")
+@click.option(
+    "--batch", "batch_mode", is_flag=True, default=False,
+    help="Return the next parallel batch (tasks sharing the lowest open parallel_group) instead of a single task (CLAWP-021).",
+)
 @click.pass_context
-def quick_next(ctx: click.Context, project_id: str | None) -> None:
-    """Get the next task to work on."""
+def quick_next(ctx: click.Context, project_id: str | None, batch_mode: bool) -> None:
+    """Get the next task to work on, or the next parallel batch with --batch."""
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
-    
+
+    if batch_mode:
+        # Batch mode requires a single project — we don't aggregate batches
+        # across projects (a batch is a unit of parallel dispatch, not a
+        # cross-portfolio queue).
+        project_id, _ = require_project(ctx, project_id)
+        from .tasks import select_next_batch
+        group, candidates, conflicts = select_next_batch(config, project_id)
+
+        if group is None:
+            payload = {
+                "group": None,
+                "candidates": [],
+                "conflicts": [],
+                "message": "No parallel batch available. Tasks need parallel_group: N in frontmatter to be batch-eligible.",
+            }
+        else:
+            payload = {
+                "group": group,
+                "candidates": [t.to_dict() for t in candidates],
+                "conflicts": conflicts,
+                "dispatch_safe": len(conflicts) == 0,
+            }
+        if fmt == OutputFormat.JSON:
+            output_json(payload)
+        else:
+            if group is None:
+                click.echo(payload["message"])
+            else:
+                click.echo(f"Parallel group {group}: {len(candidates)} candidate task(s)")
+                for t in candidates:
+                    click.echo(f"  - {t.id} [{t.state.value}] {t.title}")
+                if conflicts:
+                    click.echo("\nSCOPE CONFLICTS — cannot dispatch as a single batch:")
+                    for c in conflicts:
+                        click.echo(
+                            f"  {c['task_a']} <-> {c['task_b']}: "
+                            f"{c['overlapping_globs']}"
+                        )
+                else:
+                    click.echo("\nDispatch-safe: no scope overlaps.")
+        return
+
     if project_id:
         # Get next task for specific project
         task = get_next_task(config, project_id)
