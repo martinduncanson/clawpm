@@ -1061,6 +1061,7 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
 @click.option("--confidence", "confidence", type=int, default=None, help="Operator confidence 1-5 (1=wild guess, 5=done this before)")
 @click.option("--reference-task", "reference_tasks", multiple=True, help="Prior task IDs used as reference class (repeatable)")
 @click.option("--pre-mortem", "pre_mortem", default=None, help="'If this task fails, the most likely cause is...'")
+@click.option("--predict-iterations", "predict_iterations", type=int, default=None, help="Predicted iterate→grade→revise cycles (CLAWP-019). Default None; 1 means 'expected to land in one pass'.")
 @click.pass_context
 def tasks_edit(
     ctx: click.Context,
@@ -1084,6 +1085,7 @@ def tasks_edit(
     confidence: int | None,
     reference_tasks: tuple[str, ...],
     pre_mortem: str | None,
+    predict_iterations: int | None,
 ) -> None:
     """Edit task metadata (title, priority, complexity, body, scope)."""
     fmt = get_format(ctx)
@@ -1111,6 +1113,7 @@ def tasks_edit(
         confidence is not None,
         reference_tasks,
         pre_mortem is not None,
+        predict_iterations is not None,
     ])
 
     if not any([title, priority is not None, complexity, body, scope, has_predictions]):
@@ -1142,6 +1145,7 @@ def tasks_edit(
             confidence=confidence,
             reference_tasks=list(reference_tasks),
             pre_mortem=pre_mortem,
+            predicted_iterations=predict_iterations,
         )
 
     task = edit_task(
@@ -1316,6 +1320,7 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
                 task_id,
                 pre_transition_task.complexity,
                 all_log_entries,
+                portfolio_root=config.portfolio_root,
             )
             event_name = "task_done" if state == TaskState.DONE else "task_blocked"
             write_reflection_event(
@@ -1370,6 +1375,7 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
 @click.option("--confidence", "confidence", type=int, default=None, help="Operator confidence 1-5 (1=wild guess, 5=done this before)")
 @click.option("--reference-task", "reference_tasks", multiple=True, help="Prior task IDs used as reference class (repeatable)")
 @click.option("--pre-mortem", "pre_mortem", default=None, help="'If this task fails, the most likely cause is...'")
+@click.option("--predict-iterations", "predict_iterations", type=int, default=None, help="Predicted iterate→grade→revise cycles (CLAWP-019). Default None; 1 means 'expected to land in one pass'.")
 # --- Phase 1.6 attribution flag ---
 @click.option(
     "--predicted-by", "predicted_by",
@@ -1405,6 +1411,7 @@ def tasks_add(
     confidence: int | None,
     reference_tasks: tuple[str, ...],
     pre_mortem: str | None,
+    predict_iterations: int | None,
     predicted_by: str | None,
 ) -> None:
     """Add a new task (or subtask with --parent)."""
@@ -1456,6 +1463,7 @@ def tasks_add(
         confidence is not None,
         reference_tasks,
         pre_mortem is not None,
+        predict_iterations is not None,
     ])
     filled_by: str | None = predicted_by if predicted_by is not None else (
         "operator" if _has_predictions else None
@@ -1476,6 +1484,7 @@ def tasks_add(
         confidence=confidence,
         reference_tasks=list(reference_tasks),
         pre_mortem=pre_mortem,
+        predicted_iterations=predict_iterations,
         filled_by=filled_by,
     )
 
@@ -2600,6 +2609,22 @@ def hook_eval_stop(
             "systemMessage": f"clawpm eval-stop: judge error ({exc}); rubric not enforced",
         }))
         return
+
+    # CLAWP-019: capture the iteration event before mapping output. Errors
+    # writing the event must not block the hook response — calibration
+    # data is nice-to-have at this seam.
+    try:
+        from .reflect import write_iteration_event
+        write_iteration_event(
+            portfolio_root=config.portfolio_root,
+            task_id=task_id,
+            project_id=project_id,
+            verdict_ok=verdict.ok,
+            verdict_reason=verdict.reason,
+            verdict_impossible=verdict.impossible,
+        )
+    except Exception:
+        pass
 
     output = map_verdict_to_hook_output(verdict)
     click.echo(_json_hook.dumps(output))

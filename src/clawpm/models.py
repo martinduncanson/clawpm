@@ -281,6 +281,11 @@ class Predictions:
     confidence: int | None = None  # 1–5; None = not set
     reference_tasks: list[str] = field(default_factory=list)
     pre_mortem: str | None = None
+    # CLAWP-019 — predicted iteration count for iterate→grade→revise loops.
+    # Default None (no expectation); 1 means "expected to land in one pass".
+    # Compared against iterations_actual (count of Stop-hook eval cycles)
+    # at done-time to surface revision-count calibration.
+    predicted_iterations: int | None = None
     # Phase 1.6 — attribution: who filled in these predictions?
     filled_by: str | None = None  # "agent" | "operator" | "operator-edited" | "retroactive" | None
 
@@ -310,6 +315,7 @@ class Predictions:
             "confidence": self.confidence,
             "reference_tasks": self.reference_tasks,
             "pre_mortem": self.pre_mortem,
+            "predicted_iterations": self.predicted_iterations,
             "filled_by": self.filled_by,
         }
 
@@ -338,6 +344,7 @@ class Predictions:
             confidence=data.get("confidence"),
             reference_tasks=data.get("reference_tasks") or [],
             pre_mortem=data.get("pre_mortem"),
+            predicted_iterations=data.get("predicted_iterations"),
             filled_by=data.get("filled_by"),
         )
 
@@ -357,6 +364,7 @@ class Predictions:
             and self.confidence is None
             and not self.reference_tasks
             and self.pre_mortem is None
+            and self.predicted_iterations is None
         )
 
 
@@ -372,6 +380,10 @@ class Actuals:
     complexity: TaskComplexity | None = None
     files_changed: int | None = None
     files_touched: list[str] = field(default_factory=list)
+    # CLAWP-019 — count of Stop-hook eval cycles observed before terminal
+    # event. Populated by _compute_actuals from iteration_event lines in
+    # the reflection JSONL. None = no iterations were captured.
+    iterations: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -379,6 +391,7 @@ class Actuals:
             "complexity": self.complexity.value if self.complexity else None,
             "files_changed": self.files_changed,
             "files_touched": self.files_touched,
+            "iterations": self.iterations,
         }
 
 
