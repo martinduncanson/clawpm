@@ -174,7 +174,11 @@ def build_settings_payload(
             ],
             "PostToolUse": [
                 {
-                    "matcher": "Write|Edit",
+                    # Match every code-writing tool Claude Code exposes.
+                    # MultiEdit is the silent gap Codex round-3 caught —
+                    # subagents using batched edits would otherwise skip
+                    # the work_log entry. NotebookEdit covers Jupyter.
+                    "matcher": "Write|Edit|MultiEdit|NotebookEdit",
                     "hooks": [
                         {
                             "type": "command",

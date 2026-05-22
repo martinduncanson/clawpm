@@ -116,8 +116,17 @@ class TestSettingsPayload:
         assert "--task TEST-001" in stop_cmd
         ptu_cmd = p["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
         assert "clawpm log add" in ptu_cmd
-        # PostToolUse matcher filters to Write|Edit (don't log reads)
-        assert p["hooks"]["PostToolUse"][0]["matcher"] == "Write|Edit"
+        # PostToolUse matcher covers ALL code-writing tools. Codex round-3
+        # caught the MultiEdit gap — batched edits would otherwise skip
+        # the work_log entry.
+        matcher = p["hooks"]["PostToolUse"][0]["matcher"]
+        assert "Write" in matcher
+        assert "Edit" in matcher
+        assert "MultiEdit" in matcher
+        assert "NotebookEdit" in matcher
+        # Reads still excluded — don't log Read/Grep/Glob etc.
+        assert "Read" not in matcher
+        assert "Grep" not in matcher
 
     def test_payload_with_rubric_adds_session_start(self):
         p = build_settings_payload(
