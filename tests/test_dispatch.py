@@ -220,6 +220,16 @@ class TestWriteSafety:
         assert "TEST-001" in str(exc.value)
         assert "TEST-002" in str(exc.value)
 
+    def test_refuses_to_overwrite_same_task_id_different_project(self, tmp_path):
+        """Codex round-6 P1: same task_id in a different project must NOT
+        be treated as an idempotent re-dispatch — would silently redirect
+        future hooks to the wrong project/task."""
+        write_dispatch_settings(tmp_path, "SHARED-001", "project_a")
+        with pytest.raises(ValueError) as exc:
+            write_dispatch_settings(tmp_path, "SHARED-001", "project_b")
+        assert "project_a" in str(exc.value)
+        assert "project_b" in str(exc.value)
+
     def test_force_backs_up_operator_file(self, tmp_path):
         path = settings_path(tmp_path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -551,6 +561,49 @@ class TestDispatchRegistry:
             ["-p", "test", "tasks", "teardown-dispatch", task.id, "--target-dir", str(d)],
         )
         assert not active_dispatch_dirs(config.portfolio_root, task.id, "test")
+
+    def test_auto_teardown_fallback_respects_project_id(
+        self, temp_portfolio_with_repo, tmp_path
+    ):
+        """Codex round-6 P1: legacy fallback teardown checked marker's
+        task_id alone, bypassing the cross-project registry filter. A
+        completing project A task could tear down project B's same-task-
+        id dispatch in the same target dir."""
+        from clawpm.dispatch import (
+            read_dispatch_marker,
+            settings_path,
+            write_dispatch_settings,
+        )
+        config = temp_portfolio_with_repo["config"]
+        repo = temp_portfolio_with_repo["repo_dir"]
+
+        # Write a dispatch into repo root marked as PROJECT B's task
+        # (different project, same task ID). Done in project A SHOULD NOT
+        # touch this dispatch.
+        write_dispatch_settings(
+            repo, "SHARED-001", "project_b",
+            portfolio_root=config.portfolio_root,
+        )
+        assert settings_path(repo).exists()
+
+        # Create the same task_id under our actual test project
+        task = add_task(
+            config, "test", title="A's task",
+            task_id="SHARED-001",
+            predictions=Predictions(success_criteria=["c1"]),
+        )
+
+        # Mark done — auto-teardown should NOT touch the repo's settings
+        # (which belongs to project_b, not test)
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "state", task.id, "done"]
+        )
+        assert r.exit_code == 0, r.output
+        # Project B's dispatch survives
+        assert settings_path(repo).exists()
+        marker = read_dispatch_marker(repo)
+        assert marker["project_id"] == "project_b"
+
 
     def test_cross_project_isolation(
         self, temp_portfolio_with_repo, tmp_path

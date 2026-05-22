@@ -399,12 +399,23 @@ def write_dispatch_settings(
 
         if existing is not None and CLAWPM_MARKER_KEY in existing:
             existing_task = existing[CLAWPM_MARKER_KEY].get("task_id")
-            if existing_task != task_id and not force:
+            existing_project = existing[CLAWPM_MARKER_KEY].get("project_id")
+            # Codex round-6 P1: must compare BOTH task_id AND project_id.
+            # clawpm task IDs are per-project; two projects sharing a
+            # prefix can collide. Treating same-task-id-different-project
+            # as an idempotent re-dispatch would silently redirect future
+            # hooks to the wrong project/task.
+            same_dispatch = (
+                existing_task == task_id
+                and existing_project == project_id
+            )
+            if not same_dispatch and not force:
                 raise ValueError(
                     f"{path} is already dispatched for task "
-                    f"{existing_task!r}; refusing to overwrite for "
-                    f"{task_id!r}. Use --force to override or "
-                    f"`clawpm tasks teardown-dispatch` first."
+                    f"{existing_task!r} (project {existing_project!r}); "
+                    f"refusing to overwrite for {task_id!r} "
+                    f"(project {project_id!r}). Use --force to override "
+                    f"or `clawpm tasks teardown-dispatch` first."
                 )
         elif existing is not None and not force:
             raise FileExistsError(

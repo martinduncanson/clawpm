@@ -1348,7 +1348,16 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
                 continue
             seen_dirs.add(key)
             marker = read_dispatch_marker(cand)
-            if marker and marker.get("task_id") == task_id:
+            # Codex round-6 P1: must match BOTH task_id AND project_id.
+            # Without the project_id check on the marker, completing a
+            # task in project A could tear down a same-task-id dispatch
+            # in project B via the legacy fallback probe (registry
+            # filter doesn't apply to the fallback candidates).
+            if (
+                marker
+                and marker.get("task_id") == task_id
+                and marker.get("project_id") == project_id
+            ):
                 try:
                     teardown_dispatch_settings(
                         cand,
@@ -1380,6 +1389,7 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
                 pre_transition_task.complexity,
                 all_log_entries,
                 portfolio_root=config.portfolio_root,
+                project_id=project_id,
             )
             event_name = "task_done" if state == TaskState.DONE else "task_blocked"
             write_reflection_event(

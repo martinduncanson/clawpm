@@ -83,6 +83,29 @@ class TestIterationEvent:
     def test_count_iterations_zero_when_no_file(self, temp_portfolio):
         assert count_iterations_for_task(temp_portfolio["root"], "TEST-001") == 0
 
+    def test_count_iterations_filters_by_project(self, temp_portfolio):
+        """Codex round-6 P2: reflection JSONL is keyed by task_id alone,
+        so two projects sharing a task_id write to the same file. Counter
+        MUST filter by project_id to avoid polluting one project's
+        iteration count with another's events."""
+        root = temp_portfolio["root"]
+        # Two projects, same task_id, 3 and 2 events respectively
+        for _ in range(3):
+            write_iteration_event(
+                root, "SHARED-001", "proj_a",
+                verdict_ok=False, verdict_reason="A",
+            )
+        for _ in range(2):
+            write_iteration_event(
+                root, "SHARED-001", "proj_b",
+                verdict_ok=False, verdict_reason="B",
+            )
+        # Project-filtered counts return only the project's own events
+        assert count_iterations_for_task(root, "SHARED-001", project_id="proj_a") == 3
+        assert count_iterations_for_task(root, "SHARED-001", project_id="proj_b") == 2
+        # Legacy unfiltered behaviour: counts every event in the file
+        assert count_iterations_for_task(root, "SHARED-001") == 5
+
     def test_count_iterations_counts_only_iteration_events(self, temp_portfolio):
         root = temp_portfolio["root"]
         write_iteration_event(root, "TEST-001", "test", verdict_ok=False, verdict_reason="r1")

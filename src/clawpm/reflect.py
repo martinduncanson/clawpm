@@ -59,7 +59,10 @@ def _compute_actuals(
     task_complexity: TaskComplexity | None,
     log_entries: list[WorkLogEntry],
     portfolio_root: Path | None = None,
+    project_id: str | None = None,
 ) -> Actuals:
+    # Inner name for the cross-project filter below.
+    _project_id_hint = project_id
     """Derive Actuals from work_log entries for a given task.
 
     - duration_min: elapsed minutes between the first ``start`` log entry and now
@@ -106,7 +109,12 @@ def _compute_actuals(
     if portfolio_root is not None:
         # Populate iterations from the JSONL — even 0 is a valid signal
         # (means dispatch happened but no Stop-hook ever fired).
-        ic = count_iterations_for_task(portfolio_root, task_id)
+        # Pass project_id when available (added via the project_id kwarg
+        # below) so cross-project task_id collisions don't pollute the
+        # count. Legacy callers without project_id get the old behaviour.
+        ic = count_iterations_for_task(
+            portfolio_root, task_id, project_id=_project_id_hint
+        )
         iterations = ic if ic > 0 else None
 
     return Actuals(
@@ -158,13 +166,25 @@ def write_iteration_event(
     return ref_file
 
 
-def count_iterations_for_task(portfolio_root: Path, task_id: str) -> int:
+def count_iterations_for_task(
+    portfolio_root: Path,
+    task_id: str,
+    project_id: str | None = None,
+) -> int:
     """Count iteration_event lines for a task. Used to populate actuals.iterations.
 
     Voided events ARE counted — voiding marks a reflection event as bad
     data for calibration, but the iteration still happened. A separate
     decision can exclude voided iterations later if Phase 2 calibration
     demands it.
+
+    **Cross-project isolation** (Codex round-6 P2 fix): the reflection
+    JSONL filename is keyed by ``task_id`` alone, so two projects
+    sharing a task_id write to the same file. When ``project_id`` is
+    provided, this function filters events by project_id to prevent
+    one project's iteration cycles being counted into the other's
+    actuals. ``project_id=None`` preserves the legacy "count everything
+    in this file" behaviour for callers that haven't been threaded yet.
     """
     ref_file = _reflections_dir(portfolio_root) / f"{task_id}.jsonl"
     if not ref_file.exists():
@@ -178,8 +198,11 @@ def count_iterations_for_task(portfolio_root: Path, task_id: str) -> int:
             rec = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if rec.get("event") == "iteration_event":
-            count += 1
+        if rec.get("event") != "iteration_event":
+            continue
+        if project_id is not None and rec.get("project_id") != project_id:
+            continue
+        count += 1
     return count
 
 
