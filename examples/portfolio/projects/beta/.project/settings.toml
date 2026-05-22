@@ -1,0 +1,5 @@
+id = "beta"
+name = "Beta"
+status = "paused"
+priority = 5
+loop_enabled = false

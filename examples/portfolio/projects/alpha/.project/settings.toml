@@ -1,0 +1,7 @@
+id = "alpha"
+name = "Alpha"
+status = "active"
+priority = 2
+loop_enabled = true
+repo_path = "/home/user/Development/alpha"
+labels = ["openclaw", "infra"]

@@ -1,0 +1,5 @@
+id = "_inbox"
+name = "Inbox"
+status = "active"
+priority = 99
+labels = ["misc", "inbox"]

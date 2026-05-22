@@ -1,0 +1,46 @@
+{
+  "_comment": "Merge into ~/.claude/settings.json or <repo>/.claude/settings.json. Replace REPLACE_WITH_ABSOLUTE_PATH with the absolute path to handler.py. On Windows, use forward slashes (F:/Git/clawpm/hooks/clawpm-sync/handler.py).",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python REPLACE_WITH_ABSOLUTE_PATH/hooks/clawpm-sync/handler.py"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python REPLACE_WITH_ABSOLUTE_PATH/hooks/clawpm-sync/handler.py"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python REPLACE_WITH_ABSOLUTE_PATH/hooks/clawpm-sync/handler.py"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python REPLACE_WITH_ABSOLUTE_PATH/hooks/clawpm-sync/handler.py"
+          }
+        ]
+      }
+    ]
+  }
+}

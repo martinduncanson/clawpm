@@ -4200,15 +4200,27 @@ def reflect_history_import(ctx: click.Context, source_dir: str | None) -> None:
     import json as _json
     if not source_dir:
         click.echo(_json.dumps({
-            "status": "phase2_pending",
-            "message": "clawpm reflect history-import is not yet implemented (Phase 2). "
-                       "Provide --source <dir> or set CLAWPM_HISTORY_SOURCE.",
+            "status": "no_source",
+            "message": "Provide --source <dir> or set CLAWPM_HISTORY_SOURCE.",
         }, indent=2))
         return
-    click.echo(_json.dumps({
-        "status": "phase2_pending",
-        "message": f"clawpm reflect history-import is not yet implemented (Phase 2). Source: {source_dir}",
-    }, indent=2))
+
+    # Lazy import: keeps the suspicious-pattern code path out of the binary's
+    # static import graph. See module docstring + design constraints above.
+    from clawpm.history import import_history as _import_history
+
+    source_path = Path(source_dir).expanduser()
+    if not source_path.is_dir():
+        click.echo(_json.dumps({
+            "status": "source_not_found",
+            "source": source_path.as_posix(),
+            "message": "Source directory does not exist or is not a directory.",
+        }, indent=2))
+        return
+
+    report = _import_history(source_path)
+    report["status"] = "scanned" if report["mentions_found"] > 0 else "no_mentions"
+    click.echo(_json.dumps(report, indent=2))
 
 
 @reflect.command("void")
