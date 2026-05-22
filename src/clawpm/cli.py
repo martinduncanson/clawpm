@@ -1019,10 +1019,12 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
         sys.exit(1)
 
     # Phase 1.6: surface void tag if any reflection has been voided.
-    # Cross-project isolation (round-7 audit follow-up): the reflection
-    # JSONL filename is keyed by task_id alone, so two projects sharing
-    # a task_id share a file. Filter by project_id so we don't surface
-    # the OTHER project's void events as our own.
+    # Cross-project isolation (round-7 audit + round-8 P2 follow-up):
+    # the reflection JSONL filename is keyed by task_id alone, so two
+    # projects sharing a task_id share a file. Filter by project_id —
+    # but treat ABSENT project_id as legacy/unscoped and matching any
+    # (back-compat for void events written before project_id stamping
+    # was introduced).
     import json as _json_show
     reflections_voided = False
     ref_file = config.portfolio_root / "reflections" / f"{task_id}.jsonl"
@@ -1033,10 +1035,10 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
                 continue
             try:
                 _rec = _json_show.loads(_line)
-                if (
-                    _rec.get("event") == "void"
-                    and _rec.get("project_id") == project_id
-                ):
+                if _rec.get("event") != "void":
+                    continue
+                rec_proj = _rec.get("project_id")
+                if rec_proj is None or rec_proj == project_id:
                     reflections_voided = True
                     break
             except _json_show.JSONDecodeError:
@@ -3542,6 +3544,7 @@ def reflect_history_import(ctx: click.Context, source_dir: str | None) -> None:
 
 @reflect.command("void")
 @click.argument("task_id", required=False, default=None)
+@click.option("--project", "-p", "project_id", default=None, help="Project ID (auto-detected if not specified). Stamped on the void event for cross-project isolation.")
 @click.option("--reason", required=True, help="Why this reflection is bad data (required)")
 @click.option(
     "--all-empty-actuals", "all_empty_actuals", is_flag=True,
@@ -3551,6 +3554,7 @@ def reflect_history_import(ctx: click.Context, source_dir: str | None) -> None:
 def reflect_void(
     ctx: click.Context,
     task_id: str | None,
+    project_id: str | None,
     reason: str,
     all_empty_actuals: bool,
 ) -> None:
@@ -3589,20 +3593,17 @@ def reflect_void(
             except _json.JSONDecodeError:
                 pass
 
-        # Cross-project isolation (round-7 audit follow-up): the JSONL
-        # filename is keyed by task_id alone, so two projects sharing a
-        # task_id share a file. Stamp the void event with project_id so
-        # downstream consumers (e.g. tasks_show reflections_voided
-        # check) can filter correctly. Resolution priority:
-        #   1. explicit project_hint (from `--project` flag if given)
-        #   2. project_id field on any prior event in this file
-        #   3. None (legacy unscoped void — consumers should handle)
+        # Cross-project isolation (round-7 audit + round-8 P1 follow-up):
+        # the JSONL filename is keyed by task_id alone, so two projects
+        # sharing a task_id share a file. Stamp the void event with
+        # project_id from the EXPLICIT command-line context only — do
+        # not infer from prior file events, because in a shared file
+        # the first record could belong to a different project than
+        # the operator's `--project` context. When no command-line
+        # project is given, fall through to legacy unscoped (matches
+        # back-compat for older voids; consumers must treat absent
+        # project_id as wildcard).
         resolved_project: str | None = project_hint
-        if resolved_project is None:
-            for rec in existing_records:
-                if rec.get("project_id"):
-                    resolved_project = rec["project_id"]
-                    break
 
         # Build the void entry
         void_entry: dict = {
@@ -3628,6 +3629,16 @@ def reflect_void(
         except OSError as exc:
             errors.append({"task_id": tid, "error": str(exc)})
 
+    # Resolve project_id context for the single-task path. ONLY use
+    # the explicit --project flag, never auto-detect from CWD —
+    # auto-detect can stamp the void with the dev environment's
+    # project instead of the task's real project, which is worse than
+    # stamping unscoped (legacy consumers wildcard on absent
+    # project_id, scoped consumers in shared-task-id files get
+    # mis-attribution). When --project is omitted we fall through to
+    # legacy unscoped behaviour, which is back-compat-safe.
+    cli_project_id: str | None = project_id  # explicit only
+
     if all_empty_actuals:
         if not ref_dir.exists():
             output_json({"voided": [], "errors": [], "message": "No reflections directory found"})
@@ -3647,9 +3658,13 @@ def reflect_void(
                 except _json.JSONDecodeError:
                     pass
             if has_empty_actuals:
+                # Corpus sweep emits unscoped voids (cross-project-safe
+                # only because the consumer wildcards on absent
+                # project_id). Don't try to infer project from prior
+                # records — same hazard Codex flagged.
                 _void_task_reflection(derived_tid)
     elif task_id:
-        _void_task_reflection(task_id)
+        _void_task_reflection(task_id, project_hint=cli_project_id)
     else:
         output_error(
             "missing_target",

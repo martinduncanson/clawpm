@@ -83,6 +83,99 @@ class TestIterationEvent:
     def test_count_iterations_zero_when_no_file(self, temp_portfolio):
         assert count_iterations_for_task(temp_portfolio["root"], "TEST-001") == 0
 
+    def test_legacy_unscoped_void_surfaces_for_any_project(
+        self, temp_portfolio
+    ):
+        """Codex round-8 P2: legacy void events written without project_id
+        (back-compat) must still cause `tasks_show` to flag the task as
+        voided. Absent project_id = wildcard."""
+        import json as _json
+        from clawpm.cli import main
+        from clawpm.tasks import add_task
+
+        # Create a task in alpha + complete it to seed a reflection file
+        runner = CliRunner()
+        config = temp_portfolio["config"]
+        task = add_task(config, "test", title="Legacy")
+        runner.invoke(main, ["-p", "test", "tasks", "state", task.id, "progress"])
+        runner.invoke(main, ["-p", "test", "tasks", "state", task.id, "done"])
+
+        # Hand-write a legacy unscoped void event (no project_id field)
+        ref_file = (
+            temp_portfolio["root"] / "reflections" / f"{task.id}.jsonl"
+        )
+        assert ref_file.exists()
+        with open(ref_file, "a", encoding="utf-8") as f:
+            f.write(_json.dumps({
+                "event": "void",
+                "task_id": task.id,
+                "reason": "legacy",
+                "voided_at": "2025-01-01T00:00:00Z",
+            }) + "\n")
+
+        r = runner.invoke(main, ["-p", "test", "tasks", "show", task.id])
+        assert r.exit_code == 0
+        data = _json.loads(r.output)
+        assert data["reflections_voided"] is True
+
+    def test_void_only_stamps_project_with_explicit_flag(
+        self, temp_portfolio
+    ):
+        """Codex round-8 P1: void must NOT auto-detect project_id (CWD
+        detection picks up the wrong project when the task lives
+        elsewhere). Only explicit --project stamps. Without it, the
+        void is written unscoped (legacy back-compat)."""
+        import json as _json
+        from clawpm.cli import main
+        from clawpm.tasks import add_task
+
+        runner = CliRunner()
+        config = temp_portfolio["config"]
+        task = add_task(config, "test", title="Stamp")
+        runner.invoke(main, ["-p", "test", "tasks", "state", task.id, "progress"])
+        runner.invoke(main, ["-p", "test", "tasks", "state", task.id, "done"])
+
+        # Void WITHOUT --project — should write unscoped void
+        runner.invoke(main, ["reflect", "void", task.id, "--reason", "x"])
+        ref_file = (
+            temp_portfolio["root"] / "reflections" / f"{task.id}.jsonl"
+        )
+        events = [
+            _json.loads(line)
+            for line in ref_file.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        void_events = [e for e in events if e["event"] == "void"]
+        assert len(void_events) == 1
+        # Critical: no project_id stamped (would risk wrong attribution)
+        assert "project_id" not in void_events[0]
+
+    def test_void_with_explicit_project_stamps_project(self, temp_portfolio):
+        import json as _json
+        from clawpm.cli import main
+        from clawpm.tasks import add_task
+
+        runner = CliRunner()
+        config = temp_portfolio["config"]
+        task = add_task(config, "test", title="X")
+        runner.invoke(main, ["-p", "test", "tasks", "state", task.id, "progress"])
+        runner.invoke(main, ["-p", "test", "tasks", "state", task.id, "done"])
+
+        runner.invoke(
+            main,
+            ["reflect", "void", task.id, "--project", "test", "--reason", "x"],
+        )
+        ref_file = (
+            temp_portfolio["root"] / "reflections" / f"{task.id}.jsonl"
+        )
+        events = [
+            _json.loads(line)
+            for line in ref_file.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        void_events = [e for e in events if e["event"] == "void"]
+        assert void_events[0]["project_id"] == "test"
+
     def test_count_iterations_filters_by_project(self, temp_portfolio):
         """Codex round-6 P2: reflection JSONL is keyed by task_id alone,
         so two projects sharing a task_id write to the same file. Counter
