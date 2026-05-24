@@ -203,8 +203,27 @@ def list_missions(
 def get_mission(
     config: PortfolioConfig, project_id: str, mission_id: str
 ) -> Mission | None:
+    """Look up a mission by ID; returns None when not found OR when the ID
+    is malformed (defense-in-depth path-traversal guard).
+
+    Codex round-4 P1: mutating callers (``set_mission_status``,
+    ``add_mission_mini_goal``) flow through ``get_mission`` and then
+    ``_rewrite_mission`` writes back to ``mission.file_path``. A
+    traversal-shaped ID like ``../../foo`` could otherwise overwrite an
+    existing markdown file outside the missions directory whenever such
+    a file is parseable as Mission frontmatter. Validating here is the
+    single point of truth — every mutating flow benefits without each
+    caller needing to remember.
+    """
     md = _missions_dir(config, project_id)
     if md is None:
+        return None
+    try:
+        _assert_safe_mission_id(mission_id)
+    except ValueError:
+        # Treat malformed input as "not found" — callers already handle
+        # None. This is the fail-safe shape: never compose an
+        # attacker-controlled path.
         return None
     path = md / f"{mission_id}.md"
     if not path.exists():

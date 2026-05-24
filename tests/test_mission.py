@@ -349,6 +349,43 @@ class TestMissionIdSafety:
         )
         assert m.id == "TEST-MISSION-042"
 
+    def test_mutating_flows_safe_against_traversal(self, temp_portfolio):
+        """Codex round-4 P1: mutating callers (set_mission_status,
+        add_mission_mini_goal) flow through get_mission then write via
+        _rewrite_mission. A traversal-shaped ID must not overwrite a
+        markdown file outside missions/ even if such a file exists
+        and parses as Mission frontmatter."""
+        config = temp_portfolio["config"]
+        project_dir = temp_portfolio["project_dir"] / ".project"
+        target_file = project_dir / "trojan.md"
+        target_file.write_text(
+            "---\n"
+            "id: trojan\n"
+            "title: Trojan\n"
+            "binary_outcome: Trojan outcome\n"
+            "deadline_days: 14\n"
+            "status: active\n"
+            "mini_goals: []\n"
+            "---\n"
+            "# Trojan\n",
+            encoding="utf-8",
+        )
+
+        # get_mission returns None for malformed input
+        assert get_mission(config, "test", "../trojan") is None
+
+        # set_mission_status raises ValueError (mission not found)
+        with pytest.raises(ValueError, match="Mission not found"):
+            set_mission_status(config, "test", "../trojan", "complete")
+
+        # add_mini_goal raises ValueError (mission not found)
+        task = add_task(config, "test", title="x")
+        with pytest.raises(ValueError, match="Mission not found"):
+            add_mission_mini_goal(config, "test", "../trojan", task.id)
+
+        # Trojan file unchanged
+        assert "Trojan outcome" in target_file.read_text(encoding="utf-8")
+
 
 # ---------------------------------------------------------------------------
 # mission_status
