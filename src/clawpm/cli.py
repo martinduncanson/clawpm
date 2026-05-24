@@ -3183,6 +3183,7 @@ def mission_group() -> None:
 @click.option("--deadline-days", "-d", type=int, default=28, show_default=True, help="Days from now (7-42)")
 @click.option("--body", "-b", default="", help="Mission description (optional)")
 @click.option("--id", "mission_id", default=None, help="Override mission ID (auto-generated otherwise)")
+@click.option("--force", is_flag=True, default=False, help="Overwrite an existing mission file with the same ID (destructive)")
 @click.pass_context
 def mission_add(
     ctx: click.Context,
@@ -3192,6 +3193,7 @@ def mission_add(
     deadline_days: int,
     body: str,
     mission_id: str | None,
+    force: bool,
 ) -> None:
     """Create a new mission. Mini-goals are linked separately via add-goal."""
     from .mission import add_mission
@@ -3208,6 +3210,7 @@ def mission_add(
             deadline_days=deadline_days,
             description=body,
             mission_id=mission_id,
+            force=force,
         )
     except ValueError as exc:
         output_error("mission_add_failed", str(exc), fmt=fmt)

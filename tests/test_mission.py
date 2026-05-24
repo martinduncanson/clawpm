@@ -216,6 +216,94 @@ class TestMissionMiniGoals:
         updated = add_mission_mini_goal(config, "test", m.id, task.id)
         assert len(updated.mini_goals) == 1
 
+    def test_idempotent_relink_works_even_at_cap(self, temp_portfolio):
+        """Codex round-2 P2: re-running add-goal for a task already linked
+        must be a no-op even when the mission is at the 10-goal cap.
+        Otherwise automation retries break."""
+        config = temp_portfolio["config"]
+        m = add_mission(config, "test", "M", "O")
+        tasks = []
+        for i in range(10):
+            t = add_task(config, "test", title=f"G{i}")
+            add_mission_mini_goal(config, "test", m.id, t.id)
+            tasks.append(t)
+        # Mission is at the 10-goal cap. Re-linking the FIRST task must
+        # still be a no-op, not a cap-violation error.
+        updated = add_mission_mini_goal(config, "test", m.id, tasks[0].id)
+        assert len(updated.mini_goals) == 10  # still 10, no duplicate
+
+        # Adding a NEW task (11th) MUST still hit the cap
+        eleventh = add_task(config, "test", title="too many")
+        with pytest.raises(ValueError, match="10 mini-goals"):
+            add_mission_mini_goal(config, "test", m.id, eleventh.id)
+
+
+class TestAddMissionOverwrite:
+    """Codex round-2 P2: explicit --id reuse must not silently destroy
+    an existing mission file."""
+
+    def test_explicit_id_refuses_overwrite_without_force(self, temp_portfolio):
+        config = temp_portfolio["config"]
+        add_mission(config, "test", "First", "outcome A", mission_id="TEST-MISSION-099")
+        with pytest.raises(ValueError, match="already exists"):
+            add_mission(
+                config, "test", "Second", "outcome B",
+                mission_id="TEST-MISSION-099",
+            )
+
+    def test_force_overwrites(self, temp_portfolio):
+        config = temp_portfolio["config"]
+        add_mission(config, "test", "First", "outcome A", mission_id="TEST-MISSION-099")
+        updated = add_mission(
+            config, "test", "Second", "outcome B",
+            mission_id="TEST-MISSION-099", force=True,
+        )
+        assert updated.title == "Second"
+        assert updated.binary_outcome == "outcome B"
+
+    def test_auto_generated_id_doesnt_collide(self, temp_portfolio):
+        """Auto-IDs always pick the next free number — no collision risk."""
+        config = temp_portfolio["config"]
+        m1 = add_mission(config, "test", "A", "oA")
+        m2 = add_mission(config, "test", "B", "oB")
+        assert m1.id != m2.id
+
+    def test_cli_refuses_overwrite_without_force(self, temp_portfolio):
+        from click.testing import CliRunner
+        from clawpm.cli import main
+
+        runner = CliRunner()
+        r = runner.invoke(main, [
+            "-p", "test", "mission", "add",
+            "-t", "A", "-o", "outcome",
+            "--id", "TEST-MISSION-050",
+        ])
+        assert r.exit_code == 0, r.output
+
+        r2 = runner.invoke(main, [
+            "-p", "test", "mission", "add",
+            "-t", "B", "-o", "outcome",
+            "--id", "TEST-MISSION-050",
+        ])
+        assert r2.exit_code == 1
+        assert "already exists" in r2.output
+
+    def test_cli_force_overwrites(self, temp_portfolio):
+        from click.testing import CliRunner
+        from clawpm.cli import main
+
+        runner = CliRunner()
+        runner.invoke(main, [
+            "-p", "test", "mission", "add",
+            "-t", "A", "-o", "oA", "--id", "TEST-MISSION-051",
+        ])
+        r = runner.invoke(main, [
+            "-p", "test", "mission", "add",
+            "-t", "B", "-o", "oB", "--id", "TEST-MISSION-051",
+            "--force",
+        ])
+        assert r.exit_code == 0, r.output
+
 
 # ---------------------------------------------------------------------------
 # mission_status

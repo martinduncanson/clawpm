@@ -200,10 +200,16 @@ def add_mission(
     deadline_days: int = 28,
     description: str = "",
     mission_id: str | None = None,
+    force: bool = False,
 ) -> Mission:
     """Create a new mission file. Does NOT create mini-goal tasks — caller
     is responsible for invoking ``add_mission_mini_goal`` per goal so the
     operator can populate actor + task content explicitly.
+
+    Codex round-2 P2 fix: if an explicit ``mission_id`` is reused, refuse
+    to overwrite the existing mission unless ``force=True``. Silent
+    overwrite via ``--id`` would destroy mini_goals + status state with
+    no recovery path.
     """
     if deadline_days < 7 or deadline_days > 42:
         raise ValueError(
@@ -222,6 +228,16 @@ def add_mission(
                 existing.append(int(m.group(1)))
         next_num = max(existing, default=-1) + 1
         mission_id = f"{prefix}-MISSION-{next_num:03d}"
+    else:
+        # Caller passed an explicit ID — verify it doesn't clobber an
+        # existing mission unless --force.
+        existing_path = md / f"{mission_id}.md"
+        if existing_path.exists() and not force:
+            raise ValueError(
+                f"Mission {mission_id!r} already exists at "
+                f"{existing_path.as_posix()}. Pass force=True to "
+                f"overwrite (destructive), or pick a different ID."
+            )
 
     frontmatter = {
         "id": mission_id,
@@ -274,19 +290,22 @@ def add_mission_mini_goal(
     if mission is None:
         raise ValueError(f"Mission not found: {mission_id}")
 
-    if len(mission.mini_goals) >= 10:
-        raise ValueError(
-            f"Mission {mission_id} already has 10 mini-goals (hard cap). "
-            "Split into a follow-up mission instead."
-        )
-
-    # Check task exists and isn't already a mini-goal of this mission
+    # Codex round-2 P2 fix: idempotency check MUST run before the cap.
+    # Re-running add-goal for a task already linked to this mission
+    # should be a no-op, not a cap violation. Otherwise automation
+    # retries break once the mission fills up.
     from .tasks import get_task
     task = get_task(config, project_id, task_id)
     if task is None:
         raise ValueError(f"Task not found: {task_id}")
     if any(g.id == task_id for g in mission.mini_goals):
         return mission  # idempotent re-link to the SAME mission
+
+    if len(mission.mini_goals) >= 10:
+        raise ValueError(
+            f"Mission {mission_id} already has 10 mini-goals (hard cap). "
+            "Split into a follow-up mission instead."
+        )
 
     # Codex round-1 P2 fix: refuse cross-mission relink. If the task is
     # already a mini-goal of a DIFFERENT mission, silent overwrite would
