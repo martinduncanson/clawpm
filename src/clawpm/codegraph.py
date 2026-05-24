@@ -288,10 +288,17 @@ def count_code_files(repo_path: Path, *, max_walk: int = 5000) -> int:
     Walks lazily and stops at ``max_walk`` to keep doctor fast on
     massive repos; the threshold check (>50) is well below that ceiling
     so the cap doesn't affect the advisory.
+
+    Codex PR#9 round-4 P2: the cap is applied to SCANNED ENTRIES, not
+    matched code files. A data-heavy repo (large ``data/`` or asset
+    tree) with few code files would otherwise walk indefinitely even
+    when no code is being found. Capping scanned entries bounds the
+    walk regardless of code-density.
     """
     if not repo_path.exists():
         return 0
     count = 0
+    scanned = 0
     try:
         for root, dirs, files in os.walk(repo_path):
             # Skip vendored / generated / hidden trees that would inflate
@@ -305,10 +312,11 @@ def count_code_files(repo_path: Path, *, max_walk: int = 5000) -> int:
                 )
             ]
             for f in files:
+                scanned += 1
                 if Path(f).suffix.lower() in _CODE_EXTENSIONS:
                     count += 1
-                    if count >= max_walk:
-                        return count
+                if scanned >= max_walk:
+                    return count
     except OSError:
         return count
     return count
