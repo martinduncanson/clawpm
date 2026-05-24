@@ -190,16 +190,18 @@ def init_in_worktree(worktree_path: Path, *, timeout: int = 60) -> bool:
 # ---------------------------------------------------------------------------
 
 
-# Codex PR#9 round-1 P1 fix: the prior regex started matching at the
-# first `src|lib|...` token anywhere in the string, so a monorepo path
-# like `apps/web/src/main.ts` got truncated to `src/main.ts`. The new
-# pattern anchors at a non-path-character boundary (whitespace,
-# backtick, punctuation, line start) and walks the FULL relative path
-# — 1-6 directory segments ending in a known code extension. The
-# extension whitelist constrains arbitrary operator-input strings.
+# Codex PR#9 round-1 P1 + round-2 P2 fixes:
+#   - Anchored at a non-path-character boundary so monorepo paths like
+#     `apps/web/src/main.ts` capture in full (not truncated at `src/`).
+#   - Segments bound widened from {1,6} to {0,12} so we match BOTH
+#     root files (`main.py`, 0 dir segments) AND deep monorepo layouts
+#     (`apps/web/packages/foo/src/lib/main.ts`).
+#   - Upper bound 12 is loose enough for any realistic layout without
+#     being unbounded — keeps regex matching bounded-time.
+#   - Extension whitelist constrains arbitrary operator-input strings.
 _PATH_RE = re.compile(
     r"(?<![\w/.-])"
-    r"((?:[\w.-]+/){1,6}"
+    r"((?:[\w.-]+/){0,12}"
     r"[\w.-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|cs|rb|php|cpp|hpp|c|h|swift|kt|dart|lua|svelte|liquid|pas))"
     r"(?!\w)"
 )

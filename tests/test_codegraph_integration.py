@@ -167,6 +167,20 @@ class TestPathParser:
         for r in results[1:]:
             assert r == first
 
+    def test_root_file_captured(self):
+        """Codex PR#9 round-2 P2: previously {1,6} segment bound dropped
+        root files like `main.py`. Now {0,12} allows zero segments."""
+        text = "See `main.py` for the entry point."
+        globs = cg._parse_file_paths_to_globs(text, Path("."), max_globs=5)
+        assert "main.py" in globs
+
+    def test_deep_monorepo_path_captured(self):
+        """Upper bound widened to 12 segments accommodates layouts like
+        apps/web/packages/foo/src/lib/main.ts (6 dir segments)."""
+        text = "Entry: `apps/web/packages/foo/src/lib/main.ts`"
+        globs = cg._parse_file_paths_to_globs(text, Path("."), max_globs=5)
+        assert any("apps/web/packages/foo/src/lib" in g for g in globs)
+
 
 class TestSymbolParser:
     def test_parses_symbol_names(self):
