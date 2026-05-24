@@ -369,6 +369,45 @@ class TestMissionIdSafety:
         )
         assert m.id == "MY-AP-MISSION-001"
 
+    def test_auto_id_for_dotted_project_round_trips(self, temp_portfolio):
+        """Codex round-6 P1: project ID with a dot (e.g. `my.app` →
+        prefix `MY.AP`) used to be silently created then unreachable
+        because the validator rejects `.`. Sanitisation: dot → dash."""
+        config = temp_portfolio["config"]
+        proj_dir = config.project_roots[0] / "my.app"
+        proj_dir.mkdir(parents=True, exist_ok=True)
+        (proj_dir / ".project").mkdir(exist_ok=True)
+        (proj_dir / ".project" / "settings.toml").write_text(
+            'id = "my.app"\nname = "Dotted"\nstatus = "active"\npriority = 3\n',
+            encoding="utf-8",
+        )
+        (proj_dir / ".project" / "tasks").mkdir(exist_ok=True)
+
+        m = add_mission(config, "my.app", "X", "Y")
+        # Dot got sanitised to dash
+        assert "." not in m.id
+        # Round-trip via get_mission must work
+        reloaded = get_mission(config, "my.app", m.id)
+        assert reloaded is not None
+
+    def test_auto_id_for_underscore_project_round_trips(self, temp_portfolio):
+        """Project ID `foo_bar` → prefix `FOO_B`; underscore must
+        sanitise away."""
+        config = temp_portfolio["config"]
+        proj_dir = config.project_roots[0] / "foo_bar"
+        proj_dir.mkdir(parents=True, exist_ok=True)
+        (proj_dir / ".project").mkdir(exist_ok=True)
+        (proj_dir / ".project" / "settings.toml").write_text(
+            'id = "foo_bar"\nname = "Under"\nstatus = "active"\npriority = 3\n',
+            encoding="utf-8",
+        )
+        (proj_dir / ".project" / "tasks").mkdir(exist_ok=True)
+
+        m = add_mission(config, "foo_bar", "X", "Y")
+        assert "_" not in m.id
+        reloaded = get_mission(config, "foo_bar", m.id)
+        assert reloaded is not None
+
     def test_auto_id_for_hyphenated_project_round_trips(self, temp_portfolio):
         """End-to-end: a project ID that produces a hyphenated prefix
         creates a mission AND can be looked up via get_mission. Round 5's

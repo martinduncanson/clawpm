@@ -268,7 +268,19 @@ def add_mission(
     md = _ensure_missions_dir(config, project_id)
 
     if not mission_id:
-        prefix = project_id.upper()[:5]
+        # Codex round-6 P1: project_id can contain characters that
+        # `_assert_safe_mission_id` (rightly) rejects — dots, underscores,
+        # unicode, etc. (`my.app` → `MY.AP`; `foo_bar` → `FOO_B`; etc.).
+        # Without sanitisation, add_mission succeeds (writes the file
+        # with the unsanitised ID) but every subsequent get_mission /
+        # set_mission_status / add_mission_mini_goal fails with
+        # not-found because the validator rejects the same ID.
+        # Sanitise: replace any non-[A-Z0-9] with `-`, collapse runs of
+        # dashes, strip leading/trailing dashes. Fall back to `PROJ`
+        # when the result is empty.
+        raw_prefix = project_id.upper()[:5]
+        sanitised = re.sub(r"[^A-Z0-9]+", "-", raw_prefix).strip("-")
+        prefix = sanitised or "PROJ"
         existing = []
         for f in md.glob("*.md"):
             m = re.match(rf"^{re.escape(prefix)}-MISSION-(\d+)$", f.stem)
