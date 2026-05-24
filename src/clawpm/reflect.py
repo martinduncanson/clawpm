@@ -58,7 +58,11 @@ def _compute_actuals(
     task_id: str,
     task_complexity: TaskComplexity | None,
     log_entries: list[WorkLogEntry],
+    portfolio_root: Path | None = None,
+    project_id: str | None = None,
 ) -> Actuals:
+    # Inner name for the cross-project filter below.
+    _project_id_hint = project_id
     """Derive Actuals from work_log entries for a given task.
 
     - duration_min: elapsed minutes between the first ``start`` log entry and now
@@ -101,12 +105,105 @@ def _compute_actuals(
     files_touched = sorted(all_files)
     files_changed_count = len(files_touched) if files_touched else None
 
+    iterations: int | None = None
+    if portfolio_root is not None:
+        # Populate iterations from the JSONL — even 0 is a valid signal
+        # (means dispatch happened but no Stop-hook ever fired).
+        # Pass project_id when available (added via the project_id kwarg
+        # below) so cross-project task_id collisions don't pollute the
+        # count. Legacy callers without project_id get the old behaviour.
+        ic = count_iterations_for_task(
+            portfolio_root, task_id, project_id=_project_id_hint
+        )
+        iterations = ic if ic > 0 else None
+
     return Actuals(
         duration_min=duration_min,
         complexity=task_complexity,
         files_changed=files_changed_count,
         files_touched=files_touched,
+        iterations=iterations,
     )
+
+
+def write_iteration_event(
+    portfolio_root: Path,
+    task_id: str,
+    project_id: str,
+    verdict_ok: bool,
+    verdict_reason: str,
+    verdict_impossible: bool = False,
+) -> Path:
+    """Append a single iteration_event line to the task's reflection JSONL.
+
+    Called from the Stop-hook condition evaluator (CLAWP-017) on every
+    invocation. Each iteration represents one grader cycle in an
+    iterate→grade→revise loop; counts roll up into ``actuals.iterations``
+    at terminal-event time so the operator can see calibration delta on
+    "how many revisions did this task need".
+
+    Returns the path of the JSONL file.
+
+    The event is recorded even if verdict_ok=True (the final iteration
+    counts too) — the consumer that computes ``iterations_actual`` reads
+    all iteration_event lines and reports the count.
+    """
+    record = {
+        "event": "iteration_event",
+        "task_id": task_id,
+        "project_id": project_id,
+        "occurred_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "verdict": {
+            "ok": verdict_ok,
+            "reason": verdict_reason,
+            "impossible": verdict_impossible,
+        },
+    }
+    ref_dir = _reflections_dir(portfolio_root)
+    ref_file = ref_dir / f"{task_id}.jsonl"
+    with open(ref_file, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record) + "\n")
+    return ref_file
+
+
+def count_iterations_for_task(
+    portfolio_root: Path,
+    task_id: str,
+    project_id: str | None = None,
+) -> int:
+    """Count iteration_event lines for a task. Used to populate actuals.iterations.
+
+    Voided events ARE counted — voiding marks a reflection event as bad
+    data for calibration, but the iteration still happened. A separate
+    decision can exclude voided iterations later if Phase 2 calibration
+    demands it.
+
+    **Cross-project isolation** (Codex round-6 P2 fix): the reflection
+    JSONL filename is keyed by ``task_id`` alone, so two projects
+    sharing a task_id write to the same file. When ``project_id`` is
+    provided, this function filters events by project_id to prevent
+    one project's iteration cycles being counted into the other's
+    actuals. ``project_id=None`` preserves the legacy "count everything
+    in this file" behaviour for callers that haven't been threaded yet.
+    """
+    ref_file = _reflections_dir(portfolio_root) / f"{task_id}.jsonl"
+    if not ref_file.exists():
+        return 0
+    count = 0
+    for line in ref_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if rec.get("event") != "iteration_event":
+            continue
+        if project_id is not None and rec.get("project_id") != project_id:
+            continue
+        count += 1
+    return count
 
 
 def _compute_deltas(
@@ -168,6 +265,17 @@ def _compute_deltas(
         deltas["complexity_match"] = None
         deltas["complexity_predicted"] = pred_c
         deltas["complexity_actual"] = actual_c
+
+    # Iterations ratio (CLAWP-019): predicted vs grader-cycle count.
+    # Only meaningful when both sides set; missing data → None.
+    if predictions.predicted_iterations and actuals.iterations is not None:
+        deltas["iterations_ratio"] = round(
+            actuals.iterations / predictions.predicted_iterations, 4
+        )
+    else:
+        deltas["iterations_ratio"] = None
+    deltas["iterations_predicted"] = predictions.predicted_iterations
+    deltas["iterations_actual"] = actuals.iterations
 
     return deltas
 

@@ -154,6 +154,91 @@ def get_task(config: PortfolioConfig, project_id: str, task_id: str) -> Task | N
     return None
 
 
+def select_next_batch(
+    config: PortfolioConfig, project_id: str,
+) -> tuple[int | None, list[Task], list[dict]]:
+    """Return the next dispatchable parallel batch for a project (CLAWP-021).
+
+    Rules:
+      - Only tasks with ``parallel_group`` set are batch-eligible.
+      - The next group is the **lowest group number** such that:
+        (a) at least one task in that group is OPEN or PROGRESS,
+        (b) every task in group N-1 (and below, recursively) is DONE.
+      - Within the eligible group, **all** OPEN/PROGRESS tasks form the
+        candidate batch unless their scope sets overlap. Conflicts are
+        surfaced as a structured list — the caller decides whether to
+        dispatch only the non-conflicting subset or to refuse.
+
+    Returns ``(group_number, candidate_tasks, conflicts)``:
+      - ``group_number``: int or None if no group is dispatchable.
+      - ``candidate_tasks``: tasks in the eligible group that are
+        OPEN/PROGRESS.
+      - ``conflicts``: pairs of overlapping tasks in the candidate set
+        (heuristic via the same prefix-based overlap used by
+        ``clawpm conflicts``).
+    """
+    # Local import to avoid circular: cli.py imports from tasks.py.
+    from .cli import _globs_overlap
+
+    tasks = list_tasks(config, project_id)
+    by_id = {t.id: t for t in tasks}
+
+    # Group tasks by parallel_group; ignore tasks without the field.
+    groups: dict[int, list[Task]] = {}
+    for t in tasks:
+        if t.parallel_group is None:
+            continue
+        groups.setdefault(t.parallel_group, []).append(t)
+
+    if not groups:
+        return (None, [], [])
+
+    # Find the lowest group whose predecessors are all DONE and which has
+    # at least one OPEN/PROGRESS task remaining.
+    sorted_groups = sorted(groups.keys())
+    for g in sorted_groups:
+        # All earlier groups must be entirely done
+        predecessors_done = True
+        for earlier in sorted_groups:
+            if earlier >= g:
+                break
+            if any(
+                t.state != TaskState.DONE for t in groups[earlier]
+            ):
+                predecessors_done = False
+                break
+        if not predecessors_done:
+            continue
+
+        candidates = [
+            t for t in groups[g]
+            if t.state in (TaskState.OPEN, TaskState.PROGRESS)
+        ]
+        if not candidates:
+            # All tasks in this group are already done/blocked; try next.
+            continue
+
+        # Compute pairwise scope overlap among candidates.
+        conflicts: list[dict] = []
+        for i, ta in enumerate(candidates):
+            for tb in candidates[i + 1:]:
+                overlap_globs: list[tuple[str, str]] = []
+                for ga in ta.scope:
+                    for gb in tb.scope:
+                        if _globs_overlap(ga, gb):
+                            overlap_globs.append((ga, gb))
+                if overlap_globs:
+                    conflicts.append({
+                        "task_a": ta.id,
+                        "task_b": tb.id,
+                        "overlapping_globs": overlap_globs,
+                    })
+
+        return (g, candidates, conflicts)
+
+    return (None, [], [])
+
+
 def get_next_task(config: PortfolioConfig, project_id: str) -> Task | None:
     """Get the next task to work on (highest priority open task with satisfied dependencies)."""
     tasks = list_tasks(config, project_id)
@@ -266,6 +351,72 @@ def change_task_state(
     return Task.from_file(new_path)
 
 
+def cascade_unblock_dependents(
+    config: PortfolioConfig,
+    project_id: str,
+    completed_task_id: str,
+) -> list[dict]:
+    """Auto-promote blocked tasks whose deps are now all done.
+
+    Walks blocked tasks; for each whose ``depends`` list includes
+    ``completed_task_id`` AND whose entire ``depends`` set is now in DONE,
+    transitions the task BLOCKED → OPEN.
+
+    Returns one record per cascaded transition:
+    ``{task_id, from_state, to_state, trigger}``. Caller is responsible for
+    emitting work_log entries — keeping log I/O at the CLI boundary matches
+    the rest of the module.
+
+    The cascade is **shallow by design**: only direct dependents of
+    ``completed_task_id`` are re-evaluated. Their own dependents cascade
+    when *they* hit DONE later via the next ``done`` call. This is
+    sufficient because the outer for-loop visits each task at most once
+    and only acts on direct-dependent edges — there is no recursive
+    descent that could loop on a malformed ``A -> B -> A`` graph. If a
+    future iteration makes the cascade recursive, reintroduce a visited
+    set.
+    """
+    all_tasks = list_tasks(config, project_id)
+    by_id = {t.id: t for t in all_tasks}
+
+    transitions: list[dict] = []
+
+    for task in all_tasks:
+        if task.state != TaskState.BLOCKED:
+            continue
+        if completed_task_id not in (task.depends or []):
+            continue
+
+        # All deps done?
+        # Codex P1 fix: a MISSING dependency must be treated as
+        # UNSATISFIED — silently treating a typoed/nonexistent dep ref
+        # as "done" violates the dependency contract. The cascade will
+        # not promote tasks with dangling deps; `clawpm doctor` already
+        # surfaces these via its dangling-ref check.
+        all_deps_done = True
+        for dep_id in task.depends:
+            dep = by_id.get(dep_id)
+            if dep is None or dep.state != TaskState.DONE:
+                all_deps_done = False
+                break
+
+        if not all_deps_done:
+            continue
+
+        moved = change_task_state(
+            config, project_id, task.id, TaskState.OPEN
+        )
+        if moved is not None:
+            transitions.append({
+                "task_id": task.id,
+                "from_state": "blocked",
+                "to_state": "open",
+                "trigger": completed_task_id,
+            })
+
+    return transitions
+
+
 def add_task(
     config: PortfolioConfig,
     project_id: str,
@@ -277,6 +428,7 @@ def add_task(
     scope: list[str] | None = None,
     description: str = "",
     predictions: Predictions | None = None,
+    parallel_group: int | None = None,
 ) -> Task | None:
     """Add a new task to a project."""
     tasks_dir = get_tasks_dir(config, project_id)
@@ -344,6 +496,9 @@ def add_task(
     if scope:
         frontmatter["scope"] = scope
 
+    if parallel_group is not None:
+        frontmatter["parallel_group"] = parallel_group
+
     if predictions and not predictions.is_empty():
         pred_dict = predictions.to_dict()
         # Strip None / empty-list values to keep the file clean
@@ -392,6 +547,8 @@ def edit_task(
     scope: list[str] | None = None,
     body: str | None = None,
     predictions: Predictions | None = None,
+    parallel_group: int | None = None,
+    clear_parallel_group: bool = False,
 ) -> Task | None:
     """Edit task metadata (frontmatter) and optionally title/body."""
     task = get_task(config, project_id, task_id)
@@ -423,6 +580,10 @@ def edit_task(
             frontmatter["scope"] = scope
         else:
             frontmatter.pop("scope", None)
+    if clear_parallel_group:
+        frontmatter.pop("parallel_group", None)
+    elif parallel_group is not None:
+        frontmatter["parallel_group"] = parallel_group
     if predictions is not None:
         if predictions.is_empty():
             frontmatter.pop("predictions", None)

@@ -12,6 +12,8 @@ import click
 from . import __version__
 from .models import (
     ProjectStatus,
+    SuccessCriterion,
+    Task,
     TaskState,
     TaskComplexity,
     WorkLogAction,
@@ -523,6 +525,7 @@ def project_doctor(
 
     issues: list[dict] = []
     stale_tasks: list[dict] = []
+    stale_blocked: list[dict] = []
     drift_tasks: list[dict] = []
     unreadable_files: list[dict] = []
     commit_drift: list[dict] = []
@@ -719,6 +722,62 @@ def project_doctor(
                 "detail": f"Both {stem}.md and {stem}.progress.md exist — likely incomplete git mv",
             })
 
+        # --- Cascade health check: stale-blocked tasks whose deps are all done.
+        # The auto-cascade in tasks_state catches new transitions; this check
+        # catches the historical backlog of tasks blocked before cascade landed.
+        STALE_BLOCKED_HOURS = 24
+        blocked_dir = tasks_dir / "blocked"
+        if blocked_dir.exists():
+            tasks_for_lookup = list_tasks(config, proj.id)
+            by_id = {t.id: t for t in tasks_for_lookup}
+            cutoff_blocked = now_utc - timedelta(hours=STALE_BLOCKED_HOURS)
+            for blocked_file in blocked_dir.glob("*.md"):
+                try:
+                    bt = Task.from_file(blocked_file)
+                except (OSError, UnicodeDecodeError) as exc:
+                    # Surface unreadable files via the existing doctor
+                    # channel rather than silently skipping them.
+                    unreadable_files.append({
+                        "file": blocked_file.as_posix(),
+                        "project_id": proj.id,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    })
+                    continue
+                if not bt.depends:
+                    continue
+                # All deps resolved to done?
+                deps_resolved = True
+                missing_deps: list[str] = []
+                for dep_id in bt.depends:
+                    dep = by_id.get(dep_id)
+                    if dep is None:
+                        missing_deps.append(dep_id)
+                        continue
+                    if dep.state != TaskState.DONE:
+                        deps_resolved = False
+                        break
+                if not deps_resolved:
+                    continue
+                try:
+                    btime = datetime.fromtimestamp(
+                        blocked_file.stat().st_mtime, tz=timezone.utc
+                    )
+                except OSError:
+                    continue
+                if btime > cutoff_blocked:
+                    continue
+                stale_blocked.append({
+                    "task_id": bt.id,
+                    "project_id": proj.id,
+                    "blocked_since": btime.isoformat().replace("+00:00", "Z"),
+                    "deps": bt.depends,
+                    "missing_deps": missing_deps,
+                    "suggested_action": (
+                        "All deps are done — run `clawpm unblock` to promote, "
+                        "or remove stale dep refs"
+                    ),
+                })
+
     # --- Phase 1.8 Check d: Code-vs-tracking drift ---
     # For each project with a repo_path, compare the timestamp of the latest
     # work_log entry to commits authored after that time. >threshold = warn.
@@ -826,7 +885,7 @@ def project_doctor(
 
     # Build final output
     has_warnings = bool(
-        stale_tasks or drift_tasks or prefix_collisions or unreadable_files
+        stale_tasks or stale_blocked or drift_tasks or prefix_collisions or unreadable_files
         or commit_drift or missing_markers or codex_availability
         or any(i["level"] == "warning" for i in issues)
     )
@@ -836,6 +895,7 @@ def project_doctor(
             "issues": issues,
             "count": len(issues),
             "stale_tasks": stale_tasks,
+            "stale_blocked": stale_blocked,
             "drift_tasks": drift_tasks,
             "prefix_collisions": prefix_collisions,
             "unreadable_files": unreadable_files,
@@ -845,7 +905,7 @@ def project_doctor(
         })
     else:
         if not (
-            issues or stale_tasks or drift_tasks or prefix_collisions or unreadable_files
+            issues or stale_tasks or stale_blocked or drift_tasks or prefix_collisions or unreadable_files
             or commit_drift or missing_markers or codex_availability
         ):
             click.echo("[OK] No issues found")
@@ -857,6 +917,11 @@ def project_doctor(
                 click.echo(
                     f"[WARNING] [stale] {st['task_id']} ({st['project_id']}) "
                     f"- {st['days_stale']} days stale. {st['suggested_action']}"
+                )
+            for sb in stale_blocked:
+                click.echo(
+                    f"[WARNING] [stale-blocked] {sb['task_id']} ({sb['project_id']}) "
+                    f"- all deps done but still in blocked/. {sb['suggested_action']}"
                 )
             for dt in drift_tasks:
                 click.echo(f"[WARNING] [drift] {dt['file']} - {dt['issue']}")
@@ -953,7 +1018,13 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
         output_error("task_not_found", f"No task with id '{task_id}' in project '{project_id}'", fmt=fmt)
         sys.exit(1)
 
-    # Phase 1.6: surface void tag if any reflection has been voided
+    # Phase 1.6: surface void tag if any reflection has been voided.
+    # Cross-project isolation (round-7 audit + round-8 P2 follow-up):
+    # the reflection JSONL filename is keyed by task_id alone, so two
+    # projects sharing a task_id share a file. Filter by project_id —
+    # but treat ABSENT project_id as legacy/unscoped and matching any
+    # (back-compat for void events written before project_id stamping
+    # was introduced).
     import json as _json_show
     reflections_voided = False
     ref_file = config.portfolio_root / "reflections" / f"{task_id}.jsonl"
@@ -964,7 +1035,10 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
                 continue
             try:
                 _rec = _json_show.loads(_line)
-                if _rec.get("event") == "void":
+                if _rec.get("event") != "void":
+                    continue
+                rec_proj = _rec.get("project_id")
+                if rec_proj is None or rec_proj == project_id:
                     reflections_voided = True
                     break
             except _json_show.JSONDecodeError:
@@ -988,6 +1062,8 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
 @click.option("--complexity", "-c", type=click.Choice(["s", "m", "l", "xl"]), help="New complexity")
 @click.option("--body", "-b", help="New body content (replaces description before ## sections)")
 @click.option("--scope", "-s", "scope", multiple=True, help="File glob patterns claimed by this task (can specify multiple)")
+@click.option("--parallel-group", "parallel_group", type=int, default=None, help="Batch ordinal for parallel dispatch (CLAWP-021). Use --clear-parallel-group to remove.")
+@click.option("--clear-parallel-group", "clear_parallel_group", is_flag=True, default=False, help="Remove parallel_group from the task — opts out of batch dispatch.")
 # --- Prediction flags (all optional) ---
 @click.option("--predict-duration", "predict_duration", default=None, help="Predicted duration: 90, 90m, 2h, 3d, 1w")
 @click.option("--predict-complexity", "predict_complexity", type=click.Choice(["s", "m", "l", "xl"]), default=None, help="Predicted complexity")
@@ -1003,6 +1079,7 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
 @click.option("--confidence", "confidence", type=int, default=None, help="Operator confidence 1-5 (1=wild guess, 5=done this before)")
 @click.option("--reference-task", "reference_tasks", multiple=True, help="Prior task IDs used as reference class (repeatable)")
 @click.option("--pre-mortem", "pre_mortem", default=None, help="'If this task fails, the most likely cause is...'")
+@click.option("--predict-iterations", "predict_iterations", type=int, default=None, help="Predicted iterate→grade→revise cycles (CLAWP-019). Default None; 1 means 'expected to land in one pass'.")
 @click.pass_context
 def tasks_edit(
     ctx: click.Context,
@@ -1013,6 +1090,8 @@ def tasks_edit(
     complexity: str | None,
     body: str | None,
     scope: tuple[str, ...],
+    parallel_group: int | None,
+    clear_parallel_group: bool,
     predict_duration: str | None,
     predict_complexity: str | None,
     predict_files_changed: int | None,
@@ -1026,6 +1105,7 @@ def tasks_edit(
     confidence: int | None,
     reference_tasks: tuple[str, ...],
     pre_mortem: str | None,
+    predict_iterations: int | None,
 ) -> None:
     """Edit task metadata (title, priority, complexity, body, scope)."""
     fmt = get_format(ctx)
@@ -1053,10 +1133,15 @@ def tasks_edit(
         confidence is not None,
         reference_tasks,
         pre_mortem is not None,
+        predict_iterations is not None,
     ])
 
-    if not any([title, priority is not None, complexity, body, scope, has_predictions]):
-        output_error("no_changes", "Specify at least one field to edit (--title, --priority, --complexity, --body, --scope, or --predict-*)", fmt=fmt)
+    if not any([title, priority is not None, complexity, body, scope, has_predictions, parallel_group is not None, clear_parallel_group]):
+        output_error("no_changes", "Specify at least one field to edit (--title, --priority, --complexity, --body, --scope, --parallel-group, --clear-parallel-group, or --predict-*)", fmt=fmt)
+        sys.exit(1)
+
+    if parallel_group is not None and clear_parallel_group:
+        output_error("conflicting_flags", "Cannot use both --parallel-group and --clear-parallel-group", fmt=fmt)
         sys.exit(1)
 
     cmplx = TaskComplexity(complexity) if complexity else None
@@ -1078,14 +1163,17 @@ def tasks_edit(
             frameworks=list(predict_frameworks),
             pitfalls=predict_pitfalls,
             hypothesis=hypothesis,
-            success_criteria=list(success_criteria),
+            success_criteria=[SuccessCriterion.from_cli(s) for s in success_criteria],
             approach=predict_approach,
             unknowns=unknowns,
             confidence=confidence,
             reference_tasks=list(reference_tasks),
             pre_mortem=pre_mortem,
+            predicted_iterations=predict_iterations,
         )
 
+    # --clear-parallel-group: explicit removal. --parallel-group N: set.
+    # 0 is now a valid group ordinal (sorts first); use --clear- to remove.
     task = edit_task(
         config,
         project_id,
@@ -1096,6 +1184,8 @@ def tasks_edit(
         scope=scope_list,
         body=body,
         predictions=predictions,
+        parallel_group=parallel_group,
+        clear_parallel_group=clear_parallel_group,
     )
 
     if not task:
@@ -1200,6 +1290,105 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
             auto=True,
         )
 
+    # Dependency cascade: when a task hits DONE, auto-promote any blocked
+    # tasks whose dep list is now satisfied. Emit one work_log entry per
+    # cascaded transition so the trigger is auditable.
+    cascade_results: list[dict] = []
+    cascade_errors: list[dict] = []
+    teardowns: list[dict] = []
+    teardown_errors: list[dict] = []
+    if state == TaskState.DONE:
+        from .tasks import cascade_unblock_dependents
+        try:
+            cascade_results = cascade_unblock_dependents(config, project_id, task_id)
+        except (OSError, KeyError) as exc:
+            # Filesystem or graph errors leave the cascade in a partial
+            # state but must NOT block the user's done. Surface the
+            # error in the response so it's visible — don't silently drop.
+            cascade_errors.append({"error_class": type(exc).__name__, "message": str(exc)})
+
+        for cr in cascade_results:
+            add_entry(
+                config,
+                project=project_id,
+                action=WorkLogAction.CASCADE_UNBLOCK,
+                task=cr["task_id"],
+                summary=f"Auto-unblocked by completion of {cr['trigger']}",
+                auto=True,
+            )
+
+        # Auto-teardown dispatch settings that reference the just-done task.
+        # Codex round-4 fix: use the portfolio dispatch registry so we
+        # find EVERY target_dir the operator dispatched to (custom
+        # --target-dir, CWD-at-time-of-dispatch, repo subdirs, etc.) —
+        # not just the hardcoded repo_path + worktree pair. Falls back
+        # to the legacy locations as a belt-and-braces second pass for
+        # dispatches that pre-date the registry.
+        from .dispatch import (
+            active_dispatch_dirs,
+            read_dispatch_marker,
+            teardown_dispatch_settings,
+        )
+        project = get_project(config, project_id)
+        candidate_dirs: list[Path] = list(
+            active_dispatch_dirs(
+                config.portfolio_root, task_id, project_id
+            )
+        )
+        # Legacy fallback: dispatches written before the registry was
+        # introduced won't appear in active_dispatch_dirs. Probe the
+        # canonical locations so existing in-flight dispatches still
+        # get torn down on their next done.
+        if project and project.repo_path and project.repo_path.exists():
+            if project.repo_path not in candidate_dirs:
+                candidate_dirs.append(project.repo_path)
+            wt_dir = project.repo_path / ".clawpm-worktrees" / task_id
+            if wt_dir.exists() and wt_dir not in candidate_dirs:
+                candidate_dirs.append(wt_dir)
+        seen_dirs: set[str] = set()
+        for cand in candidate_dirs:
+            # Dedup by resolved path so registry + legacy probes don't
+            # double-fire on the same directory.
+            try:
+                key = str(cand.resolve())
+            except OSError:
+                key = str(cand)
+            if key in seen_dirs:
+                continue
+            seen_dirs.add(key)
+            marker = read_dispatch_marker(cand)
+            # Codex round-6 P1: must match BOTH task_id AND project_id.
+            # Without the project_id check on the marker, completing a
+            # task in project A could tear down a same-task-id dispatch
+            # in project B via the legacy fallback probe (registry
+            # filter doesn't apply to the fallback candidates).
+            if (
+                marker
+                and marker.get("task_id") == task_id
+                and marker.get("project_id") == project_id
+            ):
+                try:
+                    teardown_dispatch_settings(
+                        cand,
+                        task_id=task_id,
+                        portfolio_root=config.portfolio_root,
+                        project_id=project_id,
+                    )
+                    teardowns.append({
+                        "target_dir": cand.as_posix(),
+                        "task_id": task_id,
+                    })
+                except (OSError, PermissionError) as exc:
+                    # Filesystem failure is the only realistic class here.
+                    # Surface to the response — silent leftover settings.json
+                    # is exactly the "stale dispatch" failure mode this
+                    # entire feature exists to prevent.
+                    teardown_errors.append({
+                        "target_dir": cand.as_posix(),
+                        "error_class": type(exc).__name__,
+                        "message": str(exc),
+                    })
+
     # Write reflection event when task completes or is blocked
     if state in (TaskState.DONE, TaskState.BLOCKED) and pre_transition_task:
         try:
@@ -1209,6 +1398,8 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
                 task_id,
                 pre_transition_task.complexity,
                 all_log_entries,
+                portfolio_root=config.portfolio_root,
+                project_id=project_id,
             )
             event_name = "task_done" if state == TaskState.DONE else "task_blocked"
             write_reflection_event(
@@ -1227,7 +1418,16 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
             # Never let reflection failure block the state change
             pass
 
-    output_success(f"Task {task_id} moved to {new_state}", data=task.to_dict(), fmt=fmt)
+    data = task.to_dict()
+    if cascade_results:
+        data["cascade_unblocks"] = cascade_results
+    if cascade_errors:
+        data["cascade_errors"] = cascade_errors
+    if teardowns:
+        data["dispatch_teardowns"] = teardowns
+    if teardown_errors:
+        data["dispatch_teardown_errors"] = teardown_errors
+    output_success(f"Task {task_id} moved to {new_state}", data=data, fmt=fmt)
 
 
 @tasks.command("add")
@@ -1238,6 +1438,7 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
 @click.option("--complexity", "-c", type=click.Choice(["s", "m", "l", "xl"]), help="Complexity")
 @click.option("--depends", "-d", multiple=True, help="Dependencies (can specify multiple)")
 @click.option("--scope", multiple=True, help="File glob patterns claimed by this task (can specify multiple)")
+@click.option("--parallel-group", "parallel_group", type=int, default=None, help="Batch ordinal for parallel dispatch (CLAWP-021). Tasks sharing a group dispatch together; group N+1 waits for group N.")
 @click.option("--parent", "parent_id", help="Parent task ID (creates subtask)")
 @click.option("--description", help="Task description (deprecated, use --body)")
 @click.option("--body", "-b", help="Task body content")
@@ -1258,6 +1459,7 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
 @click.option("--confidence", "confidence", type=int, default=None, help="Operator confidence 1-5 (1=wild guess, 5=done this before)")
 @click.option("--reference-task", "reference_tasks", multiple=True, help="Prior task IDs used as reference class (repeatable)")
 @click.option("--pre-mortem", "pre_mortem", default=None, help="'If this task fails, the most likely cause is...'")
+@click.option("--predict-iterations", "predict_iterations", type=int, default=None, help="Predicted iterate→grade→revise cycles (CLAWP-019). Default None; 1 means 'expected to land in one pass'.")
 # --- Phase 1.6 attribution flag ---
 @click.option(
     "--predicted-by", "predicted_by",
@@ -1275,6 +1477,7 @@ def tasks_add(
     complexity: str | None,
     depends: tuple[str, ...],
     scope: tuple[str, ...],
+    parallel_group: int | None,
     parent_id: str | None,
     description: str | None,
     body: str | None,
@@ -1293,6 +1496,7 @@ def tasks_add(
     confidence: int | None,
     reference_tasks: tuple[str, ...],
     pre_mortem: str | None,
+    predict_iterations: int | None,
     predicted_by: str | None,
 ) -> None:
     """Add a new task (or subtask with --parent)."""
@@ -1344,6 +1548,7 @@ def tasks_add(
         confidence is not None,
         reference_tasks,
         pre_mortem is not None,
+        predict_iterations is not None,
     ])
     filled_by: str | None = predicted_by if predicted_by is not None else (
         "operator" if _has_predictions else None
@@ -1358,12 +1563,13 @@ def tasks_add(
         frameworks=list(predict_frameworks),
         pitfalls=predict_pitfalls,
         hypothesis=hypothesis,
-        success_criteria=list(success_criteria),
+        success_criteria=[SuccessCriterion.from_cli(s) for s in success_criteria],
         approach=predict_approach,
         unknowns=unknowns,
         confidence=confidence,
         reference_tasks=list(reference_tasks),
         pre_mortem=pre_mortem,
+        predicted_iterations=predict_iterations,
         filled_by=filled_by,
     )
 
@@ -1392,6 +1598,7 @@ def tasks_add(
             scope=scope_list,
             description=task_body,
             predictions=predictions,
+            parallel_group=parallel_group,
         )
 
     if not task:
@@ -1420,6 +1627,243 @@ def tasks_add(
         sys.exit(1)
 
     output_success(f"Task {task.id} created", data=task.to_dict(), fmt=fmt)
+
+
+@tasks.command("emit-rubric")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
+@click.argument("task_id")
+@click.option(
+    "--format", "rubric_format",
+    type=click.Choice(["markdown", "outcome-payload"]),
+    default="markdown",
+    help=(
+        "markdown: print the rubric for piping into a Stop-hook prompt or "
+        "human review. outcome-payload: JSON shaped for Anthropic's "
+        "user.define_outcome event."
+    ),
+)
+@click.pass_context
+def tasks_emit_rubric(
+    ctx: click.Context,
+    project_id: str | None,
+    task_id: str,
+    rubric_format: str,
+) -> None:
+    """Render a task's success-criteria as a graded-criteria rubric.
+
+    The same rubric drives both clawpm's local Stop-hook condition evaluator
+    (CLAWP-017) and an Anthropic Managed Agents ``user.define_outcome``
+    event — clawpm is the persistence layer, the rubric is the contract.
+    """
+    import json as _json_rub
+    from .rubric import render_rubric_markdown, render_rubric_json_payload
+
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+
+    project_id, _ = require_project(ctx, project_id)
+    task_id = expand_task_id(task_id, project_id)
+
+    task = get_task(config, project_id, task_id)
+    if not task:
+        output_error(
+            "task_not_found",
+            f"No task with id '{task_id}' in project '{project_id}'",
+            fmt=fmt,
+        )
+        sys.exit(1)
+
+    if rubric_format == "markdown":
+        # The rubric IS the output — bypass output_success because the
+        # consumer (a hook command, or pipe to file) usually wants the raw
+        # markdown without a JSON envelope.
+        if fmt == OutputFormat.JSON:
+            output_json({
+                "status": "ok",
+                "task_id": task.id,
+                "format": "markdown",
+                "rubric": render_rubric_markdown(task),
+            })
+        else:
+            click.echo(render_rubric_markdown(task))
+    else:
+        payload = render_rubric_json_payload(task)
+        if fmt == OutputFormat.JSON:
+            output_json({
+                "status": "ok",
+                "task_id": task.id,
+                "format": "outcome-payload",
+                "payload": payload,
+            })
+        else:
+            click.echo(_json_rub.dumps(payload, indent=2))
+
+
+@tasks.command("dispatch")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
+@click.argument("task_id")
+@click.option(
+    "--target-dir", "target_dir", type=click.Path(), default=None,
+    help="Directory to write .claude/settings.local.json into. Default: current directory."
+)
+@click.option(
+    "--worktree", is_flag=True, default=False,
+    help="Create a git worktree at .clawpm-worktrees/<task-id>/ and dispatch there."
+)
+@click.option(
+    "--no-session-context", is_flag=True, default=False,
+    help="Skip SessionStart rubric injection (default: inject)."
+)
+@click.option(
+    "--force", "-f", is_flag=True, default=False,
+    help="Back up + overwrite an existing settings.local.json."
+)
+@click.pass_context
+def tasks_dispatch(
+    ctx: click.Context,
+    project_id: str | None,
+    task_id: str,
+    target_dir: str | None,
+    worktree: bool,
+    no_session_context: bool,
+    force: bool,
+) -> None:
+    """Emit hook-wired .claude/settings.local.json for a dispatched subagent (CLAWP-018).
+
+    The subagent uses Claude Code as normal; clawpm gets state updates and
+    success-criteria enforcement at the dispatch boundary. The Stop hook
+    blocks termination until the task's rubric (CLAWP-016) is satisfied,
+    via the local condition evaluator (CLAWP-017).
+
+    With --worktree, creates a git worktree under .clawpm-worktrees/<id>/
+    so multiple subagents can be dispatched in parallel without colliding
+    on a single .claude/settings.local.json.
+    """
+    from .dispatch import (
+        create_worktree,
+        settings_path,
+        write_dispatch_settings,
+    )
+    from .rubric import render_rubric_markdown
+
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+    project_id, _source = require_project(ctx, project_id)
+    task_id = expand_task_id(task_id, project_id)
+
+    task = get_task(config, project_id, task_id)
+    if not task:
+        output_error("task_not_found", f"No task with id '{task_id}'", fmt=fmt)
+        sys.exit(1)
+
+    project = get_project(config, project_id)
+    # Resolve target directory
+    if worktree:
+        if not project or not project.repo_path or not project.repo_path.exists():
+            output_error(
+                "no_repo",
+                "--worktree requires the project to have a valid repo_path "
+                f"(got {(project.repo_path if project else None)!r})",
+                fmt=fmt,
+            )
+            sys.exit(1)
+        try:
+            resolved_dir = create_worktree(project.repo_path, task_id)
+        except subprocess.CalledProcessError as exc:
+            output_error(
+                "worktree_failed",
+                f"git worktree add failed: {exc.stderr or exc.stdout}",
+                fmt=fmt,
+            )
+            sys.exit(1)
+    elif target_dir:
+        resolved_dir = Path(target_dir)
+        resolved_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        resolved_dir = Path.cwd()
+
+    rubric = None if no_session_context else render_rubric_markdown(task)
+
+    try:
+        path = write_dispatch_settings(
+            target_dir=resolved_dir,
+            task_id=task_id,
+            project_id=project_id,
+            rubric_markdown=rubric,
+            force=force,
+            portfolio_root=config.portfolio_root,
+        )
+    except (FileExistsError, ValueError) as exc:
+        output_error("dispatch_blocked", str(exc), fmt=fmt)
+        sys.exit(1)
+
+    invocation = f"cd {resolved_dir.as_posix()} && claude"
+    output_success(
+        f"Task {task_id} dispatched to {resolved_dir}",
+        data={
+            "task_id": task_id,
+            "target_dir": resolved_dir.as_posix(),
+            "settings_path": path.as_posix(),
+            "worktree": worktree,
+            "invocation": invocation,
+            "rubric_injected": rubric is not None,
+        },
+        fmt=fmt,
+    )
+
+
+@tasks.command("teardown-dispatch")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
+@click.argument("task_id", required=False)
+@click.option(
+    "--target-dir", "target_dir", type=click.Path(), default=None,
+    help="Directory containing .claude/settings.local.json. Default: current directory."
+)
+@click.option(
+    "--force", "-f", is_flag=True, default=False,
+    help="Remove the file even if it's not clawpm-managed (dangerous)."
+)
+@click.pass_context
+def tasks_teardown_dispatch(
+    ctx: click.Context,
+    project_id: str | None,
+    task_id: str | None,
+    target_dir: str | None,
+    force: bool,
+) -> None:
+    """Remove a dispatch .claude/settings.local.json.
+
+    By default, only removes files clawpm wrote (marker present) for the
+    given task_id. Without task_id, removes any clawpm-managed dispatch.
+    """
+    from .dispatch import read_dispatch_marker, teardown_dispatch_settings
+
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+    if task_id:
+        project_id, _ = require_project(ctx, project_id)
+        task_id = expand_task_id(task_id, project_id)
+
+    resolved_dir = Path(target_dir) if target_dir else Path.cwd()
+    marker = read_dispatch_marker(resolved_dir)
+
+    removed = teardown_dispatch_settings(
+        resolved_dir,
+        task_id=task_id,
+        force=force,
+        portfolio_root=config.portfolio_root,
+        project_id=project_id,
+    )
+
+    output_success(
+        "Dispatch torn down" if removed else "Nothing to tear down",
+        data={
+            "removed": removed,
+            "target_dir": resolved_dir.as_posix(),
+            "previous_marker": marker,
+        },
+        fmt=fmt,
+    )
 
 
 @tasks.command("split")
@@ -1577,12 +2021,58 @@ def quick_unblock(ctx: click.Context, project_id: str | None, task_id: str, note
 
 @main.command("next")
 @click.option("--project", "-p", "project_id", help="Project ID (if not specified, searches all)")
+@click.option(
+    "--batch", "batch_mode", is_flag=True, default=False,
+    help="Return the next parallel batch (tasks sharing the lowest open parallel_group) instead of a single task (CLAWP-021).",
+)
 @click.pass_context
-def quick_next(ctx: click.Context, project_id: str | None) -> None:
-    """Get the next task to work on."""
+def quick_next(ctx: click.Context, project_id: str | None, batch_mode: bool) -> None:
+    """Get the next task to work on, or the next parallel batch with --batch."""
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
-    
+
+    if batch_mode:
+        # Batch mode requires a single project — we don't aggregate batches
+        # across projects (a batch is a unit of parallel dispatch, not a
+        # cross-portfolio queue).
+        project_id, _ = require_project(ctx, project_id)
+        from .tasks import select_next_batch
+        group, candidates, conflicts = select_next_batch(config, project_id)
+
+        if group is None:
+            payload = {
+                "group": None,
+                "candidates": [],
+                "conflicts": [],
+                "message": "No parallel batch available. Tasks need parallel_group: N in frontmatter to be batch-eligible.",
+            }
+        else:
+            payload = {
+                "group": group,
+                "candidates": [t.to_dict() for t in candidates],
+                "conflicts": conflicts,
+                "dispatch_safe": len(conflicts) == 0,
+            }
+        if fmt == OutputFormat.JSON:
+            output_json(payload)
+        else:
+            if group is None:
+                click.echo(payload["message"])
+            else:
+                click.echo(f"Parallel group {group}: {len(candidates)} candidate task(s)")
+                for t in candidates:
+                    click.echo(f"  - {t.id} [{t.state.value}] {t.title}")
+                if conflicts:
+                    click.echo("\nSCOPE CONFLICTS — cannot dispatch as a single batch:")
+                    for c in conflicts:
+                        click.echo(
+                            f"  {c['task_a']} <-> {c['task_b']}: "
+                            f"{c['overlapping_globs']}"
+                        )
+                else:
+                    click.echo("\nDispatch-safe: no scope overlaps.")
+        return
+
     if project_id:
         # Get next task for specific project
         task = get_next_task(config, project_id)
@@ -2139,6 +2629,236 @@ def log_commit(ctx: click.Context, project_id: str | None, limit: int, task_id: 
         click.echo(f"Logged {len(logged)} commit(s), skipped {len(commits) - len(new_commits)} already logged")
         for e in logged:
             click.echo(f"  {e.commit_hash[:8] if e.commit_hash else '?'} {e.summary}")
+
+
+# ============================================================================
+# Hook subcommands (called by Claude Code hooks; not for direct human use)
+# ============================================================================
+
+
+@main.group()
+def hook() -> None:
+    """Hook-callable subcommands for Claude Code integration.
+
+    These commands are designed to be wired into ``.claude/settings.json``
+    (or ``.claude/settings.local.json``) Stop / PostToolUse hooks. They
+    read the standard hook stdin JSON and emit hook output JSON on stdout.
+    """
+    pass
+
+
+@hook.command("session-start")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
+@click.option("--task", "task_id", required=True, help="Task ID whose SessionStart sidecar to emit")
+@click.pass_context
+def hook_session_start(
+    ctx: click.Context,
+    project_id: str | None,
+    task_id: str,
+) -> None:
+    """Print the SessionStart additionalContext sidecar to stdout.
+
+    Wired into Claude Code as a SessionStart command hook by
+    `clawpm tasks dispatch`. Reads the sidecar JSON file co-located with
+    settings.local.json and prints it verbatim — Claude Code's hook
+    output schema accepts JSON on stdout. Cross-platform safe (no shell
+    quoting, no embedded JSON in command strings).
+    """
+    import json as _json_ss
+    from .dispatch import session_start_payload_path
+
+    fmt = get_format(ctx)
+    project_id, _ = require_project(ctx, project_id)
+    task_id = expand_task_id(task_id, project_id)
+
+    sidecar = session_start_payload_path(Path.cwd())
+    if not sidecar.exists():
+        # No sidecar = SessionStart was not configured for this dispatch
+        # (or was torn down). Emit an empty hookSpecificOutput so the
+        # hook is a no-op rather than a crash.
+        click.echo(_json_ss.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": "",
+            }
+        }))
+        return
+    try:
+        click.echo(sidecar.read_text(encoding="utf-8"))
+    except OSError as exc:
+        # Read failure must not crash the session start; emit a degraded
+        # but valid hook output with the error surfaced.
+        click.echo(_json_ss.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": (
+                    f"(clawpm: failed to read SessionStart sidecar: {exc})"
+                ),
+            }
+        }))
+
+
+@hook.command("eval-stop")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
+@click.option("--task", "task_id", required=True, help="Task ID whose rubric to evaluate against")
+@click.option("--transcript-file", "transcript_file", type=click.Path(), default=None,
+              help="Path to the transcript file. Overrides hook stdin's transcript_path.")
+@click.option("--rubric-file", "rubric_file", type=click.Path(), default=None,
+              help="Path to a pre-rendered rubric markdown file. Default: render from the task.")
+@click.pass_context
+def hook_eval_stop(
+    ctx: click.Context,
+    project_id: str | None,
+    task_id: str,
+    transcript_file: str | None,
+    rubric_file: str | None,
+) -> None:
+    """Stop-hook condition evaluator (CLAWP-017).
+
+    Reads the Claude Code Stop-hook input from stdin (JSON), extracts the
+    transcript path, renders the task's success-criteria rubric, dispatches
+    a Haiku-class judge, and emits a hook-output JSON deciding whether the
+    subagent may stop.
+
+    Local emulation of Anthropic Managed Agents' Outcomes evaluator — no
+    paid API required; uses the operator's existing Claude Code subscription
+    via subprocess to ``claude --print``. Override the judge with
+    ``CLAWPM_JUDGE_CMD`` env var.
+    """
+    import json as _json_hook
+    from .judges.stop_condition import (
+        evaluate_stop_condition,
+        load_transcript_from_hook_input,
+        map_verdict_to_hook_output,
+    )
+    from .rubric import render_rubric_markdown
+
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+    project_id, _ = require_project(ctx, project_id)
+    task_id = expand_task_id(task_id, project_id)
+
+    # 1. Load the rubric — from file if given, else render from the task.
+    rubric: str
+    if rubric_file:
+        rubric = Path(rubric_file).read_text(encoding="utf-8")
+    else:
+        task = get_task(config, project_id, task_id)
+        if not task:
+            # Task-not-found is a dispatch-config bug, NOT a soft fail.
+            # Block the Stop event so the operator sees the problem in
+            # the transcript rather than discovering it after the subagent
+            # has already finished gated work. Codex round-2 P1: use
+            # `decision: "block"` + `reason` (forces agent to keep
+            # working), NOT `continue: false` (which halts the entire
+            # pipeline / terminates the agent).
+            click.echo(_json_hook.dumps({
+                "decision": "block",
+                "reason": (
+                    f"clawpm eval-stop: task {task_id} not found in "
+                    f"project {project_id} — fix dispatch config "
+                    f"(check `clawpm tasks dispatch --task-id`) before "
+                    f"continuing."
+                ),
+            }))
+            return
+        rubric = render_rubric_markdown(task)
+
+    # 2. Load the transcript — from --transcript-file, or from hook stdin.
+    transcript: str
+    if transcript_file:
+        transcript = Path(transcript_file).read_text(encoding="utf-8", errors="replace")
+    else:
+        # Stop-hook input comes in on stdin.
+        try:
+            stdin_raw = sys.stdin.read()
+        except OSError:
+            stdin_raw = ""
+        if stdin_raw.strip():
+            try:
+                hook_input = _json_hook.loads(stdin_raw)
+            except _json_hook.JSONDecodeError:
+                hook_input = {}
+            try:
+                transcript = load_transcript_from_hook_input(hook_input)
+            except (ValueError, FileNotFoundError) as exc:
+                # Can't find the transcript — surface to operator but don't
+                # block the stop (would loop forever).
+                click.echo(_json_hook.dumps({
+                    "continue": True,
+                    "systemMessage": f"clawpm eval-stop: transcript unavailable ({exc}); rubric not enforced",
+                }))
+                return
+        else:
+            click.echo(_json_hook.dumps({
+                "continue": True,
+                "systemMessage": "clawpm eval-stop: no stdin and no --transcript-file; rubric not enforced",
+            }))
+            return
+
+    # 3. Dispatch the judge. Errors here are unexpected — surface them
+    # in a way that's visible to doctor, not silently swallowed.
+    try:
+        verdict = evaluate_stop_condition(rubric=rubric, transcript=transcript)
+    except RuntimeError as exc:
+        # Judge error = enforcement-layer down. Fail-open (continue=true)
+        # is defensible because blocking forever on a broken judge is
+        # worse, but we MUST leave a doctor signal so repeated judge
+        # errors don't silently degrade clawpm to no-enforcement.
+        try:
+            from .reflect import write_iteration_event
+            write_iteration_event(
+                portfolio_root=config.portfolio_root,
+                task_id=task_id,
+                project_id=project_id,
+                verdict_ok=False,
+                verdict_reason=f"JUDGE_ERROR: {exc}",
+                verdict_impossible=False,
+            )
+        except OSError:
+            # Writing the doctor signal failed too — last resort is the
+            # systemMessage. Don't pile silent failures.
+            pass
+        click.echo(_json_hook.dumps({
+            "continue": True,
+            "systemMessage": (
+                f"clawpm eval-stop: judge error ({exc}); rubric not "
+                f"enforced. Consecutive judge errors will be flagged by "
+                f"clawpm doctor — set CLAWPM_JUDGE_CMD or install Claude "
+                f"Code if this keeps happening."
+            ),
+        }))
+        return
+
+    # CLAWP-019: capture the iteration event. This IS the calibration
+    # spine — narrow exception so a real filesystem failure surfaces in
+    # the systemMessage instead of silently nuking the iteration count.
+    try:
+        from .reflect import write_iteration_event
+        write_iteration_event(
+            portfolio_root=config.portfolio_root,
+            task_id=task_id,
+            project_id=project_id,
+            verdict_ok=verdict.ok,
+            verdict_reason=verdict.reason,
+            verdict_impossible=verdict.impossible,
+        )
+    except OSError as exc:
+        # Disk full / permission / encoding errors. Surface in the
+        # hook output's systemMessage so the operator sees it in the
+        # next transcript update.
+        output = map_verdict_to_hook_output(verdict)
+        # Preserve continue/block decision; just decorate systemMessage.
+        existing_msg = output.get("systemMessage", "")
+        output["systemMessage"] = (
+            f"clawpm eval-stop: iteration event WRITE FAILED ({exc}); "
+            f"calibration data lost for this cycle. {existing_msg}".strip()
+        )
+        click.echo(_json_hook.dumps(output))
+        return
+
+    output = map_verdict_to_hook_output(verdict)
+    click.echo(_json_hook.dumps(output))
 
 
 # ============================================================================
@@ -2824,6 +3544,7 @@ def reflect_history_import(ctx: click.Context, source_dir: str | None) -> None:
 
 @reflect.command("void")
 @click.argument("task_id", required=False, default=None)
+@click.option("--project", "-p", "project_id", default=None, help="Project ID (auto-detected if not specified). Stamped on the void event for cross-project isolation.")
 @click.option("--reason", required=True, help="Why this reflection is bad data (required)")
 @click.option(
     "--all-empty-actuals", "all_empty_actuals", is_flag=True,
@@ -2833,6 +3554,7 @@ def reflect_history_import(ctx: click.Context, source_dir: str | None) -> None:
 def reflect_void(
     ctx: click.Context,
     task_id: str | None,
+    project_id: str | None,
     reason: str,
     all_empty_actuals: bool,
 ) -> None:
@@ -2856,7 +3578,7 @@ def reflect_void(
     voided: list[dict] = []
     errors: list[dict] = []
 
-    def _void_task_reflection(tid: str) -> None:
+    def _void_task_reflection(tid: str, project_hint: str | None = None) -> None:
         ref_file = ref_dir / f"{tid}.jsonl"
         if not ref_file.exists():
             errors.append({"task_id": tid, "error": "no_reflection_file"})
@@ -2871,6 +3593,18 @@ def reflect_void(
             except _json.JSONDecodeError:
                 pass
 
+        # Cross-project isolation (round-7 audit + round-8 P1 follow-up):
+        # the JSONL filename is keyed by task_id alone, so two projects
+        # sharing a task_id share a file. Stamp the void event with
+        # project_id from the EXPLICIT command-line context only — do
+        # not infer from prior file events, because in a shared file
+        # the first record could belong to a different project than
+        # the operator's `--project` context. When no command-line
+        # project is given, fall through to legacy unscoped (matches
+        # back-compat for older voids; consumers must treat absent
+        # project_id as wildcard).
+        resolved_project: str | None = project_hint
+
         # Build the void entry
         void_entry: dict = {
             "event": "void",
@@ -2878,6 +3612,8 @@ def reflect_void(
             "reason": reason,
             "voided_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
+        if resolved_project is not None:
+            void_entry["project_id"] = resolved_project
 
         # Append (atomic: write to .tmp then replace)
         tmp_file = ref_file.with_suffix(".jsonl.tmp")
@@ -2892,6 +3628,16 @@ def reflect_void(
             voided.append({"task_id": tid, "voided_at": void_entry["voided_at"]})
         except OSError as exc:
             errors.append({"task_id": tid, "error": str(exc)})
+
+    # Resolve project_id context for the single-task path. ONLY use
+    # the explicit --project flag, never auto-detect from CWD —
+    # auto-detect can stamp the void with the dev environment's
+    # project instead of the task's real project, which is worse than
+    # stamping unscoped (legacy consumers wildcard on absent
+    # project_id, scoped consumers in shared-task-id files get
+    # mis-attribution). When --project is omitted we fall through to
+    # legacy unscoped behaviour, which is back-compat-safe.
+    cli_project_id: str | None = project_id  # explicit only
 
     if all_empty_actuals:
         if not ref_dir.exists():
@@ -2912,9 +3658,13 @@ def reflect_void(
                 except _json.JSONDecodeError:
                     pass
             if has_empty_actuals:
+                # Corpus sweep emits unscoped voids (cross-project-safe
+                # only because the consumer wildcards on absent
+                # project_id). Don't try to infer project from prior
+                # records — same hazard Codex flagged.
                 _void_task_reflection(derived_tid)
     elif task_id:
-        _void_task_reflection(task_id)
+        _void_task_reflection(task_id, project_hint=cli_project_id)
     else:
         output_error(
             "missing_target",
