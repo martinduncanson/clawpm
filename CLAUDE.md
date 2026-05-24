@@ -14,3 +14,23 @@ This project (clawpm) uses [clawpm](https://github.com/martinduncanson/clawpm) f
 
 If `clawpm` is not on PATH: `pipx install git+https://github.com/martinduncanson/clawpm` (then `clawpm doctor` to verify).
 <!-- /clawpm:project-requirement -->
+
+## Surgical changes
+
+Touch only what the task requires. clawpm is the persistence layer other agents lean on — adjacent edits ripple harder here than in a typical project.
+
+- When editing existing code, don't "improve" adjacent code, comments, or formatting. Match the existing style even when you'd prefer different. The diff Codex sees is the diff you defend.
+- Remove only orphans your own changes created. If you notice unrelated dead code, mention it in the response — don't delete it.
+- The test: every changed line should trace directly to the operator's request OR to a finding from PRE-REVIEW / Codex. Lines that fail that trace are scope creep.
+
+## Task definition discipline
+
+clawpm ships `--success-criteria` + `emit-rubric` + the Stop-hook condition evaluator (CLAWP-016..017) specifically so tasks can be framed as **verifiable goals**, not vague intents. Use the primitive.
+
+- "Add validation" → "Write tests for invalid inputs, then make them pass" (structured `--success-criteria` form: `{criterion, gradeable_signal, comparator}`).
+- "Fix the bug" → "Write a test that reproduces it, then make it pass" — pre-state and post-state both verifiable.
+- "Refactor X" → "Ensure tests pass before and after" + a measurable shape claim (LOC delta, complexity drop, etc.).
+
+Weak criteria ("make it work", "improve X") defeat the rubric's purpose: the Stop-hook judge can't enforce what isn't measurable, and reflection events can't deliver calibration signal on success_criteria that were never gradeable in the first place. When filing a task at confidence ≥3, the rubric should already be sharp enough that another agent — or the local judge — can grade it without you in the loop.
+
+Subagent dispatch (`clawpm tasks dispatch <id>`) puts this on the rails: the subagent literally cannot terminate until the rubric is satisfied or impossibility is independently confirmed. Verifiable goals are not just better hygiene — they're the contract.
