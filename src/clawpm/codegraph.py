@@ -190,12 +190,18 @@ def init_in_worktree(worktree_path: Path, *, timeout: int = 60) -> bool:
 # ---------------------------------------------------------------------------
 
 
-# Match POSIX-style paths under common source roots (src/, lib/, tests/,
-# etc.) plus file extensions we recognise as code. This is intentionally
-# coarse — we'd rather miss a path than introduce one operator input
-# could shape into a glob.
+# Codex PR#9 round-1 P1 fix: the prior regex started matching at the
+# first `src|lib|...` token anywhere in the string, so a monorepo path
+# like `apps/web/src/main.ts` got truncated to `src/main.ts`. The new
+# pattern anchors at a non-path-character boundary (whitespace,
+# backtick, punctuation, line start) and walks the FULL relative path
+# — 1-6 directory segments ending in a known code extension. The
+# extension whitelist constrains arbitrary operator-input strings.
 _PATH_RE = re.compile(
-    r"\b((?:src|lib|tests?|app|pkg|cmd|internal|docs?)/[\w./\\-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|cs|rb|php|cpp|hpp|c|h|swift|kt|dart|lua|svelte|liquid|pas))\b"
+    r"(?<![\w/.-])"
+    r"((?:[\w.-]+/){1,6}"
+    r"[\w.-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|cs|rb|php|cpp|hpp|c|h|swift|kt|dart|lua|svelte|liquid|pas))"
+    r"(?!\w)"
 )
 
 _SYMBOL_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_.]*)`")
@@ -208,12 +214,19 @@ def _parse_file_paths_to_globs(
 
     Single-file hits become ``dir/file.ext`` (exact). Multiple files in
     the same directory roll up to ``dir/**`` to reduce glob count.
+
+    Codex PR#9 round-1 P2 fix: dedupe via ``dict.fromkeys`` rather than
+    ``set`` so iteration order is deterministic (insertion order from
+    the regex pass). This makes ``suggested_scope`` stable across runs
+    and ensures ``max_globs`` truncation drops the SAME globs each
+    invocation — important for caches and snapshot tests.
     """
-    paths = set(_PATH_RE.findall(text))
+    # Preserve first-match order; dedupe by path string.
+    paths = list(dict.fromkeys(_PATH_RE.findall(text)))
     if not paths:
         return []
 
-    # Group by parent dir
+    # Group by parent dir, preserving the order parents first appeared.
     by_parent: dict[str, list[str]] = {}
     for p in paths:
         parent = "/".join(p.split("/")[:-1])

@@ -119,6 +119,54 @@ class TestPathParser:
         globs = cg._parse_file_paths_to_globs(text, Path("."), max_globs=5)
         assert globs == ["src/auth/login.py"]
 
+    def test_monorepo_path_not_truncated(self):
+        """Codex PR#9 round-1 P1: prior regex matched at the first
+        `src|lib|...` token, so monorepo paths got truncated. Now
+        captures the full relative path."""
+        text = "`apps/web/src/main.ts` is the entry point."
+        globs = cg._parse_file_paths_to_globs(text, Path("."), max_globs=5)
+        # Must keep the apps/web/ prefix, not collapse to src/main.ts
+        assert any("apps/web" in g for g in globs)
+        # And no glob should START with src/ (which would mean truncation)
+        assert not any(g.startswith("src/") for g in globs)
+
+    def test_nested_package_layout(self):
+        """packages/foo/lib/bar.py should produce packages/foo/lib
+        path anchoring, not lib/bar.py."""
+        text = "`packages/foo/lib/bar.py`"
+        globs = cg._parse_file_paths_to_globs(text, Path("."), max_globs=5)
+        assert globs == ["packages/foo/lib/bar.py"]
+
+    def test_deterministic_order_across_runs(self):
+        """Codex PR#9 round-1 P2: set() iteration is hash-randomised,
+        so suggested_scope was non-deterministic. Now uses dict.fromkeys
+        for ordered dedup."""
+        text = (
+            "Touched `src/a/x.py`, `src/b/y.py`, `src/c/z.py`, "
+            "`src/d/w.py`, `src/e/v.py`, `src/f/u.py`."
+        )
+        results = [
+            cg._parse_file_paths_to_globs(text, Path("."), max_globs=3)
+            for _ in range(10)
+        ]
+        first = results[0]
+        for r in results[1:]:
+            assert r == first, f"non-deterministic: {first!r} vs {r!r}"
+
+    def test_truncation_drops_consistent_globs(self):
+        """When max_globs caps the result, the SAME entries must be
+        dropped every run (insertion order)."""
+        text = "\n".join(
+            f"See `module{i}/file.py`" for i in range(10)
+        )
+        results = [
+            cg._parse_file_paths_to_globs(text, Path("."), max_globs=3)
+            for _ in range(5)
+        ]
+        first = results[0]
+        for r in results[1:]:
+            assert r == first
+
 
 class TestSymbolParser:
     def test_parses_symbol_names(self):
