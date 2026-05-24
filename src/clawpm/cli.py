@@ -498,6 +498,53 @@ def project_announce(ctx: click.Context, project_id: str | None) -> None:
     is_flag=True,
     help="Network-backed check: for each project with a github.com remote, scan the last 5 closed PRs for Codex-bot appearances. Off by default to keep doctor offline-fast.",
 )
+# --- CLAWP-026: --apply mode ---
+@click.option(
+    "--apply",
+    "apply_mode",
+    is_flag=True,
+    help="After detecting warnings, run deterministic remediation arms (CLAWP-026). "
+         "Half-rename drift, state-field drift, and stale-blocked cascades are auto-applied. "
+         "Stale-tasks, prefix-collisions, unreadable-files, commit-drift, missing-markers, "
+         "and codex-availability stay operator-judgment and are listed in apply_skipped[].",
+)
+@click.option(
+    "--yes",
+    "assume_yes",
+    is_flag=True,
+    help="Non-interactive mode: skip confirmation prompts when --apply is set.",
+)
+@click.option(
+    "--dry-run",
+    "dry_run",
+    is_flag=True,
+    help="With --apply, populate the applied[] array with `would-...` results but do not "
+         "modify the filesystem or run cascades.",
+)
+@click.option(
+    "--no-apply-drift",
+    "no_apply_drift",
+    is_flag=True,
+    help="Disable the drift state-field-mismatch arm of --apply.",
+)
+@click.option(
+    "--no-apply-cascade",
+    "no_apply_cascade",
+    is_flag=True,
+    help="Disable the stale-blocked cascade arm of --apply (alias of --no-apply-stale-blocked).",
+)
+@click.option(
+    "--no-apply-stale-blocked",
+    "no_apply_stale_blocked",
+    is_flag=True,
+    help="Disable the stale-blocked cascade arm of --apply (alias of --no-apply-cascade).",
+)
+@click.option(
+    "--no-apply-half-rename",
+    "no_apply_half_rename",
+    is_flag=True,
+    help="Disable the drift half-rename arm of --apply.",
+)
 @click.pass_context
 def project_doctor(
     ctx: click.Context,
@@ -505,6 +552,13 @@ def project_doctor(
     strict: bool = False,
     commits_drift_threshold: int = 5,
     check_codex: bool = False,
+    apply_mode: bool = False,
+    assume_yes: bool = False,
+    dry_run: bool = False,
+    no_apply_drift: bool = False,
+    no_apply_cascade: bool = False,
+    no_apply_stale_blocked: bool = False,
+    no_apply_half_rename: bool = False,
 ) -> None:
     """Check for issues with projects and portfolio.
 
@@ -890,8 +944,44 @@ def project_doctor(
         or any(i["level"] == "warning" for i in issues)
     )
 
+    # --- CLAWP-026: --apply phase ---
+    applied: list[dict] = []
+    apply_skipped: list[dict] = []
+    apply_aborted = False
+    if apply_mode:
+        # Confirmation gate for interactive (non --yes) runs that will actually
+        # mutate state. Dry-run never prompts because nothing is at stake.
+        proceed = True
+        if has_warnings and not assume_yes and not dry_run:
+            proceed = click.confirm(
+                "Apply auto-remediation arms to the warnings above?",
+                default=False,
+            )
+            if not proceed:
+                apply_aborted = True
+
+        if proceed:
+            from .doctor_apply import run_apply_phase
+
+            applied, apply_skipped = run_apply_phase(
+                config=config,
+                drift_tasks=drift_tasks,
+                stale_blocked=stale_blocked,
+                stale_tasks=stale_tasks,
+                prefix_collisions=prefix_collisions,
+                unreadable_files=unreadable_files,
+                commit_drift=commit_drift,
+                missing_markers=missing_markers,
+                codex_availability=codex_availability,
+                apply_drift_flag=not no_apply_drift,
+                apply_cascade_flag=not no_apply_cascade,
+                apply_stale_blocked_flag=not no_apply_stale_blocked,
+                apply_half_rename_flag=not no_apply_half_rename,
+                dry_run=dry_run,
+            )
+
     if fmt == OutputFormat.JSON:
-        output_json({
+        payload = {
             "issues": issues,
             "count": len(issues),
             "stale_tasks": stale_tasks,
@@ -902,7 +992,12 @@ def project_doctor(
             "commit_drift": commit_drift,
             "missing_markers": missing_markers,
             "codex_availability": codex_availability,
-        })
+        }
+        if apply_mode:
+            payload["applied"] = applied
+            payload["apply_skipped"] = apply_skipped
+            payload["dry_run"] = dry_run
+        output_json(payload)
     else:
         if not (
             issues or stale_tasks or stale_blocked or drift_tasks or prefix_collisions or unreadable_files
@@ -951,6 +1046,15 @@ def project_doctor(
                 click.echo(
                     f"[WARNING] [codex-availability] {ca['project_id']} ({ca['repo']}) "
                     f"- {ca['suggested_action']}"
+                )
+
+        if apply_mode:
+            prefix = "[DRY-RUN]" if dry_run else "[APPLIED]"
+            for a in applied:
+                click.echo(f"{prefix} [{a['class']}] {a.get('target')} -> {a['result']}")
+            for s in apply_skipped:
+                click.echo(
+                    f"[SKIPPED] [{s['class']}] {s.get('target')} -> {s['reason']}"
                 )
 
     if strict and has_warnings:
@@ -2862,6 +2966,331 @@ def hook_eval_stop(
 
 
 # ============================================================================
+# Agent dispatch wrapper (CLAWP-024)
+# ============================================================================
+
+
+@main.group("agent")
+def agent_group() -> None:
+    """Parent-spawned subagent dispatch with Stop-hook judge integration.
+
+    ``clawpm tasks dispatch`` (CLAWP-018) writes the per-target settings
+    so a hand-launched subagent's Stop / PostToolUse / SessionStart hooks
+    fire. ``clawpm agent dispatch`` (CLAWP-024) wraps the full cycle in
+    one command — task create, dispatch settings write, subagent invoke,
+    judge grade, state transition — so the rubric is enforced on every
+    parent-spawned subagent without the parent needing to remember the
+    six-step manual sequence.
+    """
+    pass
+
+
+@agent_group.command("dispatch")
+@click.option(
+    "--project", "-p", "project_id",
+    help="Project ID (auto-detected if not specified)",
+)
+@click.option(
+    "--prompt", "prompt", required=True,
+    help="The subagent prompt — becomes the subtask body AND is fed on stdin to the judge CLI.",
+)
+@click.option(
+    "--parent", "parent_id", default=None,
+    help="Optional parent task ID. Recorded in the reflection event for traceability.",
+)
+@click.option(
+    "--rubric-criteria", "rubric_criteria", multiple=True,
+    help="Success criterion (repeatable). Plain string OR JSON object "
+         "{'criterion':'...','gradeable_signal':'...','comparator':'...'} — "
+         "parsed via SuccessCriterion.from_cli.",
+)
+@click.option(
+    "--title", "title", default=None,
+    help="Optional subtask title. Defaults to a truncated prompt preview.",
+)
+@click.option(
+    "--judge-cmd-override", "judge_cmd_override", default=None,
+    help="Override the judge subprocess command (highest priority — beats "
+         "CLAWPM_JUDGE_CMD env var). Use a stub here for offline testing.",
+)
+@click.pass_context
+def agent_dispatch(
+    ctx: click.Context,
+    project_id: str | None,
+    prompt: str,
+    parent_id: str | None,
+    rubric_criteria: tuple[str, ...],
+    title: str | None,
+    judge_cmd_override: str | None,
+) -> None:
+    """Spawn a subagent, grade its output against the rubric, persist the verdict.
+
+    Flow:
+      1. ``add_task`` with prompt as body + rubric_criteria as
+         ``predictions.success_criteria``.
+      2. ``create_worktree`` under ``<repo>/.clawpm-worktrees/<subtask-id>/``.
+      3. ``write_dispatch_settings`` into the worktree (Stop / PostToolUse /
+         SessionStart hooks).
+      4. Subprocess to ``claude --print`` (or ``--judge-cmd-override``)
+         with the prompt on stdin; capture stdout as the transcript.
+      5. ``evaluate_stop_condition(rubric, transcript)``.
+      6. ``ok=True``  → mark subtask DONE + write reflection event.
+         ``ok=False`` → mark subtask BLOCKED + write iteration event.
+
+    The wrapper is testable without a real ``claude`` CLI by passing a
+    ``--judge-cmd-override`` that points to a stub command, or by setting
+    ``CLAWPM_JUDGE_CMD`` (legacy env var from CLAWP-017).
+    """
+    from .agent import AgentDispatchError, dispatch_agent
+
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+    project_id, _ = require_project(ctx, project_id)
+
+    if parent_id:
+        parent_id = expand_task_id(parent_id, project_id)
+
+    try:
+        result = dispatch_agent(
+            config=config,
+            project_id=project_id,
+            prompt=prompt,
+            success_criteria=list(rubric_criteria),
+            parent_id=parent_id,
+            judge_cmd_override=judge_cmd_override,
+            title=title,
+        )
+    except AgentDispatchError as exc:
+        output_error("agent_dispatch_failed", str(exc), fmt=fmt)
+        sys.exit(1)
+
+    # Surface the verdict-derived headline in the success message so
+    # text-mode operators see at-a-glance whether the dispatch passed
+    # without parsing JSON.
+    verdict = result["verdict"]
+    if verdict["ok"]:
+        headline = f"Agent dispatch ok ({result['subtask_id']}): {verdict['reason'][:120]}"
+    elif verdict["impossible"]:
+        headline = (
+            f"Agent dispatch IMPOSSIBLE ({result['subtask_id']}): "
+            f"{verdict['reason'][:120]} — subtask marked blocked"
+        )
+    else:
+        headline = (
+            f"Agent dispatch failed ({result['subtask_id']}): "
+            f"{verdict['reason'][:120]} — subtask marked blocked"
+        )
+
+    output_success(headline, data=result, fmt=fmt)
+
+
+# ============================================================================
+# Mission Control commands (CLAWP-022)
+# ============================================================================
+
+
+@main.group("mission")
+def mission_group() -> None:
+    """Mission Control — macro binary-outcome layer above tasks."""
+    pass
+
+
+@mission_group.command("add")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected)")
+@click.option("--title", "-t", required=True, help="Mission title (6-8 words, ship-able statement)")
+@click.option("--binary-outcome", "-o", required=True, help="YES/NO check at the deadline (<=12 words)")
+@click.option("--deadline-days", "-d", type=int, default=28, show_default=True, help="Days from now (7-42)")
+@click.option("--body", "-b", default="", help="Mission description (optional)")
+@click.option("--id", "mission_id", default=None, help="Override mission ID (auto-generated otherwise)")
+@click.pass_context
+def mission_add(
+    ctx: click.Context,
+    project_id: str | None,
+    title: str,
+    binary_outcome: str,
+    deadline_days: int,
+    body: str,
+    mission_id: str | None,
+) -> None:
+    """Create a new mission. Mini-goals are linked separately via add-goal."""
+    from .mission import add_mission
+
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+    project_id, _ = require_project(ctx, project_id)
+
+    try:
+        mission = add_mission(
+            config, project_id,
+            title=title,
+            binary_outcome=binary_outcome,
+            deadline_days=deadline_days,
+            description=body,
+            mission_id=mission_id,
+        )
+    except ValueError as exc:
+        output_error("mission_add_failed", str(exc), fmt=fmt)
+        sys.exit(1)
+
+    output_success(f"Mission {mission.id} created", data=mission.to_dict(), fmt=fmt)
+
+
+@mission_group.command("list")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected)")
+@click.option("--status", "-s", "status_filter",
+              type=click.Choice(["active", "complete", "failed", "cancelled"]),
+              default=None,
+              help="Filter by status")
+@click.pass_context
+def mission_list(
+    ctx: click.Context, project_id: str | None, status_filter: str | None
+) -> None:
+    """List missions for a project."""
+    from .mission import list_missions
+
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+    project_id, _ = require_project(ctx, project_id)
+
+    missions = list_missions(config, project_id, status_filter=status_filter)
+    if fmt == OutputFormat.JSON:
+        output_json([m.to_dict() for m in missions])
+    else:
+        for m in missions:
+            click.echo(f"{m.id} [{m.status}] {m.title} -> {m.binary_outcome[:60]}")
+
+
+@mission_group.command("status")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected)")
+@click.argument("mission_id")
+@click.pass_context
+def mission_status_cmd(
+    ctx: click.Context, project_id: str | None, mission_id: str
+) -> None:
+    """Compute progress + outcome state for a mission."""
+    from .mission import mission_status
+
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+    project_id, _ = require_project(ctx, project_id)
+
+    result = mission_status(config, project_id, mission_id)
+    if "error" in result:
+        output_error("mission_not_found", result["error"], fmt=fmt)
+        sys.exit(1)
+    if fmt == OutputFormat.JSON:
+        output_json(result)
+    else:
+        click.echo(f"{result['id']}: {result['title']}")
+        click.echo(f"  outcome: {result['outcome_status']}")
+        click.echo(f"  progress: {result['complete_count']}/{result['total_count']} ({result['pct_complete']}%)")
+        if result['days_remaining'] is not None:
+            click.echo(f"  deadline: {result['deadline_date']} ({result['days_remaining']}d remaining)")
+        click.echo(f"  agent: {result['agent_counts']}")
+        click.echo(f"  human: {result['human_counts']}")
+        if result['missing_refs']:
+            click.echo(f"  WARNING: missing task refs: {result['missing_refs']}")
+
+
+@mission_group.command("tasks")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected)")
+@click.argument("mission_id")
+@click.option("--actor",
+              type=click.Choice(["agent", "human"]),
+              default=None,
+              help="Filter by actor (default: both)")
+@click.pass_context
+def mission_tasks_cmd(
+    ctx: click.Context, project_id: str | None, mission_id: str, actor: str | None
+) -> None:
+    """List mini-goal tasks for a mission, optionally filtered by actor."""
+    from .mission import mission_tasks
+
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+    project_id, _ = require_project(ctx, project_id)
+
+    tasks = mission_tasks(config, project_id, mission_id, actor_filter=actor)
+    if fmt == OutputFormat.JSON:
+        output_json([t.to_dict() for t in tasks])
+    else:
+        for t in tasks:
+            click.echo(f"{t.id} [{t.state.value}] [{t.actor or 'agent'}] {t.title[:80]}")
+
+
+@mission_group.command("add-goal")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected)")
+@click.argument("mission_id")
+@click.option("--task", "task_id", required=True, help="Task ID to link as a mini-goal")
+@click.option("--actor",
+              type=click.Choice(["agent", "human"]),
+              default="agent",
+              show_default=True,
+              help="Who runs this mini-goal")
+@click.pass_context
+def mission_add_goal(
+    ctx: click.Context,
+    project_id: str | None,
+    mission_id: str,
+    task_id: str,
+    actor: str,
+) -> None:
+    """Link an existing task to a mission as a mini-goal."""
+    from .mission import add_mission_mini_goal
+
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+    project_id, _ = require_project(ctx, project_id)
+    task_id = expand_task_id(task_id, project_id)
+
+    try:
+        mission = add_mission_mini_goal(
+            config, project_id, mission_id, task_id, actor=actor
+        )
+    except ValueError as exc:
+        output_error("mission_add_goal_failed", str(exc), fmt=fmt)
+        sys.exit(1)
+
+    output_success(
+        f"Linked {task_id} to {mission_id} as {actor}",
+        data=mission.to_dict(),
+        fmt=fmt,
+    )
+
+
+@mission_group.command("state")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected)")
+@click.argument("mission_id")
+@click.argument("new_status",
+                type=click.Choice(["active", "complete", "failed", "cancelled"]))
+@click.pass_context
+def mission_state(
+    ctx: click.Context,
+    project_id: str | None,
+    mission_id: str,
+    new_status: str,
+) -> None:
+    """Transition a mission to complete / failed / cancelled / active."""
+    from .mission import set_mission_status
+
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+    project_id, _ = require_project(ctx, project_id)
+
+    try:
+        mission = set_mission_status(config, project_id, mission_id, new_status)
+    except ValueError as exc:
+        output_error("mission_state_failed", str(exc), fmt=fmt)
+        sys.exit(1)
+
+    output_success(
+        f"Mission {mission_id} -> {new_status}",
+        data=mission.to_dict(),
+        fmt=fmt,
+    )
+
+
+# ============================================================================
 # Research commands
 # ============================================================================
 
@@ -3102,8 +3531,27 @@ def version(ctx: click.Context) -> None:
     is_flag=True,
     help="Network-backed check: scan last 5 closed PRs per github-remote project for Codex-bot presence. Off by default.",
 )
+@click.option("--apply", "apply_mode", is_flag=True, help="Run deterministic auto-remediation arms after detection (CLAWP-026).")
+@click.option("--yes", "assume_yes", is_flag=True, help="Non-interactive mode for --apply.")
+@click.option("--dry-run", "dry_run", is_flag=True, help="With --apply, report would-do actions without modifying state.")
+@click.option("--no-apply-drift", "no_apply_drift", is_flag=True, help="Disable drift state-mismatch arm.")
+@click.option("--no-apply-cascade", "no_apply_cascade", is_flag=True, help="Disable stale-blocked cascade arm.")
+@click.option("--no-apply-stale-blocked", "no_apply_stale_blocked", is_flag=True, help="Alias for --no-apply-cascade.")
+@click.option("--no-apply-half-rename", "no_apply_half_rename", is_flag=True, help="Disable drift half-rename arm.")
 @click.pass_context
-def doctor(ctx: click.Context, strict: bool, commits_drift_threshold: int, check_codex: bool) -> None:
+def doctor(
+    ctx: click.Context,
+    strict: bool,
+    commits_drift_threshold: int,
+    check_codex: bool,
+    apply_mode: bool = False,
+    assume_yes: bool = False,
+    dry_run: bool = False,
+    no_apply_drift: bool = False,
+    no_apply_cascade: bool = False,
+    no_apply_stale_blocked: bool = False,
+    no_apply_half_rename: bool = False,
+) -> None:
     """Run full health check."""
     # Delegate to project doctor with no specific project
     ctx.invoke(
@@ -3112,6 +3560,13 @@ def doctor(ctx: click.Context, strict: bool, commits_drift_threshold: int, check
         strict=strict,
         commits_drift_threshold=commits_drift_threshold,
         check_codex=check_codex,
+        apply_mode=apply_mode,
+        assume_yes=assume_yes,
+        dry_run=dry_run,
+        no_apply_drift=no_apply_drift,
+        no_apply_cascade=no_apply_cascade,
+        no_apply_stale_blocked=no_apply_stale_blocked,
+        no_apply_half_rename=no_apply_half_rename,
     )
 
 
