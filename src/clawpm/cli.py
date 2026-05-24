@@ -1730,7 +1730,31 @@ def tasks_add(
             output_error("add_failed", f"Failed to add task to project '{project_id}'", fmt=fmt)
         sys.exit(1)
 
-    output_success(f"Task {task.id} created", data=task.to_dict(), fmt=fmt)
+    # CLAWP-023: surface reference-task suggestions at predict-time when
+    # the operator/agent didn't already pin them. Anchors new predictions
+    # to the calibration corpus instead of pure inside view.
+    task_dict = task.to_dict()
+    if not reference_tasks and task.predictions and not task.predictions.is_empty():
+        try:
+            from .reflect import find_reference_tasks
+            suggestions = find_reference_tasks(
+                config.portfolio_root,
+                project_id=project_id,
+                complexity=task.predictions.complexity,
+                files_scope=task.predictions.files_scope,
+                frameworks=task.predictions.frameworks,
+                success_criteria_text=[
+                    sc.criterion for sc in task.predictions.success_criteria
+                ],
+                k=3,
+            )
+            if suggestions:
+                task_dict["suggested_references"] = suggestions
+        except Exception:
+            # Reference suggestions are nice-to-have; don't fail task creation
+            pass
+
+    output_success(f"Task {task.id} created", data=task_dict, fmt=fmt)
 
 
 @tasks.command("emit-rubric")
