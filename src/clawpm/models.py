@@ -424,6 +424,13 @@ class Task:
     # becomes eligible once every group-N task is DONE. Absent field =
     # excluded from --batch (sequential by default).
     parallel_group: int | None = None
+    # CLAWP-022 Mission Control: a task can belong to a mission (the macro
+    # binary-outcome layer above tasks) and carry an actor tag.
+    # actor: "agent" (default, dispatchable to a subagent) or "human"
+    # (operator-only, e.g. on-camera recording, physical signature).
+    # parent_mission: ID of the mission this task is a mini-goal of.
+    actor: str | None = None  # None = legacy/unspecified, defaults to "agent" semantics
+    parent_mission: str | None = None
 
     @property
     def is_parent(self) -> bool:
@@ -492,6 +499,11 @@ class Task:
             except (TypeError, ValueError):
                 parallel_group = None
 
+        actor_raw = frontmatter.get("actor")
+        actor: str | None = None
+        if isinstance(actor_raw, str) and actor_raw in ("agent", "human"):
+            actor = actor_raw
+
         return cls(
             id=frontmatter.get("id", path.stem.replace(".progress", "")),
             title=title,
@@ -506,6 +518,8 @@ class Task:
             file_path=path,
             predictions=predictions,
             parallel_group=parallel_group,
+            actor=actor,
+            parent_mission=frontmatter.get("parent_mission"),
         )
 
     @property
@@ -545,6 +559,8 @@ class Task:
             "created": self.created,
             "file_path": str(self.file_path) if self.file_path else None,
             "parallel_group": self.parallel_group,
+            "actor": self.actor,
+            "parent_mission": self.parent_mission,
         }
         body = self.body
         if body:
