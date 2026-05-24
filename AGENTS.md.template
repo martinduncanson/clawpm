@@ -42,19 +42,46 @@ clawpm block <task-id> --project <REPLACE-WITH-PROJECT-ID> --note "Waiting on cr
 
 # Log progress without state change
 clawpm log add --task <task-id> --action progress --summary "What I did" --project <REPLACE-WITH-PROJECT-ID>
+
+# Session orientation — Claude-rendered 2-paragraph briefing (CLAWP-025)
+clawpm resume --project <REPLACE-WITH-PROJECT-ID>
+
+# Reference-class anchoring at predict time (CLAWP-023) — tasks add emits
+# `suggested_references` in the response when --reference-task isn't pinned
+# AND predictions are set. Look at the prior actuals before committing to
+# your duration estimate.
+
+# Parent-spawned subagent dispatch with rubric enforcement (CLAWP-024)
+clawpm agent dispatch --prompt "do X" \
+    --rubric-criteria "evidence Y in transcript" \
+    --rubric-criteria "no regression in Z" \
+    --parent <task-id> --project <REPLACE-WITH-PROJECT-ID>
+
+# Mission Control — 4-week binary outcome above tasks (CLAWP-022)
+clawpm mission add --title "Ship X" --binary-outcome "X in prod" \
+    --deadline-days 28 --project <REPLACE-WITH-PROJECT-ID>
+clawpm mission add-goal <MISSION-ID> --task <task-id> --actor agent
+clawpm mission status <MISSION-ID> --project <REPLACE-WITH-PROJECT-ID>
+
+# Auto-remediation of doctor warnings (CLAWP-026)
+clawpm doctor --apply --yes --project <REPLACE-WITH-PROJECT-ID>
+clawpm doctor --apply --dry-run --project <REPLACE-WITH-PROJECT-ID>  # preview
 ```
 
 ## When to invoke
 
 | Lifecycle moment | clawpm action |
 |---|---|
-| Session start | `clawpm context` to resume |
-| Before any meaningful work unit (≥15 min) | `clawpm tasks add` with predictions, then `clawpm start` |
-| Before dispatching subagents | `clawpm conflicts --task` to verify safe scope |
-| On completion | `clawpm done` with `--reflect-note` |
+| Session start | `clawpm resume` for orientation, then `clawpm context` for full state |
+| Before any meaningful work unit (≥15 min) | `clawpm tasks add` with predictions — check `suggested_references` in the response for reference-class anchoring |
+| Before dispatching parallel subagents | `clawpm conflicts --task` to verify safe scope; `clawpm next --batch` to find a dispatchable group |
+| When spawning a subagent | `clawpm agent dispatch --prompt ... --rubric-criteria ...` — enforces rubric via Stop-hook judge |
+| On completion | `clawpm done` with `--reflect-note` + `--process-lesson` |
 | On blocker | `clawpm block --note` |
 | Before commit | `clawpm log add --action progress --summary "what's about to commit"` |
 | After commit | `clawpm log commit` to record the SHA against the task |
+| Maintenance | `clawpm doctor --apply --dry-run` to preview auto-fixes, then `--apply --yes` to apply |
+| Macro-experiment (4-week outcome) | `clawpm mission add` → `add-goal` per mini-goal → `mission status` for progress |
 | Session end | `clawpm log tail --limit 5` to verify the trail is captured |
 
 ## Output format

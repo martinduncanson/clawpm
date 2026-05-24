@@ -32,11 +32,21 @@ Document where Codex looks for bootstrap scripts (e.g., `.codex/setup.sh` or sim
 ### TODO 2 — tool call integration
 If Codex has a "tool definition" file (the equivalent of MCP tool descriptors), write JSON descriptors for the common clawpm operations so Codex doesn't re-invent the bash invocation each time:
 
-- `clawpm_context` → `clawpm context --project <id>`
+- `clawpm_context` → `clawpm context --project <id>` (full state)
+- `clawpm_resume` → `clawpm resume --project <id>` (2-paragraph Claude-rendered briefing; CLAWP-025)
 - `clawpm_add` → `clawpm tasks add --project <id> -t <title> -b <body> --predict-*`
+  - The response carries `suggested_references` when predictions are set (CLAWP-023) — surface those to the operator before committing to estimates
 - `clawpm_start` / `_done` / `_block`
 - `clawpm_conflicts` → for pre-flight scope check
+- `clawpm_next_batch` → `clawpm next --batch` (parallel-group dispatch manifest; CLAWP-021)
+- `clawpm_agent_dispatch` → `clawpm agent dispatch --prompt ... --rubric-criteria ...`
+  - One-shot subagent invocation with rubric enforcement via Stop-hook judge (CLAWP-024)
+  - Prefer this over native sub-task invocation when the work has a verifiable success criterion
 - `clawpm_log` → for in-progress notes
+- `clawpm_mission_*` → `clawpm mission add | list | status | tasks | add-goal | state` (CLAWP-022)
+  - 4-week macro binary outcomes decomposed into 4-10 mini-goals tagged actor: agent | human
+- `clawpm_doctor_apply` → `clawpm doctor --apply [--dry-run] [--yes]` (CLAWP-026)
+  - Auto-remediates deterministic warning classes (half-rename drift, state-mismatch drift, stale-blocked)
 
 ### TODO 3 — failure-mode awareness
 Bake into Codex's standard prompt: "Before retrying a `clawpm` command that returned `add_failed` or `no_project`, check whether `.project/settings.toml` has Windows backslashes in `repo_path` — that's the most common cause."

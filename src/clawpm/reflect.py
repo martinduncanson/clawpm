@@ -166,6 +166,237 @@ def write_iteration_event(
     return ref_file
 
 
+def find_reference_tasks(
+    portfolio_root: Path,
+    *,
+    project_id: str,
+    complexity: "TaskComplexity | str | None" = None,
+    files_scope: list[str] | None = None,
+    frameworks: list[str] | None = None,
+    success_criteria_text: list[str] | None = None,
+    k: int = 3,
+) -> list[dict]:
+    """Find prior similar tasks for reference-class anchoring (CLAWP-023).
+
+    Walks ``~/clawpm/reflections/*.jsonl`` looking for ``task_done`` events
+    from the SAME project_id (cross-project isolation per the round-5-8
+    sweep) and scores each by similarity to the proposed predictions:
+
+      - +3 if complexity matches the proposed tier exactly
+      - +2 per files_scope glob that overlaps the proposed scope (prefix-
+        prefix overlap, same heuristic as ``cli._globs_overlap``)
+      - +2 per framework intersection
+      - +1 per success-criteria-text Jaccard-overlap step (tokenised on
+        whitespace, lowercased, stop-words ignored)
+      - +1 baseline if the candidate has actuals.duration_min set
+        (otherwise its calibration value is zero — skip)
+
+    Returns top-k results ordered by score desc, each as a dict carrying
+    task_id, similarity_score, predicted vs actual duration, and the
+    deltas the corpus already computed.
+
+    The matching is intentionally simple — no embeddings, no LLM. The
+    operator/agent gets fast O(reflections-file) suggestions at predict
+    time without any subprocess or network. Phase 2 can swap in something
+    smarter; the API surface stays the same.
+    """
+    ref_dir = _reflections_dir(portfolio_root)
+    if not ref_dir.exists():
+        return []
+
+    # Normalise inputs
+    target_complexity: str | None = None
+    if complexity is not None:
+        if hasattr(complexity, "value"):
+            target_complexity = complexity.value
+        elif isinstance(complexity, str):
+            target_complexity = complexity
+    target_scope = files_scope or []
+    target_frameworks = {f.lower() for f in (frameworks or [])}
+    target_sc_tokens = _tokenise_criteria(success_criteria_text or [])
+
+    candidates: list[dict] = []
+    for ref_file in ref_dir.glob("*.jsonl"):
+        try:
+            text = ref_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        # Codex round-1 P2 fix: voided events MUST be excluded from
+        # reference-class anchoring. `reflect void` is the operator's
+        # explicit signal that a reflection is bad calibration data.
+        # Surfacing it as a reference would degrade prediction quality
+        # with examples the operator already flagged as untrustworthy.
+        # We track void events keyed on (task_id, project_id) and skip
+        # any task_done event matching a void record. Absent project_id
+        # on the void = legacy unscoped void = matches any project (the
+        # back-compat rule from the prior PR's round 8).
+        done_record: dict | None = None
+        voided = False
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            evt = rec.get("event")
+            if evt == "void":
+                # Void records match this project if their project_id
+                # is absent (legacy unscoped) OR matches. Once voided
+                # for this project, we don't surface the task as a
+                # reference regardless of other event content.
+                rec_proj = rec.get("project_id")
+                if rec_proj is None or rec_proj == project_id:
+                    voided = True
+                continue
+            if evt != "task_done":
+                continue
+            if rec.get("project_id") != project_id:
+                continue
+            # Keep the latest task_done event in the file (some tasks have
+            # multiple if re-done after revert — rare but possible).
+            done_record = rec
+        if done_record is None or voided:
+            continue
+
+        actuals = done_record.get("actuals") or {}
+        if actuals.get("duration_min") is None:
+            # No real actuals = no calibration value
+            continue
+
+        predictions = done_record.get("predictions") or {}
+        score = _similarity_score(
+            predictions=predictions,
+            target_complexity=target_complexity,
+            target_scope=target_scope,
+            target_frameworks=target_frameworks,
+            target_sc_tokens=target_sc_tokens,
+        )
+        if score <= 0:
+            continue
+
+        deltas = done_record.get("deltas") or {}
+        candidates.append({
+            "task_id": done_record.get("task_id", ref_file.stem),
+            "similarity_score": score,
+            "predicted_duration_min": predictions.get("duration_min"),
+            "actual_duration_min": actuals.get("duration_min"),
+            "duration_ratio": deltas.get("duration_ratio"),
+            "complexity_predicted": predictions.get("complexity"),
+            "complexity_actual": actuals.get("complexity"),
+            "iterations_predicted": predictions.get("predicted_iterations"),
+            "iterations_actual": actuals.get("iterations"),
+            "process_lesson": done_record.get("process_lesson"),
+            "surprise_taxonomy": done_record.get("surprise_taxonomy") or [],
+        })
+
+    candidates.sort(key=lambda c: c["similarity_score"], reverse=True)
+    return candidates[:k]
+
+
+# Stopwords filtered when tokenising success criteria — common English
+# function words that don't carry domain signal. Conservative list;
+# Phase 2 could swap in a real tokeniser if precision matters.
+_SC_STOPWORDS = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "been",
+    "of", "in", "on", "at", "to", "for", "with", "from", "by",
+    "and", "or", "not", "no", "yes", "if", "when", "then", "than",
+    "this", "that", "these", "those", "it", "its", "as",
+})
+
+
+def _tokenise_criteria(criteria: list) -> set[str]:
+    """Tokenise success_criteria text for Jaccard scoring.
+
+    Accepts either bare strings or {criterion, ...} dicts (clawpm's
+    structured form per CLAWP-016).
+    """
+    tokens: set[str] = set()
+    for c in criteria:
+        if isinstance(c, str):
+            text = c
+        elif isinstance(c, dict):
+            text = c.get("criterion", "")
+        else:
+            text = str(c)
+        for tok in text.lower().split():
+            # Strip common punctuation
+            tok = tok.strip(".,;:!?\"'()[]{}<>")
+            if not tok or tok in _SC_STOPWORDS:
+                continue
+            tokens.add(tok)
+    return tokens
+
+
+def _similarity_score(
+    *,
+    predictions: dict,
+    target_complexity: str | None,
+    target_scope: list[str],
+    target_frameworks: set[str],
+    target_sc_tokens: set[str],
+) -> int:
+    """Compute a simple additive similarity score. Higher = more similar."""
+    score = 0
+
+    if target_complexity is not None:
+        pc = predictions.get("complexity")
+        if pc == target_complexity:
+            score += 3
+
+    # Scope-glob overlap (prefix-prefix heuristic, same as _globs_overlap)
+    pred_scope = predictions.get("files_scope") or []
+    if target_scope and pred_scope:
+        for a in target_scope:
+            for b in pred_scope:
+                if _scope_overlap_simple(a, b):
+                    score += 2
+                    break  # one match per target glob
+
+    # Framework intersection
+    pred_frameworks = {
+        f.lower() for f in (predictions.get("frameworks") or [])
+    }
+    if target_frameworks and pred_frameworks:
+        score += 2 * len(target_frameworks & pred_frameworks)
+
+    # Success-criteria token Jaccard step-score: every 3 shared tokens
+    # adds 1, capped at 4 to prevent a single text-heavy criterion from
+    # dominating the ranking.
+    if target_sc_tokens:
+        pred_sc_tokens = _tokenise_criteria(
+            predictions.get("success_criteria") or []
+        )
+        shared = len(target_sc_tokens & pred_sc_tokens)
+        score += min(4, shared // 3)
+
+    # Baseline: candidate has actuals (guaranteed by caller filtering,
+    # but the +1 documents that real actuals beat empty ones).
+    score += 1
+
+    return score
+
+
+def _scope_overlap_simple(a: str, b: str) -> bool:
+    """Prefix-prefix heuristic — same shape as cli._globs_overlap but
+    importable from reflect.py without the circular dep."""
+    if a == b:
+        return True
+    # Strip glob metas to literal prefix
+    def _prefix(p: str) -> str:
+        for ch in ("*", "?", "["):
+            i = p.find(ch)
+            if i != -1:
+                p = p[:i]
+        return p.rstrip("/")
+    pa = _prefix(a)
+    pb = _prefix(b)
+    if pa == "" or pb == "":
+        return True
+    return pa.startswith(pb) or pb.startswith(pa)
+
+
 def count_iterations_for_task(
     portfolio_root: Path,
     task_id: str,
