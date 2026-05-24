@@ -60,6 +60,10 @@ class ResumeSignals:
     next_task: dict[str, Any] | None = None
     recent_worklog: list[dict[str, Any]] = field(default_factory=list)
     recent_reflections: list[dict[str, Any]] = field(default_factory=list)
+    # CLAWP-028: codegraph-rendered code orientation for the in-progress
+    # task's scope or title. Empty when codegraph isn't installed or the
+    # project isn't indexed — graceful degrade.
+    codegraph_context: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -73,6 +77,7 @@ class ResumeSignals:
             "next_task": self.next_task,
             "recent_worklog": self.recent_worklog,
             "recent_reflections": self.recent_reflections,
+            "codegraph_context": self.codegraph_context,
         }
 
 
@@ -157,6 +162,21 @@ def gather_signals(
                 sig.recent_reflections.extend(project_scoped[-5:])
             except OSError:
                 pass
+
+        # CLAWP-028: prepend codegraph orientation for the in-progress
+        # task's scope/title. Best-effort — graceful degrade when
+        # codegraph isn't installed or the project isn't indexed.
+        if repo is not None:
+            try:
+                from .codegraph import context_brief
+                # Use scope when available, fall back to title — codegraph
+                # context takes free-text input.
+                query = " ".join(t.scope) if t.scope else t.title
+                sig.codegraph_context = context_brief(
+                    query, repo, max_chars=1500
+                )
+            except Exception:
+                sig.codegraph_context = ""
     else:
         # No active task — surface the next one so the briefing has somewhere to go
         from .tasks import get_next_task
@@ -192,6 +212,7 @@ Hard rules:
   - Address the developer in the second person ("you").
   - Keep it under 180 words total. Cut filler.
   - If a signal is missing (no in-progress task, no recent commits, etc.) say so plainly — don't invent.
+  - When ``codegraph_context`` is present, weave the code-level orientation (key symbols, file paths) into paragraph 1 — but don't quote it verbatim, summarise.
 
 === SIGNALS (JSON) ===
 {signals_json}

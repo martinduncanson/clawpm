@@ -192,6 +192,7 @@ def dispatch_agent(
     judge_invoker: Optional[JudgeInvoker] = None,
     judge_cmd_override: Optional[str] = None,
     title: Optional[str] = None,
+    init_codegraph: bool = True,
 ) -> dict:
     """Run a parent-spawned subagent through the full clawpm enforcement loop.
 
@@ -276,6 +277,18 @@ def dispatch_agent(
         raise AgentDispatchError(
             f"git worktree add failed: {error_detail}"
         ) from exc
+
+    # CLAWP-029: initialise CodeGraph in the worktree so the subagent
+    # has the index from turn one. Best-effort — failure (codegraph not
+    # installed, indexing timeout) silently degrades; the dispatch
+    # proceeds without the index.
+    codegraph_initialized = False
+    if init_codegraph:
+        try:
+            from .codegraph import init_in_worktree
+            codegraph_initialized = init_in_worktree(target_dir)
+        except Exception:
+            codegraph_initialized = False
 
     rubric_markdown = render_rubric_markdown(task)
 
@@ -428,6 +441,7 @@ def dispatch_agent(
         ),
         "target_dir": str(target_dir),
         "settings_path": str(settings_path),
+        "codegraph_initialized": codegraph_initialized,
         "rubric_markdown": rubric_markdown,
         "dispatched_at": datetime.now(timezone.utc).isoformat().replace(
             "+00:00", "Z"

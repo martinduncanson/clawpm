@@ -585,8 +585,10 @@ def project_doctor(
     commit_drift: list[dict] = []
     missing_markers: list[dict] = []
     codex_availability: list[dict] = []
+    codegraph_advice: list[dict] = []
 
     STALE_DAYS = 7
+    CODEGRAPH_FILE_THRESHOLD = 50  # below this we don't bother advising
 
     # Validate portfolio
     portfolio_issues = validate_portfolio(config)
@@ -924,6 +926,32 @@ def project_doctor(
             if warning is not None:
                 codex_availability.append({"project_id": proj.id, **warning})
 
+    # --- CLAWP-031: CodeGraph advisory ---
+    # Soft signal (NOT a warning). For projects with substantial code
+    # but no .codegraph/, surface that `codegraph init` would speed up
+    # subsequent agent operations. Operator-judgment class — never
+    # auto-applied (codegraph creates `.claude/CLAUDE.md` which the
+    # operator may not want).
+    from .codegraph import count_code_files, is_project_indexed
+    for proj in projects_to_check:
+        if not proj.repo_path or not proj.repo_path.exists():
+            continue
+        if is_project_indexed(proj.repo_path):
+            continue
+        code_count = count_code_files(proj.repo_path)
+        if code_count >= CODEGRAPH_FILE_THRESHOLD:
+            codegraph_advice.append({
+                "project_id": proj.id,
+                "repo_path": proj.repo_path.as_posix(),
+                "code_files": code_count,
+                "suggested_action": (
+                    f"Code-bearing project ({code_count} files) without "
+                    f"CodeGraph. Run `codegraph init -i` from {proj.repo_path.as_posix()} "
+                    "to add ~35% cheaper / ~70% fewer-tool-call code "
+                    "exploration for any agent using this project."
+                ),
+            })
+
     # --- Phase 1.6 Check c: Cross-project prefix collisions ---
     # Prefix = project_id.upper()[:5] (mirrors add_task logic)
     prefix_map: dict[str, list[str]] = {}
@@ -992,6 +1020,7 @@ def project_doctor(
             "commit_drift": commit_drift,
             "missing_markers": missing_markers,
             "codex_availability": codex_availability,
+            "codegraph_advice": codegraph_advice,
         }
         if apply_mode:
             payload["applied"] = applied
@@ -999,9 +1028,14 @@ def project_doctor(
             payload["dry_run"] = dry_run
         output_json(payload)
     else:
+        # Codex PR#9 round-3 P2: codegraph_advice must factor into the
+        # "anything to show?" guard, else text-mode operators with only
+        # advisories see "[OK] No issues found" and miss the advice
+        # entirely. Advisories are still NOT warnings (don't trip
+        # --strict / has_warnings), but they ARE worth printing.
         if not (
             issues or stale_tasks or stale_blocked or drift_tasks or prefix_collisions or unreadable_files
-            or commit_drift or missing_markers or codex_availability
+            or commit_drift or missing_markers or codex_availability or codegraph_advice
         ):
             click.echo("[OK] No issues found")
         else:
@@ -1046,6 +1080,12 @@ def project_doctor(
                 click.echo(
                     f"[WARNING] [codex-availability] {ca['project_id']} ({ca['repo']}) "
                     f"- {ca['suggested_action']}"
+                )
+            for cg in codegraph_advice:
+                click.echo(
+                    f"[ADVICE] [codegraph] {cg['project_id']} "
+                    f"({cg['code_files']} code files, no .codegraph/) "
+                    f"- {cg['suggested_action']}"
                 )
 
         if apply_mode:
@@ -1737,6 +1777,11 @@ def tasks_add(
     if not reference_tasks and task.predictions and not task.predictions.is_empty():
         try:
             from .reflect import find_reference_tasks
+            # CLAWP-030: pass repo_path so reference scoring can augment
+            # with CodeGraph semantic-symbol overlap when the project is
+            # indexed. find_reference_tasks degrades gracefully when not.
+            _proj = get_project(config, project_id)
+            _repo = _proj.repo_path if _proj else None
             suggestions = find_reference_tasks(
                 config.portfolio_root,
                 project_id=project_id,
@@ -1746,12 +1791,37 @@ def tasks_add(
                 success_criteria_text=[
                     sc.criterion for sc in task.predictions.success_criteria
                 ],
+                repo_path=_repo,
                 k=3,
             )
             if suggestions:
                 task_dict["suggested_references"] = suggestions
         except Exception:
             # Reference suggestions are nice-to-have; don't fail task creation
+            pass
+
+    # CLAWP-027: auto-suggest files_scope when operator didn't pin one.
+    # If a CodeGraph index exists for the project's repo, query it with
+    # title+body and propose scope globs. Operator can copy into a
+    # follow-up `tasks edit --predict-scope` or accept as-is.
+    if not task.predictions.files_scope and not predict_scope:
+        try:
+            project = get_project(config, project_id)
+            if project and project.repo_path and project.repo_path.exists():
+                from .codegraph import suggest_scope_from_text
+                query_text = (
+                    (task.title or "")
+                    + "\n"
+                    + (task.body or task.content or "")
+                )
+                suggested = suggest_scope_from_text(
+                    query_text.strip(),
+                    project.repo_path,
+                )
+                if suggested:
+                    task_dict["suggested_scope"] = suggested
+        except Exception:
+            # Scope suggestions are nice-to-have; don't fail task creation
             pass
 
     output_success(f"Task {task.id} created", data=task_dict, fmt=fmt)
@@ -3094,6 +3164,12 @@ def agent_group() -> None:
     help="Override the judge subprocess command (highest priority — beats "
          "CLAWPM_JUDGE_CMD env var). Use a stub here for offline testing.",
 )
+@click.option(
+    "--no-codegraph", "no_codegraph", is_flag=True, default=False,
+    help="Skip codegraph init+index inside the worktree (CLAWP-029). "
+         "Default: init when codegraph is on PATH. Use this for batches "
+         "where per-dispatch index cost dominates.",
+)
 @click.pass_context
 def agent_dispatch(
     ctx: click.Context,
@@ -3103,6 +3179,7 @@ def agent_dispatch(
     rubric_criteria: tuple[str, ...],
     title: str | None,
     judge_cmd_override: str | None,
+    no_codegraph: bool,
 ) -> None:
     """Spawn a subagent, grade its output against the rubric, persist the verdict.
 
@@ -3140,6 +3217,7 @@ def agent_dispatch(
             parent_id=parent_id,
             judge_cmd_override=judge_cmd_override,
             title=title,
+            init_codegraph=not no_codegraph,
         )
     except AgentDispatchError as exc:
         output_error("agent_dispatch_failed", str(exc), fmt=fmt)
