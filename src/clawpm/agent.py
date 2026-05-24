@@ -295,13 +295,36 @@ def dispatch_agent(
     # 3. Write the dispatch settings — same Stop / PostToolUse /
     # SessionStart hooks `tasks dispatch` writes, so this command is the
     # programmatic equivalent of the manual dispatch+launch pair.
-    settings_path = write_dispatch_settings(
-        target_dir=target_dir,
-        task_id=subtask_id,
-        project_id=project_id,
-        rubric_markdown=rubric_markdown,
-        portfolio_root=config.portfolio_root,
-    )
+    #
+    # Codex round-8 P2: write_dispatch_settings can raise
+    # FileExistsError / ValueError (marker conflicts) or OSError (disk
+    # full / permissions). Same orphan-cleanup pattern as the worktree-
+    # creation guard above: mark the subtask BLOCKED with a clear reason
+    # before re-raising AgentDispatchError. Otherwise the command
+    # crashes and leaves the subtask OPEN with no dispatch artifacts —
+    # retries create duplicates.
+    try:
+        settings_path = write_dispatch_settings(
+            target_dir=target_dir,
+            task_id=subtask_id,
+            project_id=project_id,
+            rubric_markdown=rubric_markdown,
+            portfolio_root=config.portfolio_root,
+        )
+    except (FileExistsError, ValueError, OSError) as exc:
+        error_detail = str(exc)
+        try:
+            change_task_state(
+                config, project_id, subtask_id, TaskState.BLOCKED,
+                note=f"clawpm agent dispatch: write_dispatch_settings "
+                     f"failed — {error_detail}",
+            )
+        except Exception:
+            # Best-effort cleanup; don't mask the original error.
+            pass
+        raise AgentDispatchError(
+            f"write_dispatch_settings failed: {error_detail}"
+        ) from exc
 
     # 4. Invoke the subagent. Tests pass `judge_invoker`; the CLI passes
     # `judge_cmd_override` or falls through to CLAWPM_JUDGE_CMD /

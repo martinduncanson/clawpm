@@ -135,18 +135,31 @@ def gather_signals(
             "priority": t.priority,
         }
 
-        # Recent reflection events for this task (if any)
+        # Recent reflection events for this task (if any).
+        # Codex round-7 P2: the reflection JSONL is keyed by task_id
+        # ALONE, so two projects sharing a task_id share a file. Filter
+        # event records by project_id before tailing, otherwise resume
+        # for one project can surface another project's reflections.
+        # Legacy events without a project_id field stay included (back-
+        # compat — they pre-date the cross-project stamping work).
         ref_file = config.portfolio_root / "reflections" / f"{t.id}.jsonl"
         if ref_file.exists():
             try:
                 lines = ref_file.read_text(encoding="utf-8").splitlines()
-                # Tail last 5 reflection events
-                tail = [ln for ln in lines if ln.strip()][-5:]
-                for ln in tail:
+                project_scoped: list[dict[str, Any]] = []
+                for ln in lines:
+                    ln = ln.strip()
+                    if not ln:
+                        continue
                     try:
-                        sig.recent_reflections.append(json.loads(ln))
+                        rec = json.loads(ln)
                     except json.JSONDecodeError:
                         continue
+                    rec_proj = rec.get("project_id")
+                    if rec_proj is None or rec_proj == project_id:
+                        project_scoped.append(rec)
+                # Tail last 5 of the project-scoped slice
+                sig.recent_reflections.extend(project_scoped[-5:])
             except OSError:
                 pass
 

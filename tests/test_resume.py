@@ -312,3 +312,50 @@ class TestResumeCLI:
         assert (
             temp_portfolio["root"] / "resume_cache_test.txt"
         ).read_text(encoding="utf-8") == CANNED_BRIEFING
+
+
+# ---------------------------------------------------------------------------
+# (f) Cross-project isolation (Codex round-7 P2 fix)
+# ---------------------------------------------------------------------------
+
+
+class TestResumeCrossProjectIsolation:
+    """The reflection JSONL is keyed by task_id alone, so two projects
+    with the same task_id share a file. gather_signals must filter
+    events by project_id before tailing, otherwise resume for one
+    project surfaces another project's reflections."""
+
+    def test_gather_signals_filters_reflections_by_project(
+        self, temp_portfolio
+    ):
+        config = temp_portfolio["config"]
+        task_id = _seed_in_progress(config)
+
+        # Write a reflection file with mixed-project events for the
+        # SAME task_id (the actual exploit shape — two projects sharing
+        # a task_id share the JSONL file).
+        ref_file = (
+            temp_portfolio["root"] / "reflections" / f"{task_id}.jsonl"
+        )
+        ref_file.parent.mkdir(parents=True, exist_ok=True)
+        events = [
+            {"event": "task_done", "task_id": task_id,
+             "project_id": "test", "note": "OUR_PROJECT_NOTE",
+             "predictions": {}, "actuals": {}, "deltas": {}},
+            {"event": "task_done", "task_id": task_id,
+             "project_id": "OTHER_PROJECT", "note": "WRONG_PROJECT_NOTE",
+             "predictions": {}, "actuals": {}, "deltas": {}},
+            # Legacy unscoped event — must still be included for back-compat
+            {"event": "task_done", "task_id": task_id,
+             "note": "LEGACY_NOTE",
+             "predictions": {}, "actuals": {}, "deltas": {}},
+        ]
+        with open(ref_file, "w", encoding="utf-8") as f:
+            for ev in events:
+                f.write(json.dumps(ev) + "\n")
+
+        sig = resume_mod.gather_signals(config, "test")
+        notes = [r.get("note") for r in sig.recent_reflections]
+        assert "OUR_PROJECT_NOTE" in notes
+        assert "LEGACY_NOTE" in notes  # back-compat for unscoped events
+        assert "WRONG_PROJECT_NOTE" not in notes  # cross-project leak
