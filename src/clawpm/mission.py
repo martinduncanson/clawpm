@@ -45,7 +45,13 @@ from .models import PortfolioConfig, Task, TaskState
 from .tasks import list_tasks
 
 
-MISSION_ID_PATTERN = re.compile(r"^[A-Z]+-MISSION-\d{3}$")
+# Codex round-5 P1: the prefix is project_id.upper()[:5], so project IDs
+# like "proj1" → "PROJ1" or "my-app" → "MY-AP" yield prefixes that
+# contain digits or hyphens. Accept one-or-more [A-Z0-9] groups joined
+# by single hyphens, then -MISSION- + 3 digits. This still forbids
+# leading/trailing/double hyphens, `..`, path separators, etc. —
+# everything that would let an attacker escape the missions/ directory.
+MISSION_ID_PATTERN = re.compile(r"^[A-Z0-9]+(-[A-Z0-9]+)*-MISSION-\d{3}$")
 
 
 def _assert_safe_mission_id(value: str) -> None:

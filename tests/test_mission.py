@@ -349,6 +349,50 @@ class TestMissionIdSafety:
         )
         assert m.id == "TEST-MISSION-042"
 
+    def test_digit_only_prefix_accepted(self, temp_portfolio):
+        """Codex round-5 P1: prefix is project_id.upper()[:5]. A project
+        named 'proj1' yields 'PROJ1' — must validate, not reject."""
+        config = temp_portfolio["config"]
+        m = add_mission(
+            config, "test", "X", "Y",
+            mission_id="PROJ1-MISSION-001",
+        )
+        assert m.id == "PROJ1-MISSION-001"
+
+    def test_hyphenated_prefix_accepted(self, temp_portfolio):
+        """Project named 'my-app' yields prefix 'MY-AP'; mission ID
+        'MY-AP-MISSION-001' must validate."""
+        config = temp_portfolio["config"]
+        m = add_mission(
+            config, "test", "X", "Y",
+            mission_id="MY-AP-MISSION-001",
+        )
+        assert m.id == "MY-AP-MISSION-001"
+
+    def test_auto_id_for_hyphenated_project_round_trips(self, temp_portfolio):
+        """End-to-end: a project ID that produces a hyphenated prefix
+        creates a mission AND can be looked up via get_mission. Round 5's
+        actual exploit shape: add_mission succeeded but get_mission
+        rejected the same ID as malformed."""
+        config = temp_portfolio["config"]
+        # Forge a project context with a hyphenated ID via direct file
+        # write — easier than restructuring the fixture.
+        proj_dir = config.project_roots[0] / "my-app"
+        proj_dir.mkdir(parents=True, exist_ok=True)
+        (proj_dir / ".project").mkdir(exist_ok=True)
+        (proj_dir / ".project" / "settings.toml").write_text(
+            'id = "my-app"\nname = "My App"\nstatus = "active"\npriority = 3\n',
+            encoding="utf-8",
+        )
+        (proj_dir / ".project" / "tasks").mkdir(exist_ok=True)
+
+        m = add_mission(config, "my-app", "X", "Y")
+        assert m.id.startswith("MY-AP")
+        # Round-trip via get_mission
+        reloaded = get_mission(config, "my-app", m.id)
+        assert reloaded is not None
+        assert reloaded.id == m.id
+
     def test_mutating_flows_safe_against_traversal(self, temp_portfolio):
         """Codex round-4 P1: mutating callers (set_mission_status,
         add_mission_mini_goal) flow through get_mission then write via
