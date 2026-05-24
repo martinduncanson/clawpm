@@ -15,14 +15,6 @@ This project (clawpm) uses [clawpm](https://github.com/martinduncanson/clawpm) f
 If `clawpm` is not on PATH: `pipx install git+https://github.com/martinduncanson/clawpm` (then `clawpm doctor` to verify).
 <!-- /clawpm:project-requirement -->
 
-## Surgical changes
-
-Touch only what the task requires. clawpm is the persistence layer other agents lean on — adjacent edits ripple harder here than in a typical project.
-
-- When editing existing code, don't "improve" adjacent code, comments, or formatting. Match the existing style even when you'd prefer different. The diff Codex sees is the diff you defend.
-- Remove only orphans your own changes created. If you notice unrelated dead code, mention it in the response — don't delete it.
-- The test: every changed line should trace directly to the operator's request OR to a finding from PRE-REVIEW / Codex. Lines that fail that trace are scope creep.
-
 ## Task definition discipline
 
 clawpm ships `--success-criteria` + `emit-rubric` + the Stop-hook condition evaluator (CLAWP-016..017) specifically so tasks can be framed as **verifiable goals**, not vague intents. Use the primitive.
