@@ -474,6 +474,36 @@ class TestWorktreeCwdAndOrphanCleanup:
             t.state == TaskState.BLOCKED for t in tasks
         )
 
+    def test_orphan_subtask_blocked_on_settings_write_failure(
+        self, temp_portfolio_with_repo, monkeypatch
+    ):
+        """Codex round-8 P2: write_dispatch_settings raising must mark
+        the subtask BLOCKED and surface AgentDispatchError, same as
+        worktree creation failure. Otherwise the command crashes and
+        leaves an OPEN orphan that retries duplicate."""
+        from clawpm import agent as ag
+        from clawpm.models import TaskState
+        from clawpm.tasks import list_tasks
+
+        def fake_write_settings(**kwargs):
+            raise ValueError("simulated marker conflict")
+
+        monkeypatch.setattr(ag, "write_dispatch_settings", fake_write_settings)
+
+        with pytest.raises(ag.AgentDispatchError, match="write_dispatch_settings"):
+            ag.dispatch_agent(
+                config=temp_portfolio_with_repo["config"],
+                project_id="test",
+                prompt="do thing",
+                success_criteria=["X"],
+            )
+
+        # The orphaned subtask should be BLOCKED with the settings-write
+        # failure reason — never leave it OPEN.
+        tasks = list_tasks(temp_portfolio_with_repo["config"], "test")
+        blocked = [t for t in tasks if t.state == TaskState.BLOCKED]
+        assert len(blocked) >= 1
+
 
 # ---------------------------------------------------------------------------
 # 8. CLI integration — judge-cmd-override smoke test
