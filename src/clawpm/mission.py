@@ -286,7 +286,23 @@ def add_mission_mini_goal(
     if task is None:
         raise ValueError(f"Task not found: {task_id}")
     if any(g.id == task_id for g in mission.mini_goals):
-        return mission  # idempotent
+        return mission  # idempotent re-link to the SAME mission
+
+    # Codex round-1 P2 fix: refuse cross-mission relink. If the task is
+    # already a mini-goal of a DIFFERENT mission, silent overwrite would
+    # leave the prior mission's mini_goals list pointing at a task that
+    # now belongs elsewhere — and the same task would be counted by both
+    # missions in their separate status reports. Surface the conflict
+    # so the operator decides: unlink from the prior mission explicitly,
+    # then re-link here.
+    if task.parent_mission and task.parent_mission != mission_id:
+        raise ValueError(
+            f"Task {task_id} is already a mini-goal of mission "
+            f"{task.parent_mission!r}. Unlink it from there first "
+            f"(edit the task frontmatter or remove the mini_goals entry "
+            f"on the prior mission file) before re-linking to "
+            f"{mission_id!r}."
+        )
 
     # Update the task's frontmatter
     if task.file_path is None:

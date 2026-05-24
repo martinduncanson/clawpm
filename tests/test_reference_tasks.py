@@ -260,6 +260,46 @@ class TestFindReferenceTasks:
         # Implementation note: both events go to same file (task_id-keyed),
         # so the "latest task_done in this file matching project" wins.
 
+    def test_voided_events_excluded(self, temp_portfolio):
+        """Codex round-1 P2: voided reflection events are bad calibration
+        data and MUST NOT be surfaced as reference anchors."""
+        root = temp_portfolio["root"]
+        # Seed a task_done event, then a void for it
+        _seed_reflection(root, "TEST-VOID-001", complexity="m")
+        ref_file = root / "reflections" / "TEST-VOID-001.jsonl"
+        with open(ref_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "event": "void",
+                "task_id": "TEST-VOID-001",
+                "project_id": "test",
+                "reason": "bad actuals",
+                "voided_at": "2026-01-01T00:00:00Z",
+            }) + "\n")
+
+        # Seed a non-voided neighbour so the corpus isn't empty
+        _seed_reflection(root, "TEST-OK-002", complexity="m")
+
+        results = find_reference_tasks(root, project_id="test", complexity="m")
+        ids = {r["task_id"] for r in results}
+        assert "TEST-VOID-001" not in ids
+        assert "TEST-OK-002" in ids
+
+    def test_legacy_unscoped_void_excludes_too(self, temp_portfolio):
+        """Legacy voids without project_id match ANY project (back-compat)."""
+        root = temp_portfolio["root"]
+        _seed_reflection(root, "TEST-LEGACY-001", complexity="m")
+        ref_file = root / "reflections" / "TEST-LEGACY-001.jsonl"
+        with open(ref_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "event": "void",
+                "task_id": "TEST-LEGACY-001",
+                "reason": "pre-stamping era",
+                "voided_at": "2025-01-01T00:00:00Z",
+            }) + "\n")  # no project_id
+
+        results = find_reference_tasks(root, project_id="test", complexity="m")
+        assert all(r["task_id"] != "TEST-LEGACY-001" for r in results)
+
     def test_skips_events_with_no_actuals(self, temp_portfolio):
         root = temp_portfolio["root"]
         # Write a reflection with null actuals.duration_min

@@ -221,10 +221,17 @@ def find_reference_tasks(
             text = ref_file.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        # Track void events per task — if any void with matching project_id
-        # is present we still consider the reflection (Phase 2 may revisit
-        # exclusion); for now voiding is just metadata, not a filter.
+        # Codex round-1 P2 fix: voided events MUST be excluded from
+        # reference-class anchoring. `reflect void` is the operator's
+        # explicit signal that a reflection is bad calibration data.
+        # Surfacing it as a reference would degrade prediction quality
+        # with examples the operator already flagged as untrustworthy.
+        # We track void events keyed on (task_id, project_id) and skip
+        # any task_done event matching a void record. Absent project_id
+        # on the void = legacy unscoped void = matches any project (the
+        # back-compat rule from the prior PR's round 8).
         done_record: dict | None = None
+        voided = False
         for line in text.splitlines():
             line = line.strip()
             if not line:
@@ -233,14 +240,24 @@ def find_reference_tasks(
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if rec.get("event") != "task_done":
+            evt = rec.get("event")
+            if evt == "void":
+                # Void records match this project if their project_id
+                # is absent (legacy unscoped) OR matches. Once voided
+                # for this project, we don't surface the task as a
+                # reference regardless of other event content.
+                rec_proj = rec.get("project_id")
+                if rec_proj is None or rec_proj == project_id:
+                    voided = True
+                continue
+            if evt != "task_done":
                 continue
             if rec.get("project_id") != project_id:
                 continue
             # Keep the latest task_done event in the file (some tasks have
             # multiple if re-done after revert — rare but possible).
             done_record = rec
-        if done_record is None:
+        if done_record is None or voided:
             continue
 
         actuals = done_record.get("actuals") or {}

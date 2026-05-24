@@ -91,7 +91,10 @@ class AgentDispatchError(Exception):
     """
 
 
-def _make_default_invoker(judge_cmd_override: Optional[str]) -> JudgeInvoker:
+def _make_default_invoker(
+    judge_cmd_override: Optional[str],
+    cwd: Optional[Path] = None,
+) -> JudgeInvoker:
     """Build a judge invoker that subprocesses to a `claude --print`-like CLI.
 
     Resolution order (highest priority first):
@@ -102,6 +105,13 @@ def _make_default_invoker(judge_cmd_override: Optional[str]) -> JudgeInvoker:
     The prompt is fed on stdin so long rubrics + transcripts don't hit
     shell argument limits. 60s ceiling matches the Stop-hook judge —
     same model class, same UX expectation.
+
+    ``cwd`` (Codex round-1 P1 fix): the subprocess is invoked from this
+    directory so the per-dispatch ``.claude/settings.local.json`` and
+    hooks pick up the worktree-scoped context. Without this, the judge
+    runs from the parent process's CWD and the worktree isolation is
+    defeated. Defaults to current CWD when None (back-compat for
+    callers that don't pass it).
     """
     import os as _os
 
@@ -120,6 +130,7 @@ def _make_default_invoker(judge_cmd_override: Optional[str]) -> JudgeInvoker:
                 text=True,
                 encoding="utf-8",
                 timeout=60,
+                cwd=str(cwd) if cwd is not None else None,
             )
         except FileNotFoundError as exc:
             raise RuntimeError(
@@ -243,12 +254,27 @@ def dispatch_agent(
     # 2. Create a per-dispatch worktree under <repo>/.clawpm-worktrees/<id>.
     # create_worktree validates the task_id for shell-injection / path-
     # traversal safety (CLAWP-018 round-1 hardening).
+    #
+    # Codex round-1 P2 fix: if worktree creation fails AFTER the subtask
+    # was created, the subtask becomes an orphan — open in the backlog
+    # with no dispatch artifacts, and a retry would create a duplicate.
+    # Mark the orphan BLOCKED with a clear reason before re-raising so
+    # the operator can triage instead of finding stray opens later.
     try:
         target_dir = create_worktree(project.repo_path, subtask_id)
     except subprocess.CalledProcessError as exc:
+        error_detail = (exc.stderr or exc.stdout or "").strip() or repr(exc)
+        try:
+            change_task_state(
+                config, project_id, subtask_id, TaskState.BLOCKED,
+                note=f"clawpm agent dispatch: worktree creation failed — "
+                     f"{error_detail}",
+            )
+        except Exception:
+            # Best-effort cleanup; do not mask the original error.
+            pass
         raise AgentDispatchError(
-            f"git worktree add failed: "
-            f"{(exc.stderr or exc.stdout or '').strip() or exc!r}"
+            f"git worktree add failed: {error_detail}"
         ) from exc
 
     rubric_markdown = render_rubric_markdown(task)
@@ -267,7 +293,15 @@ def dispatch_agent(
     # 4. Invoke the subagent. Tests pass `judge_invoker`; the CLI passes
     # `judge_cmd_override` or falls through to CLAWPM_JUDGE_CMD /
     # DEFAULT_JUDGE_CMD via _make_default_invoker.
-    invoker = judge_invoker or _make_default_invoker(judge_cmd_override)
+    #
+    # Codex round-1 P1 fix: pass `cwd=target_dir` so the subprocess runs
+    # inside the worktree — picks up the per-dispatch
+    # .claude/settings.local.json hooks AND any file edits land in the
+    # isolated tree, not the parent checkout. Without this the worktree
+    # isolation is theatre.
+    invoker = judge_invoker or _make_default_invoker(
+        judge_cmd_override, cwd=target_dir
+    )
     transcript, subagent_error = _run_subagent(invoker, prompt)
     transcript_path = _write_transcript(target_dir, transcript)
 

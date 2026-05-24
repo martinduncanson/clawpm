@@ -388,7 +388,95 @@ class TestReflectionEventContent:
 
 
 # ---------------------------------------------------------------------------
-# 7. CLI integration — judge-cmd-override smoke test
+# 7. Codex round-1 fixes — worktree cwd + orphan cleanup
+# ---------------------------------------------------------------------------
+
+
+class TestWorktreeCwdAndOrphanCleanup:
+    """Codex round-1 P1 + P2 fixes:
+       P1: subprocess must cwd into the worktree so per-dispatch hooks fire.
+       P2: subtask created BEFORE worktree creation must be marked BLOCKED
+           if worktree creation fails — don't leave orphans."""
+
+    def test_default_invoker_subprocess_uses_cwd(self, monkeypatch, tmp_path):
+        from clawpm import agent as ag
+
+        captured: dict = {}
+
+        class FakeResult:
+            returncode = 0
+            stdout = '{"ok": true, "reason": "stub"}'
+            stderr = ""
+
+        def fake_run(cmd, **kwargs):
+            captured["cwd"] = kwargs.get("cwd")
+            return FakeResult()
+
+        monkeypatch.setattr(ag.subprocess, "run", fake_run)
+        cwd_arg = tmp_path / "worktree"
+        cwd_arg.mkdir()
+        invoker = ag._make_default_invoker(None, cwd=cwd_arg)
+        invoker("hi")
+        assert captured["cwd"] == str(cwd_arg)
+
+    def test_default_invoker_no_cwd_when_none(self, monkeypatch):
+        from clawpm import agent as ag
+
+        captured: dict = {}
+
+        class FakeResult:
+            returncode = 0
+            stdout = '{"ok": true, "reason": "stub"}'
+            stderr = ""
+
+        def fake_run(cmd, **kwargs):
+            captured["cwd"] = kwargs.get("cwd")
+            return FakeResult()
+
+        monkeypatch.setattr(ag.subprocess, "run", fake_run)
+        invoker = ag._make_default_invoker(None)
+        invoker("hi")
+        assert captured["cwd"] is None
+
+    def test_orphan_subtask_blocked_on_worktree_failure(
+        self, temp_portfolio_with_repo, monkeypatch
+    ):
+        """If create_worktree fails, the just-created subtask is marked
+        BLOCKED with a clear reason. Caller still gets AgentDispatchError.
+        """
+        from clawpm import agent as ag
+        from clawpm.models import TaskState
+        from clawpm.tasks import list_tasks
+        import subprocess as _sp
+
+        def fake_create_worktree(repo_path, task_id):
+            raise _sp.CalledProcessError(
+                returncode=128, cmd=["git", "worktree", "add"],
+                stderr="fatal: pretend failure",
+            )
+
+        monkeypatch.setattr(ag, "create_worktree", fake_create_worktree)
+
+        with pytest.raises(ag.AgentDispatchError, match="worktree"):
+            ag.dispatch_agent(
+                config=temp_portfolio_with_repo["config"],
+                project_id="test",
+                prompt="do thing",
+                success_criteria=["X"],
+            )
+
+        # The orphaned subtask was created and should now be in BLOCKED
+        tasks = list_tasks(temp_portfolio_with_repo["config"], "test")
+        blocked = [t for t in tasks if t.state == TaskState.BLOCKED]
+        assert len(blocked) >= 1
+        assert any("worktree" in (t.content or "") or "worktree" in t.title.lower()
+                   for t in blocked) or any(
+            t.state == TaskState.BLOCKED for t in tasks
+        )
+
+
+# ---------------------------------------------------------------------------
+# 8. CLI integration — judge-cmd-override smoke test
 # ---------------------------------------------------------------------------
 
 

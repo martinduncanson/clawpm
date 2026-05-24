@@ -192,6 +192,30 @@ class TestMissionMiniGoals:
         with pytest.raises(ValueError, match="Task not found"):
             add_mission_mini_goal(config, "test", m.id, "TEST-9999")
 
+    def test_add_mini_goal_refuses_cross_mission_relink(self, temp_portfolio):
+        """Codex round-1 P2: a task already mini-goal of mission A must
+        NOT be silently re-linked to mission B. Operator must unlink
+        from A first; otherwise A and B both count the task and metadata
+        diverges from the task's actual parent_mission."""
+        config = temp_portfolio["config"]
+        m1 = add_mission(config, "test", "M1", "O1")
+        m2 = add_mission(config, "test", "M2", "O2")
+        task = add_task(config, "test", title="Shared")
+        add_mission_mini_goal(config, "test", m1.id, task.id, actor="agent")
+
+        with pytest.raises(ValueError, match="already a mini-goal"):
+            add_mission_mini_goal(config, "test", m2.id, task.id, actor="agent")
+
+    def test_add_mini_goal_same_mission_idempotent(self, temp_portfolio):
+        """Re-linking to the SAME mission is still a no-op (back-compat)."""
+        config = temp_portfolio["config"]
+        m = add_mission(config, "test", "M", "O")
+        task = add_task(config, "test", title="X")
+        add_mission_mini_goal(config, "test", m.id, task.id)
+        # Same mission, same task — should not raise
+        updated = add_mission_mini_goal(config, "test", m.id, task.id)
+        assert len(updated.mini_goals) == 1
+
 
 # ---------------------------------------------------------------------------
 # mission_status
