@@ -305,6 +305,51 @@ class TestAddMissionOverwrite:
         assert r.exit_code == 0, r.output
 
 
+class TestMissionIdSafety:
+    """Codex round-3 P1: explicit --id must not enable path traversal."""
+
+    def test_path_traversal_rejected(self, temp_portfolio):
+        config = temp_portfolio["config"]
+        with pytest.raises(ValueError, match="unsafe mission_id"):
+            add_mission(
+                config, "test", "X", "Y",
+                mission_id="../../../etc/passwd",
+            )
+
+    def test_path_separator_rejected(self, temp_portfolio):
+        config = temp_portfolio["config"]
+        with pytest.raises(ValueError, match="unsafe mission_id"):
+            add_mission(
+                config, "test", "X", "Y",
+                mission_id="foo/bar",
+            )
+
+    def test_backslash_rejected(self, temp_portfolio):
+        config = temp_portfolio["config"]
+        with pytest.raises(ValueError, match="unsafe mission_id"):
+            add_mission(
+                config, "test", "X", "Y",
+                mission_id="C:\\Windows\\System32",
+            )
+
+    def test_arbitrary_prefix_rejected(self, temp_portfolio):
+        """Even non-traversal strings must match the strict shape."""
+        config = temp_portfolio["config"]
+        with pytest.raises(ValueError, match="unsafe mission_id"):
+            add_mission(
+                config, "test", "X", "Y",
+                mission_id="random-string",
+            )
+
+    def test_valid_id_accepted(self, temp_portfolio):
+        config = temp_portfolio["config"]
+        m = add_mission(
+            config, "test", "X", "Y",
+            mission_id="TEST-MISSION-042",
+        )
+        assert m.id == "TEST-MISSION-042"
+
+
 # ---------------------------------------------------------------------------
 # mission_status
 # ---------------------------------------------------------------------------

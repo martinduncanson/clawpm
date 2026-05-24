@@ -48,6 +48,29 @@ from .tasks import list_tasks
 MISSION_ID_PATTERN = re.compile(r"^[A-Z]+-MISSION-\d{3}$")
 
 
+def _assert_safe_mission_id(value: str) -> None:
+    """Raise ValueError unless value matches the strict mission-ID shape.
+
+    Codex round-3 P1 fix: mission_id flows into file-path joins
+    (``missions_dir / f"{mission_id}.md"``). Anything other than the
+    canonical ``<PREFIX>-MISSION-NNN`` shape risks path traversal —
+    ``../../../etc/passwd``, absolute paths on Windows
+    (``C:\\foo``), backslashes, etc.
+
+    The pattern allows uppercase letters + ``-MISSION-`` + exactly
+    three digits. That's the exact shape ``add_mission`` generates
+    when no ID is supplied; rejecting anything else here means
+    explicit ``--id`` overrides must conform to the same shape.
+    """
+    if not isinstance(value, str) or not MISSION_ID_PATTERN.match(value):
+        raise ValueError(
+            f"Refusing to use unsafe mission_id {value!r} — must match "
+            f"{MISSION_ID_PATTERN.pattern} (e.g. 'CLAWP-MISSION-007'). "
+            f"This guards against path traversal in the missions/ "
+            f"directory."
+        )
+
+
 @dataclass
 class MissionMiniGoal:
     """Reference to a task that is a mini-goal of this mission."""
@@ -229,8 +252,13 @@ def add_mission(
         next_num = max(existing, default=-1) + 1
         mission_id = f"{prefix}-MISSION-{next_num:03d}"
     else:
-        # Caller passed an explicit ID — verify it doesn't clobber an
-        # existing mission unless --force.
+        # Codex round-3 P1 fix: caller-supplied ID flows into a file
+        # path. Without validation, `--id "../../etc/passwd"` would
+        # escape the missions directory and turn add_mission into a
+        # path-traversal write primitive (combined with --force it
+        # could overwrite arbitrary .md files). Enforce the strict ID
+        # shape upstream of any path composition.
+        _assert_safe_mission_id(mission_id)
         existing_path = md / f"{mission_id}.md"
         if existing_path.exists() and not force:
             raise ValueError(
