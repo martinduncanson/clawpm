@@ -498,6 +498,15 @@ def project_announce(ctx: click.Context, project_id: str | None) -> None:
     is_flag=True,
     help="Network-backed check: for each project with a github.com remote, scan the last 5 closed PRs for Codex-bot appearances. Off by default to keep doctor offline-fast.",
 )
+@click.option(
+    "--check-encoding",
+    is_flag=True,
+    help="CLAWP-011 Check g (cp1252-stdout-risk): AST-scan every .py file in "
+         "clawpm's own src/ and in each tracked project's repo_path for "
+         "non-ASCII glyphs inside print()/echo() literals and for "
+         "open()/read_text()/write_text() calls without encoding= kwarg. "
+         "Off by default (adds noticeable cost on large repos).",
+)
 @click.pass_context
 def project_doctor(
     ctx: click.Context,
@@ -505,6 +514,7 @@ def project_doctor(
     strict: bool = False,
     commits_drift_threshold: int = 5,
     check_codex: bool = False,
+    check_encoding: bool = False,
 ) -> None:
     """Check for issues with projects and portfolio.
 
@@ -531,6 +541,7 @@ def project_doctor(
     commit_drift: list[dict] = []
     missing_markers: list[dict] = []
     codex_availability: list[dict] = []
+    encoding_findings: list[dict] = []
 
     STALE_DAYS = 7
 
@@ -870,6 +881,43 @@ def project_doctor(
             if warning is not None:
                 codex_availability.append({"project_id": proj.id, **warning})
 
+    # --- CLAWP-011 Check g: cp1252-stdout-risk (AST scan for encoding hazards) ---
+    # Off by default (--check-encoding flag) - AST-walks every .py file in clawpm's
+    # own src/ plus each tracked project's repo_path. Surfaces:
+    #   1. Non-ASCII glyphs in print()/echo() literals (Windows cp1252 stdout crash)
+    #   2. open()/read_text()/write_text() without encoding= kwarg (mojibake risk)
+    # See feedback-windows-cp1252-write-text memory for the 7-case case history that
+    # promoted this from discipline rule to tooling rule.
+    if check_encoding:
+        from clawpm.encoding_check import scan_paths as _enc_scan_paths
+        roots: list[Path] = []
+        # Scan clawpm's own source (always, regardless of which projects are tracked):
+        # clawpm itself is the most-edited tool on Martin's PATH and the most likely
+        # to regress. Located relative to this module's __file__ for portability.
+        clawpm_src = Path(__file__).resolve().parent
+        if clawpm_src.exists():
+            roots.append(clawpm_src)
+        # Scan every tracked project's repo_path
+        seen: set[Path] = set()
+        if clawpm_src.exists():
+            seen.add(clawpm_src.resolve())
+        for proj in projects_to_check:
+            if not proj.repo_path or not proj.repo_path.exists():
+                continue
+            resolved = proj.repo_path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            roots.append(proj.repo_path)
+        for hit in _enc_scan_paths(roots):
+            encoding_findings.append({
+                "file": hit.path.as_posix(),
+                "line": hit.line,
+                "kind": hit.kind,
+                "snippet": hit.snippet,
+                "detail": hit.detail,
+            })
+
     # --- Phase 1.6 Check c: Cross-project prefix collisions ---
     # Prefix = project_id.upper()[:5] (mirrors add_task logic)
     prefix_map: dict[str, list[str]] = {}
@@ -886,7 +934,7 @@ def project_doctor(
     # Build final output
     has_warnings = bool(
         stale_tasks or stale_blocked or drift_tasks or prefix_collisions or unreadable_files
-        or commit_drift or missing_markers or codex_availability
+        or commit_drift or missing_markers or codex_availability or encoding_findings
         or any(i["level"] == "warning" for i in issues)
     )
 
@@ -902,11 +950,12 @@ def project_doctor(
             "commit_drift": commit_drift,
             "missing_markers": missing_markers,
             "codex_availability": codex_availability,
+            "encoding_findings": encoding_findings,
         })
     else:
         if not (
             issues or stale_tasks or stale_blocked or drift_tasks or prefix_collisions or unreadable_files
-            or commit_drift or missing_markers or codex_availability
+            or commit_drift or missing_markers or codex_availability or encoding_findings
         ):
             click.echo("[OK] No issues found")
         else:
@@ -951,6 +1000,11 @@ def project_doctor(
                 click.echo(
                     f"[WARNING] [codex-availability] {ca['project_id']} ({ca['repo']}) "
                     f"- {ca['suggested_action']}"
+                )
+            for ef in encoding_findings:
+                click.echo(
+                    f"[WARNING] [cp1252-risk] {ef['file']}:{ef['line']} "
+                    f"[{ef['kind']}] {ef['detail']} | {ef['snippet']}"
                 )
 
     if strict and has_warnings:
@@ -2063,7 +2117,7 @@ def quick_next(ctx: click.Context, project_id: str | None, batch_mode: bool) -> 
                 for t in candidates:
                     click.echo(f"  - {t.id} [{t.state.value}] {t.title}")
                 if conflicts:
-                    click.echo("\nSCOPE CONFLICTS — cannot dispatch as a single batch:")
+                    click.echo("\nSCOPE CONFLICTS - cannot dispatch as a single batch:")
                     for c in conflicts:
                         click.echo(
                             f"  {c['task_a']} <-> {c['task_b']}: "
@@ -2298,7 +2352,7 @@ def agent_context(ctx: click.Context, project_id: str | None, log_limit: int) ->
         if issues_file.exists():
             try:
                 open_issues = []
-                with open(issues_file) as f:
+                with open(issues_file, encoding="utf-8") as f:
                     for line in f:
                         line = line.strip()
                         if line:
@@ -2448,7 +2502,7 @@ def log_tail(ctx: click.Context, project_id: str | None, limit: int, follow: boo
             
             if current_size > pos:
                 # New content - read from last position
-                with open(worklog_path) as f:
+                with open(worklog_path, encoding="utf-8") as f:
                     f.seek(pos)
                     new_lines = f.read()
                     pos = f.tell()
@@ -3102,8 +3156,20 @@ def version(ctx: click.Context) -> None:
     is_flag=True,
     help="Network-backed check: scan last 5 closed PRs per github-remote project for Codex-bot presence. Off by default.",
 )
+@click.option(
+    "--check-encoding",
+    is_flag=True,
+    help="CLAWP-011: AST-scan tracked .py files for cp1252-stdout risks "
+         "(non-ASCII glyphs in print/echo, file ops without encoding=). Off by default.",
+)
 @click.pass_context
-def doctor(ctx: click.Context, strict: bool, commits_drift_threshold: int, check_codex: bool) -> None:
+def doctor(
+    ctx: click.Context,
+    strict: bool,
+    commits_drift_threshold: int,
+    check_codex: bool,
+    check_encoding: bool,
+) -> None:
     """Run full health check."""
     # Delegate to project doctor with no specific project
     ctx.invoke(
@@ -3112,6 +3178,7 @@ def doctor(ctx: click.Context, strict: bool, commits_drift_threshold: int, check
         strict=strict,
         commits_drift_threshold=commits_drift_threshold,
         check_codex=check_codex,
+        check_encoding=check_encoding,
     )
 
 
@@ -3428,7 +3495,7 @@ def conflicts(
             if fmt == OutputFormat.JSON:
                 output_json(result)
             else:
-                click.echo(f"Task {task_id} has no scope declared — no conflicts possible.")
+                click.echo(f"Task {task_id} has no scope declared - no conflicts possible.")
             return
     else:
         query_scope = list(scope_globs)
@@ -3446,7 +3513,7 @@ def conflicts(
         for c in conflict_list:
             overlap_str = ", ".join(c["overlapping_globs"])
             click.echo(
-                f"  [{c['project_id']}] {c['task_id']} — {c['title']}\n"
+                f"  [{c['project_id']}] {c['task_id']} - {c['title']}\n"
                 f"    scope: {c['scope']}\n"
                 f"    overlapping: {overlap_str}"
             )
