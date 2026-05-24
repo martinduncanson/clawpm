@@ -181,6 +181,23 @@ class TestPathParser:
         globs = cg._parse_file_paths_to_globs(text, Path("."), max_globs=5)
         assert any("apps/web/packages/foo/src/lib" in g for g in globs)
 
+    def test_repo_root_files_listed_individually(self):
+        """Codex PR#9 round-3 P2: when multiple files are at the repo
+        root, parent is empty — naively rolling up produced '/**'
+        (catches everything). Fix: list root files individually."""
+        text = "Touched `main.py` and `app.py` directly."
+        globs = cg._parse_file_paths_to_globs(text, Path("."), max_globs=5)
+        # No '/**' (would be the broken behaviour)
+        assert "/**" not in globs
+        # Both root files should be listed individually
+        assert "main.py" in globs
+        assert "app.py" in globs
+
+    def test_repo_root_single_file_kept(self):
+        text = "See `main.py` only."
+        globs = cg._parse_file_paths_to_globs(text, Path("."), max_globs=5)
+        assert globs == ["main.py"]
+
 
 class TestSymbolParser:
     def test_parses_symbol_names(self):
@@ -503,3 +520,23 @@ class TestDoctorCodegraphAdvisory:
         payload = json.loads(r.output)
         advices = payload.get("codegraph_advice", [])
         assert not any(a["project_id"] == "test" for a in advices)
+
+    def test_text_mode_surfaces_advisory_when_only_signal(
+        self, temp_portfolio_with_repo
+    ):
+        """Codex PR#9 round-3 P2: text-mode `[OK] No issues found` guard
+        must consider codegraph_advice. Otherwise operators with only
+        an advisory never see it on the default text output."""
+        src = temp_portfolio_with_repo["repo_dir"] / "src"
+        src.mkdir()
+        for i in range(60):  # above threshold
+            (src / f"file{i}.py").write_text("x", encoding="utf-8")
+
+        runner = CliRunner()
+        r = runner.invoke(main, ["-f", "text", "doctor"])
+        assert r.exit_code == 0, r.output
+        # Must NOT see the all-clear message when an advisory exists
+        assert "No issues found" not in r.output
+        # Must see the ADVICE line
+        assert "[ADVICE]" in r.output
+        assert "codegraph" in r.output

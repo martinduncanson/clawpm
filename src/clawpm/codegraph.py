@@ -236,7 +236,13 @@ def _parse_file_paths_to_globs(
 
     globs: list[str] = []
     for parent, files in by_parent.items():
-        if len(files) >= 2:
+        # Codex PR#9 round-3 P2: repo-root files have an empty
+        # `parent`, so naively rolling up to `f"{parent}/**"` produces
+        # `/**` — an invalid scope that would catch everything. List
+        # each root file individually instead of rolling up.
+        if not parent:
+            globs.extend(files)
+        elif len(files) >= 2:
             globs.append(f"{parent}/**")
         else:
             globs.append(files[0])

@@ -1028,9 +1028,14 @@ def project_doctor(
             payload["dry_run"] = dry_run
         output_json(payload)
     else:
+        # Codex PR#9 round-3 P2: codegraph_advice must factor into the
+        # "anything to show?" guard, else text-mode operators with only
+        # advisories see "[OK] No issues found" and miss the advice
+        # entirely. Advisories are still NOT warnings (don't trip
+        # --strict / has_warnings), but they ARE worth printing.
         if not (
             issues or stale_tasks or stale_blocked or drift_tasks or prefix_collisions or unreadable_files
-            or commit_drift or missing_markers or codex_availability
+            or commit_drift or missing_markers or codex_availability or codegraph_advice
         ):
             click.echo("[OK] No issues found")
         else:
