@@ -35,3 +35,11 @@ clawpm ships `--success-criteria` + `emit-rubric` + the Stop-hook condition eval
 Weak criteria ("make it work", "improve X") defeat the rubric's purpose: the Stop-hook judge can't enforce what isn't measurable, and reflection events can't deliver calibration signal on success_criteria that were never gradeable in the first place. When filing a task at confidence ≥3, the rubric should already be sharp enough that another agent — or the local judge — can grade it without you in the loop.
 
 Subagent dispatch (`clawpm tasks dispatch <id>`) puts this on the rails: the subagent literally cannot terminate until the rubric is satisfied or impossibility is independently confirmed. Verifiable goals are not just better hygiene — they're the contract.
+
+### Canonical dispatch patterns
+
+For recurring iteration patterns, see the dispatch playbooks under `docs/playbooks/`:
+
+- **Codex-fix iteration loop** → `docs/playbooks/codex-fix-dispatch.md`. The canonical rubric (`wait-for-codex` clean + tests pass + PR mergeable) plus the dispatch invocation that hands the iteration to a subagent. Use this whenever a Codex review pass would otherwise consume 3-5 rounds of the parent agent's attention.
+
+When a new recurring iteration pattern emerges (e.g. encoding-scan zero-finding loop, dependency-bump compatibility loop), capture it as a sibling playbook so the rubric + invocation are reusable.
