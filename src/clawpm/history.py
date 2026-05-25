@@ -19,9 +19,37 @@ from pathlib import Path
 DEFAULT_OUTPUT_LIMIT = 500
 """Truncate per-entry text snippets to N chars to bound output size."""
 
-TASK_ID_RE = re.compile(r"\b([A-Z][A-Z0-9_]{1,9}-\d{1,5})\b")
-"""Match clawpm task IDs: 2-10 uppercase chars (allowing digits/underscore from
-2nd char onward), dash, 1-5 digits. Examples: CLAWP-011, ALPHA-001."""
+TASK_ID_RE = re.compile(
+    r"\b("
+    r"(?:"
+    # Multi-segment: each segment >=1 letter, 2-5 segments total, each
+    # capped at 10 chars. Catches multi-hyphen prefixes like MY-PR or
+    # A-B-C produced by project-id normalisation.
+    r"[A-Z][A-Z0-9_]{0,9}(?:-[A-Z][A-Z0-9_]{0,9}){1,4}"
+    r"|"
+    # Single-segment: 2-10 chars (original shape, retained for back-compat).
+    r"[A-Z][A-Z0-9_]{1,9}"
+    r")"
+    r"-\d{1,5}"
+    r")\b"
+)
+"""Match clawpm task IDs. Examples: CLAWP-011, ALPHA-001, MY-PR-001, A-B-C-123.
+
+Two prefix shapes covered:
+  - Single-segment: ``CLAWP-011`` — 2-10 uppercase chars (letters/digits/_)
+  - Multi-segment: ``MY-PR-001``, ``A-B-C-123`` — 2-5 segments joined by
+    hyphens, each segment starts with an uppercase letter and is up to
+    10 chars long
+
+Codex PR#5 round-2 P1 fix: project IDs are normalised via
+``re.sub(r'[^A-Z0-9]+', '-', raw_prefix).strip('-')``, which can produce
+multi-hyphen prefixes like ``MY-PR``. The previous single-hyphen regex
+matched ``MY-PR-001`` as ``PR-001``, corrupting ``by_task`` aggregation
+and ``unique_task_ids`` in ``reflect history-import``. The alternation
+keeps the original single-segment rejection of 1-char prefixes
+(``X-001``) intact — only multi-segment prefixes can use a 1-char
+first segment, because they're disambiguated by the additional
+hyphenated segments."""
 
 
 @dataclass

@@ -18,9 +18,32 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+# Defensive: Windows cp1252 stderr crashes on non-ASCII in error paths
+# (e.g. log paths containing accented chars). The hook is exit-0-always,
+# so a UnicodeEncodeError during stderr.write would still surface as an
+# unhandled exception caught by the top-level except. Reconfigure both
+# streams to UTF-8 so error formatting can't crash the hook.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+
+# Codex PR#5 round-2 P2: extract clawpm invocations from compound shell
+# commands. Previously the hook only checked if the leading-stripped command
+# starts with `clawpm `, so `cd /repo && clawpm tasks list`, env-prefixed
+# invocations (`FOO=1 clawpm ...`), and chained calls
+# (`clawpm start 42 && clawpm log progress`) were all silently dropped.
+# Splitting on shell operators (&&, ||, ;, |, newline) and inspecting each
+# segment fixes the auto-log gap.
+_SHELL_OP_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||;|\||\n)\s*")
+_LEADING_ENV_RE = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+")
 
 
 def _portfolio_root() -> Path:
@@ -49,35 +72,59 @@ def _append_work_log(entry: dict) -> None:
         sys.stderr.write(f"[clawpm-sync] could not write work log at {log_path}\n")
 
 
+def _extract_clawpm_calls(cmd: str) -> list[str]:
+    """Pull out clawpm invocations from a Bash command string.
+
+    Splits on shell operators (&&, ||, ;, |, newline) and strips leading
+    env-var assignments (e.g. ``FOO=1 clawpm ...``) before checking each
+    segment. Returns the matched ``clawpm ...`` substrings in order.
+    """
+    calls: list[str] = []
+    for segment in _SHELL_OP_SPLIT_RE.split(cmd):
+        stripped = segment.strip()
+        if not stripped:
+            continue
+        # Strip leading env-var assignments to expose the actual command.
+        stripped = _LEADING_ENV_RE.sub("", stripped)
+        if stripped.startswith("clawpm "):
+            calls.append(stripped)
+    return calls
+
+
 def _handle_post_tool_use(event: dict) -> None:
-    """If PostToolUse on a Bash `clawpm ...` command, log it."""
+    """If PostToolUse on a Bash command containing clawpm invocation(s), log them."""
     if event.get("tool_name") != "Bash":
         return
     cmd = event.get("tool_input", {}).get("command", "")
     if not isinstance(cmd, str):
         return
-    # Match "clawpm " at start, or after a shell op (&&, ||, ;, |, newline).
-    # Skip the obvious recursive cases (our own writes).
-    stripped = cmd.lstrip()
-    if not stripped.startswith("clawpm "):
+
+    calls = _extract_clawpm_calls(cmd)
+    if not calls:
         return
 
     response = event.get("tool_response", {}) or {}
     exit_code = response.get("exit_code") if isinstance(response, dict) else None
 
-    entry = {
-        "ts": _now_iso(),
-        "project": None,
-        "task": None,
-        "action": "tool_call",
-        "agent": "claude-code",
-        "session_key": event.get("session_id", ""),
-        "summary": stripped[:200],
-        "exit_code": exit_code,
-        "cwd": event.get("cwd", ""),
-        "source": "clawpm-sync hook",
-    }
-    _append_work_log(entry)
+    # Log one entry per clawpm invocation found in the compound command.
+    # Exit code from the Bash event reflects the LAST executed command in
+    # the chain — attached to all entries (the per-call exit code isn't
+    # available from PostToolUse). The summary preserves the actual call
+    # for traceability.
+    for call in calls:
+        entry = {
+            "ts": _now_iso(),
+            "project": None,
+            "task": None,
+            "action": "tool_call",
+            "agent": "claude-code",
+            "session_key": event.get("session_id", ""),
+            "summary": call[:200],
+            "exit_code": exit_code,
+            "cwd": event.get("cwd", ""),
+            "source": "clawpm-sync hook",
+        }
+        _append_work_log(entry)
 
 
 def _handle_session_boundary(event: dict, action: str) -> None:

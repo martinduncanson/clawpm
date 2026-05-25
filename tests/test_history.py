@@ -38,6 +38,12 @@ class TestTaskIdRegex:
         ("Working on CLAWP-011 + CLAWP-012", ["CLAWP-011", "CLAWP-012"]),
         ("MY_PROJ-99", ["MY_PROJ-99"]),
         ("PRJ-1", ["PRJ-1"]),
+        # Codex PR#5 round-2 P1: multi-hyphen prefixes (produced when a
+        # project ID's normalisation leaves embedded hyphens) must match
+        # in full — not truncate to the last `<chunk>-<n>` segment.
+        ("MY-PR-001", ["MY-PR-001"]),
+        ("A-B-C-123", ["A-B-C-123"]),
+        ("Working on MY-PR-001 and ALPHA-002", ["MY-PR-001", "ALPHA-002"]),
     ])
     def test_matches(self, text, expected):
         assert TASK_ID_RE.findall(text) == expected

@@ -119,6 +119,63 @@ class TestPostToolUse:
         assert len(entries) == 1
         assert entries[0]["summary"].startswith("clawpm context")
 
+    def test_cd_then_clawpm_logged(self, tmp_path):
+        # Codex PR#5 round-2 P2: `cd /repo && clawpm tasks list` was missed
+        # because the previous check only inspected the leading segment.
+        event = {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "cd /repo && clawpm tasks list --project demo"},
+            "tool_response": {"exit_code": 0},
+            "session_id": "S1",
+        }
+        _run_hook(event, tmp_path)
+        entries = _read_log(tmp_path)
+        assert len(entries) == 1
+        assert entries[0]["summary"].startswith("clawpm tasks list")
+
+    def test_chained_clawpm_calls_each_logged(self, tmp_path):
+        # Multi-clawpm chain: `clawpm start 42 && clawpm log progress` should
+        # produce two entries, one per invocation.
+        event = {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "clawpm start 42 && clawpm log progress"},
+            "tool_response": {"exit_code": 0},
+        }
+        _run_hook(event, tmp_path)
+        entries = _read_log(tmp_path)
+        assert len(entries) == 2
+        assert entries[0]["summary"].startswith("clawpm start 42")
+        assert entries[1]["summary"].startswith("clawpm log progress")
+
+    def test_env_prefix_stripped(self, tmp_path):
+        # `PYTHONIOENCODING=utf-8 clawpm doctor` is the canonical Windows
+        # invocation pattern; leading env-var assignment must not prevent match.
+        event = {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "PYTHONIOENCODING=utf-8 clawpm doctor"},
+            "tool_response": {"exit_code": 0},
+        }
+        _run_hook(event, tmp_path)
+        entries = _read_log(tmp_path)
+        assert len(entries) == 1
+        assert entries[0]["summary"].startswith("clawpm doctor")
+
+    def test_semicolon_separator_picked_up(self, tmp_path):
+        # POSIX-shell `;` separator is also a segment boundary.
+        event = {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo hi; clawpm next"},
+            "tool_response": {"exit_code": 0},
+        }
+        _run_hook(event, tmp_path)
+        entries = _read_log(tmp_path)
+        assert len(entries) == 1
+        assert entries[0]["summary"].startswith("clawpm next")
+
 
 class TestSessionBoundaries:
     def test_session_start_logged(self, tmp_path):
