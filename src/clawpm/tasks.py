@@ -507,6 +507,7 @@ def add_task(
             if v is not None and v != []
         }
 
+
     # Build content
     content = f"""---
 {yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True).strip()}
