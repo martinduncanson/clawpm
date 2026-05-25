@@ -17,3 +17,7 @@ uv.lock
 .agent/
 .claude/
 temp/
+
+# Example portfolio fixtures need .project/ committed for onboarding
+!examples/**/.project/
+!examples/**/.project/**

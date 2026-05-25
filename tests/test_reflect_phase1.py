@@ -645,17 +645,19 @@ class TestPhase2Stubs:
         data = json.loads(result.output)
         assert data["status"] == "phase2_pending"
 
-    def test_reflect_history_import_stub_no_source(self, temp_portfolio):
+    def test_reflect_history_import_no_source(self, temp_portfolio):
+        # Updated: history-import is now implemented (Phase 2 complete) — see
+        # tests/test_history.py for full coverage. This test locks the no-source
+        # error path.
         runner = CliRunner()
         result = runner.invoke(main, ["reflect", "history-import"])
         assert result.exit_code == 0, result.output
         data = json.loads(result.output)
-        assert data["status"] == "phase2_pending"
+        assert data["status"] == "no_source"
 
-    def test_reflect_history_import_stub_with_source(self, temp_portfolio):
+    def test_reflect_history_import_missing_source_dir(self, temp_portfolio):
         runner = CliRunner()
-        result = runner.invoke(main, ["reflect", "history-import", "--source", "/some/dir"])
+        result = runner.invoke(main, ["reflect", "history-import", "--source", "/some/dir/that/is/not/real"])
         assert result.exit_code == 0, result.output
         data = json.loads(result.output)
-        assert data["status"] == "phase2_pending"
-        assert "/some/dir" in data["message"]
+        assert data["status"] == "source_not_found"

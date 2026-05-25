@@ -1,0 +1,11 @@
+portfolio_root = "/home/user/Downloads/codex_test/clawpm/examples/portfolio"
+
+project_roots = [
+    "/home/user/Downloads/codex_test/clawpm/examples/portfolio/projects"
+]
+
+[defaults]
+status = "active"
+
+[openclaw]
+workspace = "~/.openclaw/workspace"
