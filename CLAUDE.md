@@ -2,6 +2,15 @@
 
 Multi-project task and research management — the persistent state substrate for cross-session, cross-agent work.
 
+## Fork-primary development model
+
+This repo is developed primarily in the operator's fork at `github.com/martinduncanson/clawpm`. The upstream `malphas-gh/clawpm` is the original source, and we push our work to it as a courtesy — but **the fork is canonical for our purposes** and upstream merge cadence is not a blocker on our cadence.
+
+Operational rule:
+- `fork` remote → `github.com/martinduncanson/clawpm` — where active branches and PRs live; `main` is the source of truth for local development.
+- `origin` remote → `github.com/malphas-gh/clawpm` — where cross-fork PRs are opened for courtesy upstreaming after the work is merged on the fork.
+- Maintainer-acceptance speed on `origin` PRs is not a concern. We don't block our work on it. Periodically reconcile `origin/main` back into our `main` to absorb upstream-only changes.
+
 <!-- clawpm:project-requirement -->
 ## Project management — clawpm
 
