@@ -4178,24 +4178,46 @@ def reflect_suggest(ctx: click.Context, task_id: str, project_id: str | None) ->
 )
 @click.pass_context
 def reflect_history_import(ctx: click.Context, source_dir: str | None) -> None:
-    """[Phase 2] Import historical session data as reflection events.
+    """Scan a directory of session transcripts / agent logs for task mentions.
 
-    DESIGN CONSTRAINTS (do not violate in Phase 2 implementation):
-    - Source path MUST come from --source flag or CLAWPM_HISTORY_SOURCE env var.
-      NO hardcoded paths (e.g. ~/.openclaw/) — this was removed at commit a06a5b8
-      precisely because static references to agent-runtime paths raise VirusTotal
-      false positives and are an operational security smell.
-    - The importer module must be lazy-imported inside this function so the
-      clawpm binary does not statically reference suspicious path patterns.
-    - clawpm setup should optionally prompt for the history source path during
-      init (Phase 2 work) — add a 'history_source' key to portfolio.toml config,
-      not a hardcoded default.
+    Walks ``<source_dir>`` (recursively) for ``.jsonl`` files, extracts every
+    line that references a clawpm task ID (per ``clawpm.history.TASK_ID_RE``),
+    and returns an aggregate report:
 
-    When implemented this will:
-    - Walk <source_dir> for session transcripts / agent logs
-    - Extract task-ID references, timestamps, file changes
-    - Synthesise Actuals records and write reflection events for historical tasks
-    - Deduplicate by task_id + occurred_at to allow re-runs safely
+    .. code-block:: json
+
+        {
+          "status": "scanned" | "no_mentions" | "no_source" | "source_not_found",
+          "source_dir": "<absolute path>",
+          "files_scanned": <int>,
+          "files_truncated": <bool>,
+          "mentions_found": <int>,
+          "unique_task_ids": <int>,
+          "by_task": {"CLAWP-011": 12, "CLAWP-018": 3, ...},
+          "mentions": [TaskMention, ...]
+        }
+
+    Source path resolution:
+    - ``--source <dir>`` flag (highest precedence).
+    - ``CLAWPM_HISTORY_SOURCE`` env var.
+    - No hardcoded fallback. Static references to agent-runtime paths (e.g.
+      ``~/.openclaw/``) were removed at commit a06a5b8 because they raised
+      VirusTotal false positives and were an operational security smell.
+
+    Implementation notes:
+    - The importer module is lazy-imported below so the clawpm binary's
+      static import graph stays free of suspicious-path patterns.
+    - TASK_ID_RE accepts both single-segment (``CLAWP-011``) and multi-segment
+      (``MY-PR-001``, ``A-B-C-123``) prefixes — matters for projects whose
+      IDs normalise to embedded hyphens.
+
+    Not yet implemented (Phase 3 work):
+    - Writing reflection events back to ``~/clawpm/reflections/<task-id>.jsonl``
+      (currently the function returns the mention report; the operator decides
+      what to do with it).
+    - Deduplication by ``task_id + occurred_at`` for safe re-runs.
+    - Optional ``history_source`` key in ``portfolio.toml`` so ``clawpm setup``
+      can prompt once instead of requiring the flag/env on every invocation.
     """
     import json as _json
     if not source_dir:

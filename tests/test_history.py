@@ -278,6 +278,26 @@ class TestReflectHistoryImportCLI:
         assert data["by_task"]["ALPHA-001"] == 1
         assert data["by_task"]["BETA-042"] == 1
 
+    def test_multi_hyphen_task_id_via_cli(self, tmp_path):
+        # End-to-end coverage of TASK_ID_RE multi-hyphen support through the
+        # CLI. Pairs the unit-level regex test with a transport-level
+        # confidence that the wiring carries the fix through to report output.
+        _write_jsonl(tmp_path / "log.jsonl",
+            {"msg": "Working on MY-PR-001"},
+            {"msg": "Followed up on MY-PR-001 and ALPHA-002"},
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, [
+            "reflect", "history-import",
+            "--source", str(tmp_path),
+        ])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["status"] == "scanned"
+        assert "MY-PR-001" in data["by_task"], data["by_task"]
+        assert data["by_task"]["MY-PR-001"] == 2
+        assert data["by_task"]["ALPHA-002"] == 1
+
     def test_no_mentions_returns_no_mentions_status(self, tmp_path):
         _write_jsonl(tmp_path / "log.jsonl", {"msg": "boring chatter no task refs"})
         runner = CliRunner()
