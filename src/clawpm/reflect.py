@@ -161,8 +161,9 @@ def write_iteration_event(
     }
     ref_dir = _reflections_dir(portfolio_root)
     ref_file = ref_dir / f"{task_id}.jsonl"
-    with open(ref_file, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record) + "\n")
+    # CLAWP-032: cross-platform locked append (Windows append is non-atomic).
+    from .concurrency import append_jsonl_line
+    append_jsonl_line(ref_file, json.dumps(record))
     return ref_file
 
 

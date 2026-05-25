@@ -148,12 +148,14 @@ def add_entry(
 
     worklog_path = get_worklog_path(config)
 
-    # Ensure parent directory exists
-    worklog_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Append to file — utf-8 so summaries with non-Latin chars survive on Windows
-    with open(worklog_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry.to_dict(), ensure_ascii=False) + "\n")
+    # Append under exclusive lock — Windows `open(p, "a")` is NOT atomic across
+    # processes and silently interleaves bytes on concurrent writes. Per CLAWP-032
+    # all JSONL appenders route through `locked_append`.
+    from .concurrency import append_jsonl_line
+    append_jsonl_line(
+        worklog_path,
+        json.dumps(entry.to_dict(), ensure_ascii=False),
+    )
 
     return entry
 

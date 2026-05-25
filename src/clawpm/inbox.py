@@ -57,9 +57,13 @@ def _now_iso() -> str:
 
 
 def _append_event(path: Path, event: dict) -> None:
-    """Append a single JSON event line to a JSONL file."""
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    """Append a single JSON event line to a JSONL file.
+
+    CLAWP-032: routed through `concurrency.append_jsonl_line` for cross-platform
+    locked append. Windows `open(p, "a")` is NOT atomic across processes.
+    """
+    from .concurrency import append_jsonl_line
+    append_jsonl_line(path, json.dumps(event, ensure_ascii=False))
 
 
 def _read_events(path: Path) -> list[dict]:

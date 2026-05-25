@@ -3855,8 +3855,12 @@ def issues_add(
     # Remove None values but always keep "tags" (even if empty list) and "fixed"
     entry = {k: v for k, v in entry.items() if v is not None}
 
-    with open(issues_file, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry) + "\n")
+    # CLAWP-032: cross-platform locked append. The previous non-atomic append
+    # was the originating motivation for the concurrency audit — two parallel
+    # `clawpm issues add` invocations on Windows could interleave JSON bytes
+    # and silently corrupt `.agent/issues.jsonl`.
+    from clawpm.concurrency import append_jsonl_line
+    append_jsonl_line(issues_file, json.dumps(entry))
 
     if fmt == OutputFormat.JSON:
         output_json({"status": "logged", "file": str(issues_file), "entry": entry})
