@@ -269,6 +269,52 @@ class TestRuleMissingEncodingKwarg:
         rules = [r["rule"] for r in findings]
         assert "missing-encoding-kwarg" in rules
 
+    def test_zipfile_open_not_flagged(self, tmp_path):
+        # Codex PR#5 round-1 P1: `zipfile.ZipFile(p).open(name)` is not a
+        # text-file API — encoding= isn't a valid kwarg on it. Must not flag.
+        f = _write_file(tmp_path, "x.py",
+            "import zipfile\n"
+            "def f(p, name):\n"
+            "    return zipfile.ZipFile(p).open(name)\n"
+        )
+        findings = check_file(f)
+        rules = [r["rule"] for r in findings]
+        assert "missing-encoding-kwarg" not in rules
+
+    def test_socket_open_not_flagged(self, tmp_path):
+        # Generic `obj.open(...)` on a non-pathlib receiver must not flag.
+        f = _write_file(tmp_path, "x.py",
+            "def f(conn):\n"
+            "    return conn.open()\n"
+        )
+        findings = check_file(f)
+        rules = [r["rule"] for r in findings]
+        assert "missing-encoding-kwarg" not in rules
+
+    def test_pathlib_path_open_no_encoding_still_flagged(self, tmp_path):
+        # The pathlib narrowing must not drop the real signal: Path(p).open()
+        # without encoding= is exactly what we want flagged.
+        f = _write_file(tmp_path, "x.py",
+            "from pathlib import Path\n"
+            "def f(p):\n"
+            "    return Path(p).open()\n"
+        )
+        findings = check_file(f)
+        rules = [r["rule"] for r in findings]
+        assert "missing-encoding-kwarg" in rules
+
+    def test_kwargs_forward_silences_finding(self, tmp_path):
+        # PR#5 round-2 (borrowed from PR#8): wrapper functions that forward
+        # **kwargs through to open() may legitimately have encoding= flowing
+        # in via the dict. Don't flag.
+        f = _write_file(tmp_path, "x.py",
+            "def wrapper(p, **kwargs):\n"
+            "    return open(p, **kwargs)\n"
+        )
+        findings = check_file(f)
+        rules = [r["rule"] for r in findings]
+        assert "missing-encoding-kwarg" not in rules
+
 
 class TestRuleUnconfiguredStdout:
     def test_module_with_print_no_reconfigure_flagged(self, tmp_path):
@@ -337,6 +383,22 @@ class TestRuleUnconfiguredStdout:
             "import sys\n"
             "def setup():\n"
             '    sys.stdout.reconfigure(encoding="utf-8")\n'
+            "def main():\n"
+            "    print('hello')\n"
+        )
+        findings = check_file(f)
+        rules = [r["rule"] for r in findings]
+        assert "unconfigured-stdout" in rules
+
+    def test_non_sys_stdout_reconfigure_does_not_satisfy(self, tmp_path):
+        # Codex PR#5 round-1 P2: `process.stdout.reconfigure(...)` on a
+        # subprocess handle reconfigures the subprocess's stream, not the
+        # host's. Module-level prints in this module are still at risk —
+        # must remain flagged.
+        f = _write_file(tmp_path, "x.py",
+            "import subprocess\n"
+            "process = subprocess.Popen(['x'])\n"
+            'process.stdout.reconfigure(encoding="utf-8")\n'
             "def main():\n"
             "    print('hello')\n"
         )
@@ -438,6 +500,20 @@ class TestScanPath:
         findings = scan_path(tmp_path, max_files=2)
         rules = [r["rule"] for r in findings]
         assert "scan-truncated" in rules
+
+    def test_ancestor_named_build_not_skipped(self, tmp_path):
+        # Codex PR#5 round-1 P1: a project located UNDER a directory named
+        # "build" (e.g. CI runners use `/build/<workspace>/...`) was
+        # silently skipped because absolute path.parts matched skip_dirs.
+        # Filter must apply to parts RELATIVE to root, not absolute.
+        ancestor_build = tmp_path / "build"
+        ancestor_build.mkdir()
+        proj = ancestor_build / "myproj"
+        proj.mkdir()
+        _write_file(proj, "risky.py", 'print("→ glyph in real source")\n')
+        findings = scan_path(proj)
+        rules = [r["rule"] for r in findings]
+        assert "nonascii-in-print" in rules, findings
 
     def test_two_sided_skip_assertion(self, tmp_path):
         # Defends against "scanner broken entirely" regressions: a risky

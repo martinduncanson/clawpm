@@ -42,8 +42,25 @@ PRINT_LIKE_RECEIVERS = {"click", "typer", "sys"}
 the match so domain objects with .print/.echo methods (logger.echo, Rich's
 console.print, model.print) don't false-positive."""
 
-FILE_OP_ATTRS = {"read_text", "write_text", "open", "read_bytes", "write_bytes"}
-"""Pathlib methods that take an encoding= kwarg (or bypass it for bytes)."""
+TEXT_FILE_OP_ATTRS = {"read_text", "write_text"}
+"""Pathlib methods that take an encoding= kwarg — unambiguous (no other API
+uses these names with file-text semantics)."""
+
+BYTES_FILE_OP_ATTRS = {"read_bytes", "write_bytes"}
+"""Pathlib bytes methods; tracked separately because they don't take encoding=."""
+
+PATHLIB_RECEIVER_NAMES = {
+    "Path", "PurePath", "PurePosixPath", "PureWindowsPath",
+    "PosixPath", "WindowsPath",
+}
+"""Pathlib class names whose `.open()` is unambiguously a text file op.
+
+Codex PR#5 round-1 P1: any `.open()` attribute call matched as a file op,
+which false-positives on `zipfile.ZipFile(p).open(...)`, `tarfile.open(...)`,
+`socket.create_connection(...).open(...)`, etc. Narrow `.open` matching to
+calls whose receiver is provably a pathlib Path — Call to a pathlib name
+like `Path(p).open(...)` or `pathlib.Path(p).open(...)`. The bare `open(...)`
+builtin remains broadly matched."""
 
 
 def _is_nonascii(s: str) -> bool:
@@ -97,24 +114,66 @@ def _is_print_like_call(node: ast.Call) -> bool:
     return False
 
 
+def _is_pathlib_receiver(node: ast.expr) -> bool:
+    """True if expr is a Call to a pathlib class — `Path(p)`, `pathlib.Path(p)`,
+    `PurePath(p)`, etc.
+
+    Used to narrow `.open()` matching so zipfile/tarfile/socket-style
+    `.open()` calls don't false-positive. Conservative: only direct Call
+    nodes count, since a Name like `p` could be any type at static-analysis
+    time (we'd miss `p = Path(x); p.open()` — accepted as a known
+    detection gap, captured in the concerns block).
+    """
+    if not isinstance(node, ast.Call):
+        return False
+    f = node.func
+    if isinstance(f, ast.Name) and f.id in PATHLIB_RECEIVER_NAMES:
+        return True
+    if isinstance(f, ast.Attribute) and f.attr in PATHLIB_RECEIVER_NAMES:
+        return True
+    return False
+
+
 def _is_file_op_call(node: ast.Call) -> tuple[bool, str]:
     """Return (is_file_op, name) for the call.
 
-    Detects: `open(...)`, `<path>.open(...)`, `<path>.read_text(...)`,
-    `<path>.write_text(...)`. The bytes variants are tracked but reported
-    separately because they don't take encoding=.
+    Detects:
+      - `open(...)` — bare Name call (builtin)
+      - `<receiver>.read_text(...)` / `.write_text(...)` — unambiguous pathlib
+      - `<receiver>.read_bytes(...)` / `.write_bytes(...)` — pathlib bytes
+      - `Path(p).open(...)` etc. — pathlib `.open` only matches when receiver
+        is provably a pathlib class Call (Codex PR#5 round-1 P1 fix)
+
+    Returns (False, "") for `zipfile.ZipFile(p).open(...)`,
+    `tarfile.open(...)`, `socket.open(...)`, generic `obj.open(...)` —
+    these used to false-positive as missing-encoding=.
     """
     func = node.func
     if isinstance(func, ast.Name) and func.id == "open":
         return True, "open"
-    if isinstance(func, ast.Attribute) and func.attr in FILE_OP_ATTRS:
-        return True, func.attr
+    if isinstance(func, ast.Attribute):
+        if func.attr in TEXT_FILE_OP_ATTRS or func.attr in BYTES_FILE_OP_ATTRS:
+            return True, func.attr
+        if func.attr == "open" and _is_pathlib_receiver(func.value):
+            return True, "open"
     return False, ""
 
 
 def _has_encoding_kwarg(node: ast.Call) -> bool:
-    """Return True if any keyword arg is named 'encoding'."""
-    return any(kw.arg == "encoding" for kw in node.keywords)
+    """Return True if any keyword arg is named 'encoding', OR if the call
+    forwards **kwargs (kw.arg is None on a DoubleStarred unpack).
+
+    The **kwargs case is a deliberate false-negative: wrapper functions
+    that forward kwargs through to open()/read_text()/write_text() may
+    legitimately have encoding= flowing in via the dict. Flagging every
+    such wrapper would generate noise on what is in fact a correct
+    forwarding pattern. Operators who genuinely forget encoding= in a
+    wrapper still get caught at the call site that passes the kwargs.
+    """
+    for kw in node.keywords:
+        if kw.arg is None or kw.arg == "encoding":
+            return True
+    return False
 
 
 def _has_binary_mode(node: ast.Call) -> bool:
@@ -145,14 +204,27 @@ def _has_binary_mode(node: ast.Call) -> bool:
 
 
 def _is_stdout_reconfigure_call(stmt: ast.stmt) -> bool:
-    """Return True if stmt is an Expr wrapping `<...>.stdout.reconfigure(...)`."""
+    """Return True if stmt is an Expr wrapping `sys.stdout.reconfigure(...)`.
+
+    Codex PR#5 round-1 P2 fix: previously this matched any
+    `<...>.stdout.reconfigure(...)` shape — including
+    `process.stdout.reconfigure(...)` on a subprocess handle, which doesn't
+    protect the host stdout. Now the chain must bottom out at the Name
+    `sys` (matches `sys.stdout.reconfigure(...)` exactly).
+    """
     if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)):
         return False
     call = stmt.value
-    return (isinstance(call.func, ast.Attribute)
+    if not (isinstance(call.func, ast.Attribute)
             and call.func.attr == "reconfigure"
             and isinstance(call.func.value, ast.Attribute)
-            and call.func.value.attr == "stdout")
+            and call.func.value.attr == "stdout"):
+        return False
+    # call.func.value is the `<X>.stdout` Attribute; its `.value` must be Name('sys').
+    return (
+        isinstance(call.func.value.value, ast.Name)
+        and call.func.value.value.id == "sys"
+    )
 
 
 def _has_stdout_reconfigure(tree: ast.Module) -> bool:
@@ -302,7 +374,18 @@ def scan_path(root: Path, max_files: int = 500) -> list[dict]:
     file_count = 0
     truncated = False
     for path in root.rglob("*.py"):
-        if any(part in skip_dirs for part in path.parts):
+        # Codex PR#5 round-1 P1 fix: filter skip_dirs against parts RELATIVE
+        # to root, not absolute path parts. Otherwise a project located
+        # under an ancestor named `build`, `temp`, `dist`, etc. (e.g.
+        # `C:/Users/build-bot/proj/...`) would be silently skipped.
+        try:
+            rel_parts = path.relative_to(root).parts
+        except ValueError:
+            # Defensive: rglob result should always be under root, but if a
+            # filesystem oddity (symlink, junction) produces an outside path,
+            # fall back to absolute parts rather than crash.
+            rel_parts = path.parts
+        if any(part in skip_dirs for part in rel_parts):
             continue
         file_count += 1
         if file_count > max_files:
