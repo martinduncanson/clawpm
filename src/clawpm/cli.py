@@ -4327,13 +4327,13 @@ def conflicts(
 
 
 # ============================================================================
-# Reflect command group — Phase 2 stubs
+# Reflect command group — calibration capture + consumers (CLAWP-040)
 # ============================================================================
 
 
 @main.group()
 def reflect() -> None:
-    """Reflection layer — query predictions vs actuals (Phase 2 stubs)."""
+    """Reflection layer — query predictions vs actuals and calibrate estimates."""
     pass
 
 
@@ -4341,38 +4341,91 @@ def reflect() -> None:
 @click.option("--project", "-p", "project_id", default=None, help="Project ID")
 @click.pass_context
 def reflect_summarize(ctx: click.Context, project_id: str | None) -> None:
-    """[Phase 2] Summarize prediction accuracy across completed tasks.
+    """Summarize predicted-vs-actual duration calibration across done tasks (CLAWP-040).
 
-    When implemented this will:
-    - Aggregate all reflection events for the project
-    - Compute distribution stats (duration ratio, files-changed ratio, complexity hit-rate)
-    - Surface systematic over/under-estimation patterns for operator review
+    Aggregates the reflection corpus into duration ratios (actual/predicted)
+    bucketed by complexity, confidence, and agent_profile. Rows without a
+    usable actual are flagged (dirty) and excluded so they don't poison the
+    ratio. Omit --project to span all projects. This is the measurement half
+    of the calibration loop; `reflect suggest` applies it.
     """
-    import json as _json
-    click.echo(_json.dumps({
-        "status": "phase2_pending",
-        "message": "clawpm reflect summarize is not yet implemented (Phase 2)",
-    }, indent=2))
+    from .reflect import summarize_calibration
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+    summary = summarize_calibration(config.portfolio_root, project_id)
+    output_success(
+        f"Calibration summary ({summary['project_id']}): "
+        f"{summary['with_usable_duration']}/{summary['total_done']} done tasks "
+        f"with usable duration.",
+        data=summary,
+        fmt=fmt,
+    )
 
 
 @reflect.command("suggest")
-@click.argument("task_id")
+@click.argument("task_id", required=False, default=None)
 @click.option("--project", "-p", "project_id", default=None, help="Project ID")
+@click.option("--complexity", "-c", type=click.Choice(["s", "m", "l", "xl"]), default=None, help="Complexity bucket to calibrate against (derived from the task when TASK_ID is given).")
+@click.option("--predicted-duration", "predicted_duration", default=None, help="Gut estimate to calibrate: 90, 2h, 3d. Returned deflated by the learned ratio.")
+@click.option("--confidence", type=int, default=None, help="Operator confidence 1-5 (recorded on the suggestion).")
+@click.option("--agent-profile", "agent_profile", default=None, help="Agent profile (recorded on the suggestion).")
+@click.option("--min-bucket", "min_bucket", type=int, default=5, help="Minimum samples for a complexity bucket before falling back to the global ratio.")
 @click.pass_context
-def reflect_suggest(ctx: click.Context, task_id: str, project_id: str | None) -> None:
-    """[Phase 2] Suggest predictions for a task based on past reflection history.
+def reflect_suggest(
+    ctx: click.Context,
+    task_id: str | None,
+    project_id: str | None,
+    complexity: str | None,
+    predicted_duration: str | None,
+    confidence: int | None,
+    agent_profile: str | None,
+    min_bucket: int,
+) -> None:
+    """Suggest a calibrated duration from the corpus's learned ratio (CLAWP-040).
 
-    When implemented this will:
-    - Load reflection events for the project
-    - Find tasks with similar title/scope/complexity to <task_id>
-    - Derive calibrated predictions (e.g. 'similar tasks took ~2x longer than predicted')
-    - Return suggested --predict-* values the operator can copy-paste
+    Two modes:
+      - ``reflect suggest <task_id>`` derives complexity / confidence /
+        agent_profile / predicted-duration from the task, then deflates.
+      - ``reflect suggest --complexity m --predicted-duration 6h`` calibrates
+        a bare estimate against the complexity bucket.
+
+    Deterministic — no model call. Falls back to the global ratio when the
+    complexity bucket has fewer than --min-bucket samples.
     """
-    import json as _json
-    click.echo(_json.dumps({
-        "status": "phase2_pending",
-        "message": f"clawpm reflect suggest is not yet implemented (Phase 2). Task: {task_id}",
-    }, indent=2))
+    from .reflect import parse_duration, suggest_duration
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+
+    predicted_min: int | None = None
+    if task_id:
+        project_id, _ = require_project(ctx, project_id)
+        task_id = expand_task_id(task_id, project_id)
+        t = get_task(config, project_id, task_id)
+        if not t:
+            output_error("task_not_found", f"No task with id '{task_id}' in project '{project_id}'", fmt=fmt)
+            sys.exit(1)
+        complexity = complexity or (t.complexity.value if t.complexity else None)
+        confidence = confidence if confidence is not None else t.predictions.confidence
+        agent_profile = agent_profile or t.agent_profile
+        predicted_min = t.predictions.duration_min
+
+    if predicted_duration is not None:
+        try:
+            predicted_min = parse_duration(predicted_duration)
+        except Exception as exc:
+            output_error("bad_duration", str(exc), fmt=fmt)
+            sys.exit(1)
+
+    result = suggest_duration(
+        config.portfolio_root,
+        complexity=complexity,
+        confidence=confidence,
+        agent_profile=agent_profile,
+        predicted_min=predicted_min,
+        project_id=project_id,
+        min_bucket=min_bucket,
+    )
+    output_success(f"Calibration suggestion (bucket: {result['bucket']})", data=result, fmt=fmt)
 
 
 @reflect.command("history-import")

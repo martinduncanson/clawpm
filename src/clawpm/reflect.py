@@ -1,7 +1,10 @@
-"""Reflection layer — Phase 1: compute and store predictions vs actuals.
+"""Reflection layer — compute/store predictions vs actuals and aggregate them.
 
-Phase 2 stubs (summarize / suggest / history-import) live in cli.py under the
-``clawpm reflect`` command group.
+Phase 1 records predictions + actuals + deltas per task. CLAWP-040 adds the
+calibration consumers: ``summarize_calibration`` (aggregate duration ratios
+across the corpus) and ``suggest_duration`` (deflate a new estimate by the
+learned ratio), wired to ``clawpm reflect summarize`` / ``reflect suggest``
+in cli.py. ``history-import`` remains a scanner.
 """
 
 from __future__ import annotations
@@ -9,6 +12,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import re
+import statistics
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -613,3 +617,200 @@ def write_reflection_event(
         fh.write(json.dumps(record) + "\n")
 
     return ref_file
+
+
+# ---------------------------------------------------------------------------
+# CLAWP-040 — calibration consumers: aggregate the corpus (summarize) and
+# apply the learned ratio to deflate/inflate a new estimate (suggest).
+#
+# This closes the loop the corpus was built for: predictions + actuals +
+# deltas have been recorded since Phase 1, but nothing read them back. The
+# load-bearing number is the duration ratio = actual / predicted: <1 means
+# the estimate was inflated (the "Claude says days, ships in hours" bias),
+# >1 means it was optimistic. Pure arithmetic over the JSONL — no model call.
+# ---------------------------------------------------------------------------
+
+
+def _iter_done_events(portfolio_root: Path, project_id: str | None = None):
+    """Yield the latest non-voided ``task_done`` record per reflection file.
+
+    Void handling mirrors :func:`find_reference_tasks`: a ``void`` event for
+    the file (unscoped, or matching ``project_id``) drops the file's done
+    event from the corpus — voided reflections are operator-flagged bad data.
+    When ``project_id`` is None the corpus spans all projects and ANY void
+    drops the file.
+    """
+    ref_dir = _reflections_dir(portfolio_root)
+    if not ref_dir.exists():
+        return
+    for ref_file in ref_dir.glob("*.jsonl"):
+        try:
+            text = ref_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        done_record: dict | None = None
+        voided = False
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            evt = rec.get("event")
+            if evt == "void":
+                rec_proj = rec.get("project_id")
+                if rec_proj is None or project_id is None or rec_proj == project_id:
+                    voided = True
+                continue
+            if evt != "task_done":
+                continue
+            if project_id is not None and rec.get("project_id") != project_id:
+                continue
+            done_record = rec  # keep the latest
+        if done_record is not None and not voided:
+            yield done_record
+
+
+def _duration_ratio(rec: dict) -> float | None:
+    """actual/predicted duration for a done record; None if not computable."""
+    deltas = rec.get("deltas") or {}
+    r = deltas.get("duration_ratio")
+    if r is not None:
+        return r
+    preds = rec.get("predictions") or {}
+    acts = rec.get("actuals") or {}
+    p = preds.get("duration_min")
+    a = acts.get("duration_min")
+    if p and a is not None:
+        return round(a / p, 4)
+    return None
+
+
+def _bucket_stats(ratios: list[float]) -> dict:
+    if not ratios:
+        return {"n": 0, "median_ratio": None, "mean_ratio": None}
+    return {
+        "n": len(ratios),
+        "median_ratio": round(statistics.median(ratios), 4),
+        "mean_ratio": round(statistics.fmean(ratios), 4),
+    }
+
+
+def _interpret_ratio(median_ratio: float | None) -> str:
+    if median_ratio is None:
+        return "No usable predicted-vs-actual duration pairs yet."
+    if median_ratio < 1:
+        return (
+            f"Median actual/predicted = {median_ratio}: tasks finish ~"
+            f"{round(1 / median_ratio, 1)}x FASTER than predicted "
+            f"(estimates are inflated — deflate future durations)."
+        )
+    if median_ratio > 1:
+        return (
+            f"Median actual/predicted = {median_ratio}: tasks take ~"
+            f"{median_ratio}x LONGER than predicted (estimates optimistic)."
+        )
+    return "Median actual/predicted = 1.0: well calibrated."
+
+
+def summarize_calibration(
+    portfolio_root: Path,
+    project_id: str | None = None,
+) -> dict:
+    """Aggregate predicted-vs-actual duration ratios across the corpus.
+
+    Buckets by complexity, operator confidence, and agent_profile (CLAWP-038).
+    Rows whose duration ratio can't be computed (missing/zero predicted or
+    actual) are counted as ``dirty_flagged`` and excluded from the stats so
+    they don't poison the ratio. ``project_id=None`` aggregates all projects.
+    """
+    done = list(_iter_done_events(portfolio_root, project_id))
+    usable: list[float] = []
+    dirty = 0
+    by_complexity: dict[str, list[float]] = {}
+    by_confidence: dict[str, list[float]] = {}
+    by_profile: dict[str, list[float]] = {}
+
+    for rec in done:
+        r = _duration_ratio(rec)
+        if r is None:
+            dirty += 1
+            continue
+        preds = rec.get("predictions") or {}
+        usable.append(r)
+        cx = preds.get("complexity") or "unknown"
+        cf = preds.get("confidence")
+        cf_key = str(cf) if cf is not None else "unset"
+        ap = rec.get("agent_profile") or "unspecified"
+        by_complexity.setdefault(cx, []).append(r)
+        by_confidence.setdefault(cf_key, []).append(r)
+        by_profile.setdefault(ap, []).append(r)
+
+    overall = _bucket_stats(usable)
+    return {
+        "project_id": project_id or "ALL",
+        "total_done": len(done),
+        "with_usable_duration": len(usable),
+        "dirty_flagged": dirty,
+        "overall": overall,
+        "by_complexity": {
+            k: _bucket_stats(v) for k, v in sorted(by_complexity.items())
+        },
+        "by_confidence": {
+            k: _bucket_stats(v) for k, v in sorted(by_confidence.items())
+        },
+        "by_agent_profile": {
+            k: _bucket_stats(v) for k, v in sorted(by_profile.items())
+        },
+        "interpretation": _interpret_ratio(overall["median_ratio"]),
+    }
+
+
+def suggest_duration(
+    portfolio_root: Path,
+    complexity: str | None = None,
+    confidence: int | None = None,
+    agent_profile: str | None = None,
+    predicted_min: int | None = None,
+    project_id: str | None = None,
+    min_bucket: int = 5,
+) -> dict:
+    """Suggest a calibrated duration by deflating ``predicted_min`` by the
+    learned ratio for the most specific bucket with enough data.
+
+    Selection: the ``complexity`` bucket if it has >= ``min_bucket`` samples,
+    else the global ratio (``fell_back_to_global=True``). Deterministic — no
+    model call. ``calibrated_duration_min`` is only returned when a predicted
+    duration is supplied and a ratio exists.
+    """
+    summary = summarize_calibration(portfolio_root, project_id)
+
+    chosen = summary["overall"]
+    chosen_key = "global"
+    if complexity:
+        b = summary["by_complexity"].get(complexity)
+        if b and b["n"] >= min_bucket:
+            chosen, chosen_key = b, f"complexity={complexity}"
+
+    ratio = chosen["median_ratio"]
+    result: dict = {
+        "bucket": chosen_key,
+        "n": chosen["n"],
+        "median_ratio": ratio,
+        "fell_back_to_global": chosen_key == "global",
+        "min_bucket": min_bucket,
+        "confidence": confidence,
+        "agent_profile": agent_profile,
+        "interpretation": _interpret_ratio(ratio),
+    }
+    if predicted_min is not None and ratio is not None:
+        result["predicted_duration_min"] = predicted_min
+        result["calibrated_duration_min"] = int(round(predicted_min * ratio))
+    elif predicted_min is not None:
+        # No corpus signal yet — echo the estimate unchanged so callers
+        # always get a usable number.
+        result["predicted_duration_min"] = predicted_min
+        result["calibrated_duration_min"] = predicted_min
+    return result
