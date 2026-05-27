@@ -981,12 +981,17 @@ def project_doctor(
                 "repo_path": proj.repo_path.as_posix(),
                 "doc_files": doc_count,
                 "suggested_action": (
-                    f"Doc-heavy project ({doc_count} prose files). semble "
-                    f"`--content all` gives semantic search over prose + "
-                    f"config + code that CodeGraph (code-symbol only) can't. "
-                    f"Index with `uvx --from \"semble[mcp]\" semble index "
-                    f"{proj.repo_path.as_posix()} -o "
-                    f"{proj.repo_path.as_posix()}/.clawpm-semble`."
+                    f"Doc-heavy project ({doc_count} prose files). CodeGraph "
+                    f"indexes code symbols only; semble can cover prose + "
+                    f"config too — but its `index` subcommand defaults to "
+                    f"code-only, so the docs/config must be pulled in at "
+                    f"index time with --include-text-files (not --content, "
+                    f"which is search-time only). Build a content-aware "
+                    f"index: `uvx --from \"semble[mcp]\" semble index "
+                    f"{proj.repo_path.as_posix()} --include-text-files -o "
+                    f"{proj.repo_path.as_posix()}/.clawpm-semble`, then "
+                    f"search it with `semble search \"<query>\" --index "
+                    f"{proj.repo_path.as_posix()}/.clawpm-semble --content all`."
                 ),
             })
 
