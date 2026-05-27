@@ -429,6 +429,7 @@ def add_task(
     description: str = "",
     predictions: Predictions | None = None,
     parallel_group: int | None = None,
+    agent_profile: str | None = None,
 ) -> Task | None:
     """Add a new task to a project."""
     tasks_dir = get_tasks_dir(config, project_id)
@@ -498,6 +499,9 @@ def add_task(
 
     if parallel_group is not None:
         frontmatter["parallel_group"] = parallel_group
+
+    if agent_profile:
+        frontmatter["agent_profile"] = agent_profile
 
     if predictions and not predictions.is_empty():
         pred_dict = predictions.to_dict()
@@ -678,6 +682,7 @@ def add_subtask(
     priority: int = 5,
     complexity: TaskComplexity | None = None,
     description: str = "",
+    agent_profile: str | None = None,
 ) -> Task | None:
     """Add a subtask to a parent task.
     
@@ -727,7 +732,10 @@ def add_subtask(
     
     if complexity:
         frontmatter["complexity"] = complexity.value
-    
+
+    if agent_profile:
+        frontmatter["agent_profile"] = agent_profile
+
     # Build content
     content = f"""---
 {yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True).strip()}

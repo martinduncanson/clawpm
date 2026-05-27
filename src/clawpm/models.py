@@ -431,6 +431,11 @@ class Task:
     # parent_mission: ID of the mission this task is a mini-goal of.
     actor: str | None = None  # None = legacy/unspecified, defaults to "agent" semantics
     parent_mission: str | None = None
+    # CLAWP-038 — agent_profile: a capability/skill hint (shape modeled on
+    # agenticq's AgentCard.capability) recorded on the task and propagated
+    # into reflection/iteration events so calibration can segment
+    # predicted-vs-actual by profile. None = unspecified = generic dispatch.
+    agent_profile: str | None = None
 
     @property
     def is_parent(self) -> bool:
@@ -504,6 +509,13 @@ class Task:
         if isinstance(actor_raw, str) and actor_raw in ("agent", "human"):
             actor = actor_raw
 
+        # CLAWP-038 — agent_profile is a free-form capability string. Absent
+        # or non-string (legacy task files) → None, preserving back-compat.
+        ap_raw = frontmatter.get("agent_profile")
+        agent_profile: str | None = (
+            ap_raw if isinstance(ap_raw, str) and ap_raw.strip() else None
+        )
+
         return cls(
             id=frontmatter.get("id", path.stem.replace(".progress", "")),
             title=title,
@@ -520,6 +532,7 @@ class Task:
             parallel_group=parallel_group,
             actor=actor,
             parent_mission=frontmatter.get("parent_mission"),
+            agent_profile=agent_profile,
         )
 
     @property
@@ -561,6 +574,7 @@ class Task:
             "parallel_group": self.parallel_group,
             "actor": self.actor,
             "parent_mission": self.parent_mission,
+            "agent_profile": self.agent_profile,
         }
         body = self.body
         if body:

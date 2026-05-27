@@ -1672,6 +1672,7 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
 @click.option("--depends", "-d", multiple=True, help="Dependencies (can specify multiple)")
 @click.option("--scope", multiple=True, help="File glob patterns claimed by this task (can specify multiple)")
 @click.option("--parallel-group", "parallel_group", type=int, default=None, help="Batch ordinal for parallel dispatch (CLAWP-021). Tasks sharing a group dispatch together; group N+1 waits for group N.")
+@click.option("--agent-profile", "agent_profile", default=None, help="Capability/skill profile (CLAWP-038). Recorded on the task and propagated to reflection/iteration events so calibration can segment predicted-vs-actual by profile.")
 @click.option("--parent", "parent_id", help="Parent task ID (creates subtask)")
 @click.option("--description", help="Task description (deprecated, use --body)")
 @click.option("--body", "-b", help="Task body content")
@@ -1711,6 +1712,7 @@ def tasks_add(
     depends: tuple[str, ...],
     scope: tuple[str, ...],
     parallel_group: int | None,
+    agent_profile: str | None,
     parent_id: str | None,
     description: str | None,
     body: str | None,
@@ -1817,6 +1819,7 @@ def tasks_add(
             priority=priority,
             complexity=cmplx,
             description=task_body,
+            agent_profile=agent_profile,
         )
     else:
         deps = list(depends) if depends else None
@@ -1832,6 +1835,7 @@ def tasks_add(
             description=task_body,
             predictions=predictions,
             parallel_group=parallel_group,
+            agent_profile=agent_profile,
         )
 
     if not task:
@@ -3082,6 +3086,17 @@ def hook_eval_stop(
     project_id, _ = require_project(ctx, project_id)
     task_id = expand_task_id(task_id, project_id)
 
+    # CLAWP-038 — best-effort agent_profile so the iteration events this
+    # hook writes can be bucketed by profile in `reflect summarize`. Any
+    # failure (task not found yet, parse error) degrades to None.
+    _hook_agent_profile: str | None = None
+    try:
+        _ap_task = get_task(config, project_id, task_id)
+        if _ap_task is not None:
+            _hook_agent_profile = _ap_task.agent_profile
+    except Exception:
+        _hook_agent_profile = None
+
     # 1. Load the rubric — from file if given, else render from the task.
     rubric: str
     if rubric_file:
@@ -3158,6 +3173,7 @@ def hook_eval_stop(
                 verdict_ok=False,
                 verdict_reason=f"JUDGE_ERROR: {exc}",
                 verdict_impossible=False,
+                agent_profile=_hook_agent_profile,
             )
         except OSError:
             # Writing the doctor signal failed too — last resort is the
@@ -3186,6 +3202,7 @@ def hook_eval_stop(
             verdict_ok=verdict.ok,
             verdict_reason=verdict.reason,
             verdict_impossible=verdict.impossible,
+            agent_profile=_hook_agent_profile,
         )
     except OSError as exc:
         # Disk full / permission / encoding errors. Surface in the
@@ -3259,6 +3276,12 @@ def agent_group() -> None:
          "Default: init when codegraph is on PATH. Use this for batches "
          "where per-dispatch index cost dominates.",
 )
+@click.option(
+    "--agent-profile", "agent_profile", default=None,
+    help="Capability/skill profile for the dispatched subagent (CLAWP-038). "
+         "Recorded on the subtask and in the reflection/iteration events so "
+         "`reflect summarize` can segment predicted-vs-actual by profile.",
+)
 @click.pass_context
 def agent_dispatch(
     ctx: click.Context,
@@ -3269,6 +3292,7 @@ def agent_dispatch(
     title: str | None,
     judge_cmd_override: str | None,
     no_codegraph: bool,
+    agent_profile: str | None,
 ) -> None:
     """Spawn a subagent, grade its output against the rubric, persist the verdict.
 
@@ -3307,6 +3331,7 @@ def agent_dispatch(
             judge_cmd_override=judge_cmd_override,
             title=title,
             init_codegraph=not no_codegraph,
+            agent_profile=agent_profile,
         )
     except AgentDispatchError as exc:
         output_error("agent_dispatch_failed", str(exc), fmt=fmt)

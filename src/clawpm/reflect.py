@@ -133,6 +133,7 @@ def write_iteration_event(
     verdict_ok: bool,
     verdict_reason: str,
     verdict_impossible: bool = False,
+    agent_profile: str | None = None,
 ) -> Path:
     """Append a single iteration_event line to the task's reflection JSONL.
 
@@ -152,6 +153,7 @@ def write_iteration_event(
         "event": "iteration_event",
         "task_id": task_id,
         "project_id": project_id,
+        "agent_profile": agent_profile,
         "occurred_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "verdict": {
             "ok": verdict_ok,
@@ -575,6 +577,7 @@ def write_reflection_event(
     meta_reflection: str | None = None,
     process_lesson: str | None = None,
     surprise_taxonomy: list[str] | None = None,
+    agent_profile: str | None = None,
 ) -> Path:
     """Compute deltas and append one JSON line to ~/clawpm/reflections/<task-id>.jsonl.
 
@@ -593,6 +596,7 @@ def write_reflection_event(
         "event": event,
         "task_id": task_id,
         "project_id": project_id,
+        "agent_profile": agent_profile,
         "occurred_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "predictions": predictions.to_dict(),
         "actuals": actuals.to_dict(),
