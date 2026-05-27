@@ -1460,19 +1460,25 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
 
     state = TaskState(new_state)
 
-    # Check for incomplete subtasks before attempting state change
-    if state == TaskState.DONE and not force:
-        task = get_task(config, project_id, task_id)
-        if task and task.children:
-            incomplete = []
-            for child_id in task.children:
-                child = get_task(config, project_id, child_id)
-                if child and child.state != TaskState.DONE:
-                    incomplete.append(f"{child_id} [{child.state.value}]")
-            if incomplete:
+    # CLAWP-037 — parent rollup gate. Compute readiness up front so we can
+    # either block (no --force) or proceed-and-log (--force). A missing
+    # child ref counts as unsatisfied (see parent_rollup_status).
+    rollup_incomplete: list[str] = []
+    if state == TaskState.DONE:
+        _rollup_task = get_task(config, project_id, task_id)
+        if _rollup_task and _rollup_task.children:
+            from .tasks import parent_rollup_status
+            _status = parent_rollup_status(config, project_id, _rollup_task)
+            rollup_incomplete = (
+                [f"{c['id']} [{c['state']}]" for c in _status["incomplete"]]
+                + [f"{m} [missing]" for m in _status["missing"]]
+            )
+            if rollup_incomplete and not force:
                 output_error(
                     "subtasks_incomplete",
-                    f"Cannot complete {task_id} - subtasks incomplete:\n  " + "\n  ".join(incomplete) + "\nUse --force to complete anyway.",
+                    f"Cannot complete {task_id} - subtasks incomplete:\n  "
+                    + "\n  ".join(rollup_incomplete)
+                    + "\nUse --force to complete anyway.",
                     fmt=fmt,
                 )
                 sys.exit(1)
@@ -1520,6 +1526,19 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
             task=task_id,
             summary=summary,
             files_changed=files_changed,
+            auto=True,
+        )
+
+    # CLAWP-037 — when --force completes a parent over incomplete/missing
+    # children, record which were still outstanding so the override is
+    # auditable in the work_log.
+    if state == TaskState.DONE and force and rollup_incomplete:
+        add_entry(
+            config,
+            project=project_id,
+            action=WorkLogAction.NOTE,
+            task=task_id,
+            summary="Force-completed over incomplete subtasks: " + ", ".join(rollup_incomplete),
             auto=True,
         )
 
@@ -1646,12 +1665,26 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
                 meta_reflection=meta_reflect,
                 process_lesson=process_lesson,
                 surprise_taxonomy=list(surprise_tags) if surprise_tags else [],
+                agent_profile=pre_transition_task.agent_profile,
             )
         except Exception:
             # Never let reflection failure block the state change
             pass
 
+    # CLAWP-037 — if completing this task fully rolled up its parent, surface
+    # a parent-ready advisory so the operator knows the parent is now
+    # closeable. Pure advisory; the parent is not auto-completed.
+    parent_ready = None
+    if state == TaskState.DONE:
+        from .tasks import parent_ready_signal
+        try:
+            parent_ready = parent_ready_signal(config, project_id, task_id)
+        except Exception:
+            parent_ready = None
+
     data = task.to_dict()
+    if parent_ready:
+        data["parent_ready"] = parent_ready
     if cascade_results:
         data["cascade_unblocks"] = cascade_results
     if cascade_errors:
@@ -1661,6 +1694,105 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
     if teardown_errors:
         data["dispatch_teardown_errors"] = teardown_errors
     output_success(f"Task {task_id} moved to {new_state}", data=data, fmt=fmt)
+
+
+@tasks.command("decompose")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
+@click.argument("parent_id")
+@click.option(
+    "--child", "child_specs", multiple=True, required=True,
+    help="A child subtask (repeatable). Either a plain title, OR a JSON object "
+         '{"title":"...","success_criteria":["..."],"complexity":"s|m|l|xl",'
+         '"agent_profile":"..."}. JSON lets each child carry its own rubric so '
+         "the parent rolls up only when every child's criteria pass.",
+)
+@click.pass_context
+def tasks_decompose(
+    ctx: click.Context,
+    project_id: str | None,
+    parent_id: str,
+    child_specs: tuple[str, ...],
+) -> None:
+    """Decompose a parent task into child subtasks, each with its own rubric (CLAWP-037).
+
+    Records the decomposition durably: every ``--child`` becomes a subtask
+    under PARENT (auto-splitting PARENT into a directory task), and the
+    parent then cannot be marked DONE until all children are DONE
+    (``clawpm tasks done <parent>`` enforces the rollup gate). Unlike an
+    ephemeral swarm decomposition, predicted-vs-actual per child is captured
+    for calibration.
+    """
+    import json as _json
+
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+    project_id, _ = require_project(ctx, project_id)
+    parent_id = expand_task_id(parent_id, project_id)
+
+    parent = get_task(config, project_id, parent_id)
+    if not parent:
+        output_error(
+            "parent_not_found",
+            f"No task with id '{parent_id}' in project '{project_id}'",
+            fmt=fmt,
+        )
+        sys.exit(1)
+
+    created: list[dict] = []
+    for spec in child_specs:
+        title: str | None = spec
+        criteria: list = []
+        cmplx = None
+        ap = None
+        stripped = spec.strip()
+        if stripped.startswith("{"):
+            try:
+                obj = _json.loads(stripped)
+            except _json.JSONDecodeError as exc:
+                output_error(
+                    "bad_child_spec",
+                    f"--child JSON parse failed ({exc}): {spec!r}",
+                    fmt=fmt,
+                )
+                sys.exit(1)
+            title = obj.get("title")
+            if not title:
+                output_error(
+                    "bad_child_spec",
+                    f"--child JSON missing 'title': {spec!r}",
+                    fmt=fmt,
+                )
+                sys.exit(1)
+            criteria = obj.get("success_criteria") or []
+            _c = obj.get("complexity")
+            cmplx = TaskComplexity(_c) if _c else None
+            ap = obj.get("agent_profile")
+
+        # Predictions.__post_init__ normalises str | dict | SuccessCriterion.
+        preds = Predictions(
+            success_criteria=list(criteria),
+            filled_by="agent" if criteria else None,
+        )
+        child = add_subtask(
+            config, project_id, parent_id, title,
+            complexity=cmplx, description="",
+            agent_profile=ap, predictions=preds,
+        )
+        if not child:
+            output_error(
+                "decompose_failed",
+                f"Failed to create child subtask for parent '{parent_id}'",
+                fmt=fmt,
+            )
+            sys.exit(1)
+        created.append(child.to_dict())
+
+    output_success(
+        f"Decomposed {parent_id} into {len(created)} child task(s); "
+        f"parent is now gated until all children are DONE.",
+        data={"parent_id": parent_id, "children": created},
+        fmt=fmt,
+    )
 
 
 @tasks.command("add")

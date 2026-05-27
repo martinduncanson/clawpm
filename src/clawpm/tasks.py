@@ -282,14 +282,12 @@ def change_task_state(
     current_path = task.file_path
     is_directory_task = current_path.name == "_task.md"
 
-    # Check for incomplete subtasks when marking parent as done
+    # Check for incomplete subtasks when marking parent as done. A missing
+    # child ref counts as UNSATISFIED (mirrors cascade_unblock_dependents'
+    # dangling-dep handling) — see parent_rollup_status.
     if new_state == TaskState.DONE and task.children and not force:
-        incomplete = []
-        for child_id in task.children:
-            child = get_task(config, project_id, child_id)
-            if child and child.state != TaskState.DONE:
-                incomplete.append(child_id)
-        if incomplete:
+        status = parent_rollup_status(config, project_id, task)
+        if not status["ready"]:
             # Return None to signal failure - caller should check and report
             return None
 
@@ -415,6 +413,69 @@ def cascade_unblock_dependents(
             })
 
     return transitions
+
+
+def parent_rollup_status(
+    config: PortfolioConfig,
+    project_id: str,
+    task: Task,
+) -> dict:
+    """Report whether a parent task is ready to be marked DONE (CLAWP-037).
+
+    A parent is *ready* only when every child in ``task.children`` resolves
+    to a task in DONE state. A child id that resolves to no task on disk
+    (dangling / typoed ref) counts as UNSATISFIED — mirroring the
+    missing-dependency handling in ``cascade_unblock_dependents``: a ref we
+    cannot verify is not silently treated as satisfied.
+
+    Returns ``{"ready", "incomplete", "missing"}``:
+      - ``incomplete``: ``[{"id", "state"}]`` for children not in DONE.
+      - ``missing``: ``[id]`` for child refs with no task file.
+    A task with no children is trivially ready.
+    """
+    incomplete: list[dict] = []
+    missing: list[str] = []
+    for child_id in (task.children or []):
+        child = get_task(config, project_id, child_id)
+        if child is None:
+            missing.append(child_id)
+        elif child.state != TaskState.DONE:
+            incomplete.append({"id": child_id, "state": child.state.value})
+    return {
+        "ready": not incomplete and not missing,
+        "incomplete": incomplete,
+        "missing": missing,
+    }
+
+
+def parent_ready_signal(
+    config: PortfolioConfig,
+    project_id: str,
+    child_task_id: str,
+) -> dict | None:
+    """After a child hits DONE, report if its parent is now fully rolled up.
+
+    Returns ``{"parent_id", "children", "ready": True}`` when the just-
+    completed child has a parent whose children are ALL now DONE and the
+    parent is not already DONE; ``None`` otherwise. Pure read — does NOT
+    transition the parent (a synthesis criterion or operator sign-off may
+    still gate it); the caller surfaces this as an advisory so the operator
+    knows the parent is now closeable.
+    """
+    child = get_task(config, project_id, child_task_id)
+    if child is None or not child.parent:
+        return None
+    parent = get_task(config, project_id, child.parent)
+    if parent is None or parent.state == TaskState.DONE:
+        return None
+    status = parent_rollup_status(config, project_id, parent)
+    if status["ready"]:
+        return {
+            "parent_id": parent.id,
+            "children": parent.children,
+            "ready": True,
+        }
+    return None
 
 
 def add_task(
@@ -683,6 +744,7 @@ def add_subtask(
     complexity: TaskComplexity | None = None,
     description: str = "",
     agent_profile: str | None = None,
+    predictions: Predictions | None = None,
 ) -> Task | None:
     """Add a subtask to a parent task.
     
@@ -735,6 +797,16 @@ def add_subtask(
 
     if agent_profile:
         frontmatter["agent_profile"] = agent_profile
+
+    # CLAWP-037 — children created via `tasks decompose` carry their own
+    # success_criteria (and other predictions) so each subtask is a
+    # verifiable goal, and the parent rolls up only when all pass.
+    if predictions and not predictions.is_empty():
+        pred_dict = predictions.to_dict()
+        frontmatter["predictions"] = {
+            k: v for k, v in pred_dict.items()
+            if v is not None and v != []
+        }
 
     # Build content
     content = f"""---
