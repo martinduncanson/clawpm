@@ -212,6 +212,23 @@ class TestDoctorSembleAdvisory:
             a["project_id"] == "test" for a in payload.get("semble_advice", [])
         ), "semble advisory missing on mixed repo"
 
+    def test_suggested_command_quotes_repo_path(self, temp_portfolio_with_repo):
+        # Codex P2 (round 2): a repo_path with spaces (e.g. the Windows
+        # "Martin Workspace" profile) must not split the emitted command
+        # into separate shell words — both the index input and the
+        # -o/--index target must be quoted.
+        _seed_docs(temp_portfolio_with_repo["repo_dir"], 35)
+        r = CliRunner().invoke(main, ["doctor"])
+        assert r.exit_code == 0, r.output
+        payload = json.loads(r.output)
+        advice = next(
+            a for a in payload["semble_advice"] if a["project_id"] == "test"
+        )
+        action = advice["suggested_action"]
+        posix = advice["repo_path"]
+        assert f'"{posix}"' in action
+        assert f'"{posix}/.clawpm-semble"' in action
+
     def test_text_mode_surfaces_advisory(self, temp_portfolio_with_repo):
         _seed_docs(temp_portfolio_with_repo["repo_dir"], 35)
         r = CliRunner().invoke(main, ["-f", "text", "doctor"])

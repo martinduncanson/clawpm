@@ -988,10 +988,10 @@ def project_doctor(
                     f"index time with --include-text-files (not --content, "
                     f"which is search-time only). Build a content-aware "
                     f"index: `uvx --from \"semble[mcp]\" semble index "
-                    f"{proj.repo_path.as_posix()} --include-text-files -o "
-                    f"{proj.repo_path.as_posix()}/.clawpm-semble`, then "
+                    f"\"{proj.repo_path.as_posix()}\" --include-text-files -o "
+                    f"\"{proj.repo_path.as_posix()}/.clawpm-semble\"`, then "
                     f"search it with `semble search \"<query>\" --index "
-                    f"{proj.repo_path.as_posix()}/.clawpm-semble --content all`."
+                    f"\"{proj.repo_path.as_posix()}/.clawpm-semble\" --content all`."
                 ),
             })
 
