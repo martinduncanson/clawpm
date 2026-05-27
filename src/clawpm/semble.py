@@ -24,8 +24,11 @@ the doctor command can't be taken down by an unreadable tree.
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
+
+_log = logging.getLogger(__name__)
 
 # Name of the clawpm-convention semble index. Used to make the advisory
 # idempotent: once the operator has indexed the repo here, stop nagging.
@@ -40,38 +43,51 @@ _DOC_EXTENSIONS = frozenset({
 })
 
 
+def _on_walk_error(err: OSError) -> None:
+    """``os.walk`` onerror hook: log and CONTINUE past an unreadable subtree.
+
+    A bare ``try/except`` around the whole walk would abort the census at
+    the first OSError (a permission-denied subtree, a broken Windows
+    junction) and return a partial under-count — which, because the
+    advisory only fires at ``doc_count >= threshold``, silently *suppresses*
+    the advisory on exactly the "unreadable tree" case this module exists
+    to tolerate. ``onerror`` lets the walk skip the bad directory and keep
+    counting the rest, while leaving a debug breadcrumb so the degradation
+    is observable rather than invisible.
+    """
+    _log.debug("count_doc_files: skipping unreadable path during walk: %s", err)
+
+
 def count_doc_files(repo_path: Path, *, max_walk: int = 5000) -> int:
     """Count documentation/prose files under ``repo_path`` (bounded walk).
 
-    Mirrors :func:`clawpm.codegraph.count_code_files` exactly — same
-    skip-list and scanned-entry cap — but counts prose extensions. The cap
-    is applied to SCANNED ENTRIES (not matched files) so a code-heavy repo
-    with few docs still terminates promptly.
+    Mirrors :func:`clawpm.codegraph.count_code_files` — same skip-list and
+    scanned-entry cap — but counts prose extensions. The cap is applied to
+    SCANNED ENTRIES (not matched files) so a code-heavy repo with few docs
+    still terminates promptly. An unreadable subtree is skipped (via
+    ``onerror``) rather than aborting the whole census.
     """
     if not repo_path.exists():
         return 0
     count = 0
     scanned = 0
-    try:
-        for _root, dirs, files in os.walk(repo_path):
-            # Skip vendored / generated / hidden trees that would inflate
-            # the count without representing project documentation.
-            dirs[:] = [
-                d for d in dirs
-                if not d.startswith(".")
-                and d not in (
-                    "node_modules", "venv", ".venv", "__pycache__",
-                    "dist", "build", "target", "vendor",
-                )
-            ]
-            for f in files:
-                scanned += 1
-                if Path(f).suffix.lower() in _DOC_EXTENSIONS:
-                    count += 1
-                if scanned >= max_walk:
-                    return count
-    except OSError:
-        return count
+    for _root, dirs, files in os.walk(repo_path, onerror=_on_walk_error):
+        # Skip vendored / generated / hidden trees that would inflate the
+        # count without representing project documentation.
+        dirs[:] = [
+            d for d in dirs
+            if not d.startswith(".")
+            and d not in (
+                "node_modules", "venv", ".venv", "__pycache__",
+                "dist", "build", "target", "vendor",
+            )
+        ]
+        for f in files:
+            scanned += 1
+            if Path(f).suffix.lower() in _DOC_EXTENSIONS:
+                count += 1
+            if scanned >= max_walk:
+                return count
     return count
 
 
@@ -79,9 +95,12 @@ def is_doc_indexed(repo_path: Path) -> bool:
     """True iff a clawpm-convention semble index already exists in the repo.
 
     Used by the doctor advisory to avoid re-advising a project the operator
-    has already indexed. Returns False (rather than raising) on any error.
+    has already indexed. Fails toward ``False`` (advisory fires — a harmless
+    nudge) rather than raising, with a debug breadcrumb on the rare probe
+    error.
     """
     try:
         return (repo_path / SEMBLE_INDEX_NAME).exists()
-    except OSError:
+    except OSError as err:
+        _log.debug("is_doc_indexed: probe failed for %s: %s", repo_path, err)
         return False

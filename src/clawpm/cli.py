@@ -985,7 +985,8 @@ def project_doctor(
                     f"`--content all` gives semantic search over prose + "
                     f"config + code that CodeGraph (code-symbol only) can't. "
                     f"Index with `uvx --from \"semble[mcp]\" semble index "
-                    f"{proj.repo_path.as_posix()} -o .clawpm-semble`."
+                    f"{proj.repo_path.as_posix()} -o "
+                    f"{proj.repo_path.as_posix()}/.clawpm-semble`."
                 ),
             })
 

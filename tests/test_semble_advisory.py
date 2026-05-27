@@ -98,11 +98,34 @@ class TestDocCensus:
     def test_count_doc_files_empty_for_missing_dir(self, tmp_path):
         assert sb.count_doc_files(tmp_path / "nope") == 0
 
+    def test_count_doc_files_matches_uppercase_extensions(self, tmp_path):
+        # Suffix is lowercased before matching — SHOUTY doc names count.
+        (tmp_path / "README.MD").write_text("x", encoding="utf-8")
+        (tmp_path / "NOTES.TXT").write_text("x", encoding="utf-8")
+        assert sb.count_doc_files(tmp_path) == 2
+
+    def test_count_doc_files_respects_max_walk_cap(self, tmp_path):
+        # Many non-doc entries before the cap: the census is bounded on
+        # SCANNED entries (not matches), so it terminates without scanning
+        # the whole tree and never over-counts beyond the docs present.
+        for i in range(200):
+            (tmp_path / f"asset{i}.bin").write_text("x", encoding="utf-8")
+        (tmp_path / "a.md").write_text("x", encoding="utf-8")
+        result = sb.count_doc_files(tmp_path, max_walk=50)
+        assert isinstance(result, int)
+        assert result <= 1  # at most the single .md; cap may stop before it
+
     def test_is_doc_indexed_false_for_empty(self, tmp_path):
         assert sb.is_doc_indexed(tmp_path) is False
 
     def test_is_doc_indexed_true_when_marker_present(self, tmp_path):
         (tmp_path / sb.SEMBLE_INDEX_NAME).mkdir()
+        assert sb.is_doc_indexed(tmp_path) is True
+
+    def test_is_doc_indexed_true_when_marker_is_file(self, tmp_path):
+        # semble's -o may write the index as a file rather than a dir;
+        # .exists() must accept either so suppression still works.
+        (tmp_path / sb.SEMBLE_INDEX_NAME).write_text("", encoding="utf-8")
         assert sb.is_doc_indexed(tmp_path) is True
 
 
@@ -136,6 +159,25 @@ class TestDoctorSembleAdvisory:
 
     def test_no_advisory_below_threshold(self, temp_portfolio_with_repo):
         _seed_docs(temp_portfolio_with_repo["repo_dir"], 10)  # below 30
+        r = CliRunner().invoke(main, ["doctor"])
+        assert r.exit_code == 0
+        payload = json.loads(r.output)
+        assert not any(
+            a["project_id"] == "test" for a in payload.get("semble_advice", [])
+        )
+
+    def test_advisory_fires_at_exact_threshold(self, temp_portfolio_with_repo):
+        # Fixture seeds README.md at the repo root (+1), so 29 files in
+        # docs/ == 30 total == DOC_FILE_THRESHOLD. Guard is `>=`, so fires.
+        _seed_docs(temp_portfolio_with_repo["repo_dir"], 29)
+        r = CliRunner().invoke(main, ["doctor"])
+        assert r.exit_code == 0, r.output
+        payload = json.loads(r.output)
+        assert any(a["project_id"] == "test" for a in payload["semble_advice"])
+
+    def test_no_advisory_one_below_threshold(self, temp_portfolio_with_repo):
+        # 28 in docs/ + README.md == 29 total == one below the threshold.
+        _seed_docs(temp_portfolio_with_repo["repo_dir"], 28)
         r = CliRunner().invoke(main, ["doctor"])
         assert r.exit_code == 0
         payload = json.loads(r.output)
