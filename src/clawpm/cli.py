@@ -592,10 +592,12 @@ def project_doctor(
     missing_markers: list[dict] = []
     codex_availability: list[dict] = []
     codegraph_advice: list[dict] = []
+    semble_advice: list[dict] = []
     encoding_risks: list[dict] = []
 
     STALE_DAYS = 7
     CODEGRAPH_FILE_THRESHOLD = 50  # below this we don't bother advising
+    DOC_FILE_THRESHOLD = 30  # prose files below which semble isn't worth it
 
     # Validate portfolio
     portfolio_issues = validate_portfolio(config)
@@ -959,6 +961,34 @@ def project_doctor(
                 ),
             })
 
+    # --- CLAWP-036: Semble advisory (doc / knowledge content shape) ---
+    # INDEPENDENT of the CodeGraph advisory above. CodeGraph indexes code
+    # symbols / call-graphs only and is blind to prose; semble adds
+    # semantic search over markdown/prose + config via its --content
+    # docs/all modes. A mixed repo (lots of code AND lots of docs) should
+    # get BOTH advisories — neither suppresses the other. Soft signal,
+    # never auto-applied. Idempotent via the .clawpm-semble index marker.
+    from .semble import count_doc_files, is_doc_indexed
+    for proj in projects_to_check:
+        if not proj.repo_path or not proj.repo_path.exists():
+            continue
+        if is_doc_indexed(proj.repo_path):
+            continue
+        doc_count = count_doc_files(proj.repo_path)
+        if doc_count >= DOC_FILE_THRESHOLD:
+            semble_advice.append({
+                "project_id": proj.id,
+                "repo_path": proj.repo_path.as_posix(),
+                "doc_files": doc_count,
+                "suggested_action": (
+                    f"Doc-heavy project ({doc_count} prose files). semble "
+                    f"`--content all` gives semantic search over prose + "
+                    f"config + code that CodeGraph (code-symbol only) can't. "
+                    f"Index with `uvx --from \"semble[mcp]\" semble index "
+                    f"{proj.repo_path.as_posix()} -o .clawpm-semble`."
+                ),
+            })
+
     # --- Phase 1.9 Check g (CLAWP-011): Encoding-risk AST scan ---
     # Off by default (--check-encoding flag). AST-scans each project's .py files
     # for the three cp1252-risk patterns documented in
@@ -1054,6 +1084,7 @@ def project_doctor(
             "missing_markers": missing_markers,
             "codex_availability": codex_availability,
             "codegraph_advice": codegraph_advice,
+            "semble_advice": semble_advice,
             "encoding_risks": encoding_risks,
         }
         if apply_mode:
@@ -1069,7 +1100,8 @@ def project_doctor(
         # --strict / has_warnings), but they ARE worth printing.
         if not (
             issues or stale_tasks or stale_blocked or drift_tasks or prefix_collisions or unreadable_files
-            or commit_drift or missing_markers or codex_availability or codegraph_advice or encoding_risks
+            or commit_drift or missing_markers or codex_availability or codegraph_advice
+            or semble_advice or encoding_risks
         ):
             click.echo("[OK] No issues found")
         else:
@@ -1120,6 +1152,12 @@ def project_doctor(
                     f"[ADVICE] [codegraph] {cg['project_id']} "
                     f"({cg['code_files']} code files, no .codegraph/) "
                     f"- {cg['suggested_action']}"
+                )
+            for sa in semble_advice:
+                click.echo(
+                    f"[ADVICE] [semble] {sa['project_id']} "
+                    f"({sa['doc_files']} doc files, no .clawpm-semble) "
+                    f"- {sa['suggested_action']}"
                 )
             if encoding_risks:
                 files_with_risk = {er["file"] for er in encoding_risks}
