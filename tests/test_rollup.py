@@ -202,3 +202,21 @@ class TestChildrenPersistence:
         st = parent_rollup_status(config, "test", p)
         assert c1.id in st["missing"]
         assert st["ready"] is False
+
+    def test_subtask_id_does_not_collide_with_migrated_child(
+        self, temp_portfolio_with_repo,
+    ):
+        """Codex round-2 P2 regression: after a child migrates to done/ or
+        blocked/, the next add_subtask must skip past its id rather than
+        re-issuing it (which would shadow the migrated record)."""
+        config = temp_portfolio_with_repo["config"]
+        add_task(config, "test", title="P", task_id="TEST-700")
+        c1 = add_subtask(config, "test", "TEST-700", "first")
+        change_task_state(config, "test", c1.id, TaskState.DONE)
+        # Now the parent directory has no open subtasks; the naive
+        # parent_dir.glob would suggest the next id is -001 again.
+        c2 = add_subtask(config, "test", "TEST-700", "second")
+        assert c2.id != c1.id
+        assert c2.id.endswith("-002")
+        p = get_task(config, "test", "TEST-700")
+        assert c1.id in p.children and c2.id in p.children

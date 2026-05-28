@@ -818,17 +818,35 @@ def add_subtask(
     if not parent_dir:
         return None
     
-    # Generate subtask ID
-    existing_nums = []
-    for f in parent_dir.glob(f"{parent_id}-*.md"):
+    # Generate subtask ID. Codex round-2 P2 fix: union three sources so a
+    # migrated/deleted earlier child can't have its id silently reused:
+    #   (1) files still in the parent directory (open / progress)
+    #   (2) migrated children in tasks/done/ and tasks/blocked/
+    #   (3) the parent's persisted frontmatter children list (covers
+    #       files that were deleted outright after creation)
+    # Without (2)+(3), running `tasks decompose` again on a parent whose
+    # earlier children have all moved to done/ would re-issue `P-001`,
+    # colliding with the migrated record.
+    existing_nums: set[int] = set()
+
+    def _record_num_from_id(tid: str) -> None:
         try:
-            num_str = f.stem.split("-")[-1].replace(".progress", "")
-            num = int(num_str)
-            existing_nums.append(num)
+            num_str = tid.split("-")[-1].replace(".progress", "")
+            existing_nums.add(int(num_str))
         except (IndexError, ValueError):
             pass
-    
-    next_num = max(existing_nums, default=0) + 1
+
+    for f in parent_dir.glob(f"{parent_id}-*.md"):
+        _record_num_from_id(f.stem)
+    for state_dir in (tasks_dir / "done", tasks_dir / "blocked"):
+        if state_dir.exists():
+            for f in state_dir.glob(f"{parent_id}-*.md"):
+                _record_num_from_id(f.stem)
+    for cid in (parent.children or []):
+        if cid.startswith(parent_id + "-"):
+            _record_num_from_id(cid)
+
+    next_num = (max(existing_nums) if existing_nums else 0) + 1
     subtask_id = f"{parent_id}-{next_num:03d}"
     
     # Build frontmatter
