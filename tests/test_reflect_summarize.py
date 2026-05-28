@@ -197,3 +197,45 @@ class TestGlobalProjectFlag:
         out = json.loads(r.output)
         assert out["data"]["project_id"] == "ALL"
         assert out["data"]["total_done"] == 2
+
+
+class TestSuggestUsesPredictedComplexity:
+    """Codex round-6 P2: when `reflect suggest <task_id>` is run on a task,
+    bucket selection must use the PREDICTED complexity (the key
+    summarize_calibration buckets by), not the task's current complexity —
+    the two can differ when the operator pre-set predictions but adjusted
+    complexity later."""
+
+    def test_suggest_picks_predicted_complexity_bucket(
+        self, temp_portfolio_with_repo,
+    ):
+        from clawpm.tasks import add_task
+        from clawpm.models import Predictions, TaskComplexity
+
+        config = temp_portfolio_with_repo["config"]
+        # Seed 6 'm' done events so the bucket has enough samples (n>=5).
+        for i in range(6):
+            _done(config.portfolio_root, f"M-{i}", 600, 60,
+                  complexity="m", project="test")
+
+        # Task: current complexity is 'l' (later adjustment), but the
+        # PREDICTED complexity in predictions is 'm' (the bucket key).
+        add_task(
+            config, "test", title="T", task_id="TEST-900",
+            complexity=TaskComplexity.L,
+            predictions=Predictions(
+                duration_min=600,
+                complexity=TaskComplexity.M,
+            ),
+        )
+        r = CliRunner().invoke(
+            main, ["reflect", "suggest", "TEST-900", "-p", "test"]
+        )
+        assert r.exit_code == 0, r.output
+        out = json.loads(r.output)
+        # Must pick the 'm' bucket (predicted), not 'l' (which has no data
+        # and would fall back to global).
+        assert out["data"]["bucket"] == "complexity=m"
+        assert out["data"]["fell_back_to_global"] is False
+        # 600 * 0.1 = 60
+        assert out["data"]["calibrated_duration_min"] == 60

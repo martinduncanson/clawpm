@@ -4442,7 +4442,14 @@ def reflect_suggest(
         if not t:
             output_error("task_not_found", f"No task with id '{task_id}' in project '{project_id}'", fmt=fmt)
             sys.exit(1)
-        complexity = complexity or (t.complexity.value if t.complexity else None)
+        # Codex round-6 P2: prefer t.predictions.complexity over t.complexity
+        # because summarize_calibration buckets by predictions.complexity.
+        # Using t.complexity would lookup the wrong bucket (or fall back to
+        # global) when the predicted and actual/current complexity differ.
+        complexity = complexity or (
+            t.predictions.complexity.value if t.predictions.complexity
+            else (t.complexity.value if t.complexity else None)
+        )
         confidence = confidence if confidence is not None else t.predictions.confidence
         agent_profile = agent_profile or t.agent_profile
         predicted_min = t.predictions.duration_min
