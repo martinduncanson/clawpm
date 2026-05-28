@@ -433,9 +433,36 @@ def parent_rollup_status(
       - ``missing``: ``[id]`` for child refs with no task file.
     A task with no children is trivially ready.
     """
+    # CLAWP-037 codex round-3 belt-and-braces: union the parent's persisted
+    # children list with any task whose ``parent:`` frontmatter points at
+    # this task across every state dir. Persistence (set by add_subtask) is
+    # the fast common-path; this scan is the backstop for manually-created
+    # or imported subtasks that bypassed add_subtask. Cost is one O(project)
+    # glob walk per rollup check — rollup fires only on state transitions,
+    # not in hot loops, so this is acceptable at typical project sizes.
+    children: set[str] = set(task.children or [])
+    tasks_dir = get_tasks_dir(config, project_id) if config is not None else None
+    if tasks_dir is not None:
+        scan_dirs = [tasks_dir, tasks_dir / "done", tasks_dir / "blocked"]
+        # Directory-task subtask dir (open subtasks live alongside _task.md).
+        if task.file_path is not None and task.file_path.name == "_task.md":
+            scan_dirs.append(task.file_path.parent)
+        for sd in scan_dirs:
+            if not sd.exists():
+                continue
+            for f in sd.glob("*.md"):
+                if f.name == "_task.md":
+                    continue
+                try:
+                    t = Task.from_file(f)
+                except Exception:
+                    continue
+                if t.parent == task.id:
+                    children.add(t.id)
+
     incomplete: list[dict] = []
     missing: list[str] = []
-    for child_id in (task.children or []):
+    for child_id in sorted(children):
         child = get_task(config, project_id, child_id)
         if child is None:
             missing.append(child_id)

@@ -170,3 +170,30 @@ class TestCrossProjectSummarize:
             fh.write(json.dumps({"event": "void", "task_id": "T-1"}) + "\n")
         s = summarize_calibration(tmp_path, project_id=None)
         assert s["total_done"] == 0
+
+
+class TestGlobalProjectFlag:
+    """Codex round-3 P2: a global `clawpm -p test reflect summarize` must
+    scope to `test`, not aggregate ALL projects."""
+
+    def test_global_project_scopes_summarize(self, temp_portfolio_with_repo):
+        config = temp_portfolio_with_repo["config"]
+        # Two projects' done events in the same JSONL file.
+        _done(config.portfolio_root, "T-1", 100, 50, project="test")
+        _done(config.portfolio_root, "T-1", 200, 200, project="other")
+        # Pass --project at the MAIN group, not the subcommand.
+        r = CliRunner().invoke(main, ["-p", "test", "reflect", "summarize"])
+        assert r.exit_code == 0, r.output
+        out = json.loads(r.output)
+        assert out["data"]["project_id"] == "test"
+        assert out["data"]["total_done"] == 1
+
+    def test_no_project_aggregates_all(self, temp_portfolio_with_repo):
+        config = temp_portfolio_with_repo["config"]
+        _done(config.portfolio_root, "T-1", 100, 50, project="test")
+        _done(config.portfolio_root, "T-1", 200, 200, project="other")
+        r = CliRunner().invoke(main, ["reflect", "summarize"])
+        assert r.exit_code == 0, r.output
+        out = json.loads(r.output)
+        assert out["data"]["project_id"] == "ALL"
+        assert out["data"]["total_done"] == 2

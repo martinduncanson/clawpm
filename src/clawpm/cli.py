@@ -4352,6 +4352,11 @@ def reflect_summarize(ctx: click.Context, project_id: str | None) -> None:
     from .reflect import summarize_calibration
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
+    # CLAWP-040 codex round-3 P2 fix: honor the global --project flag from
+    # the main group when the subcommand option wasn't passed. Both absent
+    # = aggregate ALL projects.
+    if project_id is None:
+        project_id = ctx.obj.get("global_project")
     summary = summarize_calibration(config.portfolio_root, project_id)
     output_success(
         f"Calibration summary ({summary['project_id']}): "
@@ -4395,6 +4400,13 @@ def reflect_suggest(
     from .reflect import parse_duration, suggest_duration
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
+
+    # CLAWP-040 codex round-3 P2 fix: honor the global --project flag from
+    # the main group when the subcommand option wasn't passed. require_project
+    # below handles the task_id case (which always needs a concrete project);
+    # the bare-bucket path inherits the global here, both-absent = ALL.
+    if project_id is None:
+        project_id = ctx.obj.get("global_project")
 
     predicted_min: int | None = None
     if task_id:

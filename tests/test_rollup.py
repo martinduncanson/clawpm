@@ -203,6 +203,37 @@ class TestChildrenPersistence:
         assert c1.id in st["missing"]
         assert st["ready"] is False
 
+    def test_manually_parented_subtask_blocks_parent(
+        self, temp_portfolio_with_repo,
+    ):
+        """Defense-in-depth: a subtask manually created with `parent: X`
+        frontmatter that bypassed add_subtask (no entry in the parent's
+        persisted children list) is still picked up by the parent-ref scan
+        and gates the parent."""
+        config = temp_portfolio_with_repo["config"]
+        parent = add_task(config, "test", title="P", task_id="TEST-800")
+        # Real add_subtask to make it a directory parent + persist a child
+        # (so we don't conflate this test with the empty-children case).
+        c1 = add_subtask(config, "test", parent.id, "first")
+        change_task_state(config, "test", c1.id, TaskState.DONE)
+        # Now manually drop a NEW subtask file with the right frontmatter
+        # but no persistence into the parent.
+        tasks_dir = temp_portfolio_with_repo["tasks_dir"]
+        orphan_path = tasks_dir / "TEST-800" / "TEST-800-999.md"
+        orphan_path.write_text(
+            "---\nid: TEST-800-999\npriority: 5\nparent: TEST-800\n---\n# manual\n",
+            encoding="utf-8",
+        )
+        # Persisted children = [c1] only; the manual one isn't there.
+        p = get_task(config, "test", "TEST-800")
+        # The parent-ref scan should pick the orphan up, mark it incomplete,
+        # and refuse the parent's DONE transition.
+        st = parent_rollup_status(config, "test", p)
+        assert any(x["id"] == "TEST-800-999" for x in st["incomplete"])
+        assert change_task_state(
+            config, "test", "TEST-800", TaskState.DONE
+        ) is None
+
     def test_subtask_id_does_not_collide_with_migrated_child(
         self, temp_portfolio_with_repo,
     ):
