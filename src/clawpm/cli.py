@@ -1773,8 +1773,22 @@ def tasks_decompose(
                 )
                 sys.exit(1)
             criteria = obj.get("success_criteria") or []
+            # Codex round-5 P3: surface invalid complexity as a structured
+            # bad_child_spec error instead of letting TaskComplexity(...)
+            # raise an unhandled ValueError + Click traceback.
             _c = obj.get("complexity")
-            cmplx = TaskComplexity(_c) if _c else None
+            cmplx = None
+            if _c is not None:
+                try:
+                    cmplx = TaskComplexity(_c)
+                except ValueError:
+                    output_error(
+                        "bad_child_spec",
+                        f"--child has invalid complexity {_c!r} "
+                        f"(expected one of s|m|l|xl): {spec!r}",
+                        fmt=fmt,
+                    )
+                    sys.exit(1)
             ap = obj.get("agent_profile")
 
         # Predictions.__post_init__ normalises str | dict | SuccessCriterion.

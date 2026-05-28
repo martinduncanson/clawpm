@@ -157,6 +157,25 @@ class TestDecomposeCLI:
         assert force_notes, "expected a work_log note naming incomplete children"
         assert "TEST-501-001" in force_notes[0].summary
 
+    def test_invalid_child_complexity_emits_clean_error(
+        self, temp_portfolio_with_repo,
+    ):
+        """Codex round-5 P3: a bad complexity in a JSON child spec must
+        surface as a structured bad_child_spec error, not a Click traceback
+        from an unhandled TaskComplexity(_c) ValueError."""
+        config = temp_portfolio_with_repo["config"]
+        add_task(config, "test", title="P", task_id="TEST-820")
+        runner = CliRunner()
+        r = runner.invoke(main, [
+            "tasks", "decompose", "TEST-820", "-p", "test",
+            "--child", json.dumps({"title": "x", "complexity": "medium"}),
+        ])
+        assert r.exit_code != 0
+        # Structured JSON error, not a traceback.
+        out = json.loads(r.output)
+        assert out["error"] == "bad_child_spec"
+        assert "complexity" in out["message"].lower()
+
     def test_child_done_emits_parent_ready(self, temp_portfolio_with_repo):
         config = temp_portfolio_with_repo["config"]
         add_task(config, "test", title="Parent", task_id="TEST-502")
