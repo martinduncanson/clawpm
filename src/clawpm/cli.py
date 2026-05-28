@@ -1460,19 +1460,30 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
 
     state = TaskState(new_state)
 
-    # Check for incomplete subtasks before attempting state change
-    if state == TaskState.DONE and not force:
-        task = get_task(config, project_id, task_id)
-        if task and task.children:
-            incomplete = []
-            for child_id in task.children:
-                child = get_task(config, project_id, child_id)
-                if child and child.state != TaskState.DONE:
-                    incomplete.append(f"{child_id} [{child.state.value}]")
-            if incomplete:
+    # CLAWP-037 — parent rollup gate. Compute readiness up front so we can
+    # either block (no --force) or proceed-and-log (--force). A missing
+    # child ref counts as unsatisfied (see parent_rollup_status).
+    #
+    # Codex round-4 fix: do NOT short-circuit on task.children being empty —
+    # parent_rollup_status's belt-and-braces parent-ref scan handles
+    # manually-created subtasks that bypassed the persistence path. Tasks
+    # with no children at all return ready=True from the scan immediately.
+    rollup_incomplete: list[str] = []
+    if state == TaskState.DONE:
+        _rollup_task = get_task(config, project_id, task_id)
+        if _rollup_task:
+            from .tasks import parent_rollup_status
+            _status = parent_rollup_status(config, project_id, _rollup_task)
+            rollup_incomplete = (
+                [f"{c['id']} [{c['state']}]" for c in _status["incomplete"]]
+                + [f"{m} [missing]" for m in _status["missing"]]
+            )
+            if rollup_incomplete and not force:
                 output_error(
                     "subtasks_incomplete",
-                    f"Cannot complete {task_id} - subtasks incomplete:\n  " + "\n  ".join(incomplete) + "\nUse --force to complete anyway.",
+                    f"Cannot complete {task_id} - subtasks incomplete:\n  "
+                    + "\n  ".join(rollup_incomplete)
+                    + "\nUse --force to complete anyway.",
                     fmt=fmt,
                 )
                 sys.exit(1)
@@ -1520,6 +1531,19 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
             task=task_id,
             summary=summary,
             files_changed=files_changed,
+            auto=True,
+        )
+
+    # CLAWP-037 — when --force completes a parent over incomplete/missing
+    # children, record which were still outstanding so the override is
+    # auditable in the work_log.
+    if state == TaskState.DONE and force and rollup_incomplete:
+        add_entry(
+            config,
+            project=project_id,
+            action=WorkLogAction.NOTE,
+            task=task_id,
+            summary="Force-completed over incomplete subtasks: " + ", ".join(rollup_incomplete),
             auto=True,
         )
 
@@ -1646,12 +1670,26 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
                 meta_reflection=meta_reflect,
                 process_lesson=process_lesson,
                 surprise_taxonomy=list(surprise_tags) if surprise_tags else [],
+                agent_profile=pre_transition_task.agent_profile,
             )
         except Exception:
             # Never let reflection failure block the state change
             pass
 
+    # CLAWP-037 — if completing this task fully rolled up its parent, surface
+    # a parent-ready advisory so the operator knows the parent is now
+    # closeable. Pure advisory; the parent is not auto-completed.
+    parent_ready = None
+    if state == TaskState.DONE:
+        from .tasks import parent_ready_signal
+        try:
+            parent_ready = parent_ready_signal(config, project_id, task_id)
+        except Exception:
+            parent_ready = None
+
     data = task.to_dict()
+    if parent_ready:
+        data["parent_ready"] = parent_ready
     if cascade_results:
         data["cascade_unblocks"] = cascade_results
     if cascade_errors:
@@ -1663,6 +1701,123 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
     output_success(f"Task {task_id} moved to {new_state}", data=data, fmt=fmt)
 
 
+@tasks.command("decompose")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
+@click.argument("parent_id")
+@click.option(
+    "--child", "child_specs", multiple=True, required=True,
+    help="A child subtask (repeatable). Either a plain title, OR a JSON object "
+         '{"title":"...","success_criteria":["..."],"complexity":"s|m|l|xl",'
+         '"agent_profile":"..."}. JSON lets each child carry its own rubric so '
+         "the parent rolls up only when every child's criteria pass.",
+)
+@click.pass_context
+def tasks_decompose(
+    ctx: click.Context,
+    project_id: str | None,
+    parent_id: str,
+    child_specs: tuple[str, ...],
+) -> None:
+    """Decompose a parent task into child subtasks, each with its own rubric (CLAWP-037).
+
+    Records the decomposition durably: every ``--child`` becomes a subtask
+    under PARENT (auto-splitting PARENT into a directory task), and the
+    parent then cannot be marked DONE until all children are DONE
+    (``clawpm tasks done <parent>`` enforces the rollup gate). Unlike an
+    ephemeral swarm decomposition, predicted-vs-actual per child is captured
+    for calibration.
+    """
+    import json as _json
+
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+    project_id, _ = require_project(ctx, project_id)
+    parent_id = expand_task_id(parent_id, project_id)
+
+    parent = get_task(config, project_id, parent_id)
+    if not parent:
+        output_error(
+            "parent_not_found",
+            f"No task with id '{parent_id}' in project '{project_id}'",
+            fmt=fmt,
+        )
+        sys.exit(1)
+
+    created: list[dict] = []
+    # NOTE: the id-collision concern Codex re-flags on this loop is
+    # addressed inside `add_subtask` (tasks.py) — its id generator unions
+    # parent_dir glob + tasks/done + tasks/blocked + parent's persisted
+    # frontmatter `children`. See test_subtask_id_does_not_collide_with_migrated_child.
+    for spec in child_specs:
+        title: str | None = spec
+        criteria: list = []
+        cmplx = None
+        ap = None
+        stripped = spec.strip()
+        if stripped.startswith("{"):
+            try:
+                obj = _json.loads(stripped)
+            except _json.JSONDecodeError as exc:
+                output_error(
+                    "bad_child_spec",
+                    f"--child JSON parse failed ({exc}): {spec!r}",
+                    fmt=fmt,
+                )
+                sys.exit(1)
+            title = obj.get("title")
+            if not title:
+                output_error(
+                    "bad_child_spec",
+                    f"--child JSON missing 'title': {spec!r}",
+                    fmt=fmt,
+                )
+                sys.exit(1)
+            criteria = obj.get("success_criteria") or []
+            # Codex round-5 P3: surface invalid complexity as a structured
+            # bad_child_spec error instead of letting TaskComplexity(...)
+            # raise an unhandled ValueError + Click traceback.
+            _c = obj.get("complexity")
+            cmplx = None
+            if _c is not None:
+                try:
+                    cmplx = TaskComplexity(_c)
+                except ValueError:
+                    output_error(
+                        "bad_child_spec",
+                        f"--child has invalid complexity {_c!r} "
+                        f"(expected one of s|m|l|xl): {spec!r}",
+                        fmt=fmt,
+                    )
+                    sys.exit(1)
+            ap = obj.get("agent_profile")
+
+        # Predictions.__post_init__ normalises str | dict | SuccessCriterion.
+        preds = Predictions(
+            success_criteria=list(criteria),
+            filled_by="agent" if criteria else None,
+        )
+        child = add_subtask(
+            config, project_id, parent_id, title,
+            complexity=cmplx, description="",
+            agent_profile=ap, predictions=preds,
+        )
+        if not child:
+            output_error(
+                "decompose_failed",
+                f"Failed to create child subtask for parent '{parent_id}'",
+                fmt=fmt,
+            )
+            sys.exit(1)
+        created.append(child.to_dict())
+
+    output_success(
+        f"Decomposed {parent_id} into {len(created)} child task(s); "
+        f"parent is now gated until all children are DONE.",
+        data={"parent_id": parent_id, "children": created},
+        fmt=fmt,
+    )
+
+
 @tasks.command("add")
 @click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
 @click.option("--title", "-t", required=True, help="Task title")
@@ -1672,6 +1827,7 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
 @click.option("--depends", "-d", multiple=True, help="Dependencies (can specify multiple)")
 @click.option("--scope", multiple=True, help="File glob patterns claimed by this task (can specify multiple)")
 @click.option("--parallel-group", "parallel_group", type=int, default=None, help="Batch ordinal for parallel dispatch (CLAWP-021). Tasks sharing a group dispatch together; group N+1 waits for group N.")
+@click.option("--agent-profile", "agent_profile", default=None, help="Capability/skill profile (CLAWP-038). Recorded on the task and propagated to reflection/iteration events so calibration can segment predicted-vs-actual by profile.")
 @click.option("--parent", "parent_id", help="Parent task ID (creates subtask)")
 @click.option("--description", help="Task description (deprecated, use --body)")
 @click.option("--body", "-b", help="Task body content")
@@ -1711,6 +1867,7 @@ def tasks_add(
     depends: tuple[str, ...],
     scope: tuple[str, ...],
     parallel_group: int | None,
+    agent_profile: str | None,
     parent_id: str | None,
     description: str | None,
     body: str | None,
@@ -1817,6 +1974,7 @@ def tasks_add(
             priority=priority,
             complexity=cmplx,
             description=task_body,
+            agent_profile=agent_profile,
         )
     else:
         deps = list(depends) if depends else None
@@ -1832,6 +1990,7 @@ def tasks_add(
             description=task_body,
             predictions=predictions,
             parallel_group=parallel_group,
+            agent_profile=agent_profile,
         )
 
     if not task:
@@ -3082,6 +3241,17 @@ def hook_eval_stop(
     project_id, _ = require_project(ctx, project_id)
     task_id = expand_task_id(task_id, project_id)
 
+    # CLAWP-038 — best-effort agent_profile so the iteration events this
+    # hook writes can be bucketed by profile in `reflect summarize`. Any
+    # failure (task not found yet, parse error) degrades to None.
+    _hook_agent_profile: str | None = None
+    try:
+        _ap_task = get_task(config, project_id, task_id)
+        if _ap_task is not None:
+            _hook_agent_profile = _ap_task.agent_profile
+    except Exception:
+        _hook_agent_profile = None
+
     # 1. Load the rubric — from file if given, else render from the task.
     rubric: str
     if rubric_file:
@@ -3158,6 +3328,7 @@ def hook_eval_stop(
                 verdict_ok=False,
                 verdict_reason=f"JUDGE_ERROR: {exc}",
                 verdict_impossible=False,
+                agent_profile=_hook_agent_profile,
             )
         except OSError:
             # Writing the doctor signal failed too — last resort is the
@@ -3186,6 +3357,7 @@ def hook_eval_stop(
             verdict_ok=verdict.ok,
             verdict_reason=verdict.reason,
             verdict_impossible=verdict.impossible,
+            agent_profile=_hook_agent_profile,
         )
     except OSError as exc:
         # Disk full / permission / encoding errors. Surface in the
@@ -3259,6 +3431,12 @@ def agent_group() -> None:
          "Default: init when codegraph is on PATH. Use this for batches "
          "where per-dispatch index cost dominates.",
 )
+@click.option(
+    "--agent-profile", "agent_profile", default=None,
+    help="Capability/skill profile for the dispatched subagent (CLAWP-038). "
+         "Recorded on the subtask and in the reflection/iteration events so "
+         "`reflect summarize` can segment predicted-vs-actual by profile.",
+)
 @click.pass_context
 def agent_dispatch(
     ctx: click.Context,
@@ -3269,6 +3447,7 @@ def agent_dispatch(
     title: str | None,
     judge_cmd_override: str | None,
     no_codegraph: bool,
+    agent_profile: str | None,
 ) -> None:
     """Spawn a subagent, grade its output against the rubric, persist the verdict.
 
@@ -3307,6 +3486,7 @@ def agent_dispatch(
             judge_cmd_override=judge_cmd_override,
             title=title,
             init_codegraph=not no_codegraph,
+            agent_profile=agent_profile,
         )
     except AgentDispatchError as exc:
         output_error("agent_dispatch_failed", str(exc), fmt=fmt)
@@ -4170,13 +4350,13 @@ def conflicts(
 
 
 # ============================================================================
-# Reflect command group — Phase 2 stubs
+# Reflect command group — calibration capture + consumers (CLAWP-040)
 # ============================================================================
 
 
 @main.group()
 def reflect() -> None:
-    """Reflection layer — query predictions vs actuals (Phase 2 stubs)."""
+    """Reflection layer — query predictions vs actuals and calibrate estimates."""
     pass
 
 
@@ -4184,38 +4364,113 @@ def reflect() -> None:
 @click.option("--project", "-p", "project_id", default=None, help="Project ID")
 @click.pass_context
 def reflect_summarize(ctx: click.Context, project_id: str | None) -> None:
-    """[Phase 2] Summarize prediction accuracy across completed tasks.
+    """Summarize predicted-vs-actual duration calibration across done tasks (CLAWP-040).
 
-    When implemented this will:
-    - Aggregate all reflection events for the project
-    - Compute distribution stats (duration ratio, files-changed ratio, complexity hit-rate)
-    - Surface systematic over/under-estimation patterns for operator review
+    Aggregates the reflection corpus into duration ratios (actual/predicted)
+    bucketed by complexity, confidence, and agent_profile. Rows without a
+    usable actual are flagged (dirty) and excluded so they don't poison the
+    ratio. Omit --project to span all projects. This is the measurement half
+    of the calibration loop; `reflect suggest` applies it.
     """
-    import json as _json
-    click.echo(_json.dumps({
-        "status": "phase2_pending",
-        "message": "clawpm reflect summarize is not yet implemented (Phase 2)",
-    }, indent=2))
+    from .reflect import summarize_calibration
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+    # CLAWP-040 codex round-3 P2 fix: honor the global --project flag from
+    # the main group when the subcommand option wasn't passed. Both absent
+    # = aggregate ALL projects.
+    if project_id is None:
+        project_id = ctx.obj.get("global_project")
+    # By here `project_id` is the resolved scope: subcommand > global, with
+    # None meaning aggregate ALL. The call below passes the resolved value,
+    # NOT a raw default.
+    summary = summarize_calibration(config.portfolio_root, project_id)
+    output_success(
+        f"Calibration summary ({summary['project_id']}): "
+        f"{summary['with_usable_duration']}/{summary['total_done']} done tasks "
+        f"with usable duration.",
+        data=summary,
+        fmt=fmt,
+    )
 
 
 @reflect.command("suggest")
-@click.argument("task_id")
+@click.argument("task_id", required=False, default=None)
 @click.option("--project", "-p", "project_id", default=None, help="Project ID")
+@click.option("--complexity", "-c", type=click.Choice(["s", "m", "l", "xl"]), default=None, help="Complexity bucket to calibrate against (derived from the task when TASK_ID is given).")
+@click.option("--predicted-duration", "predicted_duration", default=None, help="Gut estimate to calibrate: 90, 2h, 3d. Returned deflated by the learned ratio.")
+@click.option("--confidence", type=int, default=None, help="Operator confidence 1-5 (recorded on the suggestion).")
+@click.option("--agent-profile", "agent_profile", default=None, help="Agent profile (recorded on the suggestion).")
+@click.option("--min-bucket", "min_bucket", type=int, default=5, help="Minimum samples for a complexity bucket before falling back to the global ratio.")
 @click.pass_context
-def reflect_suggest(ctx: click.Context, task_id: str, project_id: str | None) -> None:
-    """[Phase 2] Suggest predictions for a task based on past reflection history.
+def reflect_suggest(
+    ctx: click.Context,
+    task_id: str | None,
+    project_id: str | None,
+    complexity: str | None,
+    predicted_duration: str | None,
+    confidence: int | None,
+    agent_profile: str | None,
+    min_bucket: int,
+) -> None:
+    """Suggest a calibrated duration from the corpus's learned ratio (CLAWP-040).
 
-    When implemented this will:
-    - Load reflection events for the project
-    - Find tasks with similar title/scope/complexity to <task_id>
-    - Derive calibrated predictions (e.g. 'similar tasks took ~2x longer than predicted')
-    - Return suggested --predict-* values the operator can copy-paste
+    Two modes:
+      - ``reflect suggest <task_id>`` derives complexity / confidence /
+        agent_profile / predicted-duration from the task, then deflates.
+      - ``reflect suggest --complexity m --predicted-duration 6h`` calibrates
+        a bare estimate against the complexity bucket.
+
+    Deterministic — no model call. Falls back to the global ratio when the
+    complexity bucket has fewer than --min-bucket samples.
     """
-    import json as _json
-    click.echo(_json.dumps({
-        "status": "phase2_pending",
-        "message": f"clawpm reflect suggest is not yet implemented (Phase 2). Task: {task_id}",
-    }, indent=2))
+    from .reflect import parse_duration, suggest_duration
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+
+    # CLAWP-040 codex round-3 P2 fix: honor the global --project flag from
+    # the main group when the subcommand option wasn't passed. require_project
+    # below handles the task_id case (which always needs a concrete project);
+    # the bare-bucket path inherits the global here, both-absent = ALL.
+    if project_id is None:
+        project_id = ctx.obj.get("global_project")
+
+    predicted_min: int | None = None
+    if task_id:
+        project_id, _ = require_project(ctx, project_id)
+        task_id = expand_task_id(task_id, project_id)
+        t = get_task(config, project_id, task_id)
+        if not t:
+            output_error("task_not_found", f"No task with id '{task_id}' in project '{project_id}'", fmt=fmt)
+            sys.exit(1)
+        # Codex round-6 P2: prefer t.predictions.complexity over t.complexity
+        # because summarize_calibration buckets by predictions.complexity.
+        # Using t.complexity would lookup the wrong bucket (or fall back to
+        # global) when the predicted and actual/current complexity differ.
+        complexity = complexity or (
+            t.predictions.complexity.value if t.predictions.complexity
+            else (t.complexity.value if t.complexity else None)
+        )
+        confidence = confidence if confidence is not None else t.predictions.confidence
+        agent_profile = agent_profile or t.agent_profile
+        predicted_min = t.predictions.duration_min
+
+    if predicted_duration is not None:
+        try:
+            predicted_min = parse_duration(predicted_duration)
+        except Exception as exc:
+            output_error("bad_duration", str(exc), fmt=fmt)
+            sys.exit(1)
+
+    result = suggest_duration(
+        config.portfolio_root,
+        complexity=complexity,
+        confidence=confidence,
+        agent_profile=agent_profile,
+        predicted_min=predicted_min,
+        project_id=project_id,
+        min_bucket=min_bucket,
+    )
+    output_success(f"Calibration suggestion (bucket: {result['bucket']})", data=result, fmt=fmt)
 
 
 @reflect.command("history-import")
