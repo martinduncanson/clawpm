@@ -157,6 +157,29 @@ class TestDecomposeCLI:
         assert force_notes, "expected a work_log note naming incomplete children"
         assert "TEST-501-001" in force_notes[0].summary
 
+    def test_nested_directory_subtask_is_resolvable(
+        self, temp_portfolio_with_repo,
+    ):
+        """Codex round-8 P2: when a subtask is decomposed further it lives
+        at tasks/PARENT/CHILD/_task.md. get_task must probe that nested
+        path; otherwise the rollup scan misclassifies the child as missing
+        and blocks the top-level parent forever."""
+        from clawpm.tasks import split_task
+
+        config = temp_portfolio_with_repo["config"]
+        parent = add_task(config, "test", title="P", task_id="TEST-830")
+        c1 = add_subtask(config, "test", parent.id, "first")
+        # Decompose c1 further -- it becomes a directory task itself.
+        split_task(config, "test", c1.id)
+        # get_task must find the nested directory task by its bare id.
+        found = get_task(config, "test", c1.id)
+        assert found is not None
+        assert found.id == c1.id
+        # Rollup must NOT classify c1 as missing.
+        p = get_task(config, "test", "TEST-830")
+        st = parent_rollup_status(config, "test", p)
+        assert c1.id not in st["missing"]
+
     def test_invalid_child_complexity_emits_clean_error(
         self, temp_portfolio_with_repo,
     ):

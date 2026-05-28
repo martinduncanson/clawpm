@@ -130,6 +130,14 @@ def get_task(config: PortfolioConfig, project_id: str, task_id: str) -> Task | N
             tasks_dir / parent_id / f"{task_id}.progress.md",
             tasks_dir / "done" / parent_id / f"{task_id}.md",
             tasks_dir / "blocked" / parent_id / f"{task_id}.md",
+            # Codex round-8 P2: the subtask itself may have been split into
+            # a directory task (i.e. decomposed further into grandchildren).
+            # Its open/progress form lives at tasks/<parent>/<child>/_task.md.
+            # When marked done/blocked the directory migrates to the top-
+            # level done/<child>/ or blocked/<child>/ via change_task_state,
+            # so the existing tasks_dir/done/<task_id>/_task.md probe
+            # already covers the terminal states.
+            tasks_dir / parent_id / task_id / "_task.md",
         ])
 
     for path in possible_paths:
