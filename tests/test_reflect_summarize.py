@@ -134,3 +134,39 @@ class TestReflectCLI:
         # 10h = 600m, ratio 0.1 -> 60m
         assert out["data"]["calibrated_duration_min"] == 60
         assert out["data"]["bucket"] == "complexity=m"
+
+
+class TestCrossProjectSummarize:
+    """Codex round-1 P2 regression: when two projects share a task_id they
+    write to the same JSONL file (reflections are keyed by task_id alone),
+    and a cross-project summary must keep BOTH records — not silently let
+    the later one overwrite the earlier."""
+
+    def test_keeps_both_when_two_projects_share_task_id(self, tmp_path):
+        _done(tmp_path, "T-1", 100, 50, project="proj-a")
+        _done(tmp_path, "T-1", 200, 200, project="proj-b")
+        s = summarize_calibration(tmp_path, project_id=None)
+        assert s["total_done"] == 2
+        assert s["with_usable_duration"] == 2
+
+    def test_scoped_void_drops_only_its_project(self, tmp_path):
+        _done(tmp_path, "T-1", 100, 50, project="proj-a")
+        _done(tmp_path, "T-1", 200, 200, project="proj-b")
+        ref_file = tmp_path / "reflections" / "T-1.jsonl"
+        with ref_file.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "event": "void", "task_id": "T-1", "project_id": "proj-a",
+            }) + "\n")
+        s = summarize_calibration(tmp_path, project_id=None)
+        # proj-a voided, proj-b survives.
+        assert s["total_done"] == 1
+        assert s["with_usable_duration"] == 1
+
+    def test_unscoped_void_drops_entire_file(self, tmp_path):
+        _done(tmp_path, "T-1", 100, 50, project="proj-a")
+        _done(tmp_path, "T-1", 200, 200, project="proj-b")
+        ref_file = tmp_path / "reflections" / "T-1.jsonl"
+        with ref_file.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"event": "void", "task_id": "T-1"}) + "\n")
+        s = summarize_calibration(tmp_path, project_id=None)
+        assert s["total_done"] == 0

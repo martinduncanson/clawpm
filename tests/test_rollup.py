@@ -170,3 +170,35 @@ class TestDecomposeCLI:
         assert r.exit_code == 0, r.output
         out = json.loads(r.output)
         assert out["data"].get("parent_ready", {}).get("parent_id") == "TEST-502"
+
+
+class TestChildrenPersistence:
+    """Codex round-1 P1 regressions: children must survive migration out
+    of the parent directory and outright deletion."""
+
+    def test_blocked_child_still_blocks_parent(self, temp_portfolio_with_repo):
+        config = temp_portfolio_with_repo["config"]
+        parent = add_task(config, "test", title="P")
+        c1 = add_subtask(config, "test", parent.id, "c1")
+        c2 = add_subtask(config, "test", parent.id, "c2")
+        change_task_state(config, "test", c1.id, TaskState.BLOCKED)
+        change_task_state(config, "test", c2.id, TaskState.DONE)
+        # Persisted in parent frontmatter — c1 still visible after migrating
+        # out of the parent directory into blocked/.
+        p = get_task(config, "test", parent.id)
+        assert c1.id in p.children and c2.id in p.children
+        # Gate must still refuse because c1 is BLOCKED, not DONE.
+        res = change_task_state(config, "test", parent.id, TaskState.DONE)
+        assert res is None
+        assert get_task(config, "test", parent.id).state != TaskState.DONE
+
+    def test_deleted_child_counted_as_missing(self, temp_portfolio_with_repo):
+        config = temp_portfolio_with_repo["config"]
+        parent = add_task(config, "test", title="P")
+        c1 = add_subtask(config, "test", parent.id, "c1")
+        # Simulate file loss (typo'd id, accidental delete, etc.).
+        c1.file_path.unlink()
+        p = get_task(config, "test", parent.id)
+        st = parent_rollup_status(config, "test", p)
+        assert c1.id in st["missing"]
+        assert st["ready"] is False

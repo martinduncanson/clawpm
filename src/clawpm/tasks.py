@@ -735,6 +735,53 @@ def split_task(
     return Task.from_file(new_path)
 
 
+def _append_child_to_parent_frontmatter(
+    parent_path: Path, child_id: str,
+) -> None:
+    """Persist ``child_id`` into the parent's frontmatter ``children`` list.
+
+    CLAWP-037 round-1 fix (codex P1): the parent's children list must survive
+    a child migrating out of the parent directory (DONE → tasks/done/, BLOCKED
+    → tasks/blocked/, or a deletion). Without persistence, dir-scan-derived
+    children silently shrink and the rollup gate's missing/dangling-child
+    handling never fires. Idempotent — repeated calls for the same child_id
+    leave the list unchanged.
+    """
+    if parent_path.name != "_task.md" or not parent_path.exists():
+        return
+    text = parent_path.read_text(encoding="utf-8")
+    if not text.startswith("---"):
+        return
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return
+    try:
+        fm = yaml.safe_load(parts[1]) or {}
+    except yaml.YAMLError:
+        return
+    children = fm.get("children")
+    if not isinstance(children, list):
+        children = []
+    if child_id in children:
+        return  # idempotent
+    children.append(child_id)
+    fm["children"] = children
+    body = parts[2].lstrip("\n")
+    new_text = (
+        "---\n"
+        + yaml.dump(fm, default_flow_style=False, allow_unicode=True).strip()
+        + "\n---\n"
+        + body
+    )
+    tmp = parent_path.with_suffix(parent_path.suffix + ".tmp")
+    try:
+        tmp.write_text(new_text, encoding="utf-8")
+        tmp.replace(parent_path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def add_subtask(
     config: PortfolioConfig,
     project_id: str,
@@ -829,5 +876,10 @@ def add_subtask(
     except Exception:
         tmp_path.unlink(missing_ok=True)
         raise
+
+    # CLAWP-037 round-1 fix: persist the child on the parent so the rollup
+    # gate keeps it in view after the child migrates to done/ or blocked/.
+    if parent.file_path is not None:
+        _append_child_to_parent_frontmatter(parent.file_path, subtask_id)
 
     return Task.from_file(file_path)

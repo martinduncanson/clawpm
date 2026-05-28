@@ -516,6 +516,20 @@ class Task:
             ap_raw if isinstance(ap_raw, str) and ap_raw.strip() else None
         )
 
+        # CLAWP-037 (codex round-1 fix) — persist children on the parent so
+        # the rollup gate sees the full set even after children migrate out
+        # of the parent directory into done/ or blocked/. Without this, a
+        # dir-scan-only children list silently shrinks as work completes,
+        # defeating the missing/dangling-child = UNSATISFIED rule.
+        # list_tasks' parent-linking still appends any newly-discovered
+        # children (idempotent), so legacy directory-only parents keep
+        # working unchanged.
+        children_raw = frontmatter.get("children") or []
+        children = (
+            [c for c in children_raw if isinstance(c, str)]
+            if isinstance(children_raw, list) else []
+        )
+
         return cls(
             id=frontmatter.get("id", path.stem.replace(".progress", "")),
             title=title,
@@ -525,6 +539,7 @@ class Task:
             depends=frontmatter.get("depends", []),
             scope=frontmatter.get("scope", []),
             parent=frontmatter.get("parent"),
+            children=children,
             created=frontmatter.get("created"),
             content=content,
             file_path=path,

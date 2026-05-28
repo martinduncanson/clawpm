@@ -632,13 +632,19 @@ def write_reflection_event(
 
 
 def _iter_done_events(portfolio_root: Path, project_id: str | None = None):
-    """Yield the latest non-voided ``task_done`` record per reflection file.
+    """Yield the latest non-voided ``task_done`` record per (file, project).
 
-    Void handling mirrors :func:`find_reference_tasks`: a ``void`` event for
-    the file (unscoped, or matching ``project_id``) drops the file's done
-    event from the corpus — voided reflections are operator-flagged bad data.
-    When ``project_id`` is None the corpus spans all projects and ANY void
-    drops the file.
+    Reflection files are keyed by ``task_id`` alone, so when two projects
+    share a task_id (e.g. both have ``TEST-001``) they write to the SAME
+    JSONL file. We therefore key per (project_id, file) — the latest
+    ``task_done`` for each project_id within a file is kept, so a cross-
+    project summary (``project_id=None``) doesn't silently drop one project
+    because its record came earlier in the file (codex round-1 P2 fix).
+
+    Void handling: an UNSCOPED void event (no ``project_id``) drops the
+    entire file. A SCOPED void event drops only that project's record
+    within the file. When the caller passes ``project_id``, only that
+    project's records are considered.
     """
     ref_dir = _reflections_dir(portfolio_root)
     if not ref_dir.exists():
@@ -648,8 +654,9 @@ def _iter_done_events(portfolio_root: Path, project_id: str | None = None):
             text = ref_file.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        done_record: dict | None = None
-        voided = False
+        per_project: dict[str | None, dict] = {}  # latest done per project_id
+        voided_projects: set[str | None] = set()
+        unscoped_void = False
         for line in text.splitlines():
             line = line.strip()
             if not line:
@@ -661,16 +668,23 @@ def _iter_done_events(portfolio_root: Path, project_id: str | None = None):
             evt = rec.get("event")
             if evt == "void":
                 rec_proj = rec.get("project_id")
-                if rec_proj is None or project_id is None or rec_proj == project_id:
-                    voided = True
+                if rec_proj is None:
+                    unscoped_void = True
+                else:
+                    voided_projects.add(rec_proj)
                 continue
             if evt != "task_done":
                 continue
-            if project_id is not None and rec.get("project_id") != project_id:
+            rec_proj = rec.get("project_id")
+            if project_id is not None and rec_proj != project_id:
                 continue
-            done_record = rec  # keep the latest
-        if done_record is not None and not voided:
-            yield done_record
+            per_project[rec_proj] = rec  # latest wins per project
+        if unscoped_void:
+            continue  # entire file voided
+        for proj, rec in per_project.items():
+            if proj in voided_projects:
+                continue
+            yield rec
 
 
 def _duration_ratio(rec: dict) -> float | None:
