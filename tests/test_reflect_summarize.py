@@ -206,6 +206,20 @@ class TestSuggestUsesPredictedComplexity:
     the two can differ when the operator pre-set predictions but adjusted
     complexity later."""
 
+    def test_zero_duration_actual_is_dirty_not_crashing(self, tmp_path):
+        """Codex round-7 P2: a task completed in the same minute it started
+        records duration_min=0; that's noise, not a 0.0 ratio. Including it
+        used to crash _interpret_ratio with a divide-by-zero."""
+        _done(tmp_path, "Z-0", 60, 0, complexity="m", project="test")
+        _done(tmp_path, "Z-1", 60, 30, complexity="m", project="test")
+        s = summarize_calibration(tmp_path, project_id="test")
+        # The zero-actual row is dirty; the real one is usable.
+        assert s["dirty_flagged"] == 1
+        assert s["with_usable_duration"] == 1
+        # No crash, interpretation string returned.
+        assert isinstance(s["interpretation"], str)
+
+
     def test_suggest_picks_predicted_complexity_bucket(
         self, temp_portfolio_with_repo,
     ):

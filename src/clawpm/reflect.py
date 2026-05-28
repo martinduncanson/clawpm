@@ -688,16 +688,23 @@ def _iter_done_events(portfolio_root: Path, project_id: str | None = None):
 
 
 def _duration_ratio(rec: dict) -> float | None:
-    """actual/predicted duration for a done record; None if not computable."""
+    """actual/predicted duration for a done record; None if not computable.
+
+    Codex round-7 P2: a zero ratio (task started + completed within the same
+    minute → ``actuals.duration_min == 0``) is treated as noise, not signal,
+    and excluded from the corpus. Including it would (a) pull bucket medians
+    toward 0 and (b) crash ``_interpret_ratio`` with a divide-by-zero when
+    converting the inverse for the "Nx faster" message.
+    """
     deltas = rec.get("deltas") or {}
     r = deltas.get("duration_ratio")
-    if r is not None:
+    if r is not None and r > 0:
         return r
     preds = rec.get("predictions") or {}
     acts = rec.get("actuals") or {}
     p = preds.get("duration_min")
     a = acts.get("duration_min")
-    if p and a is not None:
+    if p and a:  # both truthy (excludes a == 0 and a is None)
         return round(a / p, 4)
     return None
 
@@ -715,6 +722,13 @@ def _bucket_stats(ratios: list[float]) -> dict:
 def _interpret_ratio(median_ratio: float | None) -> str:
     if median_ratio is None:
         return "No usable predicted-vs-actual duration pairs yet."
+    # Defensive guard: _duration_ratio already excludes zero ratios, but
+    # keep this branch so a malformed corpus row can't crash the command.
+    if median_ratio <= 0:
+        return (
+            f"Median actual/predicted = {median_ratio}: non-positive — likely "
+            f"zero-duration actuals slipped through; check work_log timestamps."
+        )
     if median_ratio < 1:
         return (
             f"Median actual/predicted = {median_ratio}: tasks finish ~"
