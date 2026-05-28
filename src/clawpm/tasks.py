@@ -24,13 +24,24 @@ def get_tasks_dir(config: PortfolioConfig, project_id: str) -> Path | None:
 
 
 def _scan_task_files(location: Path, tasks: list[Task], state_filter: TaskState | None) -> None:
-    """Scan a directory for task files (both .md files and task directories)."""
+    """Scan a directory for task files, recursing into nested directory tasks.
+
+    Codex round-9 P2: after a subtask is itself decomposed via split_task,
+    its files live at ``tasks/<parent>/<child>/...`` — one level deeper than
+    the original scan reached. Recurse properly so nested grandchildren are
+    visible to ``list_tasks`` / ``get_next_task``, not just ``get_task``.
+    The ``_task.md`` filename is skipped in the file branch because the
+    directory-task owner is added once in the dir branch, before recursing.
+    """
     if not location.exists():
         return
 
     for item in location.iterdir():
         if item.is_file() and item.suffix == ".md":
-            # Regular task file
+            # Skip _task.md here — the dir branch below adds the directory
+            # task once when it enters the dir (avoids duplicate appends).
+            if item.name == "_task.md":
+                continue
             try:
                 task = Task.from_file(item)
                 if state_filter is None or task.state == state_filter:
@@ -38,7 +49,10 @@ def _scan_task_files(location: Path, tasks: list[Task], state_filter: TaskState 
             except Exception:
                 continue
         elif item.is_dir() and not item.name.startswith(".") and item.name not in ("done", "blocked"):
-            # Task directory - check for _task.md (parent) and subtasks
+            # Directory task: add the _task.md, then recurse for subtasks
+            # AND any nested directory subtasks. The recursion subsumes the
+            # old non-recursive single-level glob; nested directories with
+            # their own _task.md get added as we descend.
             parent_file = item / "_task.md"
             if parent_file.exists():
                 try:
@@ -46,18 +60,8 @@ def _scan_task_files(location: Path, tasks: list[Task], state_filter: TaskState 
                     if state_filter is None or parent_task.state == state_filter:
                         tasks.append(parent_task)
                 except Exception:
-                    continue
-
-            # Scan for subtasks in the directory
-            for subtask_file in item.glob("*.md"):
-                if subtask_file.name == "_task.md":
-                    continue
-                try:
-                    subtask = Task.from_file(subtask_file)
-                    if state_filter is None or subtask.state == state_filter:
-                        tasks.append(subtask)
-                except Exception:
-                    continue
+                    pass
+            _scan_task_files(item, tasks, state_filter)
 
 
 def list_tasks(

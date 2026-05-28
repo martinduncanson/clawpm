@@ -157,6 +157,26 @@ class TestDecomposeCLI:
         assert force_notes, "expected a work_log note naming incomplete children"
         assert "TEST-501-001" in force_notes[0].summary
 
+    def test_nested_directory_subtask_visible_to_list_tasks(
+        self, temp_portfolio_with_repo,
+    ):
+        """Codex round-9 P2: list_tasks must recurse into nested directory
+        subtasks so a child decomposed further (and any grandchildren)
+        remains visible to `tasks list` / `next`."""
+        from clawpm.tasks import list_tasks, split_task
+
+        config = temp_portfolio_with_repo["config"]
+        parent = add_task(config, "test", title="P", task_id="TEST-840")
+        c1 = add_subtask(config, "test", parent.id, "first")
+        split_task(config, "test", c1.id)
+        # Add a grandchild inside the now-nested directory subtask.
+        gc = add_subtask(config, "test", c1.id, "gchild")
+        all_tasks = list_tasks(config, "test")
+        ids = {t.id for t in all_tasks}
+        assert "TEST-840" in ids
+        assert c1.id in ids
+        assert gc.id in ids
+
     def test_nested_directory_subtask_is_resolvable(
         self, temp_portfolio_with_repo,
     ):
