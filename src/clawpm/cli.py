@@ -1463,10 +1463,15 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
     # CLAWP-037 — parent rollup gate. Compute readiness up front so we can
     # either block (no --force) or proceed-and-log (--force). A missing
     # child ref counts as unsatisfied (see parent_rollup_status).
+    #
+    # Codex round-4 fix: do NOT short-circuit on task.children being empty —
+    # parent_rollup_status's belt-and-braces parent-ref scan handles
+    # manually-created subtasks that bypassed the persistence path. Tasks
+    # with no children at all return ready=True from the scan immediately.
     rollup_incomplete: list[str] = []
     if state == TaskState.DONE:
         _rollup_task = get_task(config, project_id, task_id)
-        if _rollup_task and _rollup_task.children:
+        if _rollup_task:
             from .tasks import parent_rollup_status
             _status = parent_rollup_status(config, project_id, _rollup_task)
             rollup_incomplete = (
@@ -1739,6 +1744,10 @@ def tasks_decompose(
         sys.exit(1)
 
     created: list[dict] = []
+    # NOTE: the id-collision concern Codex re-flags on this loop is
+    # addressed inside `add_subtask` (tasks.py) — its id generator unions
+    # parent_dir glob + tasks/done + tasks/blocked + parent's persisted
+    # frontmatter `children`. See test_subtask_id_does_not_collide_with_migrated_child.
     for spec in child_specs:
         title: str | None = spec
         criteria: list = []
@@ -4357,6 +4366,9 @@ def reflect_summarize(ctx: click.Context, project_id: str | None) -> None:
     # = aggregate ALL projects.
     if project_id is None:
         project_id = ctx.obj.get("global_project")
+    # By here `project_id` is the resolved scope: subcommand > global, with
+    # None meaning aggregate ALL. The call below passes the resolved value,
+    # NOT a raw default.
     summary = summarize_calibration(config.portfolio_root, project_id)
     output_success(
         f"Calibration summary ({summary['project_id']}): "

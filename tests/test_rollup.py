@@ -203,6 +203,34 @@ class TestChildrenPersistence:
         assert c1.id in st["missing"]
         assert st["ready"] is False
 
+    def test_gate_runs_when_parent_has_no_persisted_children(
+        self, temp_portfolio_with_repo,
+    ):
+        """Codex round-4 fix: even when ``task.children`` is empty the gate
+        must call parent_rollup_status — a manually-parented child must
+        still gate the parent. Without this the short-circuit silently lets
+        the parent close with an open orphan."""
+        config = temp_portfolio_with_repo["config"]
+        # Create a plain (non-directory) parent task with NO subtasks via
+        # add_subtask, so parent.children stays empty.
+        parent = add_task(config, "test", title="P", task_id="TEST-810")
+        tasks_dir = temp_portfolio_with_repo["tasks_dir"]
+        # Manually drop a `parent:`-referenced file at the top level (open).
+        orphan = tasks_dir / "TEST-810-001.md"
+        orphan.write_text(
+            "---\nid: TEST-810-001\npriority: 5\nparent: TEST-810\n---\n# orphan\n",
+            encoding="utf-8",
+        )
+        # Reload — task.children stays empty (no persistence).
+        p = get_task(config, "test", "TEST-810")
+        assert p.children == []
+        # Gate must still block because the parent-ref scan finds the orphan.
+        res = change_task_state(
+            config, "test", "TEST-810", TaskState.DONE
+        )
+        assert res is None
+        assert get_task(config, "test", "TEST-810").state != TaskState.DONE
+
     def test_manually_parented_subtask_blocks_parent(
         self, temp_portfolio_with_repo,
     ):

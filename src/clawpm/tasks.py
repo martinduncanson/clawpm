@@ -285,7 +285,14 @@ def change_task_state(
     # Check for incomplete subtasks when marking parent as done. A missing
     # child ref counts as UNSATISFIED (mirrors cascade_unblock_dependents'
     # dangling-dep handling) — see parent_rollup_status.
-    if new_state == TaskState.DONE and task.children and not force:
+    #
+    # CLAWP-037 codex round-4 fix: do NOT short-circuit on task.children
+    # being empty — a child manually created with `parent: <id>` frontmatter
+    # may exist without being in the parent's persisted list, and we still
+    # need to gate on it. parent_rollup_status runs the parent-ref scan
+    # across all state dirs; for tasks with no children at all the scan
+    # finds nothing and returns ready=True immediately.
+    if new_state == TaskState.DONE and not force:
         status = parent_rollup_status(config, project_id, task)
         if not status["ready"]:
             # Return None to signal failure - caller should check and report
