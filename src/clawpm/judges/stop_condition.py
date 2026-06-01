@@ -38,6 +38,11 @@ from typing import Callable
 # model (e.g. set to `claude --model claude-haiku-4-5 -p`) or a stub for tests.
 DEFAULT_JUDGE_CMD = ["claude", "--print", "--model", "claude-haiku-4-5"]
 
+# Per-call judge subprocess budget. Shared with dispatch.py so the Stop-hook
+# timeout can be sized against the confirm-close vote budget (base + N
+# refuters run sequentially, each bounded by this).
+JUDGE_CALL_TIMEOUT_SECONDS = 60
+
 
 @dataclass
 class JudgeVerdict:
@@ -188,7 +193,7 @@ def _default_judge_invoker(prompt: str) -> str:
             capture_output=True,
             text=True,
             encoding="utf-8",
-            timeout=60,
+            timeout=JUDGE_CALL_TIMEOUT_SECONDS,
         )
     except FileNotFoundError as exc:
         # `claude` CLI not on PATH — be loud about it so the operator knows

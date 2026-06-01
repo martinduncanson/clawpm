@@ -131,15 +131,34 @@ class TestSettingsPayload:
     def test_confirm_close_appends_flag_to_stop_command(self):
         # CLAWP-041 G1: the load-bearing seam. If --confirm-close is dropped
         # here the whole tier silently no-ops in the real Stop-hook path.
-        on = build_settings_payload("TEST-001", "test", confirm_close=True)
+        on = build_settings_payload("TEST-001", "test", confirm_close=True, refute_votes=2)
         on_cmd = on["hooks"]["Stop"][0]["hooks"][0]["command"]
-        assert "--confirm-close" in on_cmd
         assert "clawpm hook eval-stop" in on_cmd
+        # The on-form signature is unambiguous (--no-confirm-close also
+        # contains the substring "--confirm-close", so match the votes suffix).
+        assert "--confirm-close --refute-votes 2" in on_cmd
 
-    def test_default_omits_confirm_close_flag(self):
+    def test_default_emits_explicit_no_confirm_close(self):
+        # Codex P2: dispatch-time gating must be authoritative — the false case
+        # emits an EXPLICIT --no-confirm-close so CLAWPM_CONFIRM_CLOSE env can't
+        # silently re-enable it at hook runtime.
         off = build_settings_payload("TEST-001", "test")
         off_cmd = off["hooks"]["Stop"][0]["hooks"][0]["command"]
-        assert "--confirm-close" not in off_cmd
+        assert "--no-confirm-close" in off_cmd
+        assert "--confirm-close --refute-votes" not in off_cmd
+
+    def test_confirm_close_scales_stop_hook_timeout(self):
+        # Codex P2: a flat 90s could kill a valid slow close (base + refuters
+        # run sequentially, 60s each). Timeout must scale with the vote budget.
+        off = build_settings_payload("TEST-001", "test")
+        assert off["hooks"]["Stop"][0]["hooks"][0]["timeout"] == 90
+        on1 = build_settings_payload("TEST-001", "test", confirm_close=True, refute_votes=1)
+        on3 = build_settings_payload("TEST-001", "test", confirm_close=True, refute_votes=3)
+        t1 = on1["hooks"]["Stop"][0]["hooks"][0]["timeout"]
+        t3 = on3["hooks"]["Stop"][0]["hooks"][0]["timeout"]
+        # base + N refuters, each 60s, + margin → must clear base+1refuter=120s.
+        assert t1 >= 120
+        assert t3 > t1
 
 
 class TestConfirmCloseAutoGate:
@@ -167,14 +186,40 @@ class TestConfirmCloseAutoGate:
             temp_portfolio_with_repo["root"], temp_portfolio_with_repo["repo_dir"],
             temp_portfolio_with_repo["config"], confidence=4,
         )
-        assert "--confirm-close" in cmd
+        assert "--confirm-close --refute-votes" in cmd
 
     def test_low_confidence_stays_off(self, temp_portfolio_with_repo):
         cmd = self._dispatch_and_read_stop_cmd(
             temp_portfolio_with_repo["root"], temp_portfolio_with_repo["repo_dir"],
             temp_portfolio_with_repo["config"], confidence=3,
         )
-        assert "--confirm-close" not in cmd
+        assert "--no-confirm-close" in cmd
+        assert "--confirm-close --refute-votes" not in cmd
+
+    def test_string_confidence_degrades_to_off(self, temp_portfolio_with_repo):
+        # Codex P2: a hand-edited task file with confidence as a quoted string
+        # must not crash dispatch — it degrades to confirm-close off.
+        config = temp_portfolio_with_repo["config"]
+        task = add_task(
+            config, "test", title="t", description="b",
+            predictions=Predictions(confidence=5, filled_by="agent"),
+        )
+        # Rewrite the task file's confidence as a YAML string to simulate a
+        # legacy / hand-edited file.
+        tfile = temp_portfolio_with_repo["tasks_dir"] / f"{task.id}.md"
+        raw = tfile.read_text(encoding="utf-8")
+        tfile.write_text(raw.replace("confidence: 5", 'confidence: "5"'), encoding="utf-8")
+        target = temp_portfolio_with_repo["repo_dir"] / f"disp-str-{task.id}"
+        result = CliRunner().invoke(
+            main,
+            ["tasks", "dispatch", task.id, "--project", "test",
+             "--target-dir", str(target), "--no-session-context"],
+        )
+        assert result.exit_code == 0, result.output
+        cmd = json.loads(
+            (target / ".claude" / "settings.local.json").read_text(encoding="utf-8")
+        )["hooks"]["Stop"][0]["hooks"][0]["command"]
+        assert "--no-confirm-close" in cmd
 
     def test_explicit_no_confirm_close_overrides_high_confidence(self, temp_portfolio_with_repo):
         cmd = self._dispatch_and_read_stop_cmd(
@@ -182,7 +227,8 @@ class TestConfirmCloseAutoGate:
             temp_portfolio_with_repo["config"], confidence=5,
             extra_args=("--no-confirm-close",),
         )
-        assert "--confirm-close" not in cmd
+        assert "--no-confirm-close" in cmd
+        assert "--confirm-close --refute-votes" not in cmd
 
     def test_payload_with_rubric_adds_session_start(self):
         p = build_settings_payload(

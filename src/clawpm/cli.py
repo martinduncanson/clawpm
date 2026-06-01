@@ -2011,6 +2011,12 @@ def tasks_emit_rubric(
          "before the rubric closes the task. Default: auto-on when the task's "
          "predicted confidence >= 4, else off."
 )
+@click.option(
+    "--refute-votes", "refute_votes", type=int, default=1,
+    help="CLAWP-041: lens-varied refutation votes baked into the Stop-hook "
+         "command when confirm-close is active (majority refute overturns). "
+         "Also sizes the hook timeout. Default 1.",
+)
 @click.pass_context
 def tasks_dispatch(
     ctx: click.Context,
@@ -2021,6 +2027,7 @@ def tasks_dispatch(
     no_session_context: bool,
     force: bool,
     confirm_close: bool | None,
+    refute_votes: int,
 ) -> None:
     """Emit hook-wired .claude/settings.local.json for a dispatched subagent (CLAWP-018).
 
@@ -2082,11 +2089,23 @@ def tasks_dispatch(
     # wins; otherwise enable when the task's predicted confidence is high
     # (>= 4) — a confident "done" is exactly where an over-charitable judge
     # is most likely to wave through unverified work.
+    #
+    # Guard the type: predictions.confidence is meant to be int|None, but task
+    # frontmatter is committed/hand-editable state and a legacy file may store
+    # it as a quoted YAML string ("4"). Comparing str >= int raises TypeError
+    # and would crash dispatch before any settings are written (Codex P2).
+    # Treat a non-int confidence as "unset" → auto-off (safe degrade).
     if confirm_close is None:
         task_confidence = (
             task.predictions.confidence if task.predictions else None
         )
-        confirm_close = task_confidence is not None and task_confidence >= 4
+        confirm_close = (
+            isinstance(task_confidence, int)
+            and not isinstance(task_confidence, bool)
+            and task_confidence >= 4
+        )
+
+    refute_votes = max(1, refute_votes)
 
     try:
         path = write_dispatch_settings(
@@ -2097,6 +2116,7 @@ def tasks_dispatch(
             force=force,
             portfolio_root=config.portfolio_root,
             confirm_close=confirm_close,
+            refute_votes=refute_votes,
         )
     except (FileExistsError, ValueError) as exc:
         output_error("dispatch_blocked", str(exc), fmt=fmt)
@@ -2113,6 +2133,7 @@ def tasks_dispatch(
             "invocation": invocation,
             "rubric_injected": rubric is not None,
             "confirm_close": confirm_close,
+            "refute_votes": refute_votes if confirm_close else None,
         },
         fmt=fmt,
     )

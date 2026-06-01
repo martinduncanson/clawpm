@@ -218,7 +218,11 @@ def settings_path(target_dir: Path) -> Path:
 
 
 def _command_for_dispatch(
-    task_id: str, project_id: str, action: str, confirm_close: bool = False
+    task_id: str,
+    project_id: str,
+    action: str,
+    confirm_close: bool = False,
+    refute_votes: int = 1,
 ) -> str:
     """Build the shell command for a hook entry.
 
@@ -242,11 +246,18 @@ def _command_for_dispatch(
     _assert_safe_identifier(task_id, "task_id")
     _assert_safe_identifier(project_id, "project_id")
     if action == "eval-stop":
-        # CLAWP-041: append --confirm-close so the Stop hook runs the
-        # adversarial refutation pass before letting the rubric close the
-        # task. Gated at dispatch time (e.g. high-confidence tasks) so the
-        # common block path stays a single judge call.
-        cc = " --confirm-close" if confirm_close else ""
+        # CLAWP-041: bake the confirm-close decision into the command so
+        # dispatch-time gating is AUTHORITATIVE — emit an explicit flag for
+        # BOTH the true and false cases. `hook eval-stop` treats an omitted
+        # flag as env-controlled (CLAWPM_CONFIRM_CLOSE); without an explicit
+        # --no-confirm-close, an operator's per-dispatch opt-out (or a
+        # low-confidence auto-off) would be silently re-enabled wherever that
+        # env var is set (Codex P2). --refute-votes likewise pins the vote
+        # budget at dispatch time rather than deferring to CLAWPM_REFUTE_VOTES.
+        if confirm_close:
+            cc = f" --confirm-close --refute-votes {int(refute_votes)}"
+        else:
+            cc = " --no-confirm-close"
         return (
             f"clawpm hook eval-stop --project {project_id} "
             f"--task {task_id}{cc}"
@@ -269,6 +280,7 @@ def build_settings_payload(
     project_id: str,
     rubric_markdown: Optional[str] = None,
     confirm_close: bool = False,
+    refute_votes: int = 1,
 ) -> dict:
     """Build the settings.local.json payload for a dispatched task.
 
@@ -278,10 +290,26 @@ def build_settings_payload(
     subagent sees its own contract on startup.
 
     ``confirm_close`` (CLAWP-041): when True, the Stop-hook command carries
-    ``--confirm-close`` so the rubric's ok=true→close transition is gated by
-    an adversarial refutation pass. The block path is unchanged.
+    ``--confirm-close --refute-votes N`` so the rubric's ok=true→close
+    transition is gated by an adversarial refutation pass. The block path is
+    unchanged.
+
+    The Stop-hook ``timeout`` scales with the confirm-close vote budget: the
+    base judge plus N refuters run SEQUENTIALLY, each bounded by
+    ``JUDGE_CALL_TIMEOUT_SECONDS``. A flat 90s would let Claude kill a valid
+    slow close (e.g. base 50s + refuter 50s) before ``eval-stop`` emits a
+    verdict (Codex P2).
     """
+    from .judges.stop_condition import JUDGE_CALL_TIMEOUT_SECONDS
+
     now = datetime.now(timezone.utc).isoformat()
+
+    # Block path = one judge call; confirm-close = 1 base + N refuters, all
+    # sequential. Size the hook timeout to the worst case plus a margin.
+    if confirm_close:
+        stop_timeout = (1 + max(1, int(refute_votes))) * JUDGE_CALL_TIMEOUT_SECONDS + 30
+    else:
+        stop_timeout = 90
     payload = {
         CLAWPM_MARKER_KEY: {
             "task_id": task_id,
@@ -298,8 +326,9 @@ def build_settings_payload(
                             "command": _command_for_dispatch(
                                 task_id, project_id, "eval-stop",
                                 confirm_close=confirm_close,
+                                refute_votes=refute_votes,
                             ),
-                            "timeout": 90,
+                            "timeout": stop_timeout,
                         }
                     ]
                 }
@@ -389,6 +418,7 @@ def write_dispatch_settings(
     force: bool = False,
     portfolio_root: Optional[Path] = None,
     confirm_close: bool = False,
+    refute_votes: int = 1,
 ) -> Path:
     """Emit settings.local.json for the dispatched task.
 
@@ -445,7 +475,8 @@ def write_dispatch_settings(
             shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
 
     payload = build_settings_payload(
-        task_id, project_id, rubric_markdown, confirm_close=confirm_close
+        task_id, project_id, rubric_markdown,
+        confirm_close=confirm_close, refute_votes=refute_votes,
     )
     # Pretty-print so dispatch settings are review-friendly when they
     # land in PR diffs.
