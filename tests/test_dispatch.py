@@ -128,6 +128,62 @@ class TestSettingsPayload:
         assert "Read" not in matcher
         assert "Grep" not in matcher
 
+    def test_confirm_close_appends_flag_to_stop_command(self):
+        # CLAWP-041 G1: the load-bearing seam. If --confirm-close is dropped
+        # here the whole tier silently no-ops in the real Stop-hook path.
+        on = build_settings_payload("TEST-001", "test", confirm_close=True)
+        on_cmd = on["hooks"]["Stop"][0]["hooks"][0]["command"]
+        assert "--confirm-close" in on_cmd
+        assert "clawpm hook eval-stop" in on_cmd
+
+    def test_default_omits_confirm_close_flag(self):
+        off = build_settings_payload("TEST-001", "test")
+        off_cmd = off["hooks"]["Stop"][0]["hooks"][0]["command"]
+        assert "--confirm-close" not in off_cmd
+
+
+class TestConfirmCloseAutoGate:
+    """CLAWP-041 G2: `tasks dispatch` auto-enables --confirm-close when the
+    task's predicted confidence >= 4, end to end through the CLI."""
+
+    def _dispatch_and_read_stop_cmd(self, env_root, repo_dir, config, confidence, extra_args=()):
+        task = add_task(
+            config, "test", title="t", description="body",
+            predictions=Predictions(confidence=confidence, filled_by="agent"),
+        )
+        target = repo_dir / f"disp-{task.id}"
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["tasks", "dispatch", task.id, "--project", "test",
+             "--target-dir", str(target), "--no-session-context", *extra_args],
+        )
+        assert result.exit_code == 0, result.output
+        payload = json.loads((target / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
+        return payload["hooks"]["Stop"][0]["hooks"][0]["command"]
+
+    def test_high_confidence_auto_enables(self, temp_portfolio_with_repo):
+        cmd = self._dispatch_and_read_stop_cmd(
+            temp_portfolio_with_repo["root"], temp_portfolio_with_repo["repo_dir"],
+            temp_portfolio_with_repo["config"], confidence=4,
+        )
+        assert "--confirm-close" in cmd
+
+    def test_low_confidence_stays_off(self, temp_portfolio_with_repo):
+        cmd = self._dispatch_and_read_stop_cmd(
+            temp_portfolio_with_repo["root"], temp_portfolio_with_repo["repo_dir"],
+            temp_portfolio_with_repo["config"], confidence=3,
+        )
+        assert "--confirm-close" not in cmd
+
+    def test_explicit_no_confirm_close_overrides_high_confidence(self, temp_portfolio_with_repo):
+        cmd = self._dispatch_and_read_stop_cmd(
+            temp_portfolio_with_repo["root"], temp_portfolio_with_repo["repo_dir"],
+            temp_portfolio_with_repo["config"], confidence=5,
+            extra_args=("--no-confirm-close",),
+        )
+        assert "--confirm-close" not in cmd
+
     def test_payload_with_rubric_adds_session_start(self):
         p = build_settings_payload(
             "TEST-001", "test",

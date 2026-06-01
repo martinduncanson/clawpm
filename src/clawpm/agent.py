@@ -360,6 +360,12 @@ def dispatch_agent(
         # callable. ``evaluate_stop_condition`` composes the
         # rubric+transcript prompt via ``build_judge_prompt`` and hands
         # it to the invoker; we get JudgeVerdict.parse() for free.
+        # Note (CLAWP-041): in this single-shot path a base-judge RuntimeError
+        # fails CLOSED (ok=False, below) — intentional, unlike the CLI Stop
+        # hook which fails open. A *refuter* error inside
+        # evaluate_stop_condition_confirmed abstains (fails open relative to
+        # the refutation pass) to avoid an infinite block loop. The mixed
+        # stance is deliberate; don't "reconcile" it without re-reading both.
         try:
             if confirm_close:
                 verdict = evaluate_stop_condition_confirmed(

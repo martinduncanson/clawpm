@@ -364,11 +364,21 @@ def evaluate_stop_condition_confirmed(
     default ``refute_votes=1`` a single refutation overturns. A surviving
     close returns the original base verdict.
 
-    Refuter-invoker errors are caught and treated as ABSTENTIONS (not
-    refutations) — a systematically broken refuter degrades to "base verdict
-    stands" rather than trapping the agent in an infinite block loop, matching
-    the CLI's existing fail-open-on-judge-error stance. The error is surfaced
-    in the returned reason so it remains visible.
+    Refuter-invoker errors are caught and treated as ABSTENTIONS — they are
+    dropped from BOTH the refutation count AND the threshold denominator, so
+    the majority is computed over the refuters that actually returned a
+    verdict. This matters under multi-vote: with ``refute_votes=3`` and two
+    refuters erroring, a single surviving ``ok=false`` vote still overturns the
+    close (1 of 1 effective vote), rather than being outvoted by two dead
+    judges (the fail-open this avoids). Only a TOTAL refuter outage (every vote
+    errored) lets the base verdict stand — the right call versus trapping the
+    agent in an infinite block loop on a systematically broken refuter.
+
+    Any refuter error decorates the returned reason with a greppable
+    ``CONFIRM_CLOSE_DEGRADED`` token so a confirm-close that silently lost its
+    refutation pass is discoverable in the persisted iteration-event stream
+    (the base-judge error path writes its own doctor signal in the CLI; this is
+    the equivalent marker for refuter degradation).
     """
     invoker = invoker or _default_judge_invoker
     base = evaluate_stop_condition(rubric, transcript, invoker=invoker)
@@ -388,8 +398,7 @@ def evaluate_stop_condition_confirmed(
         try:
             raw = invoker(prompt)
         except RuntimeError as exc:
-            # Abstention — do NOT count as a refutation (avoids infinite
-            # block loop on a broken judge). Still surfaced in the reason.
+            # Abstention — dropped from refutations AND denominator below.
             errors.append(f"{lens}:{exc}")
             continue
         vote = JudgeVerdict.parse(raw)
@@ -399,28 +408,42 @@ def evaluate_stop_condition_confirmed(
         if not vote.ok:
             refutations.append(vote.reason)
 
-    threshold = -(-votes // 2)  # ceil(votes / 2)
+    # Threshold over the refuters that ACTUALLY ran, not the configured count.
+    effective = votes - len(errors)
+    if effective <= 0:
+        # Total refuter outage → base verdict stands (fail-open vs infinite
+        # block loop), but surfaced for doctor via CONFIRM_CLOSE_DEGRADED.
+        return JudgeVerdict(
+            ok=True,
+            impossible=False,
+            reason=(
+                f"{base.reason} [CONFIRM_CLOSE_DEGRADED: all {votes} "
+                f"refuter(s) errored, none cast a vote: {errors[0]}]"
+            ),
+        )
+
+    threshold = -(-effective // 2)  # ceil(effective / 2); ties overturn
     if len(refutations) >= threshold:
         first = refutations[0] if refutations else "(no reason captured)"
         return JudgeVerdict(
             ok=False,
             impossible=False,
             reason=(
-                f"CONFIRM_CLOSE_REFUTED ({len(refutations)}/{votes} refuters "
-                f"overturned the close): {first}"
+                f"CONFIRM_CLOSE_REFUTED ({len(refutations)}/{effective} "
+                f"refuters that ran overturned the close): {first}"
             ),
         )
 
-    # Close stands. Decorate the reason if any refuter errored, so a silently
-    # degraded confirm-close is visible to the operator / doctor.
+    # Close stands. If some (but not all) refuters errored, decorate so the
+    # partial degradation is doctor-discoverable.
     if errors:
         return JudgeVerdict(
             ok=True,
             impossible=False,
             reason=(
-                f"{base.reason} [confirm-close: {len(refutations)}/{votes} "
-                f"refuted, {len(errors)} refuter error(s) abstained: "
-                f"{errors[0]}]"
+                f"{base.reason} [CONFIRM_CLOSE_DEGRADED: "
+                f"{len(refutations)}/{effective} refuted, {len(errors)} "
+                f"refuter error(s) abstained: {errors[0]}]"
             ),
         )
     return base

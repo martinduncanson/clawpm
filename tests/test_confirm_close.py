@@ -59,7 +59,12 @@ class ScriptedInvoker:
             if self.refute_error:
                 raise RuntimeError("refuter CLI exploded")
             idx = min(self.refute_calls - 1, len(self.refute_responses) - 1)
-            return self.refute_responses[idx]
+            resp = self.refute_responses[idx]
+            # Per-vote error sentinel — lets a test mix errored and live votes
+            # to exercise the abstention-denominator path.
+            if resp == "__ERROR__":
+                raise RuntimeError("refuter CLI exploded")
+            return resp
         self.base_calls += 1
         return self.base_response
 
@@ -180,6 +185,22 @@ class TestMajorityThreshold:
         assert verdict.ok is True
         assert inv.refute_calls == 3
 
+    def test_live_refutation_not_outvoted_by_errored_refuters(self):
+        # The HIGH regression (silent-failure-hunter): with votes=3, two
+        # refuters error and the ONE that ran votes to refute. Abstentions must
+        # drop from the denominator (effective=1, threshold=1) so the live
+        # refutation overturns — dead judges must NOT count as implicit passes.
+        inv = ScriptedInvoker(
+            base_response=OK_TRUE,
+            refute_responses=[OK_FALSE, "__ERROR__", "__ERROR__"],
+        )
+        verdict = evaluate_stop_condition_confirmed(
+            RUBRIC, CLAIMS_BUT_NO_EVIDENCE, invoker=inv, refute_votes=3
+        )
+        assert verdict.ok is False
+        assert "1/1" in verdict.reason  # 1 refutation of 1 effective vote
+        assert "CONFIRM_CLOSE_REFUTED" in verdict.reason
+
     def test_malformed_refuter_output_counts_as_refutation(self):
         # Parse failure defaults to ok=false -> counts as a refutation. A
         # garbage refuter response biases toward keeping the task open, never
@@ -205,7 +226,9 @@ class TestDegradedRefuter:
             RUBRIC, HAS_EVIDENCE, invoker=inv, refute_votes=1
         )
         assert verdict.ok is True
-        assert "refuter error" in verdict.reason
+        # Total outage → base stands, but surfaced with the doctor-greppable
+        # token so a silently-degraded confirm-close is discoverable.
+        assert "CONFIRM_CLOSE_DEGRADED" in verdict.reason
         assert "refuter CLI exploded" in verdict.reason
 
 
