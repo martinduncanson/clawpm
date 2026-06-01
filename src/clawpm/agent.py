@@ -50,7 +50,6 @@ Design tradeoffs:
 
 from __future__ import annotations
 
-import shlex
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -73,10 +72,6 @@ from .reflect import write_iteration_event, write_reflection_event
 from .rubric import render_rubric_markdown
 from .tasks import add_task, change_task_state
 
-
-# Default judge — matches judges.stop_condition.DEFAULT_JUDGE_CMD so the
-# wrapper and the Stop hook stay consistent.
-DEFAULT_JUDGE_CMD = ["claude", "--print", "--model", "claude-haiku-4-5"]
 
 JudgeInvoker = Callable[[str], str]
 
@@ -113,44 +108,15 @@ def _make_default_invoker(
     runs from the parent process's CWD and the worktree isolation is
     defeated. Defaults to current CWD when None (back-compat for
     callers that don't pass it).
+
+    Delegates to ``stop_condition.make_judge_invoker`` so the agent-dispatch
+    path gets the same ``claude -p`` primary + local-model fallback (and the
+    same resolution precedence) as the Stop-hook judge — one implementation,
+    not two.
     """
-    import os as _os
+    from .judges.stop_condition import make_judge_invoker
 
-    if judge_cmd_override:
-        cmd = shlex.split(judge_cmd_override)
-    else:
-        env_cmd = _os.environ.get("CLAWPM_JUDGE_CMD")
-        cmd = shlex.split(env_cmd) if env_cmd else list(DEFAULT_JUDGE_CMD)
-
-    def _invoke(prompt: str) -> str:
-        try:
-            result = subprocess.run(
-                cmd,
-                input=prompt,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                timeout=60,
-                cwd=str(cwd) if cwd is not None else None,
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                f"Judge command not found: {cmd[0]!r}. Install Claude "
-                f"Code or set CLAWPM_JUDGE_CMD / pass "
-                f"--judge-cmd-override. Error: {exc}"
-            ) from exc
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                f"Judge timed out after {exc.timeout}s; prompt or "
-                "transcript may be too large for a single call"
-            ) from exc
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Judge exited {result.returncode}: {result.stderr[:500]}"
-            )
-        return result.stdout
-
-    return _invoke
+    return make_judge_invoker(judge_cmd_override=judge_cmd_override, cwd=cwd)
 
 
 def _run_subagent(

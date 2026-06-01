@@ -201,6 +201,21 @@ class TestMajorityThreshold:
         assert "1/1" in verdict.reason  # 1 refutation of 1 effective vote
         assert "CONFIRM_CLOSE_REFUTED" in verdict.reason
 
+    def test_tie_overturns_by_design(self):
+        # CONTRACT (Codex round-2): a 1-of-2 split overturns the close — ties
+        # refute, a deliberate bias toward keeping the task open on a terminal
+        # close. This is NOT a strict >50% majority; if someone "fixes" the
+        # threshold to effective//2+1 this test must fail.
+        inv = ScriptedInvoker(
+            base_response=OK_TRUE,
+            refute_responses=[OK_FALSE, OK_TRUE],
+        )
+        verdict = evaluate_stop_condition_confirmed(
+            RUBRIC, CLAIMS_BUT_NO_EVIDENCE, invoker=inv, refute_votes=2
+        )
+        assert verdict.ok is False
+        assert "1/2" in verdict.reason
+
     def test_malformed_refuter_output_counts_as_refutation(self):
         # Parse failure defaults to ok=false -> counts as a refutation. A
         # garbage refuter response biases toward keeping the task open, never

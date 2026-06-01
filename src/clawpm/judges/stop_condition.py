@@ -29,6 +29,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -38,10 +39,31 @@ from typing import Callable
 # model (e.g. set to `claude --model claude-haiku-4-5 -p`) or a stub for tests.
 DEFAULT_JUDGE_CMD = ["claude", "--print", "--model", "claude-haiku-4-5"]
 
+# Fallback judge — a LOCAL model, tried when the primary judge is unavailable
+# (not installed, or exits non-zero, e.g. auth/quota failure). Keeps grading
+# working — and subscription-cost-free — when `claude -p` can't be reached.
+# Override the model via env CLAWPM_JUDGE_FALLBACK_CMD (e.g.
+# "ollama run qwen2.5"); set it to the empty string to DISABLE the fallback.
+DEFAULT_JUDGE_FALLBACK_CMD = ["ollama", "run", "llama3.1"]
+
 # Per-call judge subprocess budget. Shared with dispatch.py so the Stop-hook
 # timeout can be sized against the confirm-close vote budget (base + N
 # refuters run sequentially, each bounded by this).
 JUDGE_CALL_TIMEOUT_SECONDS = 60
+
+
+class JudgeUnavailable(RuntimeError):
+    """Primary judge could not produce a verdict for a reason that warrants
+    trying the fallback — command not found, or non-zero exit (broken / auth /
+    quota). Distinct from a timeout, which does NOT trigger fallback."""
+
+
+class JudgeTimeout(RuntimeError):
+    """Judge subprocess exceeded its time budget. NOT a fallback trigger: a
+    timeout usually means the prompt/transcript is too large (a local model
+    would struggle too), and falling back would double the latency past the
+    Stop-hook timeout budget. Surfaced so the caller's fail-open path handles
+    it."""
 
 
 @dataclass
@@ -168,24 +190,18 @@ JudgeInvoker = Callable[[str], str]
 """A judge invoker takes the prompt string and returns the raw text response."""
 
 
-def _default_judge_invoker(prompt: str) -> str:
-    """Default judge: subprocess to the user's `claude --print` CLI.
+def _run_judge_cmd(
+    cmd: list[str], prompt: str, cwd: Path | None = None
+) -> str:
+    """Run ONE judge command with the prompt on stdin; return stdout.
 
-    Honors ``CLAWPM_JUDGE_CMD`` when set — split via shlex so users can pass
-    flags like ``"claude -p --model claude-haiku-4-5"``. The prompt is sent on
-    stdin so even long rubrics + transcripts don't hit shell argument limits.
+    The prompt is sent on stdin so long rubrics + transcripts don't hit shell
+    argument limits. Raises:
+      - ``JudgeUnavailable`` if the binary isn't found or exits non-zero
+        (fallback-eligible: the judge is broken / missing / auth-failed).
+      - ``JudgeTimeout`` if it exceeds the per-call budget (NOT fallback-
+        eligible — see the class docstring).
     """
-    cmd_str = os.environ.get("CLAWPM_JUDGE_CMD")
-    if cmd_str:
-        cmd = shlex.split(cmd_str)
-    else:
-        cmd = list(DEFAULT_JUDGE_CMD)
-
-    # Some judge CLIs read the prompt from a positional argument when stdin is
-    # empty, others from stdin. claude --print accepts stdin, so this is the
-    # path of least surprise. 60s ceiling — Haiku usually returns in <5s;
-    # this is the generous human-perceptible bound before the operator
-    # would assume the hook is broken.
     try:
         result = subprocess.run(
             cmd,
@@ -194,24 +210,105 @@ def _default_judge_invoker(prompt: str) -> str:
             text=True,
             encoding="utf-8",
             timeout=JUDGE_CALL_TIMEOUT_SECONDS,
+            cwd=str(cwd) if cwd is not None else None,
         )
     except FileNotFoundError as exc:
-        # `claude` CLI not on PATH — be loud about it so the operator knows
-        # to install Claude Code or override CLAWPM_JUDGE_CMD.
-        raise RuntimeError(
-            f"Judge command not found: {cmd[0]!r}. Install Claude Code or "
-            f"set CLAWPM_JUDGE_CMD to an alternative judge. Error: {exc}"
+        raise JudgeUnavailable(
+            f"Judge command not found: {cmd[0]!r}. Error: {exc}"
         ) from exc
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            f"Judge timed out after {exc.timeout}s; rubric or transcript may "
-            "be too large for a single call"
+        raise JudgeTimeout(
+            f"Judge {cmd[0]!r} timed out after {exc.timeout}s; rubric or "
+            "transcript may be too large for a single call"
         ) from exc
     if result.returncode != 0:
-        raise RuntimeError(
-            f"Judge exited {result.returncode}: {result.stderr[:500]}"
+        raise JudgeUnavailable(
+            f"Judge {cmd[0]!r} exited {result.returncode}: "
+            f"{result.stderr[:500]}"
         )
     return result.stdout
+
+
+def _resolve_judge_cmds(
+    judge_cmd_override: str | None = None,
+) -> tuple[list[str], list[str] | None]:
+    """Resolve ``(primary_cmd, fallback_cmd_or_None)``.
+
+    Primary resolution (highest priority first): ``judge_cmd_override`` →
+    ``CLAWPM_JUDGE_CMD`` env → ``DEFAULT_JUDGE_CMD`` (claude --print).
+
+    Fallback: ``CLAWPM_JUDGE_FALLBACK_CMD`` env → ``DEFAULT_JUDGE_FALLBACK_CMD``
+    (local model). Setting the env var to the empty string DISABLES the
+    fallback (returns ``None``).
+    """
+    if judge_cmd_override:
+        primary = shlex.split(judge_cmd_override)
+    else:
+        env_cmd = os.environ.get("CLAWPM_JUDGE_CMD")
+        primary = shlex.split(env_cmd) if env_cmd else list(DEFAULT_JUDGE_CMD)
+
+    fb_env = os.environ.get("CLAWPM_JUDGE_FALLBACK_CMD")
+    if fb_env is not None:
+        # Explicit empty string => fallback disabled.
+        fallback = shlex.split(fb_env) if fb_env.strip() else None
+    else:
+        fallback = list(DEFAULT_JUDGE_FALLBACK_CMD)
+    return primary, fallback
+
+
+def make_judge_invoker(
+    judge_cmd_override: str | None = None, cwd: Path | None = None
+) -> JudgeInvoker:
+    """Build a judge invoker: primary judge (``claude -p`` by default), with a
+    local-model fallback when the primary is UNAVAILABLE (not installed, or
+    non-zero exit — broken / auth / quota).
+
+    A primary *timeout* does NOT fall back — it re-raises so the caller's
+    existing fail-open path handles it and the Stop-hook timeout budget stays
+    accurate (the fallback would otherwise double the latency). When the
+    fallback fires it is announced on stderr so a broken/quota'd primary is
+    visible rather than silently swapped. If both fail, a combined error is
+    raised. All errors subclass ``RuntimeError`` so existing
+    ``except RuntimeError`` handlers keep working.
+    """
+    primary, fallback = _resolve_judge_cmds(judge_cmd_override)
+
+    def _invoke(prompt: str) -> str:
+        try:
+            return _run_judge_cmd(primary, prompt, cwd=cwd)
+        except JudgeTimeout:
+            # Slow primary — surface, do not double the budget via fallback.
+            raise
+        except JudgeUnavailable as primary_exc:
+            if not fallback:
+                raise RuntimeError(
+                    f"Primary judge unavailable and no fallback configured "
+                    f"(CLAWPM_JUDGE_FALLBACK_CMD is empty). {primary_exc}"
+                ) from primary_exc
+            sys.stderr.write(
+                f"clawpm judge: primary judge unavailable ({primary_exc}); "
+                f"falling back to local judge {fallback[0]!r}\n"
+            )
+            try:
+                return _run_judge_cmd(fallback, prompt, cwd=cwd)
+            except RuntimeError as fb_exc:
+                raise RuntimeError(
+                    f"Both primary and fallback judges failed. "
+                    f"Primary: {primary_exc}  Fallback: {fb_exc}. "
+                    f"Install Claude Code or a local judge (e.g. ollama), or "
+                    f"set CLAWPM_JUDGE_CMD / CLAWPM_JUDGE_FALLBACK_CMD."
+                ) from fb_exc
+
+    return _invoke
+
+
+def _default_judge_invoker(prompt: str) -> str:
+    """Default judge: ``claude -p`` primary with the local-model fallback.
+
+    Thin back-compat wrapper over ``make_judge_invoker`` (which is what the
+    evaluate_* functions use directly so the resolution happens once per call
+    rather than per vote)."""
+    return make_judge_invoker()(prompt)
 
 
 JUDGE_PROMPT_TEMPLATE = """You are evaluating a stop-condition hook in Claude Code. Read the transcript carefully, then judge whether the rubric below is satisfied.
@@ -251,7 +348,8 @@ def evaluate_stop_condition(
 ) -> JudgeVerdict:
     """Evaluate whether the transcript satisfies the rubric.
 
-    ``invoker`` defaults to subprocess ``claude --print``; tests pass a
+    ``invoker`` defaults to ``claude --print`` (with local-model fallback,
+    via ``_default_judge_invoker`` → ``make_judge_invoker``); tests pass a
     callable that returns canned output to avoid the subprocess dependency.
     """
     invoker = invoker or _default_judge_invoker
@@ -365,13 +463,16 @@ def evaluate_stop_condition_confirmed(
     Confirm-close path (once per task, at close): when the base verdict is
     ``ok=true``, spawn ``refute_votes`` adversarial refutation calls (lens-
     varied so they are independent). The close is overturned to ``ok=false``
-    if a MAJORITY of spawned votes refute it (``ceil(votes/2)``); with the
-    default ``refute_votes=1`` a single refutation overturns. A surviving
-    close returns the original base verdict.
+    if AT LEAST HALF of the refuters that actually ran refute it
+    (``ceil(effective/2)``); with the default ``refute_votes=1`` a single
+    refutation overturns. **Ties overturn by design** — a 1-of-2 split is
+    doubt, and for a terminal close (a false ok=true ships unverified work)
+    doubt should keep the task open. This is a deliberate bias toward refuting,
+    NOT a strict >50% majority. A surviving close returns the base verdict.
 
     Refuter-invoker errors are caught and treated as ABSTENTIONS — they are
     dropped from BOTH the refutation count AND the threshold denominator, so
-    the majority is computed over the refuters that actually returned a
+    the threshold is computed over the refuters that actually returned a
     verdict. This matters under multi-vote: with ``refute_votes=3`` and two
     refuters erroring, a single surviving ``ok=false`` vote still overturns the
     close (1 of 1 effective vote), rather than being outvoted by two dead
@@ -427,7 +528,9 @@ def evaluate_stop_condition_confirmed(
             ),
         )
 
-    threshold = -(-effective // 2)  # ceil(effective / 2); ties overturn
+    # ceil(effective / 2): ties overturn, by design (bias toward refuting —
+    # NOT a strict >50% majority; see the function docstring).
+    threshold = -(-effective // 2)
     if len(refutations) >= threshold:
         first = refutations[0] if refutations else "(no reason captured)"
         return JudgeVerdict(

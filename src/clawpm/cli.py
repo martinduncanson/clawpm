@@ -2014,8 +2014,9 @@ def tasks_emit_rubric(
 @click.option(
     "--refute-votes", "refute_votes", type=int, default=1,
     help="CLAWP-041: lens-varied refutation votes baked into the Stop-hook "
-         "command when confirm-close is active (majority refute overturns). "
-         "Also sizes the hook timeout. Default 1.",
+         "command when confirm-close is active (>=half of refuters that ran "
+         "overturn the close; ties overturn). Also sizes the hook timeout. "
+         "Default 1.",
 )
 @click.pass_context
 def tasks_dispatch(
@@ -3095,7 +3096,7 @@ def hook_session_start(
                    "block path is unchanged). Default: env CLAWPM_CONFIRM_CLOSE, else off.")
 @click.option("--refute-votes", "refute_votes", type=int, default=None,
               help="CLAWP-041: number of lens-varied refutation votes when --confirm-close "
-                   "is active (majority refute overturns). Default: env CLAWPM_REFUTE_VOTES, else 1.")
+                   "is active (>=half of refuters that ran overturn; ties overturn). Default: env CLAWPM_REFUTE_VOTES, else 1.")
 @click.pass_context
 def hook_eval_stop(
     ctx: click.Context,
@@ -3335,7 +3336,7 @@ def agent_group() -> None:
 @click.option(
     "--refute-votes", "refute_votes", type=int, default=1,
     help="CLAWP-041: lens-varied refutation votes when --confirm-close is set "
-         "(majority refute overturns). Default 1.",
+         "(>=half of refuters that ran overturn; ties overturn). Default 1.",
 )
 @click.pass_context
 def agent_dispatch(
