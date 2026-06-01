@@ -2005,6 +2005,12 @@ def tasks_emit_rubric(
     "--force", "-f", is_flag=True, default=False,
     help="Back up + overwrite an existing settings.local.json."
 )
+@click.option(
+    "--confirm-close/--no-confirm-close", "confirm_close", default=None,
+    help="CLAWP-041: wire the Stop hook to run an adversarial refutation pass "
+         "before the rubric closes the task. Default: auto-on when the task's "
+         "predicted confidence >= 4, else off."
+)
 @click.pass_context
 def tasks_dispatch(
     ctx: click.Context,
@@ -2014,6 +2020,7 @@ def tasks_dispatch(
     worktree: bool,
     no_session_context: bool,
     force: bool,
+    confirm_close: bool | None,
 ) -> None:
     """Emit hook-wired .claude/settings.local.json for a dispatched subagent (CLAWP-018).
 
@@ -2071,6 +2078,16 @@ def tasks_dispatch(
 
     rubric = None if no_session_context else render_rubric_markdown(task)
 
+    # CLAWP-041: auto-gate the adversarial confirm-close pass. Explicit flag
+    # wins; otherwise enable when the task's predicted confidence is high
+    # (>= 4) — a confident "done" is exactly where an over-charitable judge
+    # is most likely to wave through unverified work.
+    if confirm_close is None:
+        task_confidence = (
+            task.predictions.confidence if task.predictions else None
+        )
+        confirm_close = task_confidence is not None and task_confidence >= 4
+
     try:
         path = write_dispatch_settings(
             target_dir=resolved_dir,
@@ -2079,6 +2096,7 @@ def tasks_dispatch(
             rubric_markdown=rubric,
             force=force,
             portfolio_root=config.portfolio_root,
+            confirm_close=confirm_close,
         )
     except (FileExistsError, ValueError) as exc:
         output_error("dispatch_blocked", str(exc), fmt=fmt)
@@ -2094,6 +2112,7 @@ def tasks_dispatch(
             "worktree": worktree,
             "invocation": invocation,
             "rubric_injected": rubric is not None,
+            "confirm_close": confirm_close,
         },
         fmt=fmt,
     )
@@ -3049,6 +3068,13 @@ def hook_session_start(
               help="Path to the transcript file. Overrides hook stdin's transcript_path.")
 @click.option("--rubric-file", "rubric_file", type=click.Path(), default=None,
               help="Path to a pre-rendered rubric markdown file. Default: render from the task.")
+@click.option("--confirm-close/--no-confirm-close", "confirm_close", default=None,
+              help="CLAWP-041: run an adversarial refutation pass before letting the "
+                   "rubric close the task (fires only on the ok=true transition; the "
+                   "block path is unchanged). Default: env CLAWPM_CONFIRM_CLOSE, else off.")
+@click.option("--refute-votes", "refute_votes", type=int, default=None,
+              help="CLAWP-041: number of lens-varied refutation votes when --confirm-close "
+                   "is active (majority refute overturns). Default: env CLAWPM_REFUTE_VOTES, else 1.")
 @click.pass_context
 def hook_eval_stop(
     ctx: click.Context,
@@ -3056,6 +3082,8 @@ def hook_eval_stop(
     task_id: str,
     transcript_file: str | None,
     rubric_file: str | None,
+    confirm_close: bool | None,
+    refute_votes: int | None,
 ) -> None:
     """Stop-hook condition evaluator (CLAWP-017).
 
@@ -3070,12 +3098,26 @@ def hook_eval_stop(
     ``CLAWPM_JUDGE_CMD`` env var.
     """
     import json as _json_hook
+    import os as _os_hook
     from .judges.stop_condition import (
         evaluate_stop_condition,
+        evaluate_stop_condition_confirmed,
         load_transcript_from_hook_input,
         map_verdict_to_hook_output,
     )
     from .rubric import render_rubric_markdown
+
+    # CLAWP-041: resolve confirm-close gating. Flag wins; else env; else off.
+    if confirm_close is None:
+        confirm_close = _os_hook.environ.get(
+            "CLAWPM_CONFIRM_CLOSE", ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+    if refute_votes is None:
+        try:
+            refute_votes = int(_os_hook.environ.get("CLAWPM_REFUTE_VOTES", "1"))
+        except ValueError:
+            refute_votes = 1
+    refute_votes = max(1, refute_votes)
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
@@ -3143,7 +3185,12 @@ def hook_eval_stop(
     # 3. Dispatch the judge. Errors here are unexpected — surface them
     # in a way that's visible to doctor, not silently swallowed.
     try:
-        verdict = evaluate_stop_condition(rubric=rubric, transcript=transcript)
+        if confirm_close:
+            verdict = evaluate_stop_condition_confirmed(
+                rubric=rubric, transcript=transcript, refute_votes=refute_votes
+            )
+        else:
+            verdict = evaluate_stop_condition(rubric=rubric, transcript=transcript)
     except RuntimeError as exc:
         # Judge error = enforcement-layer down. Fail-open (continue=true)
         # is defensible because blocking forever on a broken judge is
@@ -3259,6 +3306,16 @@ def agent_group() -> None:
          "Default: init when codegraph is on PATH. Use this for batches "
          "where per-dispatch index cost dominates.",
 )
+@click.option(
+    "--confirm-close", "confirm_close", is_flag=True, default=False,
+    help="CLAWP-041: run an adversarial refutation pass before accepting an "
+         "ok=true verdict (single-shot dispatch grades once, so this is cheap).",
+)
+@click.option(
+    "--refute-votes", "refute_votes", type=int, default=1,
+    help="CLAWP-041: lens-varied refutation votes when --confirm-close is set "
+         "(majority refute overturns). Default 1.",
+)
 @click.pass_context
 def agent_dispatch(
     ctx: click.Context,
@@ -3269,6 +3326,8 @@ def agent_dispatch(
     title: str | None,
     judge_cmd_override: str | None,
     no_codegraph: bool,
+    confirm_close: bool,
+    refute_votes: int,
 ) -> None:
     """Spawn a subagent, grade its output against the rubric, persist the verdict.
 
@@ -3307,6 +3366,8 @@ def agent_dispatch(
             judge_cmd_override=judge_cmd_override,
             title=title,
             init_codegraph=not no_codegraph,
+            confirm_close=confirm_close,
+            refute_votes=refute_votes,
         )
     except AgentDispatchError as exc:
         output_error("agent_dispatch_failed", str(exc), fmt=fmt)

@@ -217,7 +217,9 @@ def settings_path(target_dir: Path) -> Path:
     return target_dir / ".claude" / "settings.local.json"
 
 
-def _command_for_dispatch(task_id: str, project_id: str, action: str) -> str:
+def _command_for_dispatch(
+    task_id: str, project_id: str, action: str, confirm_close: bool = False
+) -> str:
     """Build the shell command for a hook entry.
 
     Commands MUST be portable across cmd.exe (Windows default for Claude
@@ -240,7 +242,15 @@ def _command_for_dispatch(task_id: str, project_id: str, action: str) -> str:
     _assert_safe_identifier(task_id, "task_id")
     _assert_safe_identifier(project_id, "project_id")
     if action == "eval-stop":
-        return f"clawpm hook eval-stop --project {project_id} --task {task_id}"
+        # CLAWP-041: append --confirm-close so the Stop hook runs the
+        # adversarial refutation pass before letting the rubric close the
+        # task. Gated at dispatch time (e.g. high-confidence tasks) so the
+        # common block path stays a single judge call.
+        cc = " --confirm-close" if confirm_close else ""
+        return (
+            f"clawpm hook eval-stop --project {project_id} "
+            f"--task {task_id}{cc}"
+        )
     if action == "log-progress":
         # Whitespace-free summary keeps the command shell-portable without
         # any quoting at all. The hook is a coarse-grained signal anyway
@@ -258,6 +268,7 @@ def build_settings_payload(
     task_id: str,
     project_id: str,
     rubric_markdown: Optional[str] = None,
+    confirm_close: bool = False,
 ) -> dict:
     """Build the settings.local.json payload for a dispatched task.
 
@@ -265,6 +276,10 @@ def build_settings_payload(
     PostToolUse on Write|Edit logs progress without polluting reads.
     SessionStart injects the task's rubric as additionalContext so the
     subagent sees its own contract on startup.
+
+    ``confirm_close`` (CLAWP-041): when True, the Stop-hook command carries
+    ``--confirm-close`` so the rubric's ok=true→close transition is gated by
+    an adversarial refutation pass. The block path is unchanged.
     """
     now = datetime.now(timezone.utc).isoformat()
     payload = {
@@ -281,7 +296,8 @@ def build_settings_payload(
                         {
                             "type": "command",
                             "command": _command_for_dispatch(
-                                task_id, project_id, "eval-stop"
+                                task_id, project_id, "eval-stop",
+                                confirm_close=confirm_close,
                             ),
                             "timeout": 90,
                         }
@@ -372,6 +388,7 @@ def write_dispatch_settings(
     rubric_markdown: Optional[str] = None,
     force: bool = False,
     portfolio_root: Optional[Path] = None,
+    confirm_close: bool = False,
 ) -> Path:
     """Emit settings.local.json for the dispatched task.
 
@@ -427,7 +444,9 @@ def write_dispatch_settings(
         if force and path.exists():
             shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
 
-    payload = build_settings_payload(task_id, project_id, rubric_markdown)
+    payload = build_settings_payload(
+        task_id, project_id, rubric_markdown, confirm_close=confirm_close
+    )
     # Pretty-print so dispatch settings are review-friendly when they
     # land in PR diffs.
     path.write_text(

@@ -61,6 +61,7 @@ from .dispatch import create_worktree, write_dispatch_settings
 from .judges.stop_condition import (
     JudgeVerdict,
     evaluate_stop_condition,
+    evaluate_stop_condition_confirmed,
 )
 from .models import (
     Actuals,
@@ -193,6 +194,8 @@ def dispatch_agent(
     judge_cmd_override: Optional[str] = None,
     title: Optional[str] = None,
     init_codegraph: bool = True,
+    confirm_close: bool = False,
+    refute_votes: int = 1,
 ) -> dict:
     """Run a parent-spawned subagent through the full clawpm enforcement loop.
 
@@ -358,11 +361,19 @@ def dispatch_agent(
         # rubric+transcript prompt via ``build_judge_prompt`` and hands
         # it to the invoker; we get JudgeVerdict.parse() for free.
         try:
-            verdict = evaluate_stop_condition(
-                rubric=rubric_markdown,
-                transcript=transcript,
-                invoker=invoker,
-            )
+            if confirm_close:
+                verdict = evaluate_stop_condition_confirmed(
+                    rubric=rubric_markdown,
+                    transcript=transcript,
+                    invoker=invoker,
+                    refute_votes=max(1, refute_votes),
+                )
+            else:
+                verdict = evaluate_stop_condition(
+                    rubric=rubric_markdown,
+                    transcript=transcript,
+                    invoker=invoker,
+                )
         except RuntimeError as exc:
             verdict = JudgeVerdict(
                 ok=False,

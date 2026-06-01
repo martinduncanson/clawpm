@@ -255,6 +255,177 @@ def evaluate_stop_condition(
     return JudgeVerdict.parse(raw)
 
 
+# ===========================================================================
+# Adversarial confirm-close tier (CLAWP-041)
+# ===========================================================================
+#
+# The base judge above runs ONCE per Stop event and is deliberately fail-
+# closed against *malformed* output. Its remaining failure mode is fail-OPEN
+# via over-charitable reading: a single judge reads "I refactored the auth
+# module" and decides the criterion "auth tests pass" is satisfied, when no
+# test run actually appears in the transcript. One judge is a single point of
+# optimistic failure.
+#
+# The confirm-close tier hardens *only the terminal decision*. A false
+# ``block`` (ok=false) is self-correcting — the agent keeps working and re-
+# grades; cost ≈ one wasted loop. A false ``ok=true`` is terminal — the task
+# closes and unverified work ships. So the adversarial cost is spent ONLY at
+# the ok=true→close transition, never on the (common, many-per-task) block
+# path. The block path stays a single judge call.
+#
+# The refuter uses the SAME ``{ok, reason, impossible}`` contract and parser,
+# but an adversarial prompt: "a prior judge passed this — try to refute it;
+# default to refuted when uncertain." ``ok=false`` from the refuter means
+# "refuted → keep blocking"; ``ok=true`` means "tried and genuinely could not
+# refute → the close stands".
+
+_REFUTE_LENSES = {
+    "evidence": (
+        "Lens: EVIDENCE — focus on whether the transcript contains concrete, "
+        "quotable evidence (command output, diffs, test results, file "
+        "contents) for each claim, not merely an assertion that it was done."
+    ),
+    "correctness": (
+        "Lens: CORRECTNESS — focus on whether the claimed work is actually "
+        "correct and complete, not merely attempted or partially done."
+    ),
+    "reproduction": (
+        "Lens: REPRODUCTION — focus on whether an independent reviewer could "
+        "reproduce or verify each claimed outcome from what the transcript "
+        "actually shows."
+    ),
+}
+
+# Default single-vote lens. EVIDENCE is the sharpest against the over-
+# charitable-reading failure mode the tier exists to catch.
+_DEFAULT_REFUTE_LENS_ORDER = ["evidence", "correctness", "reproduction"]
+
+
+REFUTE_PROMPT_TEMPLATE = """You are a SKEPTICAL verifier performing an independent confirm-close check. A prior judge has claimed the rubric below is SATISFIED by the transcript. Your job is the OPPOSITE: try to REFUTE that claim.
+
+Prior judge's stated reason for passing: {prior_reason}
+
+{lens_instruction}
+
+Examine each rubric criterion against the transcript. You are hunting for ANY criterion the transcript CLAIMS to satisfy but does not actually EVIDENCE — e.g. the work says "tests pass" but no test run appears in the transcript; it says "implemented X" but no corresponding change is shown; a gradeable signal whose actual value is absent or contradicts the claim.
+
+Your response must be a JSON object with one of these shapes:
+- {{"ok": false, "reason": "<name the specific criterion that is claimed but not evidenced, and quote what is missing>"}}  — you refuted it; the close should stay BLOCKED.
+- {{"ok": true, "reason": "<confirm every criterion is genuinely evidenced, quoting the evidence>"}}  — ONLY if you genuinely cannot refute after trying.
+
+Bias: when in doubt, REFUTE (return {{"ok": false}}). A false pass closes the task and ships unverified work; a false refute merely costs one more iteration. Default to ok=false unless the evidence is unambiguous.
+
+=== RUBRIC ===
+{rubric}
+
+=== TRANSCRIPT ===
+{transcript}
+
+=== END ===
+
+Return ONLY the JSON object. No prose before or after."""
+
+
+def build_refutation_prompt(
+    rubric: str, transcript: str, prior_reason: str, lens: str = "evidence"
+) -> str:
+    """Compose the adversarial refutation prompt for one confirm-close vote.
+
+    ``lens`` selects the angle of attack so multi-vote refutation stays
+    independent rather than collapsing to one repeated check.
+    """
+    lens_instruction = _REFUTE_LENSES.get(lens, _REFUTE_LENSES["evidence"])
+    return REFUTE_PROMPT_TEMPLATE.format(
+        rubric=rubric.strip(),
+        transcript=transcript.strip(),
+        prior_reason=(prior_reason or "(none given)").strip(),
+        lens_instruction=lens_instruction,
+    )
+
+
+def evaluate_stop_condition_confirmed(
+    rubric: str,
+    transcript: str,
+    invoker: JudgeInvoker | None = None,
+    refute_votes: int = 1,
+) -> JudgeVerdict:
+    """Base grade + adversarial confirm-close on the ok=true→close transition.
+
+    Cheap path (the common case): runs the base judge once. If the base
+    verdict is NOT ``ok`` — including an ``impossible`` verdict — it is
+    returned verbatim and **the refuter is never invoked**. The block path
+    therefore costs exactly one judge call, unchanged from
+    ``evaluate_stop_condition``.
+
+    Confirm-close path (once per task, at close): when the base verdict is
+    ``ok=true``, spawn ``refute_votes`` adversarial refutation calls (lens-
+    varied so they are independent). The close is overturned to ``ok=false``
+    if a MAJORITY of spawned votes refute it (``ceil(votes/2)``); with the
+    default ``refute_votes=1`` a single refutation overturns. A surviving
+    close returns the original base verdict.
+
+    Refuter-invoker errors are caught and treated as ABSTENTIONS (not
+    refutations) — a systematically broken refuter degrades to "base verdict
+    stands" rather than trapping the agent in an infinite block loop, matching
+    the CLI's existing fail-open-on-judge-error stance. The error is surfaced
+    in the returned reason so it remains visible.
+    """
+    invoker = invoker or _default_judge_invoker
+    base = evaluate_stop_condition(rubric, transcript, invoker=invoker)
+
+    # Block path (and impossible path): single call, refuter never runs.
+    if not base.ok:
+        return base
+
+    votes = max(1, refute_votes)
+    refutations: list[str] = []
+    errors: list[str] = []
+    for i in range(votes):
+        lens = _DEFAULT_REFUTE_LENS_ORDER[i % len(_DEFAULT_REFUTE_LENS_ORDER)]
+        prompt = build_refutation_prompt(
+            rubric, transcript, base.reason, lens=lens
+        )
+        try:
+            raw = invoker(prompt)
+        except RuntimeError as exc:
+            # Abstention — do NOT count as a refutation (avoids infinite
+            # block loop on a broken judge). Still surfaced in the reason.
+            errors.append(f"{lens}:{exc}")
+            continue
+        vote = JudgeVerdict.parse(raw)
+        # Refuter ok=false == "refuted". Parse failures default to ok=false
+        # (see JudgeVerdict.parse), which correctly counts as a refutation —
+        # a malformed refuter response biases toward keeping the task open.
+        if not vote.ok:
+            refutations.append(vote.reason)
+
+    threshold = -(-votes // 2)  # ceil(votes / 2)
+    if len(refutations) >= threshold:
+        first = refutations[0] if refutations else "(no reason captured)"
+        return JudgeVerdict(
+            ok=False,
+            impossible=False,
+            reason=(
+                f"CONFIRM_CLOSE_REFUTED ({len(refutations)}/{votes} refuters "
+                f"overturned the close): {first}"
+            ),
+        )
+
+    # Close stands. Decorate the reason if any refuter errored, so a silently
+    # degraded confirm-close is visible to the operator / doctor.
+    if errors:
+        return JudgeVerdict(
+            ok=True,
+            impossible=False,
+            reason=(
+                f"{base.reason} [confirm-close: {len(refutations)}/{votes} "
+                f"refuted, {len(errors)} refuter error(s) abstained: "
+                f"{errors[0]}]"
+            ),
+        )
+    return base
+
+
 def load_transcript_from_hook_input(hook_input: dict) -> str:
     """Best-effort transcript extraction from a Claude Code hook stdin payload.
 
