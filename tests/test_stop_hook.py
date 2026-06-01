@@ -293,7 +293,9 @@ class TestCLIEvalStop:
         def fake_invoker(prompt: str) -> str:
             return '{"ok": true, "reason": "stubbed pass"}'
 
-        monkeypatch.setattr(sc_mod, "_default_judge_invoker", fake_invoker)
+        # Patch the invoker FACTORY (the default path builds a fresh invoker
+        # per grade via make_judge_invoker; CLAWP-041 fallback).
+        monkeypatch.setattr(sc_mod, "make_judge_invoker", lambda *a, **k: fake_invoker)
 
         # Make a task with a rubric
         config = temp_portfolio["config"]
@@ -332,7 +334,9 @@ class TestCLIEvalStop:
         def fake_invoker(prompt: str) -> str:
             return ('{"ok": false, "reason": "transcript shows tests failing"}')
 
-        monkeypatch.setattr(sc_mod, "_default_judge_invoker", fake_invoker)
+        # Patch the invoker FACTORY (the default path builds a fresh invoker
+        # per grade via make_judge_invoker; CLAWP-041 fallback).
+        monkeypatch.setattr(sc_mod, "make_judge_invoker", lambda *a, **k: fake_invoker)
 
         config = temp_portfolio["config"]
         task = add_task(
@@ -434,7 +438,7 @@ class TestJudgeSubprocessFailures:
                 "Code or set CLAWPM_JUDGE_CMD"
             )
 
-        monkeypatch.setattr(sc_mod, "_default_judge_invoker", raise_filenotfound)
+        monkeypatch.setattr(sc_mod, "make_judge_invoker", lambda *a, **k: raise_filenotfound)
 
         config = temp_portfolio["config"]
         task = add_task(

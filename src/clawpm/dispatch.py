@@ -294,22 +294,23 @@ def build_settings_payload(
     transition is gated by an adversarial refutation pass. The block path is
     unchanged.
 
-    The Stop-hook ``timeout`` scales with the confirm-close vote budget: the
-    base judge plus N refuters run SEQUENTIALLY, each bounded by
-    ``JUDGE_CALL_TIMEOUT_SECONDS``. A flat 90s would let Claude kill a valid
-    slow close (e.g. base 50s + refuter 50s) before ``eval-stop`` emits a
-    verdict (Codex P2).
+    The Stop-hook ``timeout`` scales with the worst-case wall clock of
+    ``eval-stop``: each logical judge call may attempt the primary judge AND
+    THEN the local fallback (each bounded by ``JUDGE_CALL_TIMEOUT_SECONDS``),
+    and confirm-close runs 1 base + N refuters sequentially. A flat 90s would
+    let Claude kill a valid slow grade — base + refuter, or primary + fallback
+    — before a verdict is emitted (Codex P2). The timeout is a ceiling, not a
+    delay: a healthy judge returns in seconds.
     """
     from .judges.stop_condition import JUDGE_CALL_TIMEOUT_SECONDS
 
     now = datetime.now(timezone.utc).isoformat()
 
-    # Block path = one judge call; confirm-close = 1 base + N refuters, all
-    # sequential. Size the hook timeout to the worst case plus a margin.
-    if confirm_close:
-        stop_timeout = (1 + max(1, int(refute_votes))) * JUDGE_CALL_TIMEOUT_SECONDS + 30
-    else:
-        stop_timeout = 90
+    # A logical judge call may run primary THEN fallback → budget 2x per call.
+    # Block path = one logical call; confirm-close = 1 base + N refuters.
+    per_call = 2 * JUDGE_CALL_TIMEOUT_SECONDS
+    n_calls = (1 + max(1, int(refute_votes))) if confirm_close else 1
+    stop_timeout = n_calls * per_call + 30
     payload = {
         CLAWPM_MARKER_KEY: {
             "task_id": task_id,

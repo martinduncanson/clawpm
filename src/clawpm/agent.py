@@ -109,14 +109,19 @@ def _make_default_invoker(
     defeated. Defaults to current CWD when None (back-compat for
     callers that don't pass it).
 
-    Delegates to ``stop_condition.make_judge_invoker`` so the agent-dispatch
-    path gets the same ``claude -p`` primary + local-model fallback (and the
-    same resolution precedence) as the Stop-hook judge — one implementation,
-    not two.
+    Delegates to ``stop_condition.make_judge_invoker`` (one implementation, not
+    two) but with ``enable_fallback=False``: in ``agent dispatch`` this invoker
+    runs the SUBAGENT (its stdout becomes the transcript) as well as grading,
+    so a local-model fallback would mean the WORK gets done by `ollama` instead
+    of a real Claude Code agent honoring the worktree `.claude` hooks — and
+    could then be marked DONE. A missing/broken primary must BLOCK here, not
+    silently substitute. (The fallback's home is the separate Stop-hook judge.)
     """
     from .judges.stop_condition import make_judge_invoker
 
-    return make_judge_invoker(judge_cmd_override=judge_cmd_override, cwd=cwd)
+    return make_judge_invoker(
+        judge_cmd_override=judge_cmd_override, cwd=cwd, enable_fallback=False
+    )
 
 
 def _run_subagent(

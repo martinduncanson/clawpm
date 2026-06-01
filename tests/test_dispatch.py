@@ -148,16 +148,19 @@ class TestSettingsPayload:
         assert "--confirm-close --refute-votes" not in off_cmd
 
     def test_confirm_close_scales_stop_hook_timeout(self):
-        # Codex P2: a flat 90s could kill a valid slow close (base + refuters
-        # run sequentially, 60s each). Timeout must scale with the vote budget.
+        # Codex P2 (round 1 + round 3): each logical judge call may run primary
+        # THEN fallback (2x60s), and confirm-close runs 1 base + N refuters
+        # sequentially. A flat 90s could kill a valid slow grade before a
+        # verdict is emitted. Timeout must scale with both factors.
         off = build_settings_payload("TEST-001", "test")
-        assert off["hooks"]["Stop"][0]["hooks"][0]["timeout"] == 90
+        # Block path = one logical call, but that call may fall back: 2*60+30.
+        assert off["hooks"]["Stop"][0]["hooks"][0]["timeout"] == 150
         on1 = build_settings_payload("TEST-001", "test", confirm_close=True, refute_votes=1)
         on3 = build_settings_payload("TEST-001", "test", confirm_close=True, refute_votes=3)
         t1 = on1["hooks"]["Stop"][0]["hooks"][0]["timeout"]
         t3 = on3["hooks"]["Stop"][0]["hooks"][0]["timeout"]
-        # base + N refuters, each 60s, + margin → must clear base+1refuter=120s.
-        assert t1 >= 120
+        # (1 base + N refuters) * (primary+fallback) + margin.
+        assert t1 >= (1 + 1) * 120
         assert t3 > t1
 
 

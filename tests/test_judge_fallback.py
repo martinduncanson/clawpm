@@ -129,7 +129,7 @@ class TestFallback:
     def test_fallback_disabled_reraises(self, patch_subprocess, monkeypatch):
         monkeypatch.setenv("CLAWPM_JUDGE_FALLBACK_CMD", "")
         fake = patch_subprocess({"claude": "notfound"})
-        with pytest.raises(RuntimeError, match="no fallback configured"):
+        with pytest.raises(RuntimeError, match="fallback disabled/unconfigured"):
             sc.make_judge_invoker()("prompt")
         assert fake.binaries == ["claude"]
 
@@ -144,10 +144,41 @@ class TestFallback:
         assert issubclass(sc.JudgeUnavailable, RuntimeError)
         assert issubclass(sc.JudgeTimeout, RuntimeError)
 
-    def test_fallback_used_by_evaluate_stop_condition(self, patch_subprocess):
+    def test_fallback_used_by_evaluate_stop_condition_tags_reason(self, patch_subprocess):
         # End to end through the public judge entry: primary down → local
-        # fallback grades → verdict parses.
+        # fallback grades → verdict parses AND carries the durable
+        # FALLBACK_MARKER so doctor/reflection logs can spot a degraded primary
+        # (Codex round-3 P2).
         patch_subprocess({"claude": "notfound", "ollama": OK})
         verdict = sc.evaluate_stop_condition("rubric", "transcript")
         assert verdict.ok is True
+        assert sc.FALLBACK_MARKER in verdict.reason
+        assert "done" in verdict.reason
+
+    def test_no_marker_when_primary_succeeds(self, patch_subprocess):
+        patch_subprocess({"claude": OK})
+        verdict = sc.evaluate_stop_condition("rubric", "transcript")
+        assert sc.FALLBACK_MARKER not in verdict.reason
         assert verdict.reason == "done"
+
+
+class TestFallbackDisabledForExecution:
+    """CLAWP-041 / Codex round-3 P2: the agent-dispatch invoker must be
+    primary-only — a local model must never silently *perform the work*."""
+
+    def test_enable_fallback_false_does_not_fall_back(self, patch_subprocess, monkeypatch):
+        # Even with a fallback configured in the env, enable_fallback=False
+        # means a missing primary raises rather than running on the local model.
+        monkeypatch.setenv("CLAWPM_JUDGE_FALLBACK_CMD", "ollama run llama3.1")
+        fake = patch_subprocess({"claude": "notfound", "ollama": OK})
+        with pytest.raises(RuntimeError):
+            sc.make_judge_invoker(enable_fallback=False)("prompt")
+        assert fake.binaries == ["claude"]  # ollama (the work) never ran
+
+    def test_agent_default_invoker_is_primary_only(self, patch_subprocess):
+        # agent._make_default_invoker must build a no-fallback invoker.
+        from clawpm.agent import _make_default_invoker
+        fake = patch_subprocess({"claude": "notfound", "ollama": OK})
+        with pytest.raises(RuntimeError):
+            _make_default_invoker(None)("prompt")
+        assert fake.binaries == ["claude"]
