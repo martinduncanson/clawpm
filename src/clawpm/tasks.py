@@ -24,13 +24,24 @@ def get_tasks_dir(config: PortfolioConfig, project_id: str) -> Path | None:
 
 
 def _scan_task_files(location: Path, tasks: list[Task], state_filter: TaskState | None) -> None:
-    """Scan a directory for task files (both .md files and task directories)."""
+    """Scan a directory for task files, recursing into nested directory tasks.
+
+    Codex round-9 P2: after a subtask is itself decomposed via split_task,
+    its files live at ``tasks/<parent>/<child>/...`` — one level deeper than
+    the original scan reached. Recurse properly so nested grandchildren are
+    visible to ``list_tasks`` / ``get_next_task``, not just ``get_task``.
+    The ``_task.md`` filename is skipped in the file branch because the
+    directory-task owner is added once in the dir branch, before recursing.
+    """
     if not location.exists():
         return
 
     for item in location.iterdir():
         if item.is_file() and item.suffix == ".md":
-            # Regular task file
+            # Skip _task.md here — the dir branch below adds the directory
+            # task once when it enters the dir (avoids duplicate appends).
+            if item.name == "_task.md":
+                continue
             try:
                 task = Task.from_file(item)
                 if state_filter is None or task.state == state_filter:
@@ -38,7 +49,10 @@ def _scan_task_files(location: Path, tasks: list[Task], state_filter: TaskState 
             except Exception:
                 continue
         elif item.is_dir() and not item.name.startswith(".") and item.name not in ("done", "blocked"):
-            # Task directory - check for _task.md (parent) and subtasks
+            # Directory task: add the _task.md, then recurse for subtasks
+            # AND any nested directory subtasks. The recursion subsumes the
+            # old non-recursive single-level glob; nested directories with
+            # their own _task.md get added as we descend.
             parent_file = item / "_task.md"
             if parent_file.exists():
                 try:
@@ -46,18 +60,8 @@ def _scan_task_files(location: Path, tasks: list[Task], state_filter: TaskState 
                     if state_filter is None or parent_task.state == state_filter:
                         tasks.append(parent_task)
                 except Exception:
-                    continue
-
-            # Scan for subtasks in the directory
-            for subtask_file in item.glob("*.md"):
-                if subtask_file.name == "_task.md":
-                    continue
-                try:
-                    subtask = Task.from_file(subtask_file)
-                    if state_filter is None or subtask.state == state_filter:
-                        tasks.append(subtask)
-                except Exception:
-                    continue
+                    pass
+            _scan_task_files(item, tasks, state_filter)
 
 
 def list_tasks(
@@ -130,6 +134,14 @@ def get_task(config: PortfolioConfig, project_id: str, task_id: str) -> Task | N
             tasks_dir / parent_id / f"{task_id}.progress.md",
             tasks_dir / "done" / parent_id / f"{task_id}.md",
             tasks_dir / "blocked" / parent_id / f"{task_id}.md",
+            # Codex round-8 P2: the subtask itself may have been split into
+            # a directory task (i.e. decomposed further into grandchildren).
+            # Its open/progress form lives at tasks/<parent>/<child>/_task.md.
+            # When marked done/blocked the directory migrates to the top-
+            # level done/<child>/ or blocked/<child>/ via change_task_state,
+            # so the existing tasks_dir/done/<task_id>/_task.md probe
+            # already covers the terminal states.
+            tasks_dir / parent_id / task_id / "_task.md",
         ])
 
     for path in possible_paths:
@@ -282,14 +294,19 @@ def change_task_state(
     current_path = task.file_path
     is_directory_task = current_path.name == "_task.md"
 
-    # Check for incomplete subtasks when marking parent as done
-    if new_state == TaskState.DONE and task.children and not force:
-        incomplete = []
-        for child_id in task.children:
-            child = get_task(config, project_id, child_id)
-            if child and child.state != TaskState.DONE:
-                incomplete.append(child_id)
-        if incomplete:
+    # Check for incomplete subtasks when marking parent as done. A missing
+    # child ref counts as UNSATISFIED (mirrors cascade_unblock_dependents'
+    # dangling-dep handling) — see parent_rollup_status.
+    #
+    # CLAWP-037 codex round-4 fix: do NOT short-circuit on task.children
+    # being empty — a child manually created with `parent: <id>` frontmatter
+    # may exist without being in the parent's persisted list, and we still
+    # need to gate on it. parent_rollup_status runs the parent-ref scan
+    # across all state dirs; for tasks with no children at all the scan
+    # finds nothing and returns ready=True immediately.
+    if new_state == TaskState.DONE and not force:
+        status = parent_rollup_status(config, project_id, task)
+        if not status["ready"]:
             # Return None to signal failure - caller should check and report
             return None
 
@@ -417,6 +434,96 @@ def cascade_unblock_dependents(
     return transitions
 
 
+def parent_rollup_status(
+    config: PortfolioConfig,
+    project_id: str,
+    task: Task,
+) -> dict:
+    """Report whether a parent task is ready to be marked DONE (CLAWP-037).
+
+    A parent is *ready* only when every child in ``task.children`` resolves
+    to a task in DONE state. A child id that resolves to no task on disk
+    (dangling / typoed ref) counts as UNSATISFIED — mirroring the
+    missing-dependency handling in ``cascade_unblock_dependents``: a ref we
+    cannot verify is not silently treated as satisfied.
+
+    Returns ``{"ready", "incomplete", "missing"}``:
+      - ``incomplete``: ``[{"id", "state"}]`` for children not in DONE.
+      - ``missing``: ``[id]`` for child refs with no task file.
+    A task with no children is trivially ready.
+    """
+    # CLAWP-037 codex round-3 belt-and-braces: union the parent's persisted
+    # children list with any task whose ``parent:`` frontmatter points at
+    # this task across every state dir. Persistence (set by add_subtask) is
+    # the fast common-path; this scan is the backstop for manually-created
+    # or imported subtasks that bypassed add_subtask. Cost is one O(project)
+    # glob walk per rollup check — rollup fires only on state transitions,
+    # not in hot loops, so this is acceptable at typical project sizes.
+    children: set[str] = set(task.children or [])
+    tasks_dir = get_tasks_dir(config, project_id) if config is not None else None
+    if tasks_dir is not None:
+        scan_dirs = [tasks_dir, tasks_dir / "done", tasks_dir / "blocked"]
+        # Directory-task subtask dir (open subtasks live alongside _task.md).
+        if task.file_path is not None and task.file_path.name == "_task.md":
+            scan_dirs.append(task.file_path.parent)
+        for sd in scan_dirs:
+            if not sd.exists():
+                continue
+            for f in sd.glob("*.md"):
+                if f.name == "_task.md":
+                    continue
+                try:
+                    t = Task.from_file(f)
+                except Exception:
+                    continue
+                if t.parent == task.id:
+                    children.add(t.id)
+
+    incomplete: list[dict] = []
+    missing: list[str] = []
+    for child_id in sorted(children):
+        child = get_task(config, project_id, child_id)
+        if child is None:
+            missing.append(child_id)
+        elif child.state != TaskState.DONE:
+            incomplete.append({"id": child_id, "state": child.state.value})
+    return {
+        "ready": not incomplete and not missing,
+        "incomplete": incomplete,
+        "missing": missing,
+    }
+
+
+def parent_ready_signal(
+    config: PortfolioConfig,
+    project_id: str,
+    child_task_id: str,
+) -> dict | None:
+    """After a child hits DONE, report if its parent is now fully rolled up.
+
+    Returns ``{"parent_id", "children", "ready": True}`` when the just-
+    completed child has a parent whose children are ALL now DONE and the
+    parent is not already DONE; ``None`` otherwise. Pure read — does NOT
+    transition the parent (a synthesis criterion or operator sign-off may
+    still gate it); the caller surfaces this as an advisory so the operator
+    knows the parent is now closeable.
+    """
+    child = get_task(config, project_id, child_task_id)
+    if child is None or not child.parent:
+        return None
+    parent = get_task(config, project_id, child.parent)
+    if parent is None or parent.state == TaskState.DONE:
+        return None
+    status = parent_rollup_status(config, project_id, parent)
+    if status["ready"]:
+        return {
+            "parent_id": parent.id,
+            "children": parent.children,
+            "ready": True,
+        }
+    return None
+
+
 def add_task(
     config: PortfolioConfig,
     project_id: str,
@@ -429,6 +536,7 @@ def add_task(
     description: str = "",
     predictions: Predictions | None = None,
     parallel_group: int | None = None,
+    agent_profile: str | None = None,
 ) -> Task | None:
     """Add a new task to a project."""
     tasks_dir = get_tasks_dir(config, project_id)
@@ -498,6 +606,9 @@ def add_task(
 
     if parallel_group is not None:
         frontmatter["parallel_group"] = parallel_group
+
+    if agent_profile:
+        frontmatter["agent_profile"] = agent_profile
 
     if predictions and not predictions.is_empty():
         pred_dict = predictions.to_dict()
@@ -670,6 +781,53 @@ def split_task(
     return Task.from_file(new_path)
 
 
+def _append_child_to_parent_frontmatter(
+    parent_path: Path, child_id: str,
+) -> None:
+    """Persist ``child_id`` into the parent's frontmatter ``children`` list.
+
+    CLAWP-037 round-1 fix (codex P1): the parent's children list must survive
+    a child migrating out of the parent directory (DONE → tasks/done/, BLOCKED
+    → tasks/blocked/, or a deletion). Without persistence, dir-scan-derived
+    children silently shrink and the rollup gate's missing/dangling-child
+    handling never fires. Idempotent — repeated calls for the same child_id
+    leave the list unchanged.
+    """
+    if parent_path.name != "_task.md" or not parent_path.exists():
+        return
+    text = parent_path.read_text(encoding="utf-8")
+    if not text.startswith("---"):
+        return
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return
+    try:
+        fm = yaml.safe_load(parts[1]) or {}
+    except yaml.YAMLError:
+        return
+    children = fm.get("children")
+    if not isinstance(children, list):
+        children = []
+    if child_id in children:
+        return  # idempotent
+    children.append(child_id)
+    fm["children"] = children
+    body = parts[2].lstrip("\n")
+    new_text = (
+        "---\n"
+        + yaml.dump(fm, default_flow_style=False, allow_unicode=True).strip()
+        + "\n---\n"
+        + body
+    )
+    tmp = parent_path.with_suffix(parent_path.suffix + ".tmp")
+    try:
+        tmp.write_text(new_text, encoding="utf-8")
+        tmp.replace(parent_path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def add_subtask(
     config: PortfolioConfig,
     project_id: str,
@@ -678,6 +836,8 @@ def add_subtask(
     priority: int = 5,
     complexity: TaskComplexity | None = None,
     description: str = "",
+    agent_profile: str | None = None,
+    predictions: Predictions | None = None,
 ) -> Task | None:
     """Add a subtask to a parent task.
     
@@ -704,17 +864,35 @@ def add_subtask(
     if not parent_dir:
         return None
     
-    # Generate subtask ID
-    existing_nums = []
-    for f in parent_dir.glob(f"{parent_id}-*.md"):
+    # Generate subtask ID. Codex round-2 P2 fix: union three sources so a
+    # migrated/deleted earlier child can't have its id silently reused:
+    #   (1) files still in the parent directory (open / progress)
+    #   (2) migrated children in tasks/done/ and tasks/blocked/
+    #   (3) the parent's persisted frontmatter children list (covers
+    #       files that were deleted outright after creation)
+    # Without (2)+(3), running `tasks decompose` again on a parent whose
+    # earlier children have all moved to done/ would re-issue `P-001`,
+    # colliding with the migrated record.
+    existing_nums: set[int] = set()
+
+    def _record_num_from_id(tid: str) -> None:
         try:
-            num_str = f.stem.split("-")[-1].replace(".progress", "")
-            num = int(num_str)
-            existing_nums.append(num)
+            num_str = tid.split("-")[-1].replace(".progress", "")
+            existing_nums.add(int(num_str))
         except (IndexError, ValueError):
             pass
-    
-    next_num = max(existing_nums, default=0) + 1
+
+    for f in parent_dir.glob(f"{parent_id}-*.md"):
+        _record_num_from_id(f.stem)
+    for state_dir in (tasks_dir / "done", tasks_dir / "blocked"):
+        if state_dir.exists():
+            for f in state_dir.glob(f"{parent_id}-*.md"):
+                _record_num_from_id(f.stem)
+    for cid in (parent.children or []):
+        if cid.startswith(parent_id + "-"):
+            _record_num_from_id(cid)
+
+    next_num = (max(existing_nums) if existing_nums else 0) + 1
     subtask_id = f"{parent_id}-{next_num:03d}"
     
     # Build frontmatter
@@ -727,7 +905,20 @@ def add_subtask(
     
     if complexity:
         frontmatter["complexity"] = complexity.value
-    
+
+    if agent_profile:
+        frontmatter["agent_profile"] = agent_profile
+
+    # CLAWP-037 — children created via `tasks decompose` carry their own
+    # success_criteria (and other predictions) so each subtask is a
+    # verifiable goal, and the parent rolls up only when all pass.
+    if predictions and not predictions.is_empty():
+        pred_dict = predictions.to_dict()
+        frontmatter["predictions"] = {
+            k: v for k, v in pred_dict.items()
+            if v is not None and v != []
+        }
+
     # Build content
     content = f"""---
 {yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True).strip()}
@@ -749,5 +940,10 @@ def add_subtask(
     except Exception:
         tmp_path.unlink(missing_ok=True)
         raise
+
+    # CLAWP-037 round-1 fix: persist the child on the parent so the rollup
+    # gate keeps it in view after the child migrates to done/ or blocked/.
+    if parent.file_path is not None:
+        _append_child_to_parent_frontmatter(parent.file_path, subtask_id)
 
     return Task.from_file(file_path)

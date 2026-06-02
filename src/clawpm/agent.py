@@ -167,6 +167,7 @@ def dispatch_agent(
     init_codegraph: bool = True,
     confirm_close: bool = False,
     refute_votes: int = 1,
+    agent_profile: Optional[str] = None,
 ) -> dict:
     """Run a parent-spawned subagent through the full clawpm enforcement loop.
 
@@ -211,6 +212,7 @@ def dispatch_agent(
         title=title,
         description=prompt,
         predictions=predictions,
+        agent_profile=agent_profile,
     )
     if not task:
         raise AgentDispatchError(
@@ -386,6 +388,7 @@ def dispatch_agent(
                 f"agent dispatch verdict ok; parent={parent_link!r}; "
                 f"reason: {verdict.reason[:300]}"
             ),
+            agent_profile=agent_profile,
         )
     else:
         # BLOCKED path: iteration_event so the calibration loop sees the
@@ -413,11 +416,13 @@ def dispatch_agent(
                 else verdict.reason
             ),
             verdict_impossible=verdict.impossible,
+            agent_profile=agent_profile,
         )
 
     return {
         "subtask_id": subtask_id,
         "parent_id": parent_link,
+        "agent_profile": agent_profile,
         "verdict": {
             "ok": verdict.ok,
             "reason": verdict.reason,

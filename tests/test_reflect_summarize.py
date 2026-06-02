@@ -1,0 +1,255 @@
+"""Tests for the calibration consumers — reflect summarize + suggest (CLAWP-040)."""
+
+from __future__ import annotations
+
+import json
+
+from click.testing import CliRunner
+
+from clawpm.cli import main
+from clawpm.models import Actuals, Predictions, TaskComplexity
+from clawpm.reflect import (
+    summarize_calibration,
+    suggest_duration,
+    write_reflection_event,
+)
+
+from test_agent_dispatch import temp_portfolio_with_repo  # noqa: F401
+
+
+def _done(root, tid, pred_min, act_min, complexity="m", confidence=3,
+          profile=None, project="test"):
+    write_reflection_event(
+        root,
+        event="task_done",
+        task_id=tid,
+        project_id=project,
+        predictions=Predictions(
+            duration_min=pred_min,
+            complexity=TaskComplexity(complexity) if complexity else None,
+            confidence=confidence,
+        ),
+        actuals=Actuals(
+            duration_min=act_min,
+            complexity=TaskComplexity(complexity) if complexity else None,
+        ),
+        agent_profile=profile,
+    )
+
+
+class TestSummarize:
+    def test_aggregates_ratio_buckets(self, tmp_path):
+        # 3 'm' tasks predicted 600 actual 60 -> ratio 0.1 (10x inflation)
+        for i in range(3):
+            _done(tmp_path, f"M-{i}", 600, 60, complexity="m", confidence=3)
+        # 1 'l' task predicted 100 actual 200 -> ratio 2.0 (optimistic)
+        _done(tmp_path, "L-0", 100, 200, complexity="l", confidence=2)
+        # 1 dirty row: no actual duration
+        _done(tmp_path, "D-0", 600, None, complexity="m")
+
+        summary = summarize_calibration(tmp_path, project_id="test")
+        assert summary["total_done"] == 5
+        assert summary["with_usable_duration"] == 4
+        assert summary["dirty_flagged"] == 1
+        assert summary["by_complexity"]["m"]["n"] == 3
+        assert summary["by_complexity"]["m"]["median_ratio"] == 0.1
+        assert summary["by_complexity"]["l"]["median_ratio"] == 2.0
+        assert summary["by_confidence"]["3"]["n"] == 3
+        assert "FASTER" in summary["interpretation"]  # overall median < 1
+
+    def test_agent_profile_segmentation(self, tmp_path):
+        for i in range(2):
+            _done(tmp_path, f"A-{i}", 100, 50, profile="code-architect")
+        _done(tmp_path, "G-0", 100, 90, profile=None)
+        summary = summarize_calibration(tmp_path, project_id="test")
+        assert summary["by_agent_profile"]["code-architect"]["n"] == 2
+        assert summary["by_agent_profile"]["unspecified"]["n"] == 1
+
+    def test_project_filter_isolates(self, tmp_path):
+        _done(tmp_path, "P1-0", 100, 50, project="proj-a")
+        _done(tmp_path, "P2-0", 100, 50, project="proj-b")
+        a = summarize_calibration(tmp_path, project_id="proj-a")
+        assert a["total_done"] == 1
+        allp = summarize_calibration(tmp_path, project_id=None)
+        assert allp["total_done"] == 2
+
+
+class TestSuggest:
+    def test_uses_complexity_bucket_when_enough_samples(self, tmp_path):
+        for i in range(6):
+            _done(tmp_path, f"M-{i}", 600, 60, complexity="m")  # ratio 0.1
+        res = suggest_duration(
+            tmp_path, complexity="m", predicted_min=600,
+            project_id="test", min_bucket=5,
+        )
+        assert res["bucket"] == "complexity=m"
+        assert res["n"] == 6
+        assert res["median_ratio"] == 0.1
+        assert res["fell_back_to_global"] is False
+        assert res["calibrated_duration_min"] == 60  # 600 * 0.1
+
+    def test_falls_back_to_global_when_bucket_thin(self, tmp_path):
+        # Only 'm' data; ask for 'l' -> bucket thin -> global fallback.
+        for i in range(6):
+            _done(tmp_path, f"M-{i}", 600, 60, complexity="m")
+        res = suggest_duration(
+            tmp_path, complexity="l", predicted_min=600,
+            project_id="test", min_bucket=5,
+        )
+        assert res["fell_back_to_global"] is True
+        assert res["bucket"] == "global"
+        assert res["calibrated_duration_min"] == 60
+
+    def test_empty_corpus_echoes_estimate(self, tmp_path):
+        res = suggest_duration(tmp_path, complexity="m", predicted_min=120,
+                               project_id="test")
+        assert res["median_ratio"] is None
+        assert res["calibrated_duration_min"] == 120  # unchanged, no signal
+
+
+class TestReflectCLI:
+    def _seed(self, config):
+        root = config.portfolio_root
+        for i in range(6):
+            _done(root, f"M-{i}", 600, 60, complexity="m", confidence=3)
+
+    def test_cli_summarize(self, temp_portfolio_with_repo):
+        config = temp_portfolio_with_repo["config"]
+        self._seed(config)
+        r = CliRunner().invoke(main, ["reflect", "summarize", "-p", "test"])
+        assert r.exit_code == 0, r.output
+        out = json.loads(r.output)
+        assert out["data"]["by_complexity"]["m"]["n"] == 6
+        assert "FASTER" in out["data"]["interpretation"]
+
+    def test_cli_suggest_complexity(self, temp_portfolio_with_repo):
+        config = temp_portfolio_with_repo["config"]
+        self._seed(config)
+        r = CliRunner().invoke(main, [
+            "reflect", "suggest", "-p", "test",
+            "--complexity", "m", "--predicted-duration", "10h",
+        ])
+        assert r.exit_code == 0, r.output
+        out = json.loads(r.output)
+        # 10h = 600m, ratio 0.1 -> 60m
+        assert out["data"]["calibrated_duration_min"] == 60
+        assert out["data"]["bucket"] == "complexity=m"
+
+
+class TestCrossProjectSummarize:
+    """Codex round-1 P2 regression: when two projects share a task_id they
+    write to the same JSONL file (reflections are keyed by task_id alone),
+    and a cross-project summary must keep BOTH records — not silently let
+    the later one overwrite the earlier."""
+
+    def test_keeps_both_when_two_projects_share_task_id(self, tmp_path):
+        _done(tmp_path, "T-1", 100, 50, project="proj-a")
+        _done(tmp_path, "T-1", 200, 200, project="proj-b")
+        s = summarize_calibration(tmp_path, project_id=None)
+        assert s["total_done"] == 2
+        assert s["with_usable_duration"] == 2
+
+    def test_scoped_void_drops_only_its_project(self, tmp_path):
+        _done(tmp_path, "T-1", 100, 50, project="proj-a")
+        _done(tmp_path, "T-1", 200, 200, project="proj-b")
+        ref_file = tmp_path / "reflections" / "T-1.jsonl"
+        with ref_file.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "event": "void", "task_id": "T-1", "project_id": "proj-a",
+            }) + "\n")
+        s = summarize_calibration(tmp_path, project_id=None)
+        # proj-a voided, proj-b survives.
+        assert s["total_done"] == 1
+        assert s["with_usable_duration"] == 1
+
+    def test_unscoped_void_drops_entire_file(self, tmp_path):
+        _done(tmp_path, "T-1", 100, 50, project="proj-a")
+        _done(tmp_path, "T-1", 200, 200, project="proj-b")
+        ref_file = tmp_path / "reflections" / "T-1.jsonl"
+        with ref_file.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"event": "void", "task_id": "T-1"}) + "\n")
+        s = summarize_calibration(tmp_path, project_id=None)
+        assert s["total_done"] == 0
+
+
+class TestGlobalProjectFlag:
+    """Codex round-3 P2: a global `clawpm -p test reflect summarize` must
+    scope to `test`, not aggregate ALL projects."""
+
+    def test_global_project_scopes_summarize(self, temp_portfolio_with_repo):
+        config = temp_portfolio_with_repo["config"]
+        # Two projects' done events in the same JSONL file.
+        _done(config.portfolio_root, "T-1", 100, 50, project="test")
+        _done(config.portfolio_root, "T-1", 200, 200, project="other")
+        # Pass --project at the MAIN group, not the subcommand.
+        r = CliRunner().invoke(main, ["-p", "test", "reflect", "summarize"])
+        assert r.exit_code == 0, r.output
+        out = json.loads(r.output)
+        assert out["data"]["project_id"] == "test"
+        assert out["data"]["total_done"] == 1
+
+    def test_no_project_aggregates_all(self, temp_portfolio_with_repo):
+        config = temp_portfolio_with_repo["config"]
+        _done(config.portfolio_root, "T-1", 100, 50, project="test")
+        _done(config.portfolio_root, "T-1", 200, 200, project="other")
+        r = CliRunner().invoke(main, ["reflect", "summarize"])
+        assert r.exit_code == 0, r.output
+        out = json.loads(r.output)
+        assert out["data"]["project_id"] == "ALL"
+        assert out["data"]["total_done"] == 2
+
+
+class TestSuggestUsesPredictedComplexity:
+    """Codex round-6 P2: when `reflect suggest <task_id>` is run on a task,
+    bucket selection must use the PREDICTED complexity (the key
+    summarize_calibration buckets by), not the task's current complexity —
+    the two can differ when the operator pre-set predictions but adjusted
+    complexity later."""
+
+    def test_zero_duration_actual_is_dirty_not_crashing(self, tmp_path):
+        """Codex round-7 P2: a task completed in the same minute it started
+        records duration_min=0; that's noise, not a 0.0 ratio. Including it
+        used to crash _interpret_ratio with a divide-by-zero."""
+        _done(tmp_path, "Z-0", 60, 0, complexity="m", project="test")
+        _done(tmp_path, "Z-1", 60, 30, complexity="m", project="test")
+        s = summarize_calibration(tmp_path, project_id="test")
+        # The zero-actual row is dirty; the real one is usable.
+        assert s["dirty_flagged"] == 1
+        assert s["with_usable_duration"] == 1
+        # No crash, interpretation string returned.
+        assert isinstance(s["interpretation"], str)
+
+
+    def test_suggest_picks_predicted_complexity_bucket(
+        self, temp_portfolio_with_repo,
+    ):
+        from clawpm.tasks import add_task
+        from clawpm.models import Predictions, TaskComplexity
+
+        config = temp_portfolio_with_repo["config"]
+        # Seed 6 'm' done events so the bucket has enough samples (n>=5).
+        for i in range(6):
+            _done(config.portfolio_root, f"M-{i}", 600, 60,
+                  complexity="m", project="test")
+
+        # Task: current complexity is 'l' (later adjustment), but the
+        # PREDICTED complexity in predictions is 'm' (the bucket key).
+        add_task(
+            config, "test", title="T", task_id="TEST-900",
+            complexity=TaskComplexity.L,
+            predictions=Predictions(
+                duration_min=600,
+                complexity=TaskComplexity.M,
+            ),
+        )
+        r = CliRunner().invoke(
+            main, ["reflect", "suggest", "TEST-900", "-p", "test"]
+        )
+        assert r.exit_code == 0, r.output
+        out = json.loads(r.output)
+        # Must pick the 'm' bucket (predicted), not 'l' (which has no data
+        # and would fall back to global).
+        assert out["data"]["bucket"] == "complexity=m"
+        assert out["data"]["fell_back_to_global"] is False
+        # 600 * 0.1 = 60
+        assert out["data"]["calibrated_duration_min"] == 60

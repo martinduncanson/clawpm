@@ -626,24 +626,34 @@ class TestShortcutCommandsPassFlags:
 
 
 # ---------------------------------------------------------------------------
-# 9. Phase 2 stubs return phase2_pending and exit 0
+# 9. Calibration consumers (CLAWP-040) — formerly Phase 2 stubs.
+#    summarize aggregates the corpus; suggest deflates an estimate by the
+#    learned ratio. See tests/test_reflect_summarize.py for full coverage.
 # ---------------------------------------------------------------------------
 
 
 class TestPhase2Stubs:
-    def test_reflect_summarize_stub(self, temp_portfolio):
+    def test_reflect_summarize_runs(self, temp_portfolio):
         runner = CliRunner()
         result = runner.invoke(main, ["reflect", "summarize", "--project", "test"])
         assert result.exit_code == 0, result.output
         data = json.loads(result.output)
-        assert data["status"] == "phase2_pending"
+        # Implemented now: returns a calibration summary (empty corpus → zeros).
+        assert data["status"] == "ok"
+        assert data["data"]["total_done"] == 0
+        assert "by_complexity" in data["data"]
 
-    def test_reflect_suggest_stub(self, temp_portfolio):
+    def test_reflect_suggest_runs(self, temp_portfolio):
         runner = CliRunner()
-        result = runner.invoke(main, ["reflect", "suggest", "TEST-001", "--project", "test"])
+        result = runner.invoke(
+            main, ["reflect", "suggest", "--complexity", "m", "--project", "test"]
+        )
         assert result.exit_code == 0, result.output
         data = json.loads(result.output)
-        assert data["status"] == "phase2_pending"
+        assert data["status"] == "ok"
+        # Empty corpus → no signal → global bucket, null ratio.
+        assert data["data"]["bucket"] == "global"
+        assert data["data"]["median_ratio"] is None
 
     def test_reflect_history_import_no_source(self, temp_portfolio):
         # Updated: history-import is now implemented (Phase 2 complete) — see
