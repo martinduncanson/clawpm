@@ -147,6 +147,28 @@ class TestSettingsPayload:
         assert "--no-confirm-close" in off_cmd
         assert "--confirm-close --refute-votes" not in off_cmd
 
+    def test_lease_heartbeat_adds_posttooluse_hook(self):
+        # CLAWP-039: with a lease, the PostToolUse matcher carries a SECOND hook
+        # (the heartbeat) alongside log-progress, so tool use resets the TTL.
+        on = build_settings_payload("TEST-001", "test", lease_heartbeat=True)
+        ptu = on["hooks"]["PostToolUse"][0]["hooks"]
+        cmds = [h["command"] for h in ptu]
+        assert any("clawpm log add" in c for c in cmds)
+        assert any("clawpm lease heartbeat --project test --task TEST-001" in c for c in cmds)
+
+    def test_default_has_no_heartbeat_hook(self):
+        off = build_settings_payload("TEST-001", "test")
+        cmds = [h["command"] for h in off["hooks"]["PostToolUse"][0]["hooks"]]
+        assert not any("lease heartbeat" in c for c in cmds)
+
+    def test_heartbeat_hook_carries_holder(self):
+        # CLAWP-039 (Codex P2): the heartbeat hook bakes the holder so a
+        # replaced-holder zombie's beat is ignored on replay.
+        on = build_settings_payload("TEST-001", "test", lease_heartbeat=True,
+                                    lease_holder="F:/repo/wt")
+        cmds = [h["command"] for h in on["hooks"]["PostToolUse"][0]["hooks"]]
+        assert any("lease heartbeat --project test --task TEST-001 --holder F:/repo/wt" in c for c in cmds)
+
     def test_confirm_close_scales_stop_hook_timeout(self):
         # Codex P2 (round 1 + round 3): each logical judge call may run primary
         # THEN fallback (2x60s), and confirm-close runs 1 base + N refuters
