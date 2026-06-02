@@ -500,10 +500,14 @@ def write_dispatch_settings(
         if force and path.exists():
             shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
 
-    # The lease holder is the resolved target dir — the SAME value
-    # `tasks dispatch` grants the lease with, so the hook's heartbeat matches
-    # the lease holder on replay (and a different holder is rejected).
-    lease_holder = target_dir.resolve().as_posix() if lease_heartbeat else None
+    # The lease holder is a shell-safe TOKEN of the resolved target dir — the
+    # SAME token `tasks dispatch` grants the lease with — so the hook's heartbeat
+    # matches the lease holder on replay (a different holder is rejected) and a
+    # target path with spaces can't break the hook command (Codex P2).
+    lease_holder = None
+    if lease_heartbeat:
+        from .leases import holder_token
+        lease_holder = holder_token(target_dir.resolve().as_posix())
     payload = build_settings_payload(
         task_id, project_id, rubric_markdown,
         confirm_close=confirm_close, refute_votes=refute_votes,

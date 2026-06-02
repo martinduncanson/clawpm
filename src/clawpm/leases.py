@@ -27,6 +27,7 @@ append-only JSONL replayed to reconstruct current lease state, written through
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -123,6 +124,19 @@ class Lease:
 
     def expires_at(self) -> datetime:
         return self.last_heartbeat_at + timedelta(seconds=self.ttl_seconds)
+
+
+def holder_token(target_dir: str) -> str:
+    """A shell-safe, deterministic holder id derived from the dispatch target.
+
+    The heartbeat hook bakes this into a command string, so the holder must be
+    whitespace-free and free of shell metacharacters (cmd.exe + POSIX) — a raw
+    path with spaces would split before Click sees it and the heartbeat would
+    fail, getting an alive agent swept as expired (Codex P2). A sha256 prefix
+    is collision-safe enough to distinguish holders and trivially shell-safe.
+    The readable path stays available via the lease's ``target_dir`` field.
+    """
+    return "wt-" + hashlib.sha256(target_dir.encode("utf-8")).hexdigest()[:16]
 
 
 def _registry_path(portfolio_root: Path) -> Path:

@@ -2407,16 +2407,19 @@ def tasks_dispatch(
     # Grant the lease AFTER settings are written (so a settings failure doesn't
     # leave a lease with no heartbeat source).
     if lease_ttl is not None:
-        from .leases import FallbackPolicy, grant_lease
+        from .leases import FallbackPolicy, grant_lease, holder_token
         # Store an ABSOLUTE target dir (Codex P2): a relative --target-dir would
         # make a later sweep (run from another CWD) tear down the wrong path.
+        # The holder is a shell-safe TOKEN of that path (Codex P2) — the same
+        # token the heartbeat hook bakes in — so a path with spaces can't break
+        # the hook or the holder match.
         _abs_target = resolved_dir.resolve().as_posix()
         try:
             grant_lease(
                 config.portfolio_root, task_id, project_id,
                 ttl_seconds=lease_ttl,
                 fallback_policy=FallbackPolicy(fallback_policy),
-                holder_id=_abs_target,
+                holder_id=holder_token(_abs_target),
                 target_dir=_abs_target,
             )
         except ValueError as exc:

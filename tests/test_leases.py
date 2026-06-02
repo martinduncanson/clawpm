@@ -345,7 +345,11 @@ class TestDispatchIntegration:
         assert lease.fallback_policy is FallbackPolicy.ESCALATE
         settings = json.loads((target / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
         cmds = [h["command"] for h in settings["hooks"]["PostToolUse"][0]["hooks"]]
-        assert any("lease heartbeat" in c for c in cmds)
+        hb = next(c for c in cmds if "lease heartbeat" in c)
+        # The hook's holder TOKEN matches the granted lease's holder (so the
+        # beat is accepted) and is shell-safe (no raw path / spaces).
+        assert f"--holder {lease.holder_id}" in hb
+        assert lease.holder_id.startswith("wt-")
 
         # The CLI done transition releases the lease, so a completed task is
         # never swept into a fallback.
@@ -494,6 +498,16 @@ class TestLeaseCLI:
         # dry-run must NOT move the task.
         assert get_task(config, "test", task_id).state == TaskState.PROGRESS
         assert get_lease(portfolio["root"], task_id, "test").active is True
+
+
+class TestHolderToken:
+    def test_token_is_shell_safe_and_deterministic(self):
+        from clawpm.leases import holder_token
+        t = holder_token("F:/path with spaces & meta$/wt")
+        assert " " not in t and t.startswith("wt-")
+        assert all(c.isalnum() or c == "-" for c in t)  # no shell metachars
+        assert holder_token("F:/path with spaces & meta$/wt") == t  # deterministic
+        assert holder_token("F:/other") != t
 
 
 class TestPolicyParsing:
