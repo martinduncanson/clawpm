@@ -278,7 +278,11 @@ def _replay(portfolio_root: Path) -> dict[tuple[str, str], Lease]:
             # later valid lease) — Codex P2.
             try:
                 policy = FallbackPolicy.from_str(ev.get("fallback_policy", ""))
-                ttl = int(ev.get("ttl_seconds", 0)) or 1
+                # Strict TTL (Codex P2): a missing/zero/garbage ttl is a
+                # malformed grant — let it raise (TypeError/ValueError) and be
+                # skipped below, NOT coerced to a real 1s lease that the next
+                # sweep would act on.
+                ttl = int(ev["ttl_seconds"])
                 leases[key] = Lease(
                     task_id=task_id,
                     project_id=project_id,
@@ -290,11 +294,17 @@ def _replay(portfolio_root: Path) -> dict[tuple[str, str], Lease]:
                     status=LeaseStatus.ACTIVE,
                     target_dir=ev.get("target_dir"),
                 )
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, KeyError):
                 continue
         elif action == _HEARTBEAT:
             lease = leases.get(key)
-            if lease and lease.active and ts is not None and ts > lease.last_heartbeat_at:
+            hb_holder = ev.get("holder_id")
+            # Holder check (Codex P2): ignore a heartbeat from a REPLACED holder.
+            # After a requeue→re-grant to a new holder, a zombie original holder
+            # could otherwise refresh the new lease and mask its crash. A
+            # holder-less heartbeat (manual / legacy) stays lenient.
+            holder_ok = hb_holder is None or hb_holder == lease.holder_id if lease else False
+            if lease and lease.active and ts is not None and ts > lease.last_heartbeat_at and holder_ok:
                 lease.last_heartbeat_at = ts
         elif action == _RELEASED:
             lease = leases.get(key)

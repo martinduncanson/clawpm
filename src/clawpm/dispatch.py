@@ -223,6 +223,7 @@ def _command_for_dispatch(
     action: str,
     confirm_close: bool = False,
     refute_votes: int = 1,
+    lease_holder: Optional[str] = None,
 ) -> str:
     """Build the shell command for a hook entry.
 
@@ -274,7 +275,13 @@ def _command_for_dispatch(
         return f"clawpm hook session-start --project {project_id} --task {task_id}"
     if action == "lease-heartbeat":
         # CLAWP-039: every code-touching tool use doubles as a liveness beat.
-        return f"clawpm lease heartbeat --project {project_id} --task {task_id}"
+        # The holder is baked in so a replaced-holder zombie's beat (a different
+        # target dir) is ignored on replay rather than refreshing the new lease.
+        holder = f" --holder {lease_holder}" if lease_holder else ""
+        return (
+            f"clawpm lease heartbeat --project {project_id} "
+            f"--task {task_id}{holder}"
+        )
     raise ValueError(f"unknown action: {action!r}")
 
 
@@ -285,6 +292,7 @@ def build_settings_payload(
     confirm_close: bool = False,
     refute_votes: int = 1,
     lease_heartbeat: bool = False,
+    lease_holder: Optional[str] = None,
 ) -> dict:
     """Build the settings.local.json payload for a dispatched task.
 
@@ -365,7 +373,8 @@ def build_settings_payload(
         payload["hooks"]["PostToolUse"][0]["hooks"].append({
             "type": "command",
             "command": _command_for_dispatch(
-                task_id, project_id, "lease-heartbeat"
+                task_id, project_id, "lease-heartbeat",
+                lease_holder=lease_holder,
             ),
             "timeout": 15,
         })
@@ -491,10 +500,14 @@ def write_dispatch_settings(
         if force and path.exists():
             shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
 
+    # The lease holder is the resolved target dir — the SAME value
+    # `tasks dispatch` grants the lease with, so the hook's heartbeat matches
+    # the lease holder on replay (and a different holder is rejected).
+    lease_holder = target_dir.resolve().as_posix() if lease_heartbeat else None
     payload = build_settings_payload(
         task_id, project_id, rubric_markdown,
         confirm_close=confirm_close, refute_votes=refute_votes,
-        lease_heartbeat=lease_heartbeat,
+        lease_heartbeat=lease_heartbeat, lease_holder=lease_holder,
     )
     # Pretty-print so dispatch settings are review-friendly when they
     # land in PR diffs.

@@ -521,6 +521,56 @@ class TestCorruptionResilience:
         # Replay still recovers the valid grant.
         assert get_lease(root, "T", "test") is not None
 
+    def test_zero_ttl_grant_line_skipped(self, portfolio):
+        # Codex P2: a zero/missing ttl is a malformed grant — it must NOT become
+        # a real 1s lease the next sweep acts on.
+        import json
+        root = portfolio["root"]
+        reg = root / leases.LEASE_REGISTRY_FILENAME
+        reg.write_text(json.dumps({"action": "granted", "task_id": "Z", "project_id": "test",
+                                   "ttl_seconds": 0, "fallback_policy": "fail",
+                                   "ts": "2026-01-01T00:00:00Z"}) + "\n", encoding="utf-8")
+        assert get_lease(root, "Z", "test") is None
+
+    def test_heartbeat_from_replaced_holder_ignored(self, portfolio):
+        # Codex P2: a heartbeat from a REPLACED holder must not refresh the
+        # active lease (which would mask the new holder's crash). Controlled
+        # timestamps make this deterministic.
+        import json
+        root = portfolio["root"]
+        reg = root / leases.LEASE_REGISTRY_FILENAME
+        reg.write_text(
+            json.dumps({"action": "granted", "task_id": "T", "project_id": "test",
+                        "holder_id": "W1", "ttl_seconds": 300, "fallback_policy": "fail",
+                        "ts": "2026-01-01T00:00:00Z"}) + "\n"
+            + json.dumps({"action": "heartbeat", "task_id": "T", "project_id": "test",
+                          "holder_id": "W2", "ts": "2026-01-01T00:01:00Z"}) + "\n",
+            encoding="utf-8",
+        )
+        lease = get_lease(root, "T", "test")
+        # The W2 (wrong-holder) beat, though later, did NOT advance the W1 lease.
+        assert lease.last_heartbeat_at == leases._parse_ts("2026-01-01T00:00:00Z")
+        # A matching W1 beat DOES advance.
+        with open(reg, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"action": "heartbeat", "task_id": "T", "project_id": "test",
+                                "holder_id": "W1", "ts": "2026-01-01T00:02:00Z"}) + "\n")
+        assert get_lease(root, "T", "test").last_heartbeat_at == leases._parse_ts("2026-01-01T00:02:00Z")
+
+    def test_holderless_heartbeat_stays_lenient(self, portfolio):
+        # A manual/legacy heartbeat with no holder still advances (can't check).
+        import json
+        root = portfolio["root"]
+        reg = root / leases.LEASE_REGISTRY_FILENAME
+        reg.write_text(
+            json.dumps({"action": "granted", "task_id": "T", "project_id": "test",
+                        "holder_id": "W1", "ttl_seconds": 300, "fallback_policy": "fail",
+                        "ts": "2026-01-01T00:00:00Z"}) + "\n"
+            + json.dumps({"action": "heartbeat", "task_id": "T", "project_id": "test",
+                          "ts": "2026-01-01T00:01:00Z"}) + "\n",
+            encoding="utf-8",
+        )
+        assert get_lease(root, "T", "test").last_heartbeat_at == leases._parse_ts("2026-01-01T00:01:00Z")
+
     def test_bad_ttl_grant_line_skipped_not_aborting(self, portfolio):
         # Codex P2: a corrupted ttl_seconds on ONE grant must skip only that
         # line, never abort the whole replay (which would disable crash

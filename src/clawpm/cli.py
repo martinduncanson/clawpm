@@ -2377,7 +2377,10 @@ def tasks_dispatch(
     swept = []
     sweep_error = None
     try:
-        swept = _lease_sweep(config, config.portfolio_root)
+        # Scope to the dispatched project (Codex P2): `dispatch --project A`
+        # must not reap project B's leased tasks. Portfolio-wide reaping is
+        # `clawpm doctor`'s job, not a side effect of an A-scoped dispatch.
+        swept = _lease_sweep(config, config.portfolio_root, project_id=project_id)
     except Exception as exc:
         # A sweep failure must not block the dispatch (the user's actual
         # intent), but must not be silent either — else `leases_swept: 0`
@@ -4267,6 +4270,10 @@ def lease_grant(ctx, project_id, task_id, ttl, fallback_policy, holder_id, targe
     config = require_portfolio(ctx)
     project_id, _ = require_project(ctx, project_id)
     task_id = expand_task_id(task_id, project_id)
+    # Store an ABSOLUTE target dir (Codex P2) so a later sweep from a different
+    # CWD tears down the right path — matching what `tasks dispatch` does.
+    if target_dir:
+        target_dir = Path(target_dir).resolve().as_posix()
     try:
         grant_lease(
             config.portfolio_root, task_id, project_id, ttl_seconds=ttl,
