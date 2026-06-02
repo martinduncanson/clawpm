@@ -272,6 +272,9 @@ def _command_for_dispatch(
         )
     if action == "session-start":
         return f"clawpm hook session-start --project {project_id} --task {task_id}"
+    if action == "lease-heartbeat":
+        # CLAWP-039: every code-touching tool use doubles as a liveness beat.
+        return f"clawpm lease heartbeat --project {project_id} --task {task_id}"
     raise ValueError(f"unknown action: {action!r}")
 
 
@@ -281,6 +284,7 @@ def build_settings_payload(
     rubric_markdown: Optional[str] = None,
     confirm_close: bool = False,
     refute_votes: int = 1,
+    lease_heartbeat: bool = False,
 ) -> dict:
     """Build the settings.local.json payload for a dispatched task.
 
@@ -354,6 +358,17 @@ def build_settings_payload(
             ],
         },
     }
+    if lease_heartbeat:
+        # CLAWP-039: a code-touching tool use is a liveness beat. Added as a
+        # SECOND PostToolUse hook on the same matcher so the lease's TTL window
+        # resets every time the subagent does real work.
+        payload["hooks"]["PostToolUse"][0]["hooks"].append({
+            "type": "command",
+            "command": _command_for_dispatch(
+                task_id, project_id, "lease-heartbeat"
+            ),
+            "timeout": 15,
+        })
     if rubric_markdown:
         # SessionStart additionalContext is too large + escape-prone to
         # embed in a shell command string portably. Instead we write the
@@ -420,6 +435,7 @@ def write_dispatch_settings(
     portfolio_root: Optional[Path] = None,
     confirm_close: bool = False,
     refute_votes: int = 1,
+    lease_heartbeat: bool = False,
 ) -> Path:
     """Emit settings.local.json for the dispatched task.
 
@@ -478,6 +494,7 @@ def write_dispatch_settings(
     payload = build_settings_payload(
         task_id, project_id, rubric_markdown,
         confirm_close=confirm_close, refute_votes=refute_votes,
+        lease_heartbeat=lease_heartbeat,
     )
     # Pretty-print so dispatch settings are review-friendly when they
     # land in PR diffs.

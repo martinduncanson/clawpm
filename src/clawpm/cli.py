@@ -1034,10 +1034,34 @@ def project_doctor(
         if len(pids) > 1
     ]
 
+    # --- CLAWP-039: expired dispatch leases (crash-safe dispatch) ---
+    # No daemon — doctor is one of the two lazy expiry detectors (the other is
+    # the next `tasks dispatch`). Detect here; remediate (apply the fallback)
+    # under --apply.
+    expired_lease_findings: list[dict] = []
+    try:
+        from .leases import expired_leases as _expired_leases
+        _now_doc = datetime.now(timezone.utc)
+        for _l in _expired_leases(config.portfolio_root, _now_doc):
+            if project_id and _l.project_id != project_id:
+                continue
+            _age = int((_now_doc - _l.last_heartbeat_at).total_seconds())
+            expired_lease_findings.append({
+                "task_id": _l.task_id,
+                "project_id": _l.project_id,
+                "ttl_seconds": _l.ttl_seconds,
+                "age_seconds": _age,
+                "fallback_policy": _l.fallback_policy.value,
+                "suggested_action": "run `clawpm lease sweep` (or `clawpm doctor --apply`)",
+            })
+    except Exception:
+        expired_lease_findings = []
+
     # Build final output
     has_warnings = bool(
         stale_tasks or stale_blocked or drift_tasks or prefix_collisions or unreadable_files
         or commit_drift or missing_markers or codex_availability or encoding_risks
+        or expired_lease_findings
         or any(i["level"] == "warning" for i in issues)
     )
 
@@ -1077,6 +1101,28 @@ def project_doctor(
                 dry_run=dry_run,
             )
 
+            # CLAWP-039: expired-lease fallback is a deterministic remediation
+            # arm. Apply it here so `doctor --apply` reaps dead holders.
+            if expired_lease_findings and not dry_run:
+                from .leases import sweep as _lease_sweep
+                for _act in _lease_sweep(config, config.portfolio_root):
+                    applied.append({
+                        "class": "lease-expired",
+                        "target": f"{_act['task_id']} ({_act['project_id']})",
+                        "result": (
+                            f"{_act['policy']} -> {_act['resulting_state']}"
+                            if not _act.get("retired_without_fallback")
+                            else f"retired (task already {_act['resulting_state']})"
+                        ),
+                    })
+            elif expired_lease_findings and dry_run:
+                for _f in expired_lease_findings:
+                    apply_skipped.append({
+                        "class": "lease-expired",
+                        "target": f"{_f['task_id']} ({_f['project_id']})",
+                        "reason": f"dry-run: would apply {_f['fallback_policy']}",
+                    })
+
     if fmt == OutputFormat.JSON:
         payload = {
             "issues": issues,
@@ -1092,6 +1138,7 @@ def project_doctor(
             "codegraph_advice": codegraph_advice,
             "semble_advice": semble_advice,
             "encoding_risks": encoding_risks,
+            "expired_leases": expired_lease_findings,
         }
         if apply_mode:
             payload["applied"] = applied
@@ -1107,7 +1154,7 @@ def project_doctor(
         if not (
             issues or stale_tasks or stale_blocked or drift_tasks or prefix_collisions or unreadable_files
             or commit_drift or missing_markers or codex_availability or codegraph_advice
-            or semble_advice or encoding_risks
+            or semble_advice or encoding_risks or expired_lease_findings
         ):
             click.echo("[OK] No issues found")
         else:
@@ -1175,6 +1222,12 @@ def project_doctor(
                 click.echo(
                     f"[WARNING] [encoding-risk:{er['rule']}] {er['project_id']} "
                     f"{er['file']}:{er['line']} - {er['evidence']}"
+                )
+            for el in expired_lease_findings:
+                click.echo(
+                    f"[WARNING] [lease-expired] {el['task_id']} ({el['project_id']}) "
+                    f"- no heartbeat for {el['age_seconds']}s (TTL {el['ttl_seconds']}s); "
+                    f"fallback {el['fallback_policy']}. {el['suggested_action']}"
                 )
 
         if apply_mode:
@@ -1573,6 +1626,16 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
                 summary=f"Auto-unblocked by completion of {cr['trigger']}",
                 auto=True,
             )
+
+        # CLAWP-039: release any crash-safety lease on clean completion so a
+        # finished task is never swept into a fallback. (The sweep also guards
+        # against moving non-PROGRESS tasks, but releasing here retires the
+        # lease immediately rather than waiting for the next sweep.)
+        try:
+            from .leases import release_lease
+            release_lease(config.portfolio_root, task_id, project_id)
+        except Exception:
+            pass
 
         # Auto-teardown dispatch settings that reference the just-done task.
         # Codex round-4 fix: use the portfolio dispatch registry so we
@@ -2145,6 +2208,12 @@ def tasks_emit_rubric(
             click.echo(_json_rub.dumps(payload, indent=2))
 
 
+# CLAWP-039: fallback policies for crash-safe dispatch leases. Defined here
+# (before `tasks dispatch` which references it in an option) and reused by the
+# `lease` command group.
+_FALLBACK_POLICIES = ["requeue", "route-secondary", "escalate-to-human", "fail"]
+
+
 @tasks.command("dispatch")
 @click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
 @click.argument("task_id")
@@ -2177,6 +2246,17 @@ def tasks_emit_rubric(
          "overturn the close; ties overturn). Also sizes the hook timeout. "
          "Default 1.",
 )
+@click.option(
+    "--lease-ttl", "lease_ttl", type=int, default=None,
+    help="CLAWP-039: grant a crash-safety lease with this TTL (seconds). The "
+         "subagent heartbeats via the PostToolUse hook; if it goes silent past "
+         "the TTL, a doctor/dispatch sweep applies the fallback policy.",
+)
+@click.option(
+    "--fallback-policy", "fallback_policy", type=click.Choice(_FALLBACK_POLICIES),
+    default="requeue", show_default=True,
+    help="CLAWP-039: what to do with the task if its lease expires.",
+)
 @click.pass_context
 def tasks_dispatch(
     ctx: click.Context,
@@ -2188,6 +2268,8 @@ def tasks_dispatch(
     force: bool,
     confirm_close: bool | None,
     refute_votes: int,
+    lease_ttl: int | None,
+    fallback_policy: str,
 ) -> None:
     """Emit hook-wired .claude/settings.local.json for a dispatched subagent (CLAWP-018).
 
@@ -2267,6 +2349,17 @@ def tasks_dispatch(
 
     refute_votes = max(1, refute_votes)
 
+    # CLAWP-039: opportunistic lease sweep before granting — this is one of the
+    # two no-daemon expiry detectors (the other is `clawpm doctor`). A holder
+    # that died is reaped here, on the next dispatch, instead of lingering.
+    swept = []
+    if lease_ttl is not None:
+        from .leases import sweep as _lease_sweep
+        try:
+            swept = _lease_sweep(config, config.portfolio_root)
+        except Exception:
+            swept = []
+
     try:
         path = write_dispatch_settings(
             target_dir=resolved_dir,
@@ -2277,10 +2370,27 @@ def tasks_dispatch(
             portfolio_root=config.portfolio_root,
             confirm_close=confirm_close,
             refute_votes=refute_votes,
+            lease_heartbeat=lease_ttl is not None,
         )
     except (FileExistsError, ValueError) as exc:
         output_error("dispatch_blocked", str(exc), fmt=fmt)
         sys.exit(1)
+
+    # Grant the lease AFTER settings are written (so a settings failure doesn't
+    # leave a lease with no heartbeat source).
+    if lease_ttl is not None:
+        from .leases import FallbackPolicy, grant_lease
+        try:
+            grant_lease(
+                config.portfolio_root, task_id, project_id,
+                ttl_seconds=lease_ttl,
+                fallback_policy=FallbackPolicy(fallback_policy),
+                holder_id=resolved_dir.as_posix(),
+                target_dir=resolved_dir.as_posix(),
+            )
+        except ValueError as exc:
+            output_error("lease_grant_failed", str(exc), fmt=fmt)
+            sys.exit(1)
 
     invocation = f"cd {resolved_dir.as_posix()} && claude"
     output_success(
@@ -2294,6 +2404,9 @@ def tasks_dispatch(
             "rubric_injected": rubric is not None,
             "confirm_close": confirm_close,
             "refute_votes": refute_votes if confirm_close else None,
+            "lease_ttl": lease_ttl,
+            "fallback_policy": fallback_policy if lease_ttl is not None else None,
+            "leases_swept": len(swept),
         },
         fmt=fmt,
     )
@@ -4089,6 +4202,140 @@ def doctor(
         no_apply_half_rename=no_apply_half_rename,
         check_encoding=check_encoding,
     )
+
+
+# ============================================================================
+# Lease commands (CLAWP-039) — crash-safe dispatch
+# ============================================================================
+
+
+@main.group("lease")
+def lease_group() -> None:
+    """Crash-safe dispatch leases: TTL + heartbeat + expiry → fallback.
+
+    A dispatched subtask carries a lease; the holder heartbeats while alive
+    (wired to the dispatch PostToolUse hook). If the holder goes silent past
+    the TTL, a sweep (run by ``clawpm doctor`` and on the next ``tasks
+    dispatch``) transitions the task per its fallback policy. No daemon —
+    expiry is detected lazily on sweep.
+    """
+    pass
+
+
+@lease_group.command("grant")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
+@click.option("--task", "task_id", required=True, help="Task the lease is granted on")
+@click.option("--ttl", "ttl", type=int, required=True, help="Lease TTL in seconds (no heartbeat within → expired)")
+@click.option("--fallback-policy", "fallback_policy", type=click.Choice(_FALLBACK_POLICIES), default="requeue", show_default=True)
+@click.option("--holder", "holder_id", default=None, help="Optional holder identifier (e.g. worktree path / session id)")
+@click.option("--target-dir", "target_dir", default=None, help="Dispatch target dir (torn down on requeue fallback)")
+@click.pass_context
+def lease_grant(ctx, project_id, task_id, ttl, fallback_policy, holder_id, target_dir):
+    """Grant a lease on a dispatched task."""
+    from .leases import FallbackPolicy, grant_lease
+
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+    project_id, _ = require_project(ctx, project_id)
+    task_id = expand_task_id(task_id, project_id)
+    try:
+        grant_lease(
+            config.portfolio_root, task_id, project_id, ttl_seconds=ttl,
+            fallback_policy=FallbackPolicy(fallback_policy),
+            holder_id=holder_id, target_dir=target_dir,
+        )
+    except ValueError as exc:
+        output_error("lease_grant_failed", str(exc), fmt=fmt)
+        sys.exit(1)
+    output_success(
+        f"Lease granted on {task_id} (ttl {ttl}s, fallback {fallback_policy})",
+        data={"task_id": task_id, "ttl_seconds": ttl, "fallback_policy": fallback_policy},
+        fmt=fmt,
+    )
+
+
+@lease_group.command("heartbeat")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
+@click.option("--task", "task_id", required=True, help="Task whose lease to heartbeat")
+@click.option("--holder", "holder_id", default=None)
+@click.pass_context
+def lease_heartbeat(ctx, project_id, task_id, holder_id):
+    """Record a heartbeat — the holder is alive. (Called by the dispatch hook.)"""
+    from .leases import heartbeat
+
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+    project_id, _ = require_project(ctx, project_id)
+    task_id = expand_task_id(task_id, project_id)
+    heartbeat(config.portfolio_root, task_id, project_id, holder_id=holder_id)
+    output_success(f"Heartbeat recorded for {task_id}", data={"task_id": task_id}, fmt=fmt)
+
+
+@lease_group.command("release")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
+@click.option("--task", "task_id", required=True, help="Task whose lease to release (clean completion)")
+@click.pass_context
+def lease_release(ctx, project_id, task_id):
+    """Release a lease — clean completion, no fallback on later sweeps."""
+    from .leases import release_lease
+
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+    project_id, _ = require_project(ctx, project_id)
+    task_id = expand_task_id(task_id, project_id)
+    release_lease(config.portfolio_root, task_id, project_id)
+    output_success(f"Lease released for {task_id}", data={"task_id": task_id}, fmt=fmt)
+
+
+@lease_group.command("list")
+@click.option("--project", "-p", "project_id", help="Filter to a project (default: all)")
+@click.pass_context
+def lease_list(ctx, project_id):
+    """List active leases with their expiry + fallback policy."""
+    from datetime import datetime, timezone
+    from .leases import active_leases
+
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+    now = datetime.now(timezone.utc)
+    rows = []
+    for l in active_leases(config.portfolio_root):
+        if project_id and l.project_id != project_id:
+            continue
+        rows.append({
+            "task_id": l.task_id,
+            "project_id": l.project_id,
+            "holder_id": l.holder_id,
+            "ttl_seconds": l.ttl_seconds,
+            "last_heartbeat_at": l.last_heartbeat_at.isoformat().replace("+00:00", "Z"),
+            "expires_at": l.expires_at().isoformat().replace("+00:00", "Z"),
+            "expired": l.is_expired(now),
+            "fallback_policy": l.fallback_policy.value,
+        })
+    output_success(f"{len(rows)} active lease(s)", data={"leases": rows}, fmt=fmt)
+
+
+@lease_group.command("sweep")
+@click.option("--dry-run", "dry_run", is_flag=True, default=False, help="Report expired leases without applying fallback.")
+@click.pass_context
+def lease_sweep(ctx, dry_run):
+    """Detect expired leases and apply their fallback (the no-daemon expiry check)."""
+    from datetime import datetime, timezone
+    from .leases import expired_leases, sweep
+
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+    now = datetime.now(timezone.utc)
+    if dry_run:
+        rows = [
+            {"task_id": l.task_id, "project_id": l.project_id,
+             "fallback_policy": l.fallback_policy.value}
+            for l in expired_leases(config.portfolio_root, now)
+        ]
+        output_success(f"{len(rows)} expired lease(s) (dry-run)", data={"expired": rows}, fmt=fmt)
+        return
+    actions = sweep(config, config.portfolio_root, now=now)
+    output_success(f"Swept {len(actions)} expired lease(s)", data={"actions": actions}, fmt=fmt)
 
 
 # ============================================================================
