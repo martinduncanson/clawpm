@@ -247,6 +247,22 @@ class TestLifecycle:
         assert fresh.active is True
         assert fresh.fallback_policy is FallbackPolicy.FAIL
 
+    def test_open_leased_task_is_reaped(self, portfolio):
+        # Codex P1: `tasks dispatch --lease-ttl` does not move the task to
+        # PROGRESS, so a leased task is commonly still OPEN while the holder
+        # works. A dead holder on an OPEN task MUST trigger the fallback.
+        config, root = portfolio["config"], portfolio["root"]
+        task = add_task(config, "test", title="open work",
+                        predictions=Predictions(success_criteria=["c"]))
+        # Left OPEN (not moved to progress).
+        grant_lease(root, task.id, "test", ttl_seconds=30, fallback_policy=FallbackPolicy.ESCALATE)
+        lease = get_lease(root, task.id, "test")
+        actions = sweep(config, root, now=lease.granted_at + timedelta(seconds=90))
+        assert len(actions) == 1
+        assert actions[0]["transitioned"] is True
+        assert not actions[0].get("retired_without_fallback")
+        assert get_task(config, "test", task.id).state == TaskState.BLOCKED
+
     def test_finished_task_not_yanked_back_by_stale_lease(self, portfolio):
         # Holder completed the work (task -> done) but crashed before releasing
         # the lease. A later sweep must retire the lease, NOT move the done task.
@@ -504,3 +520,19 @@ class TestCorruptionResilience:
             f.write('{"action": "heartbeat", "task_id": "T"\n')  # truncated JSON
         # Replay still recovers the valid grant.
         assert get_lease(root, "T", "test") is not None
+
+    def test_bad_ttl_grant_line_skipped_not_aborting(self, portfolio):
+        # Codex P2: a corrupted ttl_seconds on ONE grant must skip only that
+        # line, never abort the whole replay (which would disable crash
+        # detection for every later valid lease).
+        import json
+        root = portfolio["root"]
+        reg = root / leases.LEASE_REGISTRY_FILENAME
+        with open(reg, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"action": "granted", "task_id": "BAD", "project_id": "test",
+                                "ttl_seconds": "not-an-int", "fallback_policy": "fail",
+                                "ts": "2026-01-01T00:00:00Z"}) + "\n")
+        # A valid grant AFTER the bad line must still be recovered.
+        grant_lease(root, "GOOD", "test", ttl_seconds=60, fallback_policy=FallbackPolicy.FAIL)
+        assert get_lease(root, "BAD", "test") is None      # malformed → skipped
+        assert get_lease(root, "GOOD", "test") is not None  # replay didn't abort

@@ -2310,6 +2310,13 @@ def tasks_dispatch(
         output_error("task_not_found", f"No task with id '{task_id}'", fmt=fmt)
         sys.exit(1)
 
+    # CLAWP-039: validate the lease TTL BEFORE writing any settings (Codex P2),
+    # so a bad --lease-ttl never leaves the target half-dispatched.
+    if lease_ttl is not None and lease_ttl <= 0:
+        output_error("lease_grant_failed",
+                     f"--lease-ttl must be positive, got {lease_ttl}", fmt=fmt)
+        sys.exit(1)
+
     project = get_project(config, project_id)
     # Resolve target directory
     if worktree:
@@ -2363,18 +2370,20 @@ def tasks_dispatch(
     # CLAWP-039: opportunistic lease sweep before granting — this is one of the
     # two no-daemon expiry detectors (the other is `clawpm doctor`). A holder
     # that died is reaped here, on the next dispatch, instead of lingering.
+    # Run on EVERY dispatch, not only leased ones (Codex P2): a dead holder
+    # from an earlier lease must be reaped on the next dispatch even if this one
+    # isn't requesting a lease. Cheap — a no-op when leases.jsonl is absent.
+    from .leases import sweep as _lease_sweep
     swept = []
     sweep_error = None
-    if lease_ttl is not None:
-        from .leases import sweep as _lease_sweep
-        try:
-            swept = _lease_sweep(config, config.portfolio_root)
-        except Exception as exc:
-            # A sweep failure must not block the dispatch (the user's actual
-            # intent), but must not be silent either — else `leases_swept: 0`
-            # hides a broken janitor (Codex/silent-failure).
-            swept = []
-            sweep_error = f"{type(exc).__name__}: {exc}"
+    try:
+        swept = _lease_sweep(config, config.portfolio_root)
+    except Exception as exc:
+        # A sweep failure must not block the dispatch (the user's actual
+        # intent), but must not be silent either — else `leases_swept: 0`
+        # hides a broken janitor (Codex/silent-failure).
+        swept = []
+        sweep_error = f"{type(exc).__name__}: {exc}"
 
     try:
         path = write_dispatch_settings(
@@ -2396,13 +2405,16 @@ def tasks_dispatch(
     # leave a lease with no heartbeat source).
     if lease_ttl is not None:
         from .leases import FallbackPolicy, grant_lease
+        # Store an ABSOLUTE target dir (Codex P2): a relative --target-dir would
+        # make a later sweep (run from another CWD) tear down the wrong path.
+        _abs_target = resolved_dir.resolve().as_posix()
         try:
             grant_lease(
                 config.portfolio_root, task_id, project_id,
                 ttl_seconds=lease_ttl,
                 fallback_policy=FallbackPolicy(fallback_policy),
-                holder_id=resolved_dir.as_posix(),
-                target_dir=resolved_dir.as_posix(),
+                holder_id=_abs_target,
+                target_dir=_abs_target,
             )
         except ValueError as exc:
             output_error("lease_grant_failed", str(exc), fmt=fmt)

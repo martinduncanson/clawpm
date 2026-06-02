@@ -272,21 +272,26 @@ def _replay(portfolio_root: Path) -> dict[tuple[str, str], Lease]:
         if action == _GRANTED:
             if ts is None:
                 continue
+            # Defensive: a corrupted ttl/policy or a Lease invariant violation
+            # must skip ONLY this malformed grant, never abort the whole replay
+            # (one bad line would otherwise disable crash detection for every
+            # later valid lease) — Codex P2.
             try:
                 policy = FallbackPolicy.from_str(ev.get("fallback_policy", ""))
-            except ValueError:
+                ttl = int(ev.get("ttl_seconds", 0)) or 1
+                leases[key] = Lease(
+                    task_id=task_id,
+                    project_id=project_id,
+                    holder_id=ev.get("holder_id"),
+                    granted_at=ts,
+                    ttl_seconds=ttl,
+                    fallback_policy=policy,
+                    last_heartbeat_at=ts,
+                    status=LeaseStatus.ACTIVE,
+                    target_dir=ev.get("target_dir"),
+                )
+            except (ValueError, TypeError):
                 continue
-            leases[key] = Lease(
-                task_id=task_id,
-                project_id=project_id,
-                holder_id=ev.get("holder_id"),
-                granted_at=ts,
-                ttl_seconds=int(ev.get("ttl_seconds", 0)) or 1,
-                fallback_policy=policy,
-                last_heartbeat_at=ts,
-                status=LeaseStatus.ACTIVE,
-                target_dir=ev.get("target_dir"),
-            )
         elif action == _HEARTBEAT:
             lease = leases.get(key)
             if lease and lease.active and ts is not None and ts > lease.last_heartbeat_at:
@@ -352,13 +357,16 @@ def apply_fallback(config, portfolio_root: Path, lease: Lease, now: datetime) ->
     from .models import TaskState
     from .tasks import change_task_state, get_task
 
-    # Crash-safety guard: a fallback only makes sense for a task still being
-    # worked (PROGRESS). If the holder actually FINISHED (task already done) or
-    # the task is already blocked/gone — e.g. it completed but crashed before
-    # releasing the lease — retire the lease WITHOUT moving the task. Otherwise
-    # a stale lease would yank a completed task back out of done.
+    # Crash-safety guard: a fallback makes sense for a task still being worked.
+    # `tasks dispatch` does NOT move the task to PROGRESS, so a leased task is
+    # commonly still OPEN while the holder works — both OPEN and PROGRESS are
+    # reapable (Codex P1). But if the holder FINISHED (task already done) or the
+    # task is already BLOCKED — e.g. it completed but crashed before releasing —
+    # retire the lease WITHOUT moving the task, so a stale lease never yanks a
+    # done/blocked task back into the work queue.
+    _REAPABLE = {TaskState.OPEN, TaskState.PROGRESS}
     current = get_task(config, lease.project_id, lease.task_id)
-    if current is None or current.state is not TaskState.PROGRESS:
+    if current is None or current.state not in _REAPABLE:
         release_lease(portfolio_root, lease.task_id, lease.project_id)
         return {
             "task_id": lease.task_id,
