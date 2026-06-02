@@ -29,6 +29,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -37,6 +38,32 @@ from typing import Callable
 # print mode. Override via env CLAWPM_JUDGE_CMD when you want a different
 # model (e.g. set to `claude --model claude-haiku-4-5 -p`) or a stub for tests.
 DEFAULT_JUDGE_CMD = ["claude", "--print", "--model", "claude-haiku-4-5"]
+
+# Fallback judge — a LOCAL model, tried when the primary judge is unavailable
+# (not installed, or exits non-zero, e.g. auth/quota failure). Keeps grading
+# working — and subscription-cost-free — when `claude -p` can't be reached.
+# Override the model via env CLAWPM_JUDGE_FALLBACK_CMD (e.g.
+# "ollama run qwen2.5"); set it to the empty string to DISABLE the fallback.
+DEFAULT_JUDGE_FALLBACK_CMD = ["ollama", "run", "llama3.1"]
+
+# Per-call judge subprocess budget. Shared with dispatch.py so the Stop-hook
+# timeout can be sized against the confirm-close vote budget (base + N
+# refuters run sequentially, each bounded by this).
+JUDGE_CALL_TIMEOUT_SECONDS = 60
+
+
+class JudgeUnavailable(RuntimeError):
+    """Primary judge could not produce a verdict for a reason that warrants
+    trying the fallback — command not found, or non-zero exit (broken / auth /
+    quota). Distinct from a timeout, which does NOT trigger fallback."""
+
+
+class JudgeTimeout(RuntimeError):
+    """Judge subprocess exceeded its time budget. NOT a fallback trigger: a
+    timeout usually means the prompt/transcript is too large (a local model
+    would struggle too), and falling back would double the latency past the
+    Stop-hook timeout budget. Surfaced so the caller's fail-open path handles
+    it."""
 
 
 @dataclass
@@ -163,24 +190,18 @@ JudgeInvoker = Callable[[str], str]
 """A judge invoker takes the prompt string and returns the raw text response."""
 
 
-def _default_judge_invoker(prompt: str) -> str:
-    """Default judge: subprocess to the user's `claude --print` CLI.
+def _run_judge_cmd(
+    cmd: list[str], prompt: str, cwd: Path | None = None
+) -> str:
+    """Run ONE judge command with the prompt on stdin; return stdout.
 
-    Honors ``CLAWPM_JUDGE_CMD`` when set — split via shlex so users can pass
-    flags like ``"claude -p --model claude-haiku-4-5"``. The prompt is sent on
-    stdin so even long rubrics + transcripts don't hit shell argument limits.
+    The prompt is sent on stdin so long rubrics + transcripts don't hit shell
+    argument limits. Raises:
+      - ``JudgeUnavailable`` if the binary isn't found or exits non-zero
+        (fallback-eligible: the judge is broken / missing / auth-failed).
+      - ``JudgeTimeout`` if it exceeds the per-call budget (NOT fallback-
+        eligible — see the class docstring).
     """
-    cmd_str = os.environ.get("CLAWPM_JUDGE_CMD")
-    if cmd_str:
-        cmd = shlex.split(cmd_str)
-    else:
-        cmd = list(DEFAULT_JUDGE_CMD)
-
-    # Some judge CLIs read the prompt from a positional argument when stdin is
-    # empty, others from stdin. claude --print accepts stdin, so this is the
-    # path of least surprise. 60s ceiling — Haiku usually returns in <5s;
-    # this is the generous human-perceptible bound before the operator
-    # would assume the hook is broken.
     try:
         result = subprocess.run(
             cmd,
@@ -188,25 +209,138 @@ def _default_judge_invoker(prompt: str) -> str:
             capture_output=True,
             text=True,
             encoding="utf-8",
-            timeout=60,
+            timeout=JUDGE_CALL_TIMEOUT_SECONDS,
+            cwd=str(cwd) if cwd is not None else None,
         )
     except FileNotFoundError as exc:
-        # `claude` CLI not on PATH — be loud about it so the operator knows
-        # to install Claude Code or override CLAWPM_JUDGE_CMD.
-        raise RuntimeError(
-            f"Judge command not found: {cmd[0]!r}. Install Claude Code or "
-            f"set CLAWPM_JUDGE_CMD to an alternative judge. Error: {exc}"
+        raise JudgeUnavailable(
+            f"Judge command not found: {cmd[0]!r}. Error: {exc}"
         ) from exc
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            f"Judge timed out after {exc.timeout}s; rubric or transcript may "
-            "be too large for a single call"
+        raise JudgeTimeout(
+            f"Judge {cmd[0]!r} timed out after {exc.timeout}s; rubric or "
+            "transcript may be too large for a single call"
         ) from exc
     if result.returncode != 0:
-        raise RuntimeError(
-            f"Judge exited {result.returncode}: {result.stderr[:500]}"
+        raise JudgeUnavailable(
+            f"Judge {cmd[0]!r} exited {result.returncode}: "
+            f"{result.stderr[:500]}"
         )
     return result.stdout
+
+
+def _resolve_judge_cmds(
+    judge_cmd_override: str | None = None,
+) -> tuple[list[str], list[str] | None]:
+    """Resolve ``(primary_cmd, fallback_cmd_or_None)``.
+
+    Primary resolution (highest priority first): ``judge_cmd_override`` →
+    ``CLAWPM_JUDGE_CMD`` env → ``DEFAULT_JUDGE_CMD`` (claude --print).
+
+    Fallback: ``CLAWPM_JUDGE_FALLBACK_CMD`` env → ``DEFAULT_JUDGE_FALLBACK_CMD``
+    (local model). Setting the env var to the empty string DISABLES the
+    fallback (returns ``None``).
+    """
+    if judge_cmd_override:
+        primary = shlex.split(judge_cmd_override)
+    else:
+        env_cmd = os.environ.get("CLAWPM_JUDGE_CMD")
+        primary = shlex.split(env_cmd) if env_cmd else list(DEFAULT_JUDGE_CMD)
+
+    fb_env = os.environ.get("CLAWPM_JUDGE_FALLBACK_CMD")
+    if fb_env is not None:
+        # Explicit empty string => fallback disabled.
+        fallback = shlex.split(fb_env) if fb_env.strip() else None
+    else:
+        fallback = list(DEFAULT_JUDGE_FALLBACK_CMD)
+    return primary, fallback
+
+
+def make_judge_invoker(
+    judge_cmd_override: str | None = None,
+    cwd: Path | None = None,
+    enable_fallback: bool = True,
+) -> JudgeInvoker:
+    """Build a judge invoker: primary judge (``claude -p`` by default), with a
+    local-model fallback when the primary is UNAVAILABLE (not installed, or
+    non-zero exit — broken / auth / quota).
+
+    A primary *timeout* does NOT fall back — it re-raises so the caller's
+    existing fail-open path handles it and the Stop-hook timeout budget stays
+    accurate (the fallback would otherwise double the latency). When the
+    fallback fires it is announced on stderr AND the returned invoker's
+    ``fallback_used`` attribute is set True, so callers can persist a durable
+    degradation marker (see ``_annotate_fallback``). If both fail, a combined
+    error is raised. All errors subclass ``RuntimeError`` so existing
+    ``except RuntimeError`` handlers keep working.
+
+    ``enable_fallback=False`` forces primary-only — used for the agent-dispatch
+    SUBAGENT runner, where falling back would mean a local text model
+    *performs the work* (its output becomes the transcript) instead of a real
+    Claude Code agent honoring the worktree `.claude` hooks. Fallback is a
+    JUDGE concept (grade with whatever's available), never an execution one.
+    """
+    primary, fallback = _resolve_judge_cmds(judge_cmd_override)
+    if not enable_fallback:
+        fallback = None
+
+    def _invoke(prompt: str) -> str:
+        try:
+            return _run_judge_cmd(primary, prompt, cwd=cwd)
+        except JudgeTimeout:
+            # Slow primary — surface, do not double the budget via fallback.
+            raise
+        except JudgeUnavailable as primary_exc:
+            if not fallback:
+                raise RuntimeError(
+                    f"Primary judge unavailable and fallback "
+                    f"disabled/unconfigured. {primary_exc}"
+                ) from primary_exc
+            sys.stderr.write(
+                f"clawpm judge: primary judge unavailable ({primary_exc}); "
+                f"falling back to local judge {fallback[0]!r}\n"
+            )
+            try:
+                out = _run_judge_cmd(fallback, prompt, cwd=cwd)
+            except RuntimeError as fb_exc:
+                raise RuntimeError(
+                    f"Both primary and fallback judges failed. "
+                    f"Primary: {primary_exc}  Fallback: {fb_exc}. "
+                    f"Install Claude Code or a local judge (e.g. ollama), or "
+                    f"set CLAWPM_JUDGE_CMD / CLAWPM_JUDGE_FALLBACK_CMD."
+                ) from fb_exc
+            _invoke.fallback_used = True
+            return out
+
+    _invoke.fallback_used = False
+    return _invoke
+
+
+# Durable marker folded into a verdict's reason when the local fallback graded
+# it — so the reflection JSONL (and `doctor`) can tell a healthy primary from
+# "every close is now being graded by the local fallback" (Codex P2). Greppable.
+FALLBACK_MARKER = "[JUDGE_FALLBACK_USED]"
+
+
+def _annotate_fallback(verdict: "JudgeVerdict", invoker: JudgeInvoker) -> "JudgeVerdict":
+    """Prefix ``FALLBACK_MARKER`` into ``verdict.reason`` if the invoker fell
+    back to the local judge for this grade. No-op for stub/primary invokers."""
+    if getattr(invoker, "fallback_used", False) and FALLBACK_MARKER not in verdict.reason:
+        return JudgeVerdict(
+            ok=verdict.ok,
+            reason=f"{FALLBACK_MARKER} {verdict.reason}",
+            impossible=verdict.impossible,
+        )
+    return verdict
+
+
+def _default_judge_invoker(prompt: str) -> str:
+    """Default judge: ``claude -p`` primary with the local-model fallback.
+
+    Thin back-compat wrapper over ``make_judge_invoker`` (which is what the
+    evaluate_* functions use directly so the resolution happens once per call
+    rather than per vote)."""
+    return make_judge_invoker()(prompt)
 
 
 JUDGE_PROMPT_TEMPLATE = """You are evaluating a stop-condition hook in Claude Code. Read the transcript carefully, then judge whether the rubric below is satisfied.
@@ -246,13 +380,223 @@ def evaluate_stop_condition(
 ) -> JudgeVerdict:
     """Evaluate whether the transcript satisfies the rubric.
 
-    ``invoker`` defaults to subprocess ``claude --print``; tests pass a
-    callable that returns canned output to avoid the subprocess dependency.
+    ``invoker`` defaults to ``claude --print`` (with local-model fallback);
+    tests pass a callable that returns canned output to avoid the subprocess
+    dependency. When the default invoker falls back to the local judge, the
+    verdict reason is tagged with ``FALLBACK_MARKER`` for durable visibility.
     """
-    invoker = invoker or _default_judge_invoker
+    invoker = invoker or make_judge_invoker()
     prompt = build_judge_prompt(rubric, transcript)
     raw = invoker(prompt)
-    return JudgeVerdict.parse(raw)
+    return _annotate_fallback(JudgeVerdict.parse(raw), invoker)
+
+
+# ===========================================================================
+# Adversarial confirm-close tier (CLAWP-041)
+# ===========================================================================
+#
+# The base judge above runs ONCE per Stop event and is deliberately fail-
+# closed against *malformed* output. Its remaining failure mode is fail-OPEN
+# via over-charitable reading: a single judge reads "I refactored the auth
+# module" and decides the criterion "auth tests pass" is satisfied, when no
+# test run actually appears in the transcript. One judge is a single point of
+# optimistic failure.
+#
+# The confirm-close tier hardens *only the terminal decision*. A false
+# ``block`` (ok=false) is self-correcting — the agent keeps working and re-
+# grades; cost ≈ one wasted loop. A false ``ok=true`` is terminal — the task
+# closes and unverified work ships. So the adversarial cost is spent ONLY at
+# the ok=true→close transition, never on the (common, many-per-task) block
+# path. The block path stays a single judge call.
+#
+# The refuter uses the SAME ``{ok, reason, impossible}`` contract and parser,
+# but an adversarial prompt: "a prior judge passed this — try to refute it;
+# default to refuted when uncertain." ``ok=false`` from the refuter means
+# "refuted → keep blocking"; ``ok=true`` means "tried and genuinely could not
+# refute → the close stands".
+
+_REFUTE_LENSES = {
+    "evidence": (
+        "Lens: EVIDENCE — focus on whether the transcript contains concrete, "
+        "quotable evidence (command output, diffs, test results, file "
+        "contents) for each claim, not merely an assertion that it was done."
+    ),
+    "correctness": (
+        "Lens: CORRECTNESS — focus on whether the claimed work is actually "
+        "correct and complete, not merely attempted or partially done."
+    ),
+    "reproduction": (
+        "Lens: REPRODUCTION — focus on whether an independent reviewer could "
+        "reproduce or verify each claimed outcome from what the transcript "
+        "actually shows."
+    ),
+}
+
+# Default single-vote lens. EVIDENCE is the sharpest against the over-
+# charitable-reading failure mode the tier exists to catch.
+_DEFAULT_REFUTE_LENS_ORDER = ["evidence", "correctness", "reproduction"]
+
+
+REFUTE_PROMPT_TEMPLATE = """You are a SKEPTICAL verifier performing an independent confirm-close check. A prior judge has claimed the rubric below is SATISFIED by the transcript. Your job is the OPPOSITE: try to REFUTE that claim.
+
+Prior judge's stated reason for passing: {prior_reason}
+
+{lens_instruction}
+
+Examine each rubric criterion against the transcript. You are hunting for ANY criterion the transcript CLAIMS to satisfy but does not actually EVIDENCE — e.g. the work says "tests pass" but no test run appears in the transcript; it says "implemented X" but no corresponding change is shown; a gradeable signal whose actual value is absent or contradicts the claim.
+
+Your response must be a JSON object with one of these shapes:
+- {{"ok": false, "reason": "<name the specific criterion that is claimed but not evidenced, and quote what is missing>"}}  — you refuted it; the close should stay BLOCKED.
+- {{"ok": true, "reason": "<confirm every criterion is genuinely evidenced, quoting the evidence>"}}  — ONLY if you genuinely cannot refute after trying.
+
+Bias: when in doubt, REFUTE (return {{"ok": false}}). A false pass closes the task and ships unverified work; a false refute merely costs one more iteration. Default to ok=false unless the evidence is unambiguous.
+
+=== RUBRIC ===
+{rubric}
+
+=== TRANSCRIPT ===
+{transcript}
+
+=== END ===
+
+Return ONLY the JSON object. No prose before or after."""
+
+
+def build_refutation_prompt(
+    rubric: str, transcript: str, prior_reason: str, lens: str = "evidence"
+) -> str:
+    """Compose the adversarial refutation prompt for one confirm-close vote.
+
+    ``lens`` selects the angle of attack so multi-vote refutation stays
+    independent rather than collapsing to one repeated check.
+    """
+    lens_instruction = _REFUTE_LENSES.get(lens, _REFUTE_LENSES["evidence"])
+    return REFUTE_PROMPT_TEMPLATE.format(
+        rubric=rubric.strip(),
+        transcript=transcript.strip(),
+        prior_reason=(prior_reason or "(none given)").strip(),
+        lens_instruction=lens_instruction,
+    )
+
+
+def evaluate_stop_condition_confirmed(
+    rubric: str,
+    transcript: str,
+    invoker: JudgeInvoker | None = None,
+    refute_votes: int = 1,
+) -> JudgeVerdict:
+    """Base grade + adversarial confirm-close on the ok=true→close transition.
+
+    Cheap path (the common case): runs the base judge once. If the base
+    verdict is NOT ``ok`` — including an ``impossible`` verdict — it is
+    returned verbatim and **the refuter is never invoked**. The block path
+    therefore costs exactly one judge call, unchanged from
+    ``evaluate_stop_condition``.
+
+    Confirm-close path (once per task, at close): when the base verdict is
+    ``ok=true``, spawn ``refute_votes`` adversarial refutation calls (lens-
+    varied so they are independent). The close is overturned to ``ok=false``
+    if AT LEAST HALF of the refuters that actually ran refute it
+    (``ceil(effective/2)``); with the default ``refute_votes=1`` a single
+    refutation overturns. **Ties overturn by design** — a 1-of-2 split is
+    doubt, and for a terminal close (a false ok=true ships unverified work)
+    doubt should keep the task open. This is a deliberate bias toward refuting,
+    NOT a strict >50% majority. A surviving close returns the base verdict.
+
+    Refuter-invoker errors are caught and treated as ABSTENTIONS — they are
+    dropped from BOTH the refutation count AND the threshold denominator, so
+    the threshold is computed over the refuters that actually returned a
+    verdict. This matters under multi-vote: with ``refute_votes=3`` and two
+    refuters erroring, a single surviving ``ok=false`` vote still overturns the
+    close (1 of 1 effective vote), rather than being outvoted by two dead
+    judges (the fail-open this avoids). Only a TOTAL refuter outage (every vote
+    errored) lets the base verdict stand — the right call versus trapping the
+    agent in an infinite block loop on a systematically broken refuter.
+
+    Any refuter error decorates the returned reason with a greppable
+    ``CONFIRM_CLOSE_DEGRADED`` token so a confirm-close that silently lost its
+    refutation pass is discoverable in the persisted iteration-event stream
+    (the base-judge error path writes its own doctor signal in the CLI; this is
+    the equivalent marker for refuter degradation).
+    """
+    invoker = invoker or make_judge_invoker()
+    base = evaluate_stop_condition(rubric, transcript, invoker=invoker)
+
+    # Block path (and impossible path): single call, refuter never runs.
+    if not base.ok:
+        return base  # already fallback-annotated by evaluate_stop_condition
+
+    votes = max(1, refute_votes)
+    refutations: list[str] = []
+    errors: list[str] = []
+    for i in range(votes):
+        lens = _DEFAULT_REFUTE_LENS_ORDER[i % len(_DEFAULT_REFUTE_LENS_ORDER)]
+        prompt = build_refutation_prompt(
+            rubric, transcript, base.reason, lens=lens
+        )
+        try:
+            raw = invoker(prompt)
+        except RuntimeError as exc:
+            # Abstention — dropped from refutations AND denominator below.
+            errors.append(f"{lens}:{exc}")
+            continue
+        vote = JudgeVerdict.parse(raw)
+        # Refuter ok=false == "refuted". Parse failures default to ok=false
+        # (see JudgeVerdict.parse), which correctly counts as a refutation —
+        # a malformed refuter response biases toward keeping the task open.
+        if not vote.ok:
+            refutations.append(vote.reason)
+
+    # Threshold over the refuters that ACTUALLY ran, not the configured count.
+    effective = votes - len(errors)
+    if effective <= 0:
+        # Total refuter outage → base verdict stands (fail-open vs infinite
+        # block loop), but surfaced for doctor via CONFIRM_CLOSE_DEGRADED.
+        return _annotate_fallback(
+            JudgeVerdict(
+                ok=True,
+                impossible=False,
+                reason=(
+                    f"{base.reason} [CONFIRM_CLOSE_DEGRADED: all {votes} "
+                    f"refuter(s) errored, none cast a vote: {errors[0]}]"
+                ),
+            ),
+            invoker,
+        )
+
+    # ceil(effective / 2): ties overturn, by design (bias toward refuting —
+    # NOT a strict >50% majority; see the function docstring).
+    threshold = -(-effective // 2)
+    if len(refutations) >= threshold:
+        first = refutations[0] if refutations else "(no reason captured)"
+        return _annotate_fallback(
+            JudgeVerdict(
+                ok=False,
+                impossible=False,
+                reason=(
+                    f"CONFIRM_CLOSE_REFUTED ({len(refutations)}/{effective} "
+                    f"refuters that ran overturned the close): {first}"
+                ),
+            ),
+            invoker,
+        )
+
+    # Close stands. If some (but not all) refuters errored, decorate so the
+    # partial degradation is doctor-discoverable.
+    if errors:
+        return _annotate_fallback(
+            JudgeVerdict(
+                ok=True,
+                impossible=False,
+                reason=(
+                    f"{base.reason} [CONFIRM_CLOSE_DEGRADED: "
+                    f"{len(refutations)}/{effective} refuted, {len(errors)} "
+                    f"refuter error(s) abstained: {errors[0]}]"
+                ),
+            ),
+            invoker,
+        )
+    return _annotate_fallback(base, invoker)
 
 
 def load_transcript_from_hook_input(hook_input: dict) -> str:

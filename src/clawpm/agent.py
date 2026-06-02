@@ -50,7 +50,6 @@ Design tradeoffs:
 
 from __future__ import annotations
 
-import shlex
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,6 +60,7 @@ from .dispatch import create_worktree, write_dispatch_settings
 from .judges.stop_condition import (
     JudgeVerdict,
     evaluate_stop_condition,
+    evaluate_stop_condition_confirmed,
 )
 from .models import (
     Actuals,
@@ -72,10 +72,6 @@ from .reflect import write_iteration_event, write_reflection_event
 from .rubric import render_rubric_markdown
 from .tasks import add_task, change_task_state
 
-
-# Default judge — matches judges.stop_condition.DEFAULT_JUDGE_CMD so the
-# wrapper and the Stop hook stay consistent.
-DEFAULT_JUDGE_CMD = ["claude", "--print", "--model", "claude-haiku-4-5"]
 
 JudgeInvoker = Callable[[str], str]
 
@@ -112,44 +108,20 @@ def _make_default_invoker(
     runs from the parent process's CWD and the worktree isolation is
     defeated. Defaults to current CWD when None (back-compat for
     callers that don't pass it).
+
+    Delegates to ``stop_condition.make_judge_invoker`` (one implementation, not
+    two) but with ``enable_fallback=False``: in ``agent dispatch`` this invoker
+    runs the SUBAGENT (its stdout becomes the transcript) as well as grading,
+    so a local-model fallback would mean the WORK gets done by `ollama` instead
+    of a real Claude Code agent honoring the worktree `.claude` hooks — and
+    could then be marked DONE. A missing/broken primary must BLOCK here, not
+    silently substitute. (The fallback's home is the separate Stop-hook judge.)
     """
-    import os as _os
+    from .judges.stop_condition import make_judge_invoker
 
-    if judge_cmd_override:
-        cmd = shlex.split(judge_cmd_override)
-    else:
-        env_cmd = _os.environ.get("CLAWPM_JUDGE_CMD")
-        cmd = shlex.split(env_cmd) if env_cmd else list(DEFAULT_JUDGE_CMD)
-
-    def _invoke(prompt: str) -> str:
-        try:
-            result = subprocess.run(
-                cmd,
-                input=prompt,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                timeout=60,
-                cwd=str(cwd) if cwd is not None else None,
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                f"Judge command not found: {cmd[0]!r}. Install Claude "
-                f"Code or set CLAWPM_JUDGE_CMD / pass "
-                f"--judge-cmd-override. Error: {exc}"
-            ) from exc
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                f"Judge timed out after {exc.timeout}s; prompt or "
-                "transcript may be too large for a single call"
-            ) from exc
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Judge exited {result.returncode}: {result.stderr[:500]}"
-            )
-        return result.stdout
-
-    return _invoke
+    return make_judge_invoker(
+        judge_cmd_override=judge_cmd_override, cwd=cwd, enable_fallback=False
+    )
 
 
 def _run_subagent(
@@ -193,6 +165,8 @@ def dispatch_agent(
     judge_cmd_override: Optional[str] = None,
     title: Optional[str] = None,
     init_codegraph: bool = True,
+    confirm_close: bool = False,
+    refute_votes: int = 1,
     agent_profile: Optional[str] = None,
 ) -> dict:
     """Run a parent-spawned subagent through the full clawpm enforcement loop.
@@ -359,12 +333,26 @@ def dispatch_agent(
         # callable. ``evaluate_stop_condition`` composes the
         # rubric+transcript prompt via ``build_judge_prompt`` and hands
         # it to the invoker; we get JudgeVerdict.parse() for free.
+        # Note (CLAWP-041): in this single-shot path a base-judge RuntimeError
+        # fails CLOSED (ok=False, below) — intentional, unlike the CLI Stop
+        # hook which fails open. A *refuter* error inside
+        # evaluate_stop_condition_confirmed abstains (fails open relative to
+        # the refutation pass) to avoid an infinite block loop. The mixed
+        # stance is deliberate; don't "reconcile" it without re-reading both.
         try:
-            verdict = evaluate_stop_condition(
-                rubric=rubric_markdown,
-                transcript=transcript,
-                invoker=invoker,
-            )
+            if confirm_close:
+                verdict = evaluate_stop_condition_confirmed(
+                    rubric=rubric_markdown,
+                    transcript=transcript,
+                    invoker=invoker,
+                    refute_votes=max(1, refute_votes),
+                )
+            else:
+                verdict = evaluate_stop_condition(
+                    rubric=rubric_markdown,
+                    transcript=transcript,
+                    invoker=invoker,
+                )
         except RuntimeError as exc:
             verdict = JudgeVerdict(
                 ok=False,
