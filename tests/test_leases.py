@@ -130,18 +130,40 @@ class TestExpiryDetection:
         assert lease.is_expired(later) is True
         assert [l.task_id for l in expired_leases(root, later)] == ["T"]
 
-    def test_heartbeat_resets_expiry_window(self, portfolio):
-        root = portfolio["root"]
-        grant_lease(root, "T", "test", ttl_seconds=60, fallback_policy=FallbackPolicy.FAIL)
-        granted = get_lease(root, "T", "test").granted_at
-        heartbeat(root, "T", "test")  # a fresh beat now (real-time, > granted)
-        lease = get_lease(root, "T", "test")
-        # 120s after the ORIGINAL grant, but the heartbeat is ~now, so the lease
-        # is only expired relative to the heartbeat, not the grant.
-        check = granted + timedelta(seconds=120)
-        # heartbeat ts is real "now" which is >> granted+120 in test wall-clock?
-        # No — wall clock barely moved. Assert against the heartbeat instead.
-        assert lease.last_heartbeat_at >= granted
+    def test_is_expired_keys_off_last_heartbeat_not_grant(self):
+        # The crux of "heartbeat resets the window": expiry is measured from the
+        # last heartbeat, not the grant. Construct directly for determinism.
+        from clawpm.leases import Lease, LeaseStatus
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        lease = Lease(
+            task_id="T", project_id="p", holder_id=None,
+            granted_at=t0, ttl_seconds=60,
+            fallback_policy=FallbackPolicy.FAIL,
+            last_heartbeat_at=t0 + timedelta(seconds=50),  # a beat 50s in
+            status=LeaseStatus.ACTIVE,
+        )
+        # 100s after grant (would be expired vs grant) but only 50s after the
+        # heartbeat → NOT expired. Proves the window resets on heartbeat.
+        assert lease.is_expired(t0 + timedelta(seconds=100)) is False
+        # 70s after the heartbeat → expired.
+        assert lease.is_expired(t0 + timedelta(seconds=120)) is True
+
+    def test_expiry_boundary_age_equals_ttl_not_expired(self):
+        from clawpm.leases import Lease, LeaseStatus
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        lease = Lease(task_id="T", project_id="p", holder_id=None,
+                      granted_at=t0, ttl_seconds=60, fallback_policy=FallbackPolicy.FAIL,
+                      last_heartbeat_at=t0, status=LeaseStatus.ACTIVE)
+        assert lease.is_expired(t0 + timedelta(seconds=60)) is False   # == ttl
+        assert lease.is_expired(t0 + timedelta(seconds=61)) is True    # > ttl
+
+    def test_lease_rejects_heartbeat_before_grant(self):
+        from clawpm.leases import Lease, LeaseStatus
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        with pytest.raises(ValueError):
+            Lease(task_id="T", project_id="p", holder_id=None,
+                  granted_at=t0, ttl_seconds=60, fallback_policy=FallbackPolicy.FAIL,
+                  last_heartbeat_at=t0 - timedelta(seconds=1), status=LeaseStatus.ACTIVE)
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +371,113 @@ class TestDoctorIntegration:
         assert any(task_id in a["target"] for a in applied)
         assert get_task(config, "test", task_id).state == TaskState.BLOCKED  # escalate
         assert get_lease(root, task_id, "test").active is False
+
+
+class TestCrossProjectIsolation:
+    """Codex CRITICAL: a project-scoped sweep must not reap another project's
+    leases. expired_leases/sweep take a project_id filter."""
+
+    def test_expired_leases_scoped_to_project(self, portfolio):
+        root = portfolio["root"]
+        grant_lease(root, "A", "projA", ttl_seconds=30, fallback_policy=FallbackPolicy.FAIL)
+        grant_lease(root, "B", "projB", ttl_seconds=30, fallback_policy=FallbackPolicy.FAIL)
+        now = get_lease(root, "A", "projA").granted_at + timedelta(seconds=90)
+        scoped = expired_leases(root, now, project_id="projA")
+        assert {l.task_id for l in scoped} == {"A"}
+        assert {l.task_id for l in expired_leases(root, now)} == {"A", "B"}
+
+    def test_sweep_scoped_does_not_touch_other_project(self, portfolio):
+        config, root = portfolio["config"], portfolio["root"]
+        # Real task in "test"; a phantom lease in "other" must be left alone.
+        task_id = _dispatched_task(config, in_state=TaskState.PROGRESS)
+        grant_lease(root, task_id, "test", ttl_seconds=30, fallback_policy=FallbackPolicy.ESCALATE)
+        grant_lease(root, "OTHER-1", "other", ttl_seconds=30, fallback_policy=FallbackPolicy.FAIL)
+        now = get_lease(root, task_id, "test").granted_at + timedelta(seconds=90)
+        actions = sweep(config, root, now=now, project_id="test")
+        assert [a["task_id"] for a in actions] == [task_id]
+        # The other project's lease is untouched — still active.
+        assert get_lease(root, "OTHER-1", "other").active is True
+
+
+class TestTransitionFailure:
+    """Codex HIGH: a transition that raises must NOT retire the lease as a
+    success — the task would be orphaned in PROGRESS forever."""
+
+    def test_transition_failure_keeps_lease_active(self, portfolio, monkeypatch):
+        config, root = portfolio["config"], portfolio["root"]
+        task_id = _dispatched_task(config, in_state=TaskState.PROGRESS)
+        grant_lease(root, task_id, "test", ttl_seconds=30, fallback_policy=FallbackPolicy.REQUEUE)
+        # Force the move to raise an I/O error (apply_fallback imports
+        # change_task_state from clawpm.tasks at call time).
+        def boom(*a, **k):
+            raise OSError("disk full")
+        monkeypatch.setattr("clawpm.tasks.change_task_state", boom)
+
+        now = get_lease(root, task_id, "test").granted_at + timedelta(seconds=90)
+        actions = sweep(config, root, now=now)
+        assert len(actions) == 1
+        assert actions[0]["transitioned"] is False
+        assert "disk full" in actions[0]["transition_error"]
+        # Lease NOT retired — still active so the next sweep retries.
+        assert get_lease(root, task_id, "test").active is True
+        # Task still in PROGRESS (the move failed) — not orphaned silently.
+        assert get_task(config, "test", task_id).state == TaskState.PROGRESS
+
+    def test_requeue_tears_down_dispatch_settings(self, portfolio):
+        # REQUEUE/ROUTE_SECONDARY with a target_dir tears down stale settings.
+        import json
+        from clawpm.dispatch import write_dispatch_settings, settings_path
+        config, root = portfolio["config"], portfolio["root"]
+        task_id = _dispatched_task(config, in_state=TaskState.PROGRESS)
+        target = root / "wt"
+        write_dispatch_settings(target, task_id, "test", portfolio_root=root)
+        assert settings_path(target).exists()
+        grant_lease(root, task_id, "test", ttl_seconds=30,
+                    fallback_policy=FallbackPolicy.REQUEUE,
+                    target_dir=target.as_posix())
+        now = get_lease(root, task_id, "test").granted_at + timedelta(seconds=90)
+        actions = sweep(config, root, now=now)
+        assert actions[0]["transitioned"] is True
+        assert not settings_path(target).exists()  # torn down
+
+
+class TestLeaseCLI:
+    """Codex test-gap: the lease command group was entirely untested."""
+
+    def _run(self, args):
+        from click.testing import CliRunner
+        from clawpm.cli import main
+        return CliRunner().invoke(main, ["--format", "json", *args])
+
+    def test_grant_list_release_roundtrip(self, portfolio):
+        import json
+        task_id = _dispatched_task(portfolio["config"])
+        r = self._run(["lease", "grant", "--project", "test", "--task", task_id,
+                       "--ttl", "300", "--fallback-policy", "escalate-to-human"])
+        assert r.exit_code == 0, r.output
+        r2 = self._run(["lease", "list", "--project", "test"])
+        leased = json.loads(r2.output)["data"]["leases"]
+        assert any(l["task_id"] == task_id and not l["expired"] for l in leased)
+        assert self._run(["lease", "release", "--project", "test", "--task", task_id]).exit_code == 0
+        leased2 = json.loads(self._run(["lease", "list", "--project", "test"]).output)["data"]["leases"]
+        assert task_id not in [l["task_id"] for l in leased2]
+
+    def test_grant_rejects_bad_ttl(self, portfolio):
+        task_id = _dispatched_task(portfolio["config"])
+        r = self._run(["lease", "grant", "--project", "test", "--task", task_id, "--ttl", "0"])
+        assert r.exit_code == 1
+
+    def test_sweep_dry_run_does_not_mutate(self, portfolio):
+        config = portfolio["config"]
+        task_id = _dispatched_task(config, in_state=TaskState.PROGRESS)
+        # ttl=1 + sleep so it's genuinely expired against wall-clock.
+        grant_lease(portfolio["root"], task_id, "test", ttl_seconds=1, fallback_policy=FallbackPolicy.ESCALATE)
+        import time; time.sleep(1.1)
+        r = self._run(["lease", "sweep", "--dry-run"])
+        assert r.exit_code == 0
+        # dry-run must NOT move the task.
+        assert get_task(config, "test", task_id).state == TaskState.PROGRESS
+        assert get_lease(portfolio["root"], task_id, "test").active is True
 
 
 class TestPolicyParsing:

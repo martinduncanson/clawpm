@@ -1042,9 +1042,7 @@ def project_doctor(
     try:
         from .leases import expired_leases as _expired_leases
         _now_doc = datetime.now(timezone.utc)
-        for _l in _expired_leases(config.portfolio_root, _now_doc):
-            if project_id and _l.project_id != project_id:
-                continue
+        for _l in _expired_leases(config.portfolio_root, _now_doc, project_id=project_id):
             _age = int((_now_doc - _l.last_heartbeat_at).total_seconds())
             expired_lease_findings.append({
                 "task_id": _l.task_id,
@@ -1054,7 +1052,14 @@ def project_doctor(
                 "fallback_policy": _l.fallback_policy.value,
                 "suggested_action": "run `clawpm lease sweep` (or `clawpm doctor --apply`)",
             })
-    except Exception:
+    except Exception as _lease_exc:
+        # A diagnostic command must declare its blind spots, never imply "clean"
+        # when it couldn't check (Codex/silent-failure). Surface as an issue.
+        issues.append({
+            "level": "warning", "scope": "leases",
+            "message": f"could not evaluate dispatch leases: "
+                       f"{type(_lease_exc).__name__}: {_lease_exc}",
+        })
         expired_lease_findings = []
 
     # Build final output
@@ -1102,19 +1107,25 @@ def project_doctor(
             )
 
             # CLAWP-039: expired-lease fallback is a deterministic remediation
-            # arm. Apply it here so `doctor --apply` reaps dead holders.
+            # arm. Apply it here so `doctor --apply` reaps dead holders. SCOPE
+            # the sweep to project_id so a project-scoped run never reaps another
+            # project's leases (cross-project isolation — Codex critical).
             if expired_lease_findings and not dry_run:
                 from .leases import sweep as _lease_sweep
-                for _act in _lease_sweep(config, config.portfolio_root):
-                    applied.append({
-                        "class": "lease-expired",
-                        "target": f"{_act['task_id']} ({_act['project_id']})",
-                        "result": (
-                            f"{_act['policy']} -> {_act['resulting_state']}"
-                            if not _act.get("retired_without_fallback")
-                            else f"retired (task already {_act['resulting_state']})"
-                        ),
-                    })
+                for _act in _lease_sweep(config, config.portfolio_root, project_id=project_id):
+                    target = f"{_act['task_id']} ({_act['project_id']})"
+                    if _act.get("retired_without_fallback"):
+                        applied.append({"class": "lease-expired", "target": target,
+                                        "result": f"retired (task already {_act['resulting_state']})"})
+                    elif _act.get("transitioned"):
+                        applied.append({"class": "lease-expired", "target": target,
+                                        "result": f"{_act['policy']} -> {_act['resulting_state']}"})
+                    else:
+                        # Transition failed — lease left ACTIVE for retry, NOT a
+                        # success. Surface it as skipped, never as [APPLIED].
+                        apply_skipped.append({"class": "lease-expired", "target": target,
+                                             "reason": f"transition failed ({_act.get('transition_error')}); "
+                                                       "lease kept active for retry"})
             elif expired_lease_findings and dry_run:
                 for _f in expired_lease_findings:
                     apply_skipped.append({
@@ -2353,12 +2364,17 @@ def tasks_dispatch(
     # two no-daemon expiry detectors (the other is `clawpm doctor`). A holder
     # that died is reaped here, on the next dispatch, instead of lingering.
     swept = []
+    sweep_error = None
     if lease_ttl is not None:
         from .leases import sweep as _lease_sweep
         try:
             swept = _lease_sweep(config, config.portfolio_root)
-        except Exception:
+        except Exception as exc:
+            # A sweep failure must not block the dispatch (the user's actual
+            # intent), but must not be silent either — else `leases_swept: 0`
+            # hides a broken janitor (Codex/silent-failure).
             swept = []
+            sweep_error = f"{type(exc).__name__}: {exc}"
 
     try:
         path = write_dispatch_settings(
@@ -2407,6 +2423,7 @@ def tasks_dispatch(
             "lease_ttl": lease_ttl,
             "fallback_policy": fallback_policy if lease_ttl is not None else None,
             "leases_swept": len(swept),
+            "sweep_error": sweep_error,
         },
         fmt=fmt,
     )

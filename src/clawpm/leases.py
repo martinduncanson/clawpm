@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -37,6 +37,17 @@ from typing import Optional
 from .concurrency import append_jsonl_line
 
 LEASE_REGISTRY_FILENAME = "leases.jsonl"
+
+
+class LeaseStatus(str, Enum):
+    """Lifecycle status of a lease, derived from its latest event.
+
+    Enum (not a bare string) so a typo in the replay state machine is a
+    construction error, not a silent invariant break (Codex/type-review)."""
+
+    ACTIVE = "active"        # latest event is granted or heartbeat
+    RELEASED = "released"    # clean completion — retired, no fallback
+    REASSIGNED = "reassigned"  # expiry detected, fallback applied (terminal)
 
 
 class FallbackPolicy(str, Enum):
@@ -86,23 +97,31 @@ class Lease:
     ttl_seconds: int
     fallback_policy: FallbackPolicy
     last_heartbeat_at: datetime
-    status: str
+    status: LeaseStatus
     target_dir: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        # Boundary check: replay is the only constructor, so these guard the
+        # event-stream → snapshot projection rather than trusting it blindly.
+        if self.ttl_seconds <= 0:
+            raise ValueError(f"Lease ttl_seconds must be positive, got {self.ttl_seconds}")
+        if self.last_heartbeat_at < self.granted_at:
+            raise ValueError("Lease last_heartbeat_at cannot precede granted_at")
 
     @property
     def active(self) -> bool:
-        return self.status == "active"
+        return self.status is LeaseStatus.ACTIVE
 
     def is_expired(self, now: datetime) -> bool:
-        """True iff active AND no heartbeat within the TTL window."""
+        """True iff active AND no heartbeat within the TTL window.
+
+        Boundary: ``age == ttl`` is NOT expired (strict ``>``)."""
         if not self.active:
             return False
         age = (now - self.last_heartbeat_at).total_seconds()
         return age > self.ttl_seconds
 
     def expires_at(self) -> datetime:
-        from datetime import timedelta
-
         return self.last_heartbeat_at + timedelta(seconds=self.ttl_seconds)
 
 
@@ -265,7 +284,7 @@ def _replay(portfolio_root: Path) -> dict[tuple[str, str], Lease]:
                 ttl_seconds=int(ev.get("ttl_seconds", 0)) or 1,
                 fallback_policy=policy,
                 last_heartbeat_at=ts,
-                status="active",
+                status=LeaseStatus.ACTIVE,
                 target_dir=ev.get("target_dir"),
             )
         elif action == _HEARTBEAT:
@@ -275,11 +294,11 @@ def _replay(portfolio_root: Path) -> dict[tuple[str, str], Lease]:
         elif action == _RELEASED:
             lease = leases.get(key)
             if lease:
-                lease.status = "released"
+                lease.status = LeaseStatus.RELEASED
         elif action == _REASSIGNED:
             lease = leases.get(key)
             if lease:
-                lease.status = "reassigned"
+                lease.status = LeaseStatus.REASSIGNED
     return leases
 
 
@@ -294,9 +313,17 @@ def get_lease(
     return _replay(portfolio_root).get((task_id, project_id))
 
 
-def expired_leases(portfolio_root: Path, now: datetime) -> list[Lease]:
-    """Active leases whose last heartbeat is older than their TTL."""
-    return [l for l in active_leases(portfolio_root) if l.is_expired(now)]
+def expired_leases(
+    portfolio_root: Path, now: datetime, project_id: Optional[str] = None
+) -> list[Lease]:
+    """Active leases whose last heartbeat is older than their TTL.
+
+    ``project_id`` scopes the result — pass it so a project-scoped doctor run
+    never reaps another project's leases (cross-project isolation)."""
+    return [
+        l for l in active_leases(portfolio_root)
+        if l.is_expired(now) and (project_id is None or l.project_id == project_id)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -352,18 +379,37 @@ def apply_fallback(config, portfolio_root: Path, lease: Lease, now: datetime) ->
     )
 
     transitioned = False
+    transition_error: Optional[str] = None
     try:
+        # Only genuine I/O (the file move) raises out of change_task_state; the
+        # soft-fail paths (rollup gate, missing dir) return None. Catch ONLY
+        # OSError — a programming bug (KeyError, AttributeError) must propagate,
+        # not masquerade as a stuck holder.
         result = change_task_state(
             config, lease.project_id, lease.task_id, target_state, note=note
         )
         transitioned = result is not None
-    except Exception:
-        # A transition failure must not abort the whole sweep nor leave the
-        # lease active forever — record the reassignment regardless.
-        transitioned = False
+    except OSError as exc:
+        transition_error = f"{type(exc).__name__}: {exc}"
+
+    if not transitioned:
+        # CRITICAL (Codex/silent-failure): do NOT retire the lease as a success
+        # when the task did not actually move — that would orphan it in PROGRESS
+        # forever (lease terminal, never re-swept). Leave the lease ACTIVE so the
+        # next sweep retries, and surface the failure so it isn't silent.
+        return {
+            "task_id": lease.task_id,
+            "project_id": lease.project_id,
+            "policy": lease.fallback_policy.value,
+            "resulting_state": (current.state.value if current else "missing"),
+            "transitioned": False,
+            "transition_error": transition_error or "change_task_state returned None",
+        }
 
     # REQUEUE/ROUTE_SECONDARY: best-effort teardown of stale dispatch settings
-    # so the task can be cleanly re-dispatched. Never fatal.
+    # so the task can be cleanly re-dispatched. Never fatal — but the failure is
+    # captured in the summary so a persistent leak is observable.
+    teardown_failed: Optional[str] = None
     if lease.fallback_policy in (FallbackPolicy.REQUEUE, FallbackPolicy.ROUTE_SECONDARY) and lease.target_dir:
         try:
             from .dispatch import teardown_dispatch_settings
@@ -374,8 +420,8 @@ def apply_fallback(config, portfolio_root: Path, lease: Lease, now: datetime) ->
                 portfolio_root=portfolio_root,
                 project_id=lease.project_id,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            teardown_failed = f"{type(exc).__name__}: {exc}"
 
     _record_reassigned(
         portfolio_root,
@@ -385,23 +431,35 @@ def apply_fallback(config, portfolio_root: Path, lease: Lease, now: datetime) ->
         state_name.lower(),
         lease.last_heartbeat_at,
     )
-    return {
+    summary = {
         "task_id": lease.task_id,
         "project_id": lease.project_id,
         "policy": lease.fallback_policy.value,
         "resulting_state": state_name.lower(),
-        "transitioned": transitioned,
+        "transitioned": True,
     }
+    if teardown_failed:
+        summary["teardown_failed"] = teardown_failed
+    return summary
 
 
-def sweep(config, portfolio_root: Path, now: Optional[datetime] = None) -> list[dict]:
+def sweep(
+    config,
+    portfolio_root: Path,
+    now: Optional[datetime] = None,
+    project_id: Optional[str] = None,
+) -> list[dict]:
     """Detect every expired lease and apply its fallback. Returns one summary
     dict per lease acted on (empty if nothing expired). The no-daemon expiry
     detector: call from ``doctor`` and opportunistically on ``tasks dispatch``.
+
+    ``project_id`` scopes the sweep — pass it from a project-scoped ``doctor``
+    run so the remediation matches the detection and never reaps another
+    project's leases (cross-project isolation).
     """
     if now is None:
         now = datetime.now(timezone.utc)
     actions: list[dict] = []
-    for lease in expired_leases(portfolio_root, now):
+    for lease in expired_leases(portfolio_root, now, project_id=project_id):
         actions.append(apply_fallback(config, portfolio_root, lease, now))
     return actions
