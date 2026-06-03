@@ -167,3 +167,39 @@ These aren't features — they're constraints that should hold across all future
 | 1.8 | `clawpm project announce` + auto-run on init; doctor Check d (commit-vs-work_log drift) + Check e (missing clawpm-requirement marker in CLAUDE.md/AGENTS.md/README.md) | 2026-05-13 |
 | 1.8.1 | `clawpm issues add` accepts `observation` type + repeatable `--tag`; `issues list` filters by `--type` and `--tag` (matches the form already documented in global CLAUDE.md doctrine) | 2026-05-15 |
 | 2 (gated) | Calibration analytics (lookup/calibration/process-lessons/field-usage/project reflect) | After 2026-06-05 review |
+
+---
+
+## Rename / rebrand — `clawpm` → ?  (deferred, stub — 2026-06-03)
+
+**Trigger:** a public-launch / v2 release boundary. NOT mid-stream — `clawpm` has
+equity (ClawHub, the skill name, CLI entry point, `CLAUDE.md`/`AGENTS.md` refs,
+and the legible `malphas-gh` lineage). Only worth doing at a clean boundary, with
+a `clawpm` alias shim for a deprecation window. The upstream fork stays `clawpm`
+(can't rename someone else's project) — a rename applies only to *our* distribution.
+
+**Why:** `clawpm` is a portmanteau of open**claw** + pm — it names the *origin*, not
+the *job*, and "pm" undersells what it now is (a goals-as-contracts subagent-dispatch
+substrate with crash-safe leases + calibration, durable across sessions/agents).
+
+**The naming pattern that worked for the siblings** (the bar to clear): steal a
+vivid term from an *adjacent domain* whose literal meaning *is* the function.
+- **AgentICQ** = ICQ "I Seek You" → an agent seeks another by capability.
+- **slugline** = the screenplay scene-header term, borrowed for a content/identifier tool.
+
+**Candidates floated 2026-06-03 — operator not sold on any; keep brainstorming:**
+- `throughline` — screenwriting (the thread unifying scenes = sessions into one arc); rhymes with slugline on `-line`. Best *continuity* fit.
+- `callsheet` — film production (daily crew dispatch doc); ephemeral, so slight mismatch with "durable".
+- `docket` — law/scheduling (literal "list of work"); short, plain.
+- `quartermaster` — military logistics (assign / track / reclaim-from-the-fallen = dispatch+leases+fallback); precise but long.
+- `almanac` — data + predictions over time (the calibration angle); misses dispatch.
+
+**Sketch:** revisit fresh. Themes to mine that the above under-explore — *persistence/
+memory* (cairn, lodestar, palimpsest, throughline), *dispatch/logistics* (quartermaster,
+foreman, dispatch, relay), *ledger/record* (docket, manifest, ledger), *calibration*
+(almanac). The two identities to weigh: **continuity** (survives sessions) vs **dispatch**
+(coordinate an agent crew). Pick which the brand should foreground first.
+
+**Inspiration:** the AgentICQ + slugline naming sensibility (adjacent-domain term,
+exact functional pun). Keep CLI ergonomics in mind — `clawpm` is 6 chars typed
+constantly; a long name needs a short alias.
