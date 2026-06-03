@@ -2,9 +2,22 @@
 
 Filesystem-first task tracker for AI agents (and humans). Persistent across sessions, JSON-first, multi-project. Survives compaction, subagent dispatch, and reboots.
 
-> Forked from [`malphas-gh/clawpm`](https://github.com/malphas-gh/clawpm). Adds: Windows TOML/backslash bug fix, `scope:` field + `clawpm conflicts` for parallel-agent safety, Phase 1 reflection layer (predictions vs actuals), Cowork bootstrap skill, Codex AGENTS.md template, Workflow Integrations docs.
+> Forked from [`malphas-gh/clawpm`](https://github.com/malphas-gh/clawpm). Adds: Windows TOML/backslash bug fix, `scope:` field + `clawpm conflicts` for parallel-agent safety, the reflection/calibration layer (predictions → actuals → learned ratios), **verifiable goals** (`--success-criteria` + a Stop-hook judge), **subagent dispatch** with **crash-safe leases**, cross-platform locked JSONL appends, Cowork bootstrap skill, Codex AGENTS.md template.
 
 [![ClawHub](https://img.shields.io/badge/ClawHub-clawpm-blue)](https://clawhub.ai/malphas-gh/clawpm)
+
+> **Status:** actively dogfooded. Core loop (add/start/done, scope, work-log, reflection) is stable. The agentic layer — rubric + Stop-hook judge, `tasks dispatch` / `agent dispatch`, crash-safe leases, `reflect summarize`/`suggest` — is shipped and tested. `clawpm serve` (web UI) is utilitarian. Python 3.11+. No database, no daemon.
+
+---
+
+## Table of contents
+
+- [What it is](#what-it-is) · [Why use it](#why-use-it) · [5-minute quickstart](#5-minute-quickstart)
+- [When to use it](#when-to-use-it-and-when-not) · [Common workflows](#common-workflows)
+- [**Verifiable goals & crash-safe dispatch**](#verifiable-goals--crash-safe-dispatch) — the agentic layer
+- [All commands](#all-commands) · [How it works](#how-it-works-architecture-in-30-seconds)
+- [Installation](#installation) · [Configuration](#configuration) · [Troubleshooting](#troubleshooting)
+- [Claude Code / Codex integration](#integration-with-claude-code) · [License](#license)
 
 ---
 
@@ -140,7 +153,7 @@ clawpm done CLAWP-042 \
     --meta-reflect "should have run a dry-run dump first to surface the conflicts; will do that next time"
 ```
 
-clawpm computes the deltas (duration ratio, scope overrun, complexity match, etc.) and writes a structured reflection event to `~/clawpm/reflections/<task-id>.jsonl`. Over weeks, you build a corpus you can mine: "tasks I labeled `m` complexity actually averaged 1.8× duration." `clawpm reflect summarize` and `clawpm reflect suggest` (Phase 2) will surface these patterns automatically — currently stub commands. `clawpm reflect history-import --source <dir>` scans historical agent log files for task-ID mentions and is implemented.
+clawpm computes the deltas (duration ratio, scope overrun, complexity match, etc.) and writes a structured reflection event to `~/clawpm/reflections/<task-id>.jsonl`. Over weeks, you build a corpus you can mine: "tasks I labeled `m` complexity actually averaged 1.8× duration." `clawpm reflect summarize` quantifies actual-vs-predicted duration ratios bucketed by complexity / confidence / agent-profile, and `clawpm reflect suggest` deflates a fresh gut estimate by the learned median ratio (falling back to the global ratio when a bucket has <5 samples). `clawpm reflect history-import --source <dir>` back-fills the corpus by scanning historical agent log files for task-ID mentions.
 
 v1.5 extends this with **applied-science framing**: `--success-criteria` (measurable performance contracts), `--predict-approach` (architectural choice), `--unknowns` (meta-curiosity), `--confidence` (1-5), `--reference-task` (outside-view anchoring), and `--pre-mortem` (Klein's pre-mortem). At completion, `--process-lesson` and `--surprise` (fixed taxonomy) close the recursive meta-loop. See `skills/clawpm/SKILL.md` for the full picture.
 
@@ -156,6 +169,53 @@ clawpm context
 ```
 
 This single command is enough briefing for an agent (or you) to resume cold.
+
+## Verifiable goals & crash-safe dispatch
+
+This is what separates clawpm from a task list. A task isn't just a title — it can be a **verifiable contract** that an independent judge enforces, dispatched to a subagent that *cannot* declare itself done until the contract is met, with a **lease** that detects the subagent dying mid-task.
+
+### Goals as contracts (`--success-criteria`)
+
+Frame a task as a measurable goal, not a vague intent. "Add validation" → "write tests for invalid inputs, then make them pass."
+
+```bash
+clawpm tasks add -t "Migrate auth to JWT" \
+    --success-criteria "P95 login latency < 200ms" \
+    --success-criteria "session-table writes drop >= 50%"
+clawpm tasks emit-rubric CLAWP-042 --format markdown   # render the gradeable rubric
+```
+
+### The Stop-hook judge
+
+When a task is dispatched, a small LLM judge reads the subagent's transcript against the rubric and returns `{ok, reason}` / `{ok:false, impossible}` — the same contract the official Claude Code `/goal` evaluator uses. Wired as a **Stop hook**, the subagent literally cannot terminate until the rubric is satisfied *or* impossibility is independently confirmed. The judge is `claude --print` by default (override with `CLAWPM_JUDGE_CMD`) and **falls back to a local model** (Ollama) when the primary is unavailable, so grading keeps working subscription-cost-free. High-confidence closes can be gated by an **adversarial confirm-close** pass (`--confirm-close`): a refutation vote tries to disprove `ok=true` before the task closes, because a false "done" is the one terminal error.
+
+### Subagent dispatch
+
+```bash
+clawpm tasks dispatch CLAWP-042 --worktree      # write hook-wired .claude/settings.local.json into an isolated worktree
+clawpm agent dispatch --prompt "…" --rubric-criteria "…"   # one-command spawn + grade + persist verdict
+```
+
+`dispatch` instruments a directory so a hand-launched (or Task-tool-spawned) subagent gets the Stop-hook rubric gate, a PostToolUse work-log/heartbeat, and its rubric injected at SessionStart — integration by construction, the subagent never needs to know clawpm exists.
+
+### Crash-safe leases
+
+A dispatched holder can die mid-task — a crashed session, a killed worktree — and stall forever with no daemon to notice. A **lease** fixes that:
+
+| Stage | What happens |
+|---|---|
+| `grant` | `tasks dispatch --lease-ttl 1800` grants a lease (TTL + fallback policy) |
+| `heartbeat` | every code-touching tool use resets the TTL (wired to the PostToolUse hook) |
+| `expiry` | a lazy **sweep** — run by `clawpm doctor` and on the next `tasks dispatch` — detects leases past TTL |
+| `fallback` | the task transitions per policy: `requeue` / `route-secondary` / `escalate-to-human` / `fail` |
+
+```bash
+clawpm tasks dispatch CLAWP-042 --worktree --lease-ttl 1800 --fallback-policy requeue
+clawpm lease list                 # active leases + expiry + policy
+clawpm lease sweep                # reap dead holders now (or let doctor do it)
+```
+
+No daemon: expiry is detected lazily on sweep, never by a timer — preserving the filesystem-first / no-daemon thesis. Append-only `leases.jsonl`, replayed to reconstruct state. (The lease model is design-donored from [agenticq](https://github.com/martinduncanson/agenticq); see `docs/playbooks/` for dispatch patterns.)
 
 ## All commands
 
@@ -210,6 +270,25 @@ clawpm conflicts --task CLAWP-042            # use task's declared scope
 
 Always exits 0. Read the JSON `conflicts` array — empty = safe.
 
+### Dispatch, judge & leases (the agentic layer)
+
+```bash
+clawpm tasks emit-rubric <id> [--format markdown]   # render a task's success-criteria as a gradeable rubric
+clawpm tasks dispatch <id> [--worktree] [--confirm-close] \
+       [--lease-ttl <secs>] [--fallback-policy requeue|route-secondary|escalate-to-human|fail]
+clawpm agent dispatch --prompt "..." --rubric-criteria "..." [--confirm-close]
+                                   # spawn a subagent, grade vs rubric, persist the verdict
+clawpm hook eval-stop --task <id>  # the Stop-hook judge (invoked by dispatched settings; CLAWPM_JUDGE_CMD overridable)
+
+clawpm lease grant --task <id> --ttl <secs> --fallback-policy <p>
+clawpm lease list [--project <p>]  # active leases, expiry, policy
+clawpm lease heartbeat --task <id> # liveness beat (the PostToolUse hook calls this)
+clawpm lease release --task <id>   # clean completion — never swept
+clawpm lease sweep [--dry-run]     # reap expired leases (doctor runs this too)
+```
+
+See [Verifiable goals & crash-safe dispatch](#verifiable-goals--crash-safe-dispatch) for the full picture.
+
 ### Work log
 
 ```bash
@@ -255,7 +334,11 @@ clawpm done <id> \
 
 A reflection event is written to `~/clawpm/reflections/<task-id>.jsonl` with predictions, actuals (computed from work log), and deltas (duration ratio, files-changed ratio, scope overrun/unused, complexity match).
 
-`clawpm reflect summarize/suggest` are Phase 2 stubs. `clawpm reflect history-import --source <dir>` (or `CLAWPM_HISTORY_SOURCE` env var) scans agent log files for task-ID mentions and emits an aggregate report — useful for back-filling reflections from session transcripts.
+```bash
+clawpm reflect summarize             # actual/predicted duration ratios, bucketed by complexity/confidence/agent
+clawpm reflect suggest --duration 2h # deflate a gut estimate by the learned median ratio
+clawpm reflect history-import --source <dir>   # back-fill the corpus from session transcripts
+```
 
 ### Web dashboard
 
@@ -271,7 +354,8 @@ Real-time view of blockers, in-flight tasks, projects. Quick-add forms. Pause/re
 ```bash
 clawpm setup                       # First-time portfolio creation
 clawpm setup --check               # Verify installation
-clawpm doctor                      # Health check (settings.toml, paths, etc.)
+clawpm doctor                      # Health check (settings.toml, paths, stale dispatches, expired leases)
+clawpm doctor --apply              # Run deterministic remediation arms (incl. reaping expired leases)
 clawpm doctor --check-codex        # Warn on projects without Codex GitHub app
 clawpm doctor --check-encoding     # AST-scan .py for cp1252-risk patterns
 clawpm version
@@ -285,8 +369,10 @@ Looking for a worked example portfolio to copy as a seed? See `examples/portfoli
 ~/clawpm/                                  ← portfolio root
 ├── portfolio.toml                         ← project registry, project_roots
 ├── work_log.jsonl                         ← append-only log of every state change
-├── reflections/                           ← per-task reflection events
+├── reflections/                           ← per-task reflection + iteration events
 │   └── CLAWP-042.jsonl
+├── dispatches.jsonl                        ← append-only dispatch registry (subagent targets)
+├── leases.jsonl                            ← append-only lease ledger (TTL/heartbeat/expiry)
 └── projects/                              ← legacy slot, mostly unused now
 
 <your project repo>/.project/              ← per-project state (committed to repo)
