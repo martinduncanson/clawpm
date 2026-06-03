@@ -49,7 +49,7 @@ Build T1–T4 **only when at least one of these is concretely true** — not spe
 
 If the dominant use is "clawpm task dispatched into Claude Code," **do not build this** — the
 native `Workflow` tool already covers it, and the better investment is the authoring-pattern
-playbook (`docs/playbooks/dispatch-fan-out.md`), not this subprocess bridge. Re-read the premise
+playbook (`playbooks/dispatch-fan-out.md`), not this subprocess bridge. Re-read the premise
 section above and confirm you're not adding redundant plumbing.
 
 ## One-line goal (once the trigger is met)
@@ -213,4 +213,4 @@ runtime.** They required no clawpm change — clawpm was the source. Do not re-d
 - Worked shapes: `examples/small-model-review.workflow.js`, `examples/plan-verify-converge.workflow.js`.
 - clawpm side: `src/clawpm/dispatch.py`, `src/clawpm/judges/stop_condition.py`,
   `src/clawpm/concurrency.py`, `src/clawpm/agent.py` (judge invoker resolution).
-- Companion playbook (build this regardless of the trigger): `docs/playbooks/dispatch-fan-out.md`.
+- Companion playbook (build this regardless of the trigger): `playbooks/dispatch-fan-out.md`.

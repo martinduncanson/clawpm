@@ -6,7 +6,7 @@ parallel decompose→verify→converge workflow, using the **harness's native fa
 **Primitives:** CLAWP-016 (rubric), CLAWP-017 (Stop-hook condition evaluator), CLAWP-018
 (subagent dispatch) + the agent harness's built-in workflow/fan-out tool.
 **Sibling playbook:** `docs/playbooks/codex-fix-dispatch.md` (iteration-loop dispatch).
-**Companion spec:** `WORKFLOW-RUNTIME-INTEGRATION.md` (the *out-of-harness* path — only when
+**Companion spec:** `../WORKFLOW-RUNTIME-INTEGRATION.md` (the *out-of-harness* path — only when
 there's no fan-out-capable harness in the loop).
 
 ## The distinction this playbook turns on
@@ -17,7 +17,7 @@ any equivalent parallel/pipeline orchestrator), a dispatched worker can fan out 
 no clawpm code change, no Node runtime, no subprocess bridge. This playbook is the authoring
 guidance for that case. It is the **default** answer for fan-out-shaped dispatched tasks.
 
-Reach for the out-of-harness runtime (`WORKFLOW-RUNTIME-INTEGRATION.md`) **only** when there is
+Reach for the out-of-harness runtime (`../WORKFLOW-RUNTIME-INTEGRATION.md`) **only** when there is
 no fan-out-capable harness: local-model dispatch, headless cron/CI, a non-Claude harness without
 the primitive. Don't build subprocess plumbing to get a capability the worker already has.
 
@@ -124,7 +124,7 @@ Teardown is the standard `clawpm tasks teardown-dispatch <CLAWP-id>` on completi
 
 1. **The harness must actually have a fan-out primitive.** If the worker runs in a harness
    without one (local model, bare CLI), this playbook doesn't apply — that's the
-   `WORKFLOW-RUNTIME-INTEGRATION.md` case. Confirm the harness capability before choosing this
+   `../WORKFLOW-RUNTIME-INTEGRATION.md` case. Confirm the harness capability before choosing this
    pattern.
 2. **Fan-out cost is real.** Multi-vote refutation multiplies model calls per finding. On a
    subscription this is rate-limit pressure; against an API key it's money. Bound the fan width
@@ -139,4 +139,4 @@ Teardown is the standard `clawpm tasks teardown-dispatch <CLAWP-id>` on completi
 - `F:/git/workflows/docs/layer-b-authoring-guidance.md` — the authoring doctrine these shapes come from.
 - `src/clawpm/judges/stop_condition.py` — the rubric gate the fan-out runs underneath.
 - `docs/playbooks/codex-fix-dispatch.md` — the iteration-loop sibling pattern.
-- `WORKFLOW-RUNTIME-INTEGRATION.md` — the out-of-harness path, for when no fan-out primitive exists.
+- `../WORKFLOW-RUNTIME-INTEGRATION.md` — the out-of-harness path, for when no fan-out primitive exists.

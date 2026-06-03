@@ -120,4 +120,3 @@ Propose all predictions in one block, then wait for confirm/edit. For operator-d
 - Roadmap: `ROADMAP.md`
 - Codex skill: `~/.agents/skills/clawpm/SKILL.md`
 - Claude Code skill: `~/.claude/skills/clawpm/skills/clawpm/SKILL.md`
-- Upstream-brief (refactors & additions): `UPSTREAM-BRIEF.md`
