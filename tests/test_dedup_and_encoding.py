@@ -16,9 +16,6 @@ CLAWP-045.
 from __future__ import annotations
 
 import json
-import os
-import shutil
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -33,11 +30,14 @@ SRC_ROOT = Path(clawpm.__file__).resolve().parent
 
 
 @pytest.fixture
-def worktree_portfolio():
+def worktree_portfolio(tmp_path, monkeypatch):
     """Portfolio with three sibling dirs all carrying id='alpha' — simulates
-    the ``foo / foo-worktree-a / foo-worktree-b`` worktree pattern."""
-    temp_dir = tempfile.mkdtemp(prefix="clawpm_dedup_test_")
-    portfolio_root = Path(temp_dir)
+    the ``foo / foo-worktree-a / foo-worktree-b`` worktree pattern.
+
+    Uses pytest's ``tmp_path`` (auto-cleaned) and ``monkeypatch`` (env auto-
+    restored even on setup failure) rather than manual tempfile + env backup."""
+    portfolio_root = tmp_path / "portfolio"
+    portfolio_root.mkdir()
 
     (portfolio_root / "portfolio.toml").write_text(
         f'portfolio_root = "{portfolio_root.as_posix()}"\n'
@@ -58,16 +58,8 @@ def worktree_portfolio():
 
     (portfolio_root / "work_log.jsonl").touch()
 
-    old_env = os.environ.get("CLAWPM_PORTFOLIO")
-    os.environ["CLAWPM_PORTFOLIO"] = str(portfolio_root)
-
+    monkeypatch.setenv("CLAWPM_PORTFOLIO", str(portfolio_root))
     yield portfolio_root
-
-    if old_env:
-        os.environ["CLAWPM_PORTFOLIO"] = old_env
-    else:
-        os.environ.pop("CLAWPM_PORTFOLIO", None)
-    shutil.rmtree(temp_dir)
 
 
 class TestProjectDedup:
@@ -91,7 +83,7 @@ class TestProjectDedup:
             f"Expected canonical dir 'alpha' to win, got '{alpha.project_dir.name}'"
         )
 
-    def test_fallback_is_deterministic_when_no_canonical_dir(self, tmp_path):
+    def test_fallback_is_deterministic_when_no_canonical_dir(self, tmp_path, monkeypatch):
         """When no sibling dir's name matches the project id, the chosen
         winner must be deterministic — sort by directory name before iterating
         so ``Path.iterdir()`` order doesn't decide which settings.toml wins."""
@@ -114,22 +106,15 @@ class TestProjectDedup:
                 encoding="utf-8",
             )
 
-        old_env = os.environ.get("CLAWPM_PORTFOLIO")
-        os.environ["CLAWPM_PORTFOLIO"] = str(portfolio_root)
-        try:
-            config = load_portfolio_config(portfolio_root)
-            projects = discover_projects(config)
-            beta = next(p for p in projects if p.id == "beta")
-            assert beta.project_dir is not None
-            assert beta.project_dir.name == "beta-pr", (
-                f"Expected sorted-first 'beta-pr' to win, got '{beta.project_dir.name}'. "
-                f"Path.iterdir() order is not guaranteed — discover_projects must sort."
-            )
-        finally:
-            if old_env:
-                os.environ["CLAWPM_PORTFOLIO"] = old_env
-            else:
-                os.environ.pop("CLAWPM_PORTFOLIO", None)
+        monkeypatch.setenv("CLAWPM_PORTFOLIO", str(portfolio_root))
+        config = load_portfolio_config(portfolio_root)
+        projects = discover_projects(config)
+        beta = next(p for p in projects if p.id == "beta")
+        assert beta.project_dir is not None
+        assert beta.project_dir.name == "beta-pr", (
+            f"Expected sorted-first 'beta-pr' to win, got '{beta.project_dir.name}'. "
+            f"Path.iterdir() order is not guaranteed — discover_projects must sort."
+        )
 
     def test_projects_list_json_has_no_duplicates(self, worktree_portfolio):
         runner = CliRunner()

@@ -2958,7 +2958,7 @@ def agent_context(ctx: click.Context, project_id: str | None, log_limit: int) ->
         if issues_file.exists():
             try:
                 open_issues = []
-                with open(issues_file, encoding="utf-8") as f:
+                with open(issues_file, encoding="utf-8", errors="replace") as f:
                     for line in f:
                         line = line.strip()
                         if line:
@@ -3165,7 +3165,7 @@ def log_tail(ctx: click.Context, project_id: str | None, limit: int, follow: boo
             
             if current_size > pos:
                 # New content - read from last position
-                with open(worklog_path, encoding="utf-8") as f:
+                with open(worklog_path, encoding="utf-8", errors="replace") as f:
                     f.seek(pos)
                     new_lines = f.read()
                     pos = f.tell()
