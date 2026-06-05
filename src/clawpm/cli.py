@@ -86,6 +86,21 @@ from .context import (
 )
 
 
+# cp1252-safe stdio (CLAWP-011): Windows consoles default to the cp1252 codec,
+# which cannot encode glyphs such as U+2192 and raises UnicodeEncodeError
+# mid-render. Reconfigure stdout/stderr to UTF-8 (errors="replace") so NO output
+# path -- echo args, --help text, command docstrings, tabulated rows -- can
+# crash, regardless of which glyph a future line introduces. This is the
+# root-cause fix the encoding_check scanner recommends; it supersedes
+# whack-a-mole glyph swapping. Guarded because redirected / wrapped streams
+# (e.g. click's CliRunner, a closed pipe) may lack reconfigure() or reject it.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, ValueError, OSError):
+    pass
+
+
 # Global format option
 pass_format = click.make_pass_decorator(OutputFormat, ensure=True)
 
@@ -2698,7 +2713,7 @@ def quick_next(ctx: click.Context, project_id: str | None, batch_mode: bool) -> 
                 for t in candidates:
                     click.echo(f"  - {t.id} [{t.state.value}] {t.title}")
                 if conflicts:
-                    click.echo("\nSCOPE CONFLICTS — cannot dispatch as a single batch:")
+                    click.echo("\nSCOPE CONFLICTS - cannot dispatch as a single batch:")
                     for c in conflicts:
                         click.echo(
                             f"  {c['task_a']} <-> {c['task_b']}: "
@@ -2933,7 +2948,7 @@ def agent_context(ctx: click.Context, project_id: str | None, log_limit: int) ->
         if issues_file.exists():
             try:
                 open_issues = []
-                with open(issues_file) as f:
+                with open(issues_file, encoding="utf-8") as f:
                     for line in f:
                         line = line.strip()
                         if line:
@@ -3001,7 +3016,7 @@ def resume_cmd(ctx: click.Context, project_id: str | None, no_cache: bool) -> No
     else:
         if status == "degraded":
             click.echo(
-                "[warning] resume judge unavailable — showing signals summary",
+                "[warning] resume judge unavailable - showing signals summary",
                 err=True,
             )
         elif status == "cached":
@@ -3140,7 +3155,7 @@ def log_tail(ctx: click.Context, project_id: str | None, limit: int, follow: boo
             
             if current_size > pos:
                 # New content - read from last position
-                with open(worklog_path) as f:
+                with open(worklog_path, encoding="utf-8") as f:
                     f.seek(pos)
                     new_lines = f.read()
                     pos = f.tell()
@@ -3599,7 +3614,7 @@ def hook_eval_stop(
                 "decision": "block",
                 "reason": (
                     f"clawpm eval-stop: task {task_id} not found in "
-                    f"project {project_id} — fix dispatch config "
+                    f"project {project_id} - fix dispatch config "
                     f"(check `clawpm tasks dispatch --task-id`) before "
                     f"continuing."
                 ),
@@ -3673,7 +3688,7 @@ def hook_eval_stop(
             "systemMessage": (
                 f"clawpm eval-stop: judge error ({exc}); rubric not "
                 f"enforced. Consecutive judge errors will be flagged by "
-                f"clawpm doctor — set CLAWPM_JUDGE_CMD or install Claude "
+                f"clawpm doctor - set CLAWPM_JUDGE_CMD or install Claude "
                 f"Code if this keeps happening."
             ),
         }))

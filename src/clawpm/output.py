@@ -14,6 +14,17 @@ from rich.panel import Panel
 from rich.text import Text
 
 
+# cp1252-safe stdio (CLAWP-011): reconfigure to UTF-8 before the rich Console is
+# constructed, so any non-ASCII glyph written to stdout/stderr on a Windows
+# cp1252 console is replaced rather than raising UnicodeEncodeError mid-render.
+# Guarded for redirected / wrapped streams that lack reconfigure().
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, ValueError, OSError):
+    pass
+
+
 console = Console()
 error_console = Console(stderr=True)
 

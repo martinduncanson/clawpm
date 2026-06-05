@@ -34,6 +34,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+# cp1252-safe stdio (CLAWP-011): this module writes the fallback announcement to
+# sys.stderr; reconfigure to UTF-8 (errors="replace") so a non-ASCII fallback
+# command repr can't raise UnicodeEncodeError on a Windows cp1252 console.
+# Guarded for redirected / wrapped streams that lack reconfigure().
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, ValueError, OSError):
+    pass
+
 # Default judge — subprocess invocation of the user's installed `claude` CLI in
 # print mode. Override via env CLAWPM_JUDGE_CMD when you want a different
 # model (e.g. set to `claude --model claude-haiku-4-5 -p`) or a stub for tests.
