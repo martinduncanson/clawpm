@@ -56,15 +56,35 @@ class Candidate:
     transcript: str
 
 
-@dataclass
+# Greppable degraded-path marker, mirroring the FALLBACK_MARKER /
+# CONFIRM_CLOSE_DEGRADED convention in stop_condition.py: a tournament whose
+# selection silently collapsed toward seed order (broken/erroring judge) or was
+# graded by the local fallback must be discoverable, not invisible.
+TOURNAMENT_DEGRADED_MARKER = "[TOURNAMENT_DEGRADED]"
+
+
+@dataclass(frozen=True)
 class Comparison:
     """The record of one decided pair: who faced whom and how it resolved.
 
     ``winner`` is the label of the surviving candidate. ``agreed`` is True when
     both position orders independently picked the same candidate (a genuine,
-    position-bias-cancelled model decision); False means the orders disagreed
-    (or a vote was unusable) and the higher seed was kept by the deterministic
-    tiebreak.
+    position-bias-cancelled model decision). ``agreed=False`` means the higher
+    seed was kept by the deterministic tiebreak — and ``degraded`` disambiguates
+    *why*:
+
+    - ``degraded=False`` — both orders returned usable verdicts but DISAGREED
+      (a genuine near-tie, or pure position bias). The judge worked; the signal
+      was just ambiguous.
+    - ``degraded=True`` — at least one order produced NO usable verdict (invoker
+      error or unparseable output). The tiebreak fired because the judge failed,
+      not because the candidates were close. This is the per-pair analogue of
+      ``CONFIRM_CLOSE_DEGRADED`` — a silent collapse to seed order that must be
+      surfaced, never mistaken for a real decision.
+
+    Invariants (enforced structurally, in the spirit of ``JudgeVerdict``):
+    ``winner`` is one of the two seeds, and an ungraded/ambiguous pair
+    (``agreed=False``) must keep the higher seed.
     """
 
     higher_seed: str
@@ -72,6 +92,20 @@ class Comparison:
     winner: str
     agreed: bool
     reason: str
+    degraded: bool = False
+
+    def __post_init__(self) -> None:
+        if self.winner not in (self.higher_seed, self.lower_seed):
+            raise ValueError(
+                f"Comparison.winner {self.winner!r} must be the higher_seed "
+                f"{self.higher_seed!r} or the lower_seed {self.lower_seed!r}"
+            )
+        if not self.agreed and self.winner != self.higher_seed:
+            raise ValueError(
+                "an unagreed (deterministic-tiebreak) Comparison must keep the "
+                f"higher seed; got winner={self.winner!r}, "
+                f"higher_seed={self.higher_seed!r}"
+            )
 
     def to_dict(self) -> dict:
         return {
@@ -79,26 +113,83 @@ class Comparison:
             "lower_seed": self.lower_seed,
             "winner": self.winner,
             "agreed": self.agreed,
+            "degraded": self.degraded,
             "reason": self.reason,
         }
 
 
 @dataclass
 class TournamentResult:
-    """The selected winner plus the full comparison log for transparency."""
+    """The selected winner plus the full comparison log for transparency.
+
+    ``fallback_used`` is True when any comparison was graded by the local-model
+    fallback rather than the primary judge (the selection still ran, but on a
+    weaker grader — surfaced for the same reason ``FALLBACK_MARKER`` is on the
+    stop-condition side). The ``*_pairs`` properties expose how much of the
+    bracket was actually model-decided versus collapsed to seed order.
+    """
 
     winner: Candidate
     comparisons: list[Comparison] = field(default_factory=list)
+    fallback_used: bool = False
+
+    @property
+    def agreed_pairs(self) -> int:
+        """Pairs decided by a genuine both-orders model agreement."""
+        return sum(1 for c in self.comparisons if c.agreed)
+
+    @property
+    def degraded_pairs(self) -> int:
+        """Pairs where the tiebreak fired because a vote was unusable."""
+        return sum(1 for c in self.comparisons if c.degraded)
+
+    @property
+    def fully_degraded(self) -> bool:
+        """Every decided pair collapsed to seed order via a degraded vote — the
+        winner is the top seed by judge-failure, not by merit. The loudest
+        fail-open signal a caller can check without reading the comparison log.
+        """
+        return bool(self.comparisons) and all(
+            c.degraded for c in self.comparisons
+        )
+
+    @property
+    def is_degraded(self) -> bool:
+        """Any degradation worth flagging: a degraded pair or fallback grading."""
+        return self.fallback_used or self.degraded_pairs > 0
 
     def to_dict(self) -> dict:
         # Deliberately omits the winner's full transcript — the caller already
         # holds the candidate files; the label is the join key. Keeps the
         # machine-readable result small even for large transcripts.
-        return {
+        d = {
             "winner": self.winner.label,
             "decided_pairs": len(self.comparisons),
+            "agreed_pairs": self.agreed_pairs,
+            "degraded_pairs": self.degraded_pairs,
+            "fully_degraded": self.fully_degraded,
+            "fallback_used": self.fallback_used,
             "comparisons": [c.to_dict() for c in self.comparisons],
         }
+        if self.is_degraded:
+            # Greppable, mirrors the stop-condition degraded markers. Composed
+            # from parts so the fallback-only case (no collapsed pair) doesn't
+            # read as "0 pair(s) collapsed".
+            parts: list[str] = []
+            if self.fully_degraded:
+                parts.append(
+                    "winner selected by SEED ORDER — every pair collapsed on a "
+                    "failed/unparseable judge vote"
+                )
+            elif self.degraded_pairs > 0:
+                parts.append(
+                    f"{self.degraded_pairs} pair(s) collapsed to seed order on a "
+                    "failed/unparseable judge vote"
+                )
+            if self.fallback_used:
+                parts.append("graded by the local fallback judge")
+            d["warning"] = f"{TOURNAMENT_DEGRADED_MARKER} " + "; ".join(parts)
+        return d
 
 
 COMPARE_PROMPT_TEMPLATE = """You are comparing two candidate deliverables, A and B, that each attempt the SAME task. Judge which candidate BETTER satisfies the rubric below — more criteria genuinely evidenced, fewer gaps, stronger proof of completion. Judge only against the rubric and what each transcript actually SHOWS; do not reward length, confident tone, or assertions unbacked by evidence.
@@ -179,9 +270,14 @@ def _safe_winner(
     A failed judge call (CLI missing / auth / quota — all ``RuntimeError`` from
     ``make_judge_invoker``) is an abstention for this order, not a crash of the
     whole tournament. ``None`` propagates to ambiguity → keep higher seed.
+
+    Only the invoker call is guarded: prompt construction is deterministic and a
+    failure there is a programmer error (e.g. a non-str transcript), which
+    should crash loudly rather than masquerade as a judge abstention.
     """
+    prompt = build_comparison_prompt(rubric, a_transcript, b_transcript)
     try:
-        raw = invoker(build_comparison_prompt(rubric, a_transcript, b_transcript))
+        raw = invoker(prompt)
     except RuntimeError:
         return None
     return parse_winner(raw)
@@ -211,17 +307,31 @@ def _compare_pair(
             lower_seed=lower.label,
             winner=pick1,
             agreed=True,
+            degraded=False,
             reason=f"both orders favoured {pick1}",
+        )
+    # Ambiguous → keep the higher seed. Distinguish a genuine disagreement (both
+    # orders returned usable but conflicting verdicts) from a DEGRADED collapse
+    # (at least one order produced no usable verdict) so the latter is not
+    # mistaken for a real near-tie.
+    degraded = o1 is None or o2 is None
+    if degraded:
+        reason = (
+            "a judge vote was unusable (error/unparseable) "
+            f"(order1={o1!r}, order2={o2!r}); collapsed to higher seed"
+        )
+    else:
+        reason = (
+            "orders disagreed (near-tie or position bias) "
+            f"(order1={o1!r}, order2={o2!r}); kept higher seed"
         )
     return Comparison(
         higher_seed=higher.label,
         lower_seed=lower.label,
         winner=higher.label,
         agreed=False,
-        reason=(
-            "orders disagreed or a vote was unusable "
-            f"(order1={o1!r}, order2={o2!r}); kept higher seed"
-        ),
+        degraded=degraded,
+        reason=reason,
     )
 
 
@@ -260,4 +370,11 @@ def evaluate_tournament(
         comparisons.append(result)
         if result.winner == challenger.label:
             incumbent = challenger
-    return TournamentResult(winner=incumbent, comparisons=comparisons)
+    # Surface local-fallback grading the same way the stop-condition side does:
+    # the default invoker sets ``fallback_used`` when the primary judge was
+    # unavailable and the local model graded instead. Stub invokers (tests)
+    # lack the attribute → False.
+    fallback_used = bool(getattr(invoker, "fallback_used", False))
+    return TournamentResult(
+        winner=incumbent, comparisons=comparisons, fallback_used=fallback_used
+    )

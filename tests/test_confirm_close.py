@@ -317,6 +317,20 @@ class TestRefuterAnchoring:
         refute_prompts = [p for p in inv.prompts if "SKEPTICAL verifier" in p]
         assert refute_prompts and all("looks done" in p for p in refute_prompts)
 
+    def test_non_truthy_env_value_stays_blind(self, monkeypatch):
+        # A non-truthy env value ("0") must fall through to blind, not be read
+        # as "set, therefore on". Pins the _TRUTHY parse.
+        monkeypatch.setenv("CLAWPM_REFUTER_SEES_PRIOR", "0")
+        inv = ScriptedInvoker(
+            base_response=OK_TRUE,
+            refute_responses=['{"ok": true, "reason": "all evidenced"}'],
+        )
+        evaluate_stop_condition_confirmed(
+            RUBRIC, HAS_EVIDENCE, invoker=inv, refute_votes=1
+        )
+        refute_prompts = [p for p in inv.prompts if "SKEPTICAL verifier" in p]
+        assert refute_prompts and all("looks done" not in p for p in refute_prompts)
+
     def test_explicit_arg_overrides_env(self, monkeypatch):
         # Explicit refuter_sees_prior=False wins over a truthy env var.
         monkeypatch.setenv("CLAWPM_REFUTER_SEES_PRIOR", "1")
