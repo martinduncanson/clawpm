@@ -3390,14 +3390,35 @@ def judge_tournament(
         )
         sys.exit(1)
 
-    rubric = Path(rubric_file).read_text(encoding="utf-8")
-    candidates = []
-    for i, cf in enumerate(candidate_files):
-        path = Path(cf)
-        label = labels[i] if labels else path.stem
-        candidates.append(
-            Candidate(label=label, transcript=path.read_text(encoding="utf-8"))
+    # Robust reads (mirror `hook eval-stop`'s errors="replace"): a non-UTF-8 or
+    # race-deleted file must surface as a structured error, not a raw traceback
+    # that breaks the JSON contract callers rely on.
+    try:
+        rubric = Path(rubric_file).read_text(encoding="utf-8", errors="replace")
+        candidates = []
+        for i, cf in enumerate(candidate_files):
+            path = Path(cf)
+            label = labels[i] if labels else path.stem
+            candidates.append(
+                Candidate(
+                    label=label,
+                    transcript=path.read_text(encoding="utf-8", errors="replace"),
+                )
+            )
+    except OSError as exc:
+        output_error("read_failed", f"Failed to read an input file: {exc}", fmt=fmt)
+        sys.exit(1)
+
+    # An empty rubric means there is nothing to judge against — the model would
+    # confidently pick a winner from noise. Refuse rather than emit a meaningless
+    # selection that then seeds the close gate.
+    if not rubric.strip():
+        output_error(
+            "empty_rubric",
+            f"Rubric file {rubric_file!r} is empty; nothing to judge candidates against.",
+            fmt=fmt,
         )
+        sys.exit(1)
 
     invoker = make_judge_invoker(judge_cmd_override) if judge_cmd_override else None
     try:
@@ -3411,8 +3432,12 @@ def judge_tournament(
     else:
         click.echo(f"Winner: {result.winner.label}")
         for c in result.comparisons:
-            mark = "=" if c.agreed else "~"
+            mark = "x" if c.degraded else ("=" if c.agreed else "~")
             click.echo(f"  {mark} {c.higher_seed} vs {c.lower_seed} -> {c.winner}")
+        if result.is_degraded:
+            click.echo(
+                f"WARNING: {result.to_dict()['warning']}", err=True
+            )
 
 
 # ============================================================================
