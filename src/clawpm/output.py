@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from dataclasses import asdict, is_dataclass
 from enum import Enum
@@ -21,8 +22,14 @@ from rich.text import Text
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-except (AttributeError, ValueError, OSError):
-    pass
+except (AttributeError, ValueError, OSError) as _stdio_exc:  # pragma: no cover
+    # Silent by default (benign on wrapped/redirected streams); breadcrumb under
+    # CLAWPM_DEBUG so a real cp1252 console that refused UTF-8 is debuggable.
+    if os.environ.get("CLAWPM_DEBUG"):
+        sys.stderr.write(
+            f"clawpm: {__name__} stdio reconfigure to utf-8 failed "
+            f"({_stdio_exc!r}); non-ASCII output may crash on a cp1252 console\n"
+        )
 
 
 console = Console()

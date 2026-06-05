@@ -97,8 +97,18 @@ from .context import (
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-except (AttributeError, ValueError, OSError):
-    pass
+except (AttributeError, ValueError, OSError) as _stdio_exc:  # pragma: no cover
+    # Don't crash at import over a display-only setting. Stay SILENT by default:
+    # the common failure is a benign wrapped/redirected stream (CliRunner, a
+    # pipe) that legitimately lacks reconfigure(), and surfacing it would
+    # false-alarm on every piped run. Under CLAWPM_DEBUG, leave a breadcrumb so a
+    # genuine cp1252 console that refused UTF-8 is debuggable, not a mystery
+    # UnicodeEncodeError three lines later (fail-open != fail-silent).
+    if os.environ.get("CLAWPM_DEBUG"):
+        sys.stderr.write(
+            f"clawpm: {__name__} stdio reconfigure to utf-8 failed "
+            f"({_stdio_exc!r}); non-ASCII output may crash on a cp1252 console\n"
+        )
 
 
 # Global format option
