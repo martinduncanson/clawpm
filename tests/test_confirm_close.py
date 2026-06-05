@@ -260,8 +260,6 @@ class TestPromptDistinct:
         assert base != refute
         assert "SKEPTICAL verifier" in refute
         assert "REFUTE" in refute
-        # The prior judge's reason is carried into the refutation prompt.
-        assert "looks done" in refute
 
     def test_lens_varies_the_prompt(self):
         a = build_refutation_prompt(RUBRIC, HAS_EVIDENCE, "r", lens="evidence")
@@ -269,3 +267,66 @@ class TestPromptDistinct:
         assert a != b
         assert "EVIDENCE" in a
         assert "REPRODUCTION" in b
+
+
+# ---------------------------------------------------------------------------
+# CLAWP-043: the refuter is BLIND to the base judge's reason by default — the
+# anchoring fix. Feeding the refuter the optimistic judge's framing softens
+# the prosecution toward agreement, the exact mutual-softening adversarial
+# review exists to prevent. The legacy anchored prompt is opt-in.
+# ---------------------------------------------------------------------------
+
+
+class TestRefuterAnchoring:
+    def test_prior_reason_absent_from_refute_prompt_by_default(self):
+        # Default (blind): the base judge's reason must NOT appear in the
+        # refutation prompt — the refuter judges rubric + transcript alone.
+        refute = build_refutation_prompt(RUBRIC, HAS_EVIDENCE, "looks done")
+        assert "looks done" not in refute
+        assert "Prior judge's stated reason" not in refute
+
+    def test_prior_reason_included_when_opted_in(self):
+        # include_prior_reason=True restores the legacy anchored prompt for A/B.
+        refute = build_refutation_prompt(
+            RUBRIC, HAS_EVIDENCE, "looks done", include_prior_reason=True
+        )
+        assert "looks done" in refute
+        assert "Prior judge's stated reason" in refute
+
+    def test_confirmed_eval_keeps_refuter_blind_by_default(self):
+        # The end-to-end path must build a blind refutation prompt by default.
+        inv = ScriptedInvoker(
+            base_response=OK_TRUE,
+            refute_responses=['{"ok": true, "reason": "all evidenced"}'],
+        )
+        evaluate_stop_condition_confirmed(
+            RUBRIC, HAS_EVIDENCE, invoker=inv, refute_votes=1
+        )
+        refute_prompts = [p for p in inv.prompts if "SKEPTICAL verifier" in p]
+        assert refute_prompts and all("looks done" not in p for p in refute_prompts)
+
+    def test_env_var_restores_anchored_prompt(self, monkeypatch):
+        monkeypatch.setenv("CLAWPM_REFUTER_SEES_PRIOR", "1")
+        inv = ScriptedInvoker(
+            base_response=OK_TRUE,
+            refute_responses=['{"ok": true, "reason": "all evidenced"}'],
+        )
+        evaluate_stop_condition_confirmed(
+            RUBRIC, HAS_EVIDENCE, invoker=inv, refute_votes=1
+        )
+        refute_prompts = [p for p in inv.prompts if "SKEPTICAL verifier" in p]
+        assert refute_prompts and all("looks done" in p for p in refute_prompts)
+
+    def test_explicit_arg_overrides_env(self, monkeypatch):
+        # Explicit refuter_sees_prior=False wins over a truthy env var.
+        monkeypatch.setenv("CLAWPM_REFUTER_SEES_PRIOR", "1")
+        inv = ScriptedInvoker(
+            base_response=OK_TRUE,
+            refute_responses=['{"ok": true, "reason": "all evidenced"}'],
+        )
+        evaluate_stop_condition_confirmed(
+            RUBRIC, HAS_EVIDENCE, invoker=inv, refute_votes=1,
+            refuter_sees_prior=False,
+        )
+        refute_prompts = [p for p in inv.prompts if "SKEPTICAL verifier" in p]
+        assert refute_prompts and all("looks done" not in p for p in refute_prompts)

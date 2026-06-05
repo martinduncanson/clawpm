@@ -439,9 +439,7 @@ _DEFAULT_REFUTE_LENS_ORDER = ["evidence", "correctness", "reproduction"]
 
 REFUTE_PROMPT_TEMPLATE = """You are a SKEPTICAL verifier performing an independent confirm-close check. A prior judge has claimed the rubric below is SATISFIED by the transcript. Your job is the OPPOSITE: try to REFUTE that claim.
 
-Prior judge's stated reason for passing: {prior_reason}
-
-{lens_instruction}
+{prior_reason_block}{lens_instruction}
 
 Examine each rubric criterion against the transcript. You are hunting for ANY criterion the transcript CLAIMS to satisfy but does not actually EVIDENCE — e.g. the work says "tests pass" but no test run appears in the transcript; it says "implemented X" but no corresponding change is shown; a gradeable signal whose actual value is absent or contradicts the claim.
 
@@ -462,19 +460,62 @@ Bias: when in doubt, REFUTE (return {{"ok": false}}). A false pass closes the ta
 Return ONLY the JSON object. No prose before or after."""
 
 
+# CLAWP-043 — env override to restore the legacy ANCHORED refuter prompt (the
+# refuter sees the base judge's passing rationale). Default is blind: feeding
+# the refuter the optimistic judge's framing anchors it toward agreement — the
+# mutual-softening effect adversarial review exists to avoid. Kept as a toggle
+# so the two arms can be A/B'd on a transcript corpus.
+REFUTER_SEES_PRIOR_ENV = "CLAWPM_REFUTER_SEES_PRIOR"
+
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _resolve_refuter_sees_prior(explicit: bool | None) -> bool:
+    """Resolve whether the refuter sees the base judge's reason.
+
+    Precedence: explicit arg → ``CLAWPM_REFUTER_SEES_PRIOR`` env → ``False``
+    (blind, the anchoring-resistant default).
+    """
+    if explicit is not None:
+        return explicit
+    return os.environ.get(REFUTER_SEES_PRIOR_ENV, "").strip().lower() in _TRUTHY
+
+
 def build_refutation_prompt(
-    rubric: str, transcript: str, prior_reason: str, lens: str = "evidence"
+    rubric: str,
+    transcript: str,
+    prior_reason: str,
+    lens: str = "evidence",
+    include_prior_reason: bool = False,
 ) -> str:
     """Compose the adversarial refutation prompt for one confirm-close vote.
 
     ``lens`` selects the angle of attack so multi-vote refutation stays
     independent rather than collapsing to one repeated check.
+
+    ``include_prior_reason`` controls whether the base judge's passing
+    rationale is shown to the refuter. It defaults to ``False`` (blind):
+    feeding the refuter the optimistic judge's framing anchors it toward
+    agreement (the mutual-softening effect adversarial review exists to
+    avoid). The refuter already has the rubric and the transcript — it does
+    not need the prior reason to independently hunt for claimed-but-
+    unevidenced criteria, and withholding it keeps the prosecution genuinely
+    independent of the defence. Set ``True`` (or
+    ``CLAWPM_REFUTER_SEES_PRIOR=1`` via ``evaluate_stop_condition_confirmed``)
+    to restore the legacy anchored prompt for A/B comparison.
     """
     lens_instruction = _REFUTE_LENSES.get(lens, _REFUTE_LENSES["evidence"])
+    if include_prior_reason:
+        prior_reason_block = (
+            "Prior judge's stated reason for passing: "
+            f"{(prior_reason or '(none given)').strip()}\n\n"
+        )
+    else:
+        prior_reason_block = ""
     return REFUTE_PROMPT_TEMPLATE.format(
         rubric=rubric.strip(),
         transcript=transcript.strip(),
-        prior_reason=(prior_reason or "(none given)").strip(),
+        prior_reason_block=prior_reason_block,
         lens_instruction=lens_instruction,
     )
 
@@ -484,6 +525,7 @@ def evaluate_stop_condition_confirmed(
     transcript: str,
     invoker: JudgeInvoker | None = None,
     refute_votes: int = 1,
+    refuter_sees_prior: bool | None = None,
 ) -> JudgeVerdict:
     """Base grade + adversarial confirm-close on the ok=true→close transition.
 
@@ -520,6 +562,7 @@ def evaluate_stop_condition_confirmed(
     the equivalent marker for refuter degradation).
     """
     invoker = invoker or make_judge_invoker()
+    sees_prior = _resolve_refuter_sees_prior(refuter_sees_prior)
     base = evaluate_stop_condition(rubric, transcript, invoker=invoker)
 
     # Block path (and impossible path): single call, refuter never runs.
@@ -532,7 +575,8 @@ def evaluate_stop_condition_confirmed(
     for i in range(votes):
         lens = _DEFAULT_REFUTE_LENS_ORDER[i % len(_DEFAULT_REFUTE_LENS_ORDER)]
         prompt = build_refutation_prompt(
-            rubric, transcript, base.reason, lens=lens
+            rubric, transcript, base.reason, lens=lens,
+            include_prior_reason=sees_prior,
         )
         try:
             raw = invoker(prompt)
