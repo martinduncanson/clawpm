@@ -41,8 +41,14 @@ from typing import Callable
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-except (AttributeError, ValueError, OSError):
-    pass
+except (AttributeError, ValueError, OSError) as _stdio_exc:  # pragma: no cover
+    # Silent by default (benign on wrapped/redirected streams); breadcrumb under
+    # CLAWPM_DEBUG so a real cp1252 console that refused UTF-8 is debuggable.
+    if os.environ.get("CLAWPM_DEBUG"):
+        sys.stderr.write(
+            f"clawpm: {__name__} stdio reconfigure to utf-8 failed "
+            f"({_stdio_exc!r}); non-ASCII output may crash on a cp1252 console\n"
+        )
 
 # Default judge — subprocess invocation of the user's installed `claude` CLI in
 # print mode. Override via env CLAWPM_JUDGE_CMD when you want a different
