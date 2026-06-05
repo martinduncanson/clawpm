@@ -239,6 +239,28 @@ class TestDegradedJudge:
         assert result.fully_degraded is True
         assert result.is_degraded is True
 
+    def test_oserror_invoker_abstains(self):
+        # The production invoker can leak a raw OSError (e.g. PermissionError
+        # exec'ing a non-executable judge) that make_judge_invoker doesn't wrap.
+        # It is a judge-unavailable condition -> abstain, not crash.
+        def os_error_invoker(prompt):
+            raise PermissionError("cannot exec judge")
+
+        cands = [Candidate("first", "alpha"), Candidate("second", "charlie")]
+        result = evaluate_tournament(RUBRIC, cands, invoker=os_error_invoker)
+        assert result.winner.label == "first"
+        assert result.comparisons[0].degraded is True
+
+    def test_programmer_bug_exception_propagates_not_abstains(self):
+        # A non-(RuntimeError|OSError) is a programmer bug and MUST crash loudly,
+        # never be masked as a silent abstention that collapses to seed order.
+        def buggy_invoker(prompt):
+            raise TypeError("invoker returned the wrong shape")
+
+        cands = [Candidate("first", "alpha"), Candidate("second", "charlie")]
+        with pytest.raises(TypeError):
+            evaluate_tournament(RUBRIC, cands, invoker=buggy_invoker)
+
 
 # ---------------------------------------------------------------------------
 # parse_winner robustness.
