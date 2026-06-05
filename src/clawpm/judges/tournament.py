@@ -267,18 +267,27 @@ def _safe_winner(
 ) -> str | None:
     """Run one comparison order and parse it; swallow invoker errors as None.
 
-    A failed judge call (CLI missing / auth / quota — all ``RuntimeError`` from
-    ``make_judge_invoker``) is an abstention for this order, not a crash of the
+    A failed judge call is an abstention for this order, not a crash of the
     whole tournament. ``None`` propagates to ambiguity → keep higher seed.
 
-    Only the invoker call is guarded: prompt construction is deterministic and a
-    failure there is a programmer error (e.g. a non-str transcript), which
-    should crash loudly rather than masquerade as a judge abstention.
+    The catch is ``(RuntimeError, OSError)``, the genuine judge-failure surface:
+    ``make_judge_invoker`` wraps missing-CLI / auth / quota / timeout into
+    ``RuntimeError``, but a raw ``OSError`` (e.g. ``PermissionError`` exec'ing a
+    non-executable judge path) can escape ``_run_judge_cmd`` unwrapped — both
+    mean "this vote is unavailable". It is deliberately NOT a blanket
+    ``except Exception``: a ``TypeError`` / ``AttributeError`` / ``ValueError``
+    is a programmer bug (a misbehaving custom invoker, a non-str transcript) and
+    must crash loudly rather than masquerade as an abstention and silently
+    collapse selection toward seed order — the fail-silent the rest of this
+    package is built to avoid.
+
+    Only the invoker call is guarded; prompt construction is deterministic and a
+    failure there is likewise a programmer error that should surface, not abstain.
     """
     prompt = build_comparison_prompt(rubric, a_transcript, b_transcript)
     try:
         raw = invoker(prompt)
-    except RuntimeError:
+    except (RuntimeError, OSError):
         return None
     return parse_winner(raw)
 
