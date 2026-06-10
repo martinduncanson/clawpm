@@ -203,10 +203,16 @@ def output_tasks_list(tasks: list[Any], fmt: OutputFormat = OutputFormat.JSON, f
                         _print_task(task_map[child_id], indent="  └─ ")
 
 
-def output_task_detail(task: Any, fmt: OutputFormat = OutputFormat.JSON) -> None:
-    """Output detailed task info."""
+def output_task_detail(
+    task: Any, fmt: OutputFormat = OutputFormat.JSON, hints: list[str] | None = None
+) -> None:
+    """Output detailed task info. ``hints`` (CLAWP-050) are terse next-action
+    suggestions folded into the JSON ``hints`` field / printed as dim lines."""
     if fmt == OutputFormat.JSON:
-        output_json(task.to_dict())
+        data = task.to_dict()
+        if hints:
+            data["hints"] = hints
+        output_json(data)
     else:
         state_color = {
             "open": "white",
@@ -245,6 +251,11 @@ def output_task_detail(task: Any, fmt: OutputFormat = OutputFormat.JSON) -> None
                 console.print(f"  Pitfalls:       {pred.pitfalls}")
             if pred.hypothesis:
                 console.print(f"  Hypothesis:     {pred.hypothesis}")
+
+        if hints:
+            console.print("")
+            for h in hints:
+                console.print(f"[dim]hint:[/dim] {h}")
 
 
 def output_worklog_entries(entries: list[Any], fmt: OutputFormat = OutputFormat.JSON) -> None:

@@ -127,13 +127,18 @@ pass_format = click.make_pass_decorator(OutputFormat, ensure=True)
     "global_project",
     help="Project ID (overrides auto-detection)",
 )
+@click.option(
+    "--no-hints", "no_hints", is_flag=True, default=False,
+    help="Suppress runtime next-action hints (CLAWP-050). Also via CLAWPM_NO_HINTS.",
+)
 @click.version_option(version=__version__)
 @click.pass_context
-def main(ctx: click.Context, format: str, global_project: str | None) -> None:
+def main(ctx: click.Context, format: str, global_project: str | None, no_hints: bool) -> None:
     """ClawPM - Filesystem-first multi-project manager."""
     ctx.ensure_object(dict)
     ctx.obj["format"] = OutputFormat(format)
     ctx.obj["global_project"] = global_project
+    ctx.obj["no_hints"] = no_hints
 
 
 def get_format(ctx: click.Context) -> OutputFormat:
@@ -1371,12 +1376,17 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
             except _json_show.JSONDecodeError:
                 pass
 
+    from .hints import hints_for_shown_task, hints_enabled
+    _hints = hints_for_shown_task(task) if hints_enabled(ctx) else None
+
     if fmt == OutputFormat.JSON:
         task_dict = task.to_dict()
         task_dict["reflections_voided"] = reflections_voided
+        if _hints:
+            task_dict["hints"] = _hints
         output_json(task_dict)
     else:
-        output_task_detail(task, fmt=fmt)
+        output_task_detail(task, fmt=fmt, hints=_hints)
         if reflections_voided:
             click.echo("[reflections_voided: true]")
 
@@ -2178,6 +2188,10 @@ def tasks_add(
             # Scope suggestions are nice-to-have; don't fail task creation
             pass
 
+    # CLAWP-050: terse, code-derived next-action hints to steer the agent.
+    from .hints import hints_for_added_task, attach_hints
+    attach_hints(ctx, task_dict, hints_for_added_task(task))
+
     output_success(f"Task {task.id} created", data=task_dict, fmt=fmt)
 
 
@@ -2744,7 +2758,9 @@ def quick_next(ctx: click.Context, project_id: str | None, batch_mode: bool) -> 
         # Get next task for specific project
         task = get_next_task(config, project_id)
         if task:
-            output_task_detail(task, fmt=fmt)
+            from .hints import hints_for_next_task, hints_enabled
+            _h = hints_for_next_task(task) if hints_enabled(ctx) else None
+            output_task_detail(task, fmt=fmt, hints=_h)
         else:
             if fmt == OutputFormat.JSON:
                 output_json({"task": None, "message": "No tasks available"})
