@@ -18,8 +18,11 @@ _TRUTHY = {"1", "true", "yes", "on"}
 
 def hints_enabled(ctx=None) -> bool:
     """Hints are on unless ``--no-hints`` (ctx.obj) or ``CLAWPM_NO_HINTS`` is set."""
-    if ctx is not None and getattr(ctx, "obj", None) and ctx.obj.get("no_hints"):
-        return False
+    if ctx is not None:
+        obj = getattr(ctx, "obj", None)
+        # Click allows ctx.obj to be any object; guard before .get().
+        if isinstance(obj, dict) and obj.get("no_hints"):
+            return False
     return os.environ.get("CLAWPM_NO_HINTS", "").strip().lower() not in _TRUTHY
 
 
