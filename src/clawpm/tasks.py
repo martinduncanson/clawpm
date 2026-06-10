@@ -524,6 +524,106 @@ def parent_ready_signal(
     return None
 
 
+# CLAWP-048 — task-ID prefix resolution. The prefix must be UNIQUE per project
+# across the portfolio: two projects minting the same prefix break the "task id
+# is a portfolio-unique handle" invariant (and feed the cross-project-isolation
+# bug class). Resolution order: explicit ``task_prefix`` (settings.toml) -> the
+# prefix inferred from the project's existing tasks (stability — never changes a
+# project that has already minted) -> a collision-free prefix derived from the
+# id (shortest extension of ``id.upper()[:5]`` no other project uses). The
+# derived choice is pinned by the first minted task file, after which inference
+# keeps it stable regardless of later portfolio changes.
+
+_PREFIX_NUM_RE = re.compile(r"^([A-Z][A-Z0-9-]*?)-(\d+)(?:\.progress)?$")
+
+
+def _infer_prefix_from_tasks(tasks_dir: Path) -> str | None:
+    """Most common task-ID prefix among existing task files/dirs, or None.
+
+    Anchored + non-greedy so a hyphenated prefix (``ARB-P``) is recovered intact
+    from ``ARB-P-000`` (cf. CLAWP-047). Subtask files live inside parent dirs,
+    not at this level, so they don't skew the count.
+    """
+    from collections import Counter
+
+    counts: Counter[str] = Counter()
+    for scan_dir in (tasks_dir, tasks_dir / "done", tasks_dir / "blocked"):
+        if not scan_dir.exists():
+            continue
+        for entry in scan_dir.iterdir():
+            name = entry.stem if entry.is_file() else entry.name
+            m = _PREFIX_NUM_RE.match(name)
+            if m:
+                pfx = m.group(1)
+                # Skip subtask-shaped names: a real prefix never ends in
+                # -<digits> (that's a parent task id, so this file is a stray
+                # subtask, not a top-level task). Mirrors the allocator's
+                # anchored exclusion of {prefix}-NNN-MMM files.
+                if re.search(r"-\d+$", pfx):
+                    continue
+                counts[pfx] += 1
+    if not counts:
+        return None
+    # Most common; deterministic tie-break by longer prefix then lexical.
+    return max(counts, key=lambda p: (counts[p], len(p), p))
+
+
+def resolve_existing_prefix(settings) -> str | None:
+    """A project's CURRENT prefix without minting: explicit -> inferred -> None.
+
+    ``None`` means the project has no explicit prefix and no tasks yet, so its
+    prefix isn't pinned. Used to build the portfolio collision set and by the
+    doctor cross-project collision check.
+    """
+    if getattr(settings, "task_prefix", None):
+        return settings.task_prefix.upper()
+    if getattr(settings, "project_dir", None):
+        # ProjectSettings.project_dir is the REPO ROOT (settings.toml.parent.parent),
+        # so tasks live under <repo>/.project/tasks, not <repo>/tasks.
+        inferred = _infer_prefix_from_tasks(settings.project_dir / ".project" / "tasks")
+        if inferred:
+            return inferred
+    return None
+
+
+def _portfolio_prefixes(config, exclude_id: str) -> set[str]:
+    """Prefixes already claimed by OTHER projects (resolved, or ``[:5]`` for the
+    task-less ones, so a new project can't grab a prefix another would derive)."""
+    from .discovery import discover_projects
+
+    used: set[str] = set()
+    for p in discover_projects(config):
+        if p.id == exclude_id:
+            continue
+        used.add(resolve_existing_prefix(p) or p.id.upper()[:5])
+    return used
+
+
+def assign_task_prefix(
+    project_id: str, tasks_dir: Path, config, explicit_prefix: str | None = None
+) -> str:
+    """Resolve the prefix to mint a new task under (CLAWP-048).
+
+    explicit ``task_prefix`` -> inferred-from-existing (stability) -> shortest
+    collision-free extension of ``id.upper()[:5]``. A new project that would
+    collide on ``[:5]`` gets the shortest longer prefix no other project uses.
+    """
+    if explicit_prefix:
+        return explicit_prefix.upper()
+    inferred = _infer_prefix_from_tasks(tasks_dir)
+    if inferred:
+        return inferred
+    full = project_id.upper()
+    used = _portfolio_prefixes(config, project_id)
+    base = full[:5] if len(full) >= 5 else full
+    if base and base not in used:
+        return base
+    for n in range(6, len(full) + 1):
+        if full[:n] not in used:
+            return full[:n]
+    return full  # ids are portfolio-unique, so the full id can't collide
+
+
 def add_task(
     config: PortfolioConfig,
     project_id: str,
@@ -555,8 +655,18 @@ def add_task(
 
     # Generate task ID if not provided
     if not task_id:
-        # Get project prefix from ID (uppercase)
-        prefix = project_id.upper()[:5]
+        # CLAWP-048: resolve a portfolio-unique prefix (explicit task_prefix ->
+        # inferred from existing tasks -> collision-free derivation) instead of
+        # the naive id.upper()[:5], which collides across near-name-twin ids.
+        from .discovery import get_project
+
+        _settings = get_project(config, project_id)
+        prefix = assign_task_prefix(
+            project_id,
+            tasks_dir,
+            config,
+            explicit_prefix=getattr(_settings, "task_prefix", None) if _settings else None,
+        )
 
         # Find highest existing task number.
         # We must check BOTH .md files and parent-task directories (e.g. OPENW-004/)

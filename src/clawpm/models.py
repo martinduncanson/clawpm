@@ -126,6 +126,10 @@ class ProjectSettings:
     repo_path: Path | None = None
     labels: list[str] = field(default_factory=list)
     project_dir: Path | None = None  # Set after loading
+    # CLAWP-048 — explicit task-ID prefix. When unset, the prefix is inferred
+    # from existing tasks (stability) or derived collision-free from the id.
+    # Set this to disambiguate two projects whose ids share a short prefix.
+    task_prefix: str | None = None
 
     @classmethod
     def load(cls, path: Path) -> ProjectSettings:
@@ -144,6 +148,7 @@ class ProjectSettings:
             priority=data.get("priority", 5),
             repo_path=repo_path,
             labels=data.get("labels", []),
+            task_prefix=data.get("task_prefix"),
         )
         settings.project_dir = path.parent.parent
         return settings
@@ -158,6 +163,7 @@ class ProjectSettings:
             "repo_path": str(self.repo_path) if self.repo_path else None,
             "labels": self.labels,
             "project_dir": str(self.project_dir) if self.project_dir else None,
+            "task_prefix": self.task_prefix,
         }
 
 
