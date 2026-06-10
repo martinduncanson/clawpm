@@ -28,14 +28,17 @@ git -C "$MIRROR" fetch local --quiet 2>/dev/null || exit 0
 # been committing INTO the mirror (the anti-pattern that caused the drift).
 # Surface it and bail rather than reset --hard over their work.
 unmerged=$(git -C "$MIRROR" rev-list --count local/main..HEAD 2>/dev/null)
+# Empty = rev-list failed (e.g. local/main absent) -> bail rather than act on a
+# blank count (which would mis-trip the != "0" guard or a bad reset below).
+[ -z "$unmerged" ] && exit 0
 if [ "$unmerged" != "0" ]; then
   echo "clawpm: skill mirror has $unmerged local commit(s) not in main — NOT auto-syncing. Reconcile $MIRROR manually." >&2
   exit 0
 fi
 
-# Already current?
+# Already current (or rev-list failed -> blank)?
 behind=$(git -C "$MIRROR" rev-list --count HEAD..local/main 2>/dev/null)
-[ "$behind" = "0" ] && exit 0
+{ [ -z "$behind" ] || [ "$behind" = "0" ]; } && exit 0
 
 # Fast-forward the mirror to current main (discards any uncommitted drift — the
 # mirror is a read-only consumer; direct edits there are the bug, not the work).
