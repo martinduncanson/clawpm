@@ -1,0 +1,45 @@
+#!/bin/sh
+# clawpm post-merge hook — keep the loaded skill mirror (~/.claude/skills/clawpm,
+# a git checkout, NOT a symlink) in sync with this repo's main after a pull/merge.
+#
+# Why: the mirror is what Claude Code actually loads as the `clawpm` skill. It is
+# a checkout of this repo, so it goes stale after every merge unless pulled. This
+# hook fires on `git pull`/`git merge` that updates main and fast-forwards the
+# mirror, killing the staleness class (CLAWP follow-up to the 79-commit-drift
+# found 2026-06-10).
+#
+# Install:  scripts/git-hooks/install.sh   (or copy this file to .git/hooks/)
+# Safe by design: only acts on main, refuses to clobber a mirror that has its own
+# unmerged commits, and is a no-op if the mirror is absent.
+
+MIRROR="$HOME/.claude/skills/clawpm"
+
+# No mirror, or not a git checkout -> nothing to do.
+[ -d "$MIRROR/.git" ] || exit 0
+
+# Only sync when this repo is on main (the mirror tracks main).
+branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+[ "$branch" = "main" ] || exit 0
+
+# The mirror's remote-of-record for this working tree is "local".
+git -C "$MIRROR" fetch local --quiet 2>/dev/null || exit 0
+
+# Refuse to clobber: if the mirror has commits not in local/main, someone has
+# been committing INTO the mirror (the anti-pattern that caused the drift).
+# Surface it and bail rather than reset --hard over their work.
+unmerged=$(git -C "$MIRROR" rev-list --count local/main..HEAD 2>/dev/null)
+if [ "$unmerged" != "0" ]; then
+  echo "clawpm: skill mirror has $unmerged local commit(s) not in main — NOT auto-syncing. Reconcile $MIRROR manually." >&2
+  exit 0
+fi
+
+# Already current?
+behind=$(git -C "$MIRROR" rev-list --count HEAD..local/main 2>/dev/null)
+[ "$behind" = "0" ] && exit 0
+
+# Fast-forward the mirror to current main (discards any uncommitted drift — the
+# mirror is a read-only consumer; direct edits there are the bug, not the work).
+if git -C "$MIRROR" reset --hard local/main --quiet 2>/dev/null; then
+  echo "clawpm: skill mirror synced to $(git -C "$MIRROR" rev-parse --short HEAD) (+$behind)" >&2
+fi
+exit 0
