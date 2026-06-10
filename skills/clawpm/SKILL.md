@@ -26,6 +26,34 @@ If unsure, use clawpm. Under-used task entries cost nothing; lost calibration da
 
 **Granularity — track the work unit, not the records it processes.** clawpm tracks phases, batches, milestones, and blockers — never the individual transactions, decisions, rows, or files a task operates on. The task is "reconcile period 2026-05" or "apply approved corrections", not one task per invoice. In high-volume-record domains (accounting, data pipelines, migrations) the >5-minute default means *phases* — otherwise you file hundreds of micro-tasks.
 
+## Capability map — which command for which situation
+
+clawpm is meant to be *agentic*: the acting agent should reach for the right primitive, not just `add`/`done`. Match the situation, not the noun.
+
+| Situation | Reach for | Why |
+|---|---|---|
+| New multi-step work unit | `tasks add` with `--predict-*` + `--success-criteria` | The success_criteria become the gradeable contract for everything below. |
+| One task is really several independent sub-pieces | `tasks decompose <id>` | Splits into child subtasks under the parent; each gets its own rubric. |
+| Several queued tasks can run in parallel | set `--parallel-group N`, then `clawpm next --batch` | Returns the next dispatchable group; `tasks add` siblings sharing a group run together. |
+| About to spawn a parallel agent on shared files | `clawpm conflicts --scope ...` (or `--task <id>`) | Pre-flight file-claim check; empty `conflicts` array = safe to dispatch. |
+| Subagent doing >5min file work toward a verifiable goal | **see "Two dispatch modes" below** | The mode depends on *how* the subagent runs (separate process vs in-harness). |
+| Verify a subagent's deliverable against its rubric | `subagent-judge` skill | Independent criterion-by-criterion grade; catches "said done, missed criterion N". |
+| Render a task's rubric for a grader / outcome payload | `tasks emit-rubric <id>` | Markdown rubric, or `--format outcome-payload` for the Anthropic Outcomes shape. |
+| Long/crash-prone dispatch that must survive a dead holder | `lease grant/heartbeat` (+ `tasks dispatch --lease-ttl`) | TTL + heartbeat; expiry → fallback policy (requeue/route/escalate). No daemon. |
+| High-confidence "done" you don't fully trust | `eval-stop --confirm-close` (or `CLAWPM_CONFIRM_CLOSE`) | Spends an adversarial refutation pass only on the ok=true→close transition. |
+| Calibrate future estimates from history | `reflect summarize` / `reflect suggest` | Actual/predicted ratios bucketed by complexity/confidence; deflates a gut estimate. |
+| Macro binary outcome above the task layer | `mission` commands | The mission layer; tasks are its mini-goals. |
+| After a merged PR | `commit-commands /clean_gone` + `tasks done` | Reaps gone branches; closing the task cascades unblocks. |
+
+### Two dispatch modes — pick by *how* the subagent runs
+
+This is the steering gap most agents miss. There are two distinct ways to hand work to a subagent, and **`tasks dispatch` only fits one of them**:
+
+- **Separate spawned `claude` process (worktree workflow):** `clawpm tasks dispatch <id> [--worktree]` writes `.claude/settings.local.json` Stop/PostToolUse/SessionStart hooks into the target dir. You then `cd` into that dir and run a **fresh `claude`** — *that* process picks up the hooks and is literally hook-gated from terminating until the rubric is satisfied (or impossibility is independently confirmed). This is the rubric-enforced contract. Use it when you genuinely spawn a separate Claude Code process per task.
+- **In-harness subagent (same session, Task/Agent tool):** a subagent you dispatch from *within* your current session does **not** pick up another dir's `settings.local.json` hooks — so `tasks dispatch`'s Stop-hook enforcement does **not** apply. Instead: put structured `--success-criteria` on the task, dispatch the in-harness subagent, then verify its deliverable with the **`subagent-judge`** skill before marking done. That's the in-harness equivalent of the hook-gated rubric.
+
+If you're driving a single Claude Code session and delegating via the Agent tool (the common case), you're in the **second** mode — reach for `success_criteria` + `subagent-judge`, not `tasks dispatch`. Reserve `tasks dispatch` for the worktree/separate-process workflow. (Rubric *scoping* discipline for either mode — never scope a dispatched rubric across a human approval gate — is in **Dispatch discipline** below.)
+
 ## How Claude fills predictions — "agent proposes, human reviews"
 
 When adding a task on the operator's behalf, **propose all predictions in a single block, then ask for confirmation/edits.** Don't silently file with bare flags; don't ask for every field individually. Single proposal, single review beat:
