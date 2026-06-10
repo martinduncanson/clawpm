@@ -1046,12 +1046,17 @@ def project_doctor(
             for finding in findings:
                 encoding_risks.append({"project_id": proj.id, **finding})
 
-    # --- Phase 1.6 Check c: Cross-project prefix collisions ---
-    # Prefix = project_id.upper()[:5] (mirrors add_task logic)
+    # --- Phase 1.6 Check c: Cross-project prefix collisions (CLAWP-048) ---
+    # Use each project's RESOLVED prefix (explicit task_prefix -> inferred from
+    # existing tasks -> [:5] for the as-yet-unminted), so the check reflects the
+    # IDs actually being minted: a task_prefix override clears a false collision,
+    # and an inferred/derived prefix surfaces a real one the naive [:5] missed.
+    from .tasks import resolve_existing_prefix as _resolve_prefix
+
     prefix_map: dict[str, list[str]] = {}
     all_projects = discover_projects(config)
     for proj in all_projects:
-        prefix = proj.id.upper()[:5]
+        prefix = _resolve_prefix(proj) or proj.id.upper()[:5]
         prefix_map.setdefault(prefix, []).append(proj.id)
     prefix_collisions = [
         {"prefix": pfx, "projects": pids}
