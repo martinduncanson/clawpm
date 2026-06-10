@@ -1,0 +1,5 @@
+# Shell hooks/scripts MUST stay LF — CRLF breaks the `/bin/sh` shebang on
+# git-bash/Windows ("bad interpreter: ^M"). The post-merge skill-sync hook lives
+# here and runs on every pull/merge.
+scripts/git-hooks/* text eol=lf
+*.sh text eol=lf
