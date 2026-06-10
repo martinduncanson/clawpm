@@ -24,6 +24,8 @@ clawpm is the defacto-default PM layer for every meaningful work session. Use it
 
 If unsure, use clawpm. Under-used task entries cost nothing; lost calibration data and forgotten cross-session work compound.
 
+**Granularity — track the work unit, not the records it processes.** clawpm tracks phases, batches, milestones, and blockers — never the individual transactions, decisions, rows, or files a task operates on. The task is "reconcile period 2026-05" or "apply approved corrections", not one task per invoice. In high-volume-record domains (accounting, data pipelines, migrations) the >5-minute default means *phases* — otherwise you file hundreds of micro-tasks.
+
 ## How Claude fills predictions — "agent proposes, human reviews"
 
 When adding a task on the operator's behalf, **propose all predictions in a single block, then ask for confirmation/edits.** Don't silently file with bare flags; don't ask for every field individually. Single proposal, single review beat:
@@ -518,6 +520,20 @@ clawpm reflect history-import   # import historical sessions as reflection event
 - **One command per call**: Don't chain clawpm commands with `&&` — run each separately
 - **Portfolio root**: Default `~/clawpm`
 - **Work log**: Append-only at `<portfolio>/work_log.jsonl`
+
+## Dispatch discipline — rubric scoping & worktree safety
+
+**A Stop-hook rubric is a hard mechanism that overrides soft policy.** A dispatched agent is hook-blocked from terminating until its rubric is satisfied, so the *fastest path to satisfaction is its incentive*. If that path runs through an action the agent is forbidden to take unilaterally but technically *can* (it holds the write capability), the hook actively incentivises the violation — e.g. an outcome rubric "the books balance" on a write-capable agent makes applying corrections *without* the required human approval the path of least resistance. The Stop hook has turned an approval gate into an obstacle to route around.
+
+**Rule: a dispatched rubric must be satisfiable entirely within the agent's authorized action space; never scope it to an outcome that requires crossing an approval / human gate.** Phase the work so each dispatched phase terminates *at* the gate:
+
+- **Compute phase rubric:** "divergence report for period X emitted; all candidates queued in `<ledger>`; **zero** state writes performed." The zero-writes criterion is itself gradeable from the audit log — a *prohibition* criterion, not just an achievement one.
+- **Apply phase rubric:** "every decision with `status:approved` applied with an audit entry; **zero** writes lacking an approved decision ID."
+- The outcome ("tie-out / books balance") is the rubric **only** for the final close task, dispatched *after* the human sign-off exists.
+
+This is the dark-side counterpart to the rubric/Stop-hook power: a goal-scoped rubric is exactly as safe as the gap between "what satisfies it" and "what the agent is allowed to do." Keep that gap at zero.
+
+**Never `--worktree`-dispatch a task that mutates a single shared store.** Worktree isolation is built for parallel *code* work with disjoint file scopes (see Scope-Aware Dispatch below). A task that appends to one shared ledger — a decisions store, `work_log.jsonl`, leases, any append-only state, **including clawpm's own JSONL stores** — must dispatch **in-place against the main repo dir**, or the ledger forks per worktree branch and records diverge or are lost. Worktree dispatch is for code; in-place dispatch is for state.
 
 ## Scope-Aware Dispatch
 
