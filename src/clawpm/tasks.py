@@ -564,20 +564,29 @@ def add_task(
         # directories, so without this check add_task would re-issue the same number.
         # Subtask files (OPENW-004-001.md) live *inside* parent dirs; they don't
         # appear at the scan-dir level, so they won't pollute top-level numbering.
+        # CLAWP-047: the prefix can ITSELF contain a hyphen — project id
+        # "arb-prd" -> prefix "ARB-P" — so the old `f.stem.split("-")[1]`
+        # grabbed the wrong segment ("P"), raised ValueError, skipped EVERY
+        # matching file, and collapsed every new task to {prefix}-000, silently
+        # overwriting prior tasks. Match the trailing number with an anchored
+        # regex instead (the in-progress `.progress` suffix is part of the
+        # stem) — the same shape the directory scan below already uses, so the
+        # two scans can't disagree.
         _dir_pat = re.compile(rf"^{re.escape(prefix)}-(\d+)$")
+        _file_pat = re.compile(rf"^{re.escape(prefix)}-(\d+)(?:\.progress)?$")
 
         existing_nums = []
 
         for scan_dir in [tasks_dir, tasks_dir / "done", tasks_dir / "blocked"]:
             if not scan_dir.exists():
                 continue
-            # .md files at this level
+            # .md files at this level. Subtask files ({prefix}-000-001.md) live
+            # inside parent dirs, not here, and the anchored pattern excludes
+            # them regardless, so they never pollute top-level numbering.
             for f in scan_dir.glob(f"{prefix}-*.md"):
-                try:
-                    num = int(f.stem.split("-")[1].replace(".progress", ""))
-                    existing_nums.append(num)
-                except (IndexError, ValueError):
-                    pass
+                m = _file_pat.match(f.stem)
+                if m:
+                    existing_nums.append(int(m.group(1)))
             # Parent-task directories at this level
             for entry in scan_dir.iterdir():
                 if entry.is_dir():
