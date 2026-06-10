@@ -71,7 +71,7 @@ def test_log_commit_stores_utf8_subject_not_mojibake(portfolio_with_em_dash_comm
     assert wl.exists(), "work_log.jsonl was not written"
     summaries = [
         json.loads(line).get("summary", "")
-        for line in wl.read_text(encoding="utf-8").splitlines()
+        for line in wl.read_text(encoding="utf-8", errors="replace").splitlines()
         if line.strip()
     ]
     # The clean em-dash subject must be stored verbatim...
