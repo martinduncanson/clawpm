@@ -1609,6 +1609,8 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
                     cwd=project.repo_path,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",  # CLAWP-046: UTF-8, not cp1252
+                    errors="replace",
                     timeout=5,
                 )
                 if result.returncode == 0 and result.stdout.strip():
@@ -2919,6 +2921,8 @@ def agent_context(ctx: click.Context, project_id: str | None, log_limit: int) ->
                 cwd=proj.repo_path,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",  # CLAWP-046: git output is UTF-8, not cp1252
+                errors="replace",
                 timeout=5,
             )
             if result.returncode == 0:
@@ -2930,6 +2934,8 @@ def agent_context(ctx: click.Context, project_id: str | None, log_limit: int) ->
                 cwd=proj.repo_path,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",  # CLAWP-046: git output is UTF-8, not cp1252
+                errors="replace",
                 timeout=5,
             )
             if result.returncode == 0:
@@ -2946,6 +2952,8 @@ def agent_context(ctx: click.Context, project_id: str | None, log_limit: int) ->
                 cwd=proj.repo_path,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",  # CLAWP-046: git output is UTF-8, not cp1252
+                errors="replace",
                 timeout=5,
             )
             if result.returncode == 0:
@@ -3098,6 +3106,8 @@ def log_add(
                     cwd=project.repo_path,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",  # CLAWP-046: UTF-8, not cp1252
+                    errors="replace",
                     timeout=5,
                 )
                 if result.returncode == 0 and result.stdout.strip():
@@ -3251,6 +3261,11 @@ def log_commit(ctx: click.Context, project_id: str | None, limit: int, task_id: 
             cwd=repo_path,
             capture_output=True,
             text=True,
+            # CLAWP-046: decode git's output as UTF-8, not the Windows locale
+            # default (cp1252) — else a non-ASCII commit subject (em-dash etc.)
+            # is mis-decoded and stored as mojibake in the work_log.
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
         )
         if result.returncode != 0:
@@ -3302,6 +3317,8 @@ def log_commit(ctx: click.Context, project_id: str | None, limit: int, task_id: 
                 cwd=repo_path,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",  # CLAWP-046: UTF-8 filenames, not cp1252
+                errors="replace",
                 timeout=10,
             )
             files_changed = None
