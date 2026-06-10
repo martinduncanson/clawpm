@@ -525,7 +525,7 @@ clawpm reflect history-import   # import historical sessions as reflection event
 
 **A Stop-hook rubric is a hard mechanism that overrides soft policy.** A dispatched agent is hook-blocked from terminating until its rubric is satisfied, so the *fastest path to satisfaction is its incentive*. If that path runs through an action the agent is forbidden to take unilaterally but technically *can* (it holds the write capability), the hook actively incentivises the violation — e.g. an outcome rubric "the books balance" on a write-capable agent makes applying corrections *without* the required human approval the path of least resistance. The Stop hook has turned an approval gate into an obstacle to route around.
 
-**Rule: a dispatched rubric must be satisfiable entirely within the agent's authorized action space; never scope it to an outcome that requires crossing an approval / human gate.** Phase the work so each dispatched phase terminates *at* the gate:
+**Rule: a dispatched rubric must be satisfiable entirely within the agent's authorised action space; never scope it to an outcome that requires crossing an approval / human gate.** Phase the work so each dispatched phase terminates *at* the gate:
 
 - **Compute phase rubric:** "divergence report for period X emitted; all candidates queued in `<ledger>`; **zero** state writes performed." The zero-writes criterion is itself gradeable from the audit log — a *prohibition* criterion, not just an achievement one.
 - **Apply phase rubric:** "every decision with `status:approved` applied with an audit entry; **zero** writes lacking an approved decision ID."
