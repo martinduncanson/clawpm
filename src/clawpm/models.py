@@ -29,6 +29,9 @@ class TaskState(str, Enum):
     PROGRESS = "progress"
     DONE = "done"
     BLOCKED = "blocked"
+    # CLAWP-053 — won't-do ledger: considered and rejected with a rationale.
+    # Terminal state (like DONE). Excluded from default listings.
+    REJECTED = "rejected"
 
 
 class TaskComplexity(str, Enum):
@@ -442,6 +445,11 @@ class Task:
     # into reflection/iteration events so calibration can segment
     # predicted-vs-actual by profile. None = unspecified = generic dispatch.
     agent_profile: str | None = None
+    # CLAWP-053 — won't-do ledger fields. Only meaningful when state==REJECTED.
+    # rationale: required free-text reason the idea was rejected.
+    # supersedes: optional task-id link (another task that replaces this one).
+    rationale: str | None = None
+    supersedes: str | None = None
 
     @property
     def is_parent(self) -> bool:
@@ -459,12 +467,14 @@ class Task:
         text = path.read_text(encoding="utf-8")
 
         # Determine state from filename/location
-        # Check path components for done/blocked (handles both regular files and task directories)
+        # Check path components for done/blocked/rejected (handles both regular files and task directories)
         path_parts = path.parts
         if "done" in path_parts:
             state = TaskState.DONE
         elif "blocked" in path_parts:
             state = TaskState.BLOCKED
+        elif "rejected" in path_parts:
+            state = TaskState.REJECTED
         elif ".progress" in path.name:
             state = TaskState.PROGRESS
         else:
@@ -536,6 +546,20 @@ class Task:
             if isinstance(children_raw, list) else []
         )
 
+        # CLAWP-053 — rationale and supersedes are only meaningful for REJECTED
+        # tasks but are stored as plain frontmatter strings so any task file
+        # can carry them without a migration step.
+        rationale_raw = frontmatter.get("rationale")
+        rationale: str | None = (
+            rationale_raw if isinstance(rationale_raw, str) and rationale_raw.strip()
+            else None
+        )
+        supersedes_raw = frontmatter.get("supersedes")
+        supersedes: str | None = (
+            supersedes_raw if isinstance(supersedes_raw, str) and supersedes_raw.strip()
+            else None
+        )
+
         return cls(
             id=frontmatter.get("id", path.stem.replace(".progress", "")),
             title=title,
@@ -554,6 +578,8 @@ class Task:
             actor=actor,
             parent_mission=frontmatter.get("parent_mission"),
             agent_profile=agent_profile,
+            rationale=rationale,
+            supersedes=supersedes,
         )
 
     @property
@@ -596,6 +622,11 @@ class Task:
             "actor": self.actor,
             "parent_mission": self.parent_mission,
             "agent_profile": self.agent_profile,
+            # CLAWP-053 — won't-do ledger. rationale/supersedes are None for
+            # non-rejected tasks; included unconditionally so the schema is
+            # stable and agents can introspect without conditional logic.
+            "rationale": self.rationale,
+            "supersedes": self.supersedes,
         }
         body = self.body
         if body:

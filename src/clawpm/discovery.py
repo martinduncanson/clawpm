@@ -420,6 +420,7 @@ def init_project_from_repo(repo_path: Path, project_id: str | None = None) -> Pr
     tasks_dir.mkdir(exist_ok=True)
     (tasks_dir / "done").mkdir(exist_ok=True)
     (tasks_dir / "blocked").mkdir(exist_ok=True)
+    (tasks_dir / "rejected").mkdir(exist_ok=True)  # CLAWP-053 won't-do ledger
 
     (project_dir / "research").mkdir(exist_ok=True)
     (project_dir / "notes").mkdir(exist_ok=True)
