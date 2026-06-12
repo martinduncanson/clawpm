@@ -459,6 +459,64 @@ class TestConstitutionViaEmitTree:
         assert result.constitution_violations == []
         assert len(result.emitted) >= 1
 
+    def test_advisory_invariant_does_not_block_strict(self, temp_portfolio):
+        """SC: an ACTIVE advisory invariant must NEVER block --strict emission.
+
+        The advisory entry IS surfaced in result.constitution_violations
+        (report-back/info) but does not raise under strict=True.
+        """
+        meta = temp_portfolio["meta"]
+        config = temp_portfolio["config"]
+        project_id = temp_portfolio["project_id"]
+
+        (meta / "constitution.yaml").write_text(
+            "invariants:\n"
+            "  - name: cite_sources\n"
+            "    kind: advisory\n"
+            "    description: 'Knowledge-work deliverables must cite sources'\n"
+        )
+
+        doc = parse_emit_document(_make_doc([
+            _make_leaf("L1", "Good leaf", with_sc=True),
+        ]))
+
+        # strict=True must NOT raise just because an advisory invariant is active.
+        result = emit_tree(config, project_id, doc, strict=True)
+
+        # Emission succeeded and the advisory entry is surfaced (not blocking).
+        assert len(result.emitted) >= 1
+        advisory = [
+            v for v in result.constitution_violations
+            if v.get("level") == "advisory"
+        ]
+        assert len(advisory) == 1
+        assert advisory[0]["invariant"] == "cite_sources"
+
+    def test_advisory_plus_codecheck_violation_blocks_strict(self, temp_portfolio):
+        """A code-checkable violation still blocks --strict even alongside advisory.
+
+        Confirms the strict filter excludes ONLY advisory entries, not real
+        code-checkable violations.
+        """
+        meta = temp_portfolio["meta"]
+        config = temp_portfolio["config"]
+        project_id = temp_portfolio["project_id"]
+
+        (meta / "constitution.yaml").write_text(
+            "invariants:\n"
+            "  - name: cite_sources\n"
+            "    kind: advisory\n"
+            "  - name: require_success_criteria\n"
+            "    kind: require_success_criteria\n"
+        )
+
+        doc = parse_emit_document(_make_doc([
+            _make_leaf("L1", "No SC leaf", with_sc=False),
+        ]))
+
+        with pytest.raises(EmitValidationError, match="constitution"):
+            emit_tree(config, project_id, doc, strict=True)
+
 
 # ---------------------------------------------------------------------------
 # CLI tests (clawpm constitution add/list/remove)

@@ -765,12 +765,17 @@ def emit_tree(
     rejected_refs = {r["leaf_ref"] for r in rejected}
     leaves_to_emit = [lf for lf in leaves_to_emit if lf.ref not in rejected_refs]
 
-    # Constitution check (CLAWP-057 — graceful no-op if not built yet)
+    # Constitution check (CLAWP-057 - graceful no-op if not built yet).
+    # Advisory invariants (level="advisory") are surfaced for report-back but
+    # must NEVER block emission - exclude them from the strict-mode blocking set.
     constitution_violations = _check_constitution(doc, config, project_id)
-    if constitution_violations and strict:
+    blocking_violations = [
+        v for v in constitution_violations if v.get("level") != "advisory"
+    ]
+    if blocking_violations and strict:
         raise EmitValidationError(
             f"Emission aborted (--strict): constitution violations: "
-            + str(constitution_violations)
+            + str(blocking_violations)
         )
 
     # ID collision pre-check (only needed when attach_to existing task;
