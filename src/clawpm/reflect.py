@@ -523,26 +523,16 @@ def detect_thrashing(
     the iteration history, so the criterion is framed purely around verdict
     progression.
 
-    Threshold configuration (highest priority first):
-      1. ``threshold`` argument (per-task: caller reads Predictions.thrash_threshold
-         and falls back to env/default).
-      2. ``CLAWPM_THRASH_THRESHOLD`` env var (global override).
-      3. ``_DEFAULT_THRASH_THRESHOLD`` (module constant, currently 4).
+    Threshold is taken AS PROVIDED by the caller -- this function is pure
+    with respect to configuration. The caller owns the per-task > env >
+    default precedence (see ``hook_eval_stop`` in cli.py, the single source
+    of truth). The ``threshold`` default here is a bare fallback for direct
+    callers/tests, NOT a resolution step. The only adjustment applied is a
+    ``threshold < 1`` clamp (a safety guard, not config resolution).
 
     Returns False when the reflection file does not exist (no iterations yet).
     """
-    import os as _os_dt
     import json as _json_dt
-
-    # Resolve effective threshold -- env var only used if the caller passed
-    # the sentinel (the module default), meaning no per-task override was found.
-    if threshold == _DEFAULT_THRASH_THRESHOLD:
-        env_val = _os_dt.environ.get("CLAWPM_THRASH_THRESHOLD", "").strip()
-        if env_val:
-            try:
-                threshold = int(env_val)
-            except ValueError:
-                pass
 
     if threshold < 1:
         threshold = 1
@@ -578,6 +568,8 @@ def detect_thrashing(
         if v.get("ok") is True or v.get("impossible") is True:
             return False
     return True
+
+
 def _compute_deltas(
     predictions: Predictions,
     actuals: Actuals,

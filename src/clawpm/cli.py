@@ -4094,8 +4094,10 @@ def hook_eval_stop(
                     reason=_thrash_reason,
                     stop_condition_tripped=True,
                 )
-        except OSError:
-            # Best-effort: thrash detection failure must not block output.
+        except Exception:
+            # Best-effort: thrash detection failure must never block hook
+            # output. Broader than OSError -- a malformed-record/parse path
+            # must fail open too.
             pass
 
     output = map_verdict_to_hook_output(verdict)

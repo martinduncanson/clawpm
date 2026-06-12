@@ -215,6 +215,23 @@ class TestPerTaskThreshold:
         # Global default would NOT have fired yet
         assert detect_thrashing(root, task_id, "test", threshold=global_default) is False
 
+    def test_detect_thrashing_is_pure_ignores_env(self, temp_portfolio, monkeypatch):
+        """detect_thrashing trusts its threshold argument and NEVER consults
+        the env var -- the caller owns precedence. A threshold EQUAL to the
+        module default must not be silently overridden by CLAWPM_THRASH_THRESHOLD."""
+        from clawpm.reflect import _DEFAULT_THRASH_THRESHOLD
+
+        monkeypatch.setenv("CLAWPM_THRASH_THRESHOLD", "10")
+        root = temp_portfolio["root"]
+        task_id = "TEST-PURE-001"
+        # Write exactly _DEFAULT_THRASH_THRESHOLD not-ok iterations.
+        _write_n_not_ok(root, task_id, _DEFAULT_THRASH_THRESHOLD)
+        # Passing threshold == the default must still trip at the default,
+        # NOT defer to the env var's 10 (which would need 10 iterations).
+        assert detect_thrashing(
+            root, task_id, "test", threshold=_DEFAULT_THRASH_THRESHOLD
+        ) is True
+
 
 # ---------------------------------------------------------------------------
 # Global env-var default (CLAWPM_THRASH_THRESHOLD)
@@ -302,6 +319,60 @@ class TestGlobalEnvThreshold:
         # None of the outputs should mention THRASHING
         for out in outputs:
             assert "THRASHING" not in out.get("systemMessage", "")
+
+    def test_per_task_threshold_equal_to_default_wins_over_env(
+        self, temp_portfolio, monkeypatch
+    ):
+        """Config-hierarchy guard: a per-task thrash_threshold that happens to
+        EQUAL the module default must NOT be overridden by a (larger) env var.
+        With per-task=4 and CLAWPM_THRASH_THRESHOLD=10, detection must trip at
+        4 iterations, not wait for 10."""
+        from clawpm.reflect import _DEFAULT_THRASH_THRESHOLD
+
+        monkeypatch.setenv("CLAWPM_THRASH_THRESHOLD", "10")
+
+        root = temp_portfolio["root"]
+        config = temp_portfolio["config"]
+        # Per-task threshold deliberately equals the module default.
+        per_task = _DEFAULT_THRASH_THRESHOLD
+        task = add_task(
+            config, "test", title="Equal-to-default threshold",
+            predictions=Predictions(
+                success_criteria=["c1"],
+                thrash_threshold=per_task,
+            ),
+        )
+        transcript_file = root / "transcript_equal.txt"
+        transcript_file.write_text("FAILED", encoding="utf-8")
+
+        import clawpm.judges.stop_condition as sc_mod
+        from clawpm.judges.stop_condition import JudgeVerdict
+
+        def fake_eval(rubric: str, transcript: str, invoker=None):
+            return JudgeVerdict(ok=False, reason="criterion not yet met")
+
+        monkeypatch.setattr(sc_mod, "evaluate_stop_condition", fake_eval)
+        runner = CliRunner()
+
+        outputs = []
+        for _ in range(per_task):
+            r = runner.invoke(
+                main,
+                ["-p", "test", "hook", "eval-stop",
+                 "--task", task.id,
+                 "--transcript-file", str(transcript_file)],
+            )
+            assert r.exit_code == 0, r.output
+            outputs.append(json.loads(r.output))
+
+        # The first per_task-1 are normal blocks (env's 10 would NOT have
+        # fired yet either, so this proves per-task is what's in effect).
+        for out in outputs[:-1]:
+            assert out.get("decision") == "block", f"expected block, got {out}"
+        # The per_task-th iteration trips thrashing -- per-task threshold won.
+        last = outputs[-1]
+        assert last.get("continue") is True, f"expected continue, got {last}"
+        assert "THRASHING" in last.get("systemMessage", "")
 
 
 # ---------------------------------------------------------------------------
