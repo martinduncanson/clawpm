@@ -1306,9 +1306,9 @@ def tasks(ctx: click.Context) -> None:
 @click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
 @click.option(
     "--state", "-s",
-    type=click.Choice(["open", "progress", "done", "blocked", "all"]),
+    type=click.Choice(["open", "progress", "done", "blocked", "rejected", "all"]),
     default=None,
-    help="Filter by state (default: all except done)",
+    help="Filter by state (default: open+progress+blocked; use 'rejected' for the won't-do ledger)",
 )
 @click.option("--flat", is_flag=True, help="Show flat list without hierarchy")
 @click.pass_context
@@ -1535,15 +1535,20 @@ def tasks_edit(
 @tasks.command("state")
 @click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
 @click.argument("task_id")
-@click.argument("new_state", type=click.Choice(["open", "progress", "done", "blocked"]))
+@click.argument("new_state", type=click.Choice(["open", "progress", "done", "blocked", "rejected"]))
 @click.option("--note", "-n", help="Note about the state change")
 @click.option("--force", "-f", is_flag=True, help="Force completion even if subtasks incomplete")
 @click.option("--reflect-note", "reflect_note", default=None, help="What surprised you (stored in reflection event)")
 @click.option("--meta-reflect", "meta_reflect", default=None, help="What could have been anticipated that wasn't, and why? (stored in reflection event)")
 @click.option("--process-lesson", "process_lesson", default=None, help="What update to your prediction PROCESS would have caught this? (recursive meta-loop)")
 @click.option("--surprise", "surprise_tags", multiple=True, help=f"Surprise taxonomy tag (repeatable): {', '.join(sorted(['unknown_unknown', 'scope_drift', 'dependency', 'tooling_friction', 'complexity_misread', 'assumption_broke', 'external_blocker']))}")
+# CLAWP-053 — won't-do ledger: rationale is required when rejecting a task.
+@click.option("--rationale", "-r", "rationale", default=None,
+              help="Required when state=rejected: one-line reason this idea was considered and rejected.")
+@click.option("--supersedes", "supersedes", default=None,
+              help="Optional task-id that supersedes this rejected task (e.g. a replacement task).")
 @click.pass_context
-def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_state: str, note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...]) -> None:
+def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_state: str, note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...], rationale: str | None, supersedes: str | None) -> None:
     """Change task state."""
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
@@ -1555,6 +1560,16 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
             "bad_surprise_tag",
             f"Unknown surprise tag(s): {invalid_tags}. "
             f"Valid values: {sorted(SURPRISE_TAXONOMY)}",
+            fmt=fmt,
+        )
+        sys.exit(1)
+
+    # CLAWP-053 — reject rationale must be validated before any IO
+    if new_state == "rejected" and (not rationale or not rationale.strip()):
+        output_error(
+            "rationale_required",
+            "Rejecting a task requires a non-empty --rationale. "
+            "Pass --rationale '<reason>' to record why this was considered and rejected.",
             fmt=fmt,
         )
         sys.exit(1)
@@ -1595,18 +1610,24 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
     # Capture task predictions before state transition (needed for reflection)
     pre_transition_task = get_task(config, project_id, task_id)
 
-    task = change_task_state(config, project_id, task_id, state, note=note, force=force)
+    task = change_task_state(
+        config, project_id, task_id, state,
+        note=note, force=force,
+        rationale=rationale, supersedes=supersedes,
+    )
 
     if not task:
         output_error("task_not_found", f"No task with id '{task_id}' in project '{project_id}'", fmt=fmt)
         sys.exit(1)
 
     # Auto-log state change
+    # CLAWP-053: REJECTED is a terminal state; log as NOTE with the rationale.
     action_map = {
         TaskState.OPEN: WorkLogAction.NOTE,
         TaskState.PROGRESS: WorkLogAction.START,
         TaskState.DONE: WorkLogAction.DONE,
         TaskState.BLOCKED: WorkLogAction.BLOCKED,
+        TaskState.REJECTED: WorkLogAction.NOTE,
     }
     if state in action_map:
         # Auto-detect git files changed

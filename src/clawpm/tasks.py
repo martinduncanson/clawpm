@@ -48,7 +48,7 @@ def _scan_task_files(location: Path, tasks: list[Task], state_filter: TaskState 
                     tasks.append(task)
             except Exception:
                 continue
-        elif item.is_dir() and not item.name.startswith(".") and item.name not in ("done", "blocked"):
+        elif item.is_dir() and not item.name.startswith(".") and item.name not in ("done", "blocked", "rejected"):
             # Directory task: add the _task.md, then recurse for subtasks
             # AND any nested directory subtasks. The recursion subsumes the
             # old non-recursive single-level glob; nested directories with
@@ -76,12 +76,17 @@ def list_tasks(
 
     tasks: list[Task] = []
 
-    # Collect tasks from all locations
-    locations = [
-        tasks_dir,  # Main dir - open or progress
-        tasks_dir / "done",
-        tasks_dir / "blocked",
-    ]
+    # CLAWP-053: rejected/ is a terminal-state silo like done/ and blocked/.
+    # It is excluded from the default (no-filter) scan so rejected tasks never
+    # surface in open listings. It is only added when explicitly requested.
+    if state_filter == TaskState.REJECTED:
+        locations = [tasks_dir / "rejected"]
+    else:
+        locations = [
+            tasks_dir,  # Main dir - open or progress
+            tasks_dir / "done",
+            tasks_dir / "blocked",
+        ]
 
     for location in locations:
         _scan_task_files(location, tasks, state_filter)
@@ -121,10 +126,13 @@ def get_task(config: PortfolioConfig, project_id: str, task_id: str) -> Task | N
         tasks_dir / f"{task_id}.progress.md",
         tasks_dir / "done" / f"{task_id}.md",
         tasks_dir / "blocked" / f"{task_id}.md",
+        # CLAWP-053 — rejected terminal state
+        tasks_dir / "rejected" / f"{task_id}.md",
         # Task directories (parent tasks)
         tasks_dir / task_id / "_task.md",
         tasks_dir / "done" / task_id / "_task.md",
         tasks_dir / "blocked" / task_id / "_task.md",
+        tasks_dir / "rejected" / task_id / "_task.md",
     ]
 
     # Add subtask paths if this looks like a subtask ID
@@ -134,6 +142,7 @@ def get_task(config: PortfolioConfig, project_id: str, task_id: str) -> Task | N
             tasks_dir / parent_id / f"{task_id}.progress.md",
             tasks_dir / "done" / parent_id / f"{task_id}.md",
             tasks_dir / "blocked" / parent_id / f"{task_id}.md",
+            tasks_dir / "rejected" / parent_id / f"{task_id}.md",  # CLAWP-053
             # Codex round-8 P2: the subtask itself may have been split into
             # a directory task (i.e. decomposed further into grandchildren).
             # Its open/progress form lives at tasks/<parent>/<child>/_task.md.
@@ -273,6 +282,52 @@ def get_next_task(config: PortfolioConfig, project_id: str) -> Task | None:
     return None
 
 
+def _write_rejection_frontmatter(
+    file_path: Path,
+    rationale: str,
+    supersedes: str | None,
+) -> None:
+    """Rewrite the task file's YAML frontmatter to add rationale (and optional
+    supersedes) before the file is moved to the rejected/ directory.
+
+    Preserves all existing frontmatter keys; only adds/overwrites
+    ``rationale`` and (if given) ``supersedes``.
+    """
+    text = file_path.read_text(encoding="utf-8")
+    if text.startswith("---"):
+        parts = text.split("---", 2)
+        if len(parts) >= 3:
+            try:
+                fm: dict = yaml.safe_load(parts[1]) or {}
+            except yaml.YAMLError:
+                fm = {}
+            body = parts[2]
+        else:
+            fm = {}
+            body = text
+    else:
+        fm = {}
+        body = text
+
+    fm["rationale"] = rationale
+    if supersedes:
+        fm["supersedes"] = supersedes
+
+    new_text = (
+        "---\n"
+        + yaml.dump(fm, default_flow_style=False, allow_unicode=True)
+        + "---"
+        + body
+    )
+    tmp = file_path.with_suffix(".tmp")
+    try:
+        tmp.write_text(new_text, encoding="utf-8")
+        tmp.replace(file_path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def change_task_state(
     config: PortfolioConfig,
     project_id: str,
@@ -280,6 +335,8 @@ def change_task_state(
     new_state: TaskState,
     note: str | None = None,
     force: bool = False,
+    rationale: str | None = None,
+    supersedes: str | None = None,
 ) -> Task | None:
     """Change a task's state by moving its file (or directory for parent tasks)."""
     tasks_dir = get_tasks_dir(config, project_id)
@@ -293,6 +350,18 @@ def change_task_state(
 
     current_path = task.file_path
     is_directory_task = current_path.name == "_task.md"
+
+    # CLAWP-053 — rationale is required for REJECTED; validate before any
+    # filesystem mutation so the task file is never left in a partial state.
+    if new_state == TaskState.REJECTED:
+        if not rationale or not rationale.strip():
+            raise ValueError(
+                "A non-empty rationale is required when rejecting a task. "
+                "Pass rationale='<reason>' to change_task_state()."
+            )
+        # Write rationale (and optional supersedes) into the task file
+        # frontmatter before moving it to the rejected/ directory.
+        _write_rejection_frontmatter(current_path, rationale.strip(), supersedes)
 
     # Check for incomplete subtasks when marking parent as done. A missing
     # child ref counts as UNSATISFIED (mirrors cascade_unblock_dependents'
@@ -328,16 +397,20 @@ def change_task_state(
             blocked_dir = tasks_dir / "blocked"
             blocked_dir.mkdir(exist_ok=True)
             new_dir = blocked_dir / task_id
+        elif new_state == TaskState.REJECTED:
+            rejected_dir = tasks_dir / "rejected"
+            rejected_dir.mkdir(exist_ok=True)
+            new_dir = rejected_dir / task_id
         else:
             return None
-        
+
         # Don't move if already in correct location
         if task_dir.resolve() == new_dir.resolve():
             return task
-        
+
         # Move the directory
         shutil.move(str(task_dir), str(new_dir))
-        
+
         # Reload and return
         return Task.from_file(new_dir / "_task.md")
     
@@ -354,6 +427,10 @@ def change_task_state(
         blocked_dir = tasks_dir / "blocked"
         blocked_dir.mkdir(exist_ok=True)
         new_path = blocked_dir / f"{task_id}.md"
+    elif new_state == TaskState.REJECTED:
+        rejected_dir = tasks_dir / "rejected"
+        rejected_dir.mkdir(exist_ok=True)
+        new_path = rejected_dir / f"{task_id}.md"
     else:
         return None
 

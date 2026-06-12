@@ -179,6 +179,7 @@ def output_tasks_list(tasks: list[Any], fmt: OutputFormat = OutputFormat.JSON, f
                 "progress": "yellow",
                 "done": "green",
                 "blocked": "red",
+                "rejected": "dim",  # CLAWP-053 — muted; rejected = won't-do
             }.get(state_val, "white")
 
         def _print_task(t: Any, indent: str = "") -> None:
