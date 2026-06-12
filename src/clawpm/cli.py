@@ -1417,6 +1417,15 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
 @click.option("--reference-task", "reference_tasks", multiple=True, help="Prior task IDs used as reference class (repeatable)")
 @click.option("--pre-mortem", "pre_mortem", default=None, help="'If this task fails, the most likely cause is...'")
 @click.option("--predict-iterations", "predict_iterations", type=int, default=None, help="Predicted iterate→grade→revise cycles (CLAWP-019). Default None; 1 means 'expected to land in one pass'.")
+# --- CLAWP-054 dispatch contract fields ---
+@click.option("--out-of-scope", "out_of_scope", multiple=True, help="Boundary items the executor MUST NOT touch (repeatable).")
+@click.option("--stop-condition", "stop_conditions", multiple=True, help="Escape-hatch conditions (repeatable).")
+@click.option(
+    "--delegability", "delegability",
+    type=click.Choice(["agent", "human", "either"]),
+    default=None,
+    help="Who may execute this task. 'human' means auto-dispatch is REFUSED.",
+)
 @click.pass_context
 def tasks_edit(
     ctx: click.Context,
@@ -1443,6 +1452,9 @@ def tasks_edit(
     reference_tasks: tuple[str, ...],
     pre_mortem: str | None,
     predict_iterations: int | None,
+    out_of_scope: tuple[str, ...] = (),
+    stop_conditions: tuple[str, ...] = (),
+    delegability: str | None = None,
 ) -> None:
     """Edit task metadata (title, priority, complexity, body, scope)."""
     fmt = get_format(ctx)
@@ -1473,8 +1485,9 @@ def tasks_edit(
         predict_iterations is not None,
     ])
 
-    if not any([title, priority is not None, complexity, body, scope, has_predictions, parallel_group is not None, clear_parallel_group]):
-        output_error("no_changes", "Specify at least one field to edit (--title, --priority, --complexity, --body, --scope, --parallel-group, --clear-parallel-group, or --predict-*)", fmt=fmt)
+    if not any([title, priority is not None, complexity, body, scope, has_predictions, parallel_group is not None, clear_parallel_group,
+                 out_of_scope, stop_conditions, delegability is not None]):
+        output_error("no_changes", "Specify at least one field to edit (--title, --priority, --complexity, --body, --scope, --parallel-group, --clear-parallel-group, --predict-*, --out-of-scope, --stop-condition, or --delegability)", fmt=fmt)
         sys.exit(1)
 
     if parallel_group is not None and clear_parallel_group:
@@ -1523,6 +1536,9 @@ def tasks_edit(
         predictions=predictions,
         parallel_group=parallel_group,
         clear_parallel_group=clear_parallel_group,
+        out_of_scope=list(out_of_scope) if out_of_scope else None,
+        stop_conditions=list(stop_conditions) if stop_conditions else None,
+        delegability=delegability,
     )
 
     if not task:
@@ -1993,6 +2009,15 @@ def tasks_decompose(
     default=None,
     help="Who filled in these predictions (default: operator). Use 'operator-edited' when agent proposed and human reviewed.",
 )
+# --- CLAWP-054 dispatch contract fields ---
+@click.option("--out-of-scope", "out_of_scope", multiple=True, help="Boundary items the executor MUST NOT touch (repeatable; file globs or named topics). Rendered verbatim in the agent preamble.")
+@click.option("--stop-condition", "stop_conditions", multiple=True, help="Escape-hatch condition: if triggered, executor must STOP and report back (repeatable, free text).")
+@click.option(
+    "--delegability", "delegability",
+    type=click.Choice(["agent", "human", "either"]),
+    default=None,
+    help="Who may execute this task. 'human' means auto-dispatch is REFUSED. Default: either.",
+)
 @click.pass_context
 def tasks_add(
     ctx: click.Context,
@@ -2025,6 +2050,9 @@ def tasks_add(
     pre_mortem: str | None,
     predict_iterations: int | None,
     predicted_by: str | None,
+    out_of_scope: tuple[str, ...] = (),
+    stop_conditions: tuple[str, ...] = (),
+    delegability: str | None = None,
 ) -> None:
     """Add a new task (or subtask with --parent)."""
     fmt = get_format(ctx)
@@ -2128,6 +2156,9 @@ def tasks_add(
             predictions=predictions,
             parallel_group=parallel_group,
             agent_profile=agent_profile,
+            out_of_scope=list(out_of_scope) if out_of_scope else None,
+            stop_conditions=list(stop_conditions) if stop_conditions else None,
+            delegability=delegability,
         )
 
     if not task:
@@ -2375,6 +2406,16 @@ def tasks_dispatch(
     task = get_task(config, project_id, task_id)
     if not task:
         output_error("task_not_found", f"No task with id '{task_id}'", fmt=fmt)
+        sys.exit(1)
+
+    # CLAWP-054: refuse auto-dispatch for human-delegability tasks
+    if getattr(task, "delegability", "either") == "human":
+        output_error(
+            "human_delegability",
+            f"Task {task_id!r} has delegability=human and cannot be auto-dispatched. "
+            "An operator must execute this task manually.",
+            fmt=fmt,
+        )
         sys.exit(1)
 
     # CLAWP-039: validate the lease TTL BEFORE writing any settings (Codex P2),
@@ -5508,3 +5549,7 @@ def serve(host: str, port: int) -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+

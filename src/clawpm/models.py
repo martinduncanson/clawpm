@@ -450,6 +450,18 @@ class Task:
     # supersedes: optional task-id link (another task that replaces this one).
     rationale: str | None = None
     supersedes: str | None = None
+    # CLAWP-054 — dispatch contract fields.
+    # out_of_scope: explicit boundary — file globs or named topics the executor
+    #   must NOT touch. Rendered verbatim in the agent preamble/rubric.
+    # stop_conditions: escape-hatch conditions — free-text triggers that, when
+    #   tripped by the executor, should cause a STOP+report-back.
+    # delegability: who may execute this leaf.
+    #   "agent"  — auto-dispatchable to a subagent
+    #   "human"  — operator-only; dispatch MUST refuse auto-dispatch
+    #   "either" — either is acceptable (default; back-compat)
+    out_of_scope: list[str] = field(default_factory=list)
+    stop_conditions: list[str] = field(default_factory=list)
+    delegability: str = "either"  # "agent" | "human" | "either"
 
     @property
     def is_parent(self) -> bool:
@@ -560,6 +572,22 @@ class Task:
             else None
         )
 
+        # CLAWP-054 — out_of_scope, stop_conditions: lists of strings
+        oos_raw = frontmatter.get("out_of_scope")
+        out_of_scope: list[str] = (
+            [s for s in oos_raw if isinstance(s, str)]
+            if isinstance(oos_raw, list) else []
+        )
+        sc_raw = frontmatter.get("stop_conditions")
+        stop_conditions: list[str] = (
+            [s for s in sc_raw if isinstance(s, str)]
+            if isinstance(sc_raw, list) else []
+        )
+        deleg_raw = frontmatter.get("delegability")
+        delegability: str = (
+            deleg_raw if deleg_raw in ("agent", "human", "either") else "either"
+        )
+
         return cls(
             id=frontmatter.get("id", path.stem.replace(".progress", "")),
             title=title,
@@ -580,6 +608,9 @@ class Task:
             agent_profile=agent_profile,
             rationale=rationale,
             supersedes=supersedes,
+            out_of_scope=out_of_scope,
+            stop_conditions=stop_conditions,
+            delegability=delegability,
         )
 
     @property
@@ -627,6 +658,10 @@ class Task:
             # stable and agents can introspect without conditional logic.
             "rationale": self.rationale,
             "supersedes": self.supersedes,
+            # CLAWP-054 — contract fields
+            "out_of_scope": self.out_of_scope,
+            "stop_conditions": self.stop_conditions,
+            "delegability": self.delegability,
         }
         body = self.body
         if body:
@@ -762,3 +797,4 @@ class Research:
             "openclaw": self.openclaw,
             "file_path": str(self.file_path) if self.file_path else None,
         }
+

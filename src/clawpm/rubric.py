@@ -49,6 +49,29 @@ def render_rubric_markdown(task: Task) -> str:
         lines.append("_(none defined — add via `clawpm tasks edit "
                      f"{task.id} --success-criteria '...'`)_")
         lines.append("")
+        # CLAWP-054 — out_of_scope and stop_conditions sections
+        if getattr(task, "out_of_scope", None):
+            lines.append("## Out of scope")
+            lines.append("")
+            lines.append(
+                "The executor MUST NOT touch the following items. "
+                "Violating these boundaries is a contract breach, not a helpful improvement."
+            )
+            lines.append("")
+            for item in task.out_of_scope:
+                lines.append(f"- {item}")
+            lines.append("")
+        if getattr(task, "stop_conditions", None):
+            lines.append("## Stop conditions")
+            lines.append("")
+            lines.append(
+                "If any of the following conditions is triggered during execution, "
+                "the executor MUST STOP and report back to the operator rather than improvising."
+            )
+            lines.append("")
+            for item in task.stop_conditions:
+                lines.append(f"- {item}")
+            lines.append("")
         lines.append(_grading_instructions())
         return "\n".join(lines)
 
@@ -71,6 +94,30 @@ def render_rubric_markdown(task: Task) -> str:
         lines.append("## Hypothesis")
         lines.append("")
         lines.append(task.predictions.hypothesis.strip())
+        lines.append("")
+
+    # CLAWP-054 -- out_of_scope and stop_conditions sections
+    if getattr(task, "out_of_scope", None):
+        lines.append("## Out of scope")
+        lines.append("")
+        lines.append(
+            "The executor MUST NOT touch the following items. "
+            "Violating these boundaries is a contract breach, not a helpful improvement."
+        )
+        lines.append("")
+        for item in task.out_of_scope:
+            lines.append(f"- {item}")
+        lines.append("")
+    if getattr(task, "stop_conditions", None):
+        lines.append("## Stop conditions")
+        lines.append("")
+        lines.append(
+            "If any of the following conditions is triggered during execution, "
+            "the executor MUST STOP and report back to the operator rather than improvising."
+        )
+        lines.append("")
+        for item in task.stop_conditions:
+            lines.append(f"- {item}")
         lines.append("")
 
     lines.append(_grading_instructions())
@@ -122,3 +169,4 @@ def render_rubric_json_payload(task: Task) -> dict:
         # max_iterations is the operator's call; default 3 per the API spec.
         "max_iterations": 3,
     }
+

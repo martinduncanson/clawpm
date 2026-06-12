@@ -168,6 +168,7 @@ def dispatch_agent(
     confirm_close: bool = False,
     refute_votes: int = 1,
     agent_profile: Optional[str] = None,
+    delegability: Optional[str] = None,
 ) -> dict:
     """Run a parent-spawned subagent through the full clawpm enforcement loop.
 
@@ -189,6 +190,13 @@ def dispatch_agent(
             f"(got {project.repo_path if project else None!r}); "
             f"agent dispatch requires a repo to create the per-dispatch "
             f"worktree under .clawpm-worktrees/."
+        )
+
+    # CLAWP-054: refuse auto-dispatch for human-delegability tasks
+    if delegability == "human":
+        raise AgentDispatchError(
+            "dispatch_agent called with delegability='human'; "
+            "human-only tasks must be executed by an operator, not auto-dispatched."
         )
 
     # 1. Auto-create the subtask. Prompt becomes the body; criteria flow
@@ -440,3 +448,4 @@ def dispatch_agent(
             "+00:00", "Z"
         ),
     }
+
