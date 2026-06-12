@@ -496,6 +496,88 @@ def count_iterations_for_task(
     return count
 
 
+
+
+_DEFAULT_THRASH_THRESHOLD = 4  # conservative default; overridable via env
+
+
+def detect_thrashing(
+    portfolio_root: Path,
+    task_id: str,
+    project_id: str,
+    threshold: int = _DEFAULT_THRASH_THRESHOLD,
+) -> bool:
+    """Return True when the task is thrashing (looping without progress).
+
+    **Signal (CLAWP-062):** thrashing = the last ``threshold`` iteration_event
+    records for this task are ALL ``ok=False`` AND ``impossible=False``.  An
+    ``ok=True`` or ``impossible=True`` event resets the consecutive counter to
+    zero -- the agent made progress (ok) or declared impossibility (handled by
+    the impossible path), so neither is stalled spinning.
+
+    What clawpm DOES track per-iteration: the full verdict (ok/impossible/
+    reason).  What it does NOT track: which individual success_criteria are
+    satisfied, or which files were modified.  The iteration-without-progress
+    signal above is therefore the strongest deterministic detector available
+    with the current JSONL schema.  Per-file-mod tracking does not exist in
+    the iteration history, so the criterion is framed purely around verdict
+    progression.
+
+    Threshold configuration (highest priority first):
+      1. ``threshold`` argument (per-task: caller reads Predictions.thrash_threshold
+         and falls back to env/default).
+      2. ``CLAWPM_THRASH_THRESHOLD`` env var (global override).
+      3. ``_DEFAULT_THRASH_THRESHOLD`` (module constant, currently 4).
+
+    Returns False when the reflection file does not exist (no iterations yet).
+    """
+    import os as _os_dt
+    import json as _json_dt
+
+    # Resolve effective threshold -- env var only used if the caller passed
+    # the sentinel (the module default), meaning no per-task override was found.
+    if threshold == _DEFAULT_THRASH_THRESHOLD:
+        env_val = _os_dt.environ.get("CLAWPM_THRASH_THRESHOLD", "").strip()
+        if env_val:
+            try:
+                threshold = int(env_val)
+            except ValueError:
+                pass
+
+    if threshold < 1:
+        threshold = 1
+
+    ref_file = _reflections_dir(portfolio_root) / f"{task_id}.jsonl"
+    if not ref_file.exists():
+        return False
+
+    # Collect iteration events for this project, in order.
+    events: list[dict] = []
+    for line in ref_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = _json_dt.loads(line)
+        except _json_dt.JSONDecodeError:
+            continue
+        if rec.get("event") != "iteration_event":
+            continue
+        if rec.get("project_id") != project_id:
+            continue
+        events.append(rec)
+
+    if len(events) < threshold:
+        return False
+
+    # Walk the last ``threshold`` events.  Any ok=True or impossible=True
+    # breaks the consecutive-not-ok run.
+    tail = events[-threshold:]
+    for ev in tail:
+        v = ev.get("verdict", {})
+        if v.get("ok") is True or v.get("impossible") is True:
+            return False
+    return True
 def _compute_deltas(
     predictions: Predictions,
     actuals: Actuals,

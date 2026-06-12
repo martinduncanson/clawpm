@@ -3894,6 +3894,7 @@ def hook_eval_stop(
     import json as _json_hook
     import os as _os_hook
     from .judges.stop_condition import (
+        JudgeVerdict,
         evaluate_stop_condition,
         evaluate_stop_condition_confirmed,
         load_transcript_from_hook_input,
@@ -4054,6 +4055,48 @@ def hook_eval_stop(
         )
         click.echo(_json_hook.dumps(output))
         return
+
+    # CLAWP-062: thrashing detection -- check AFTER writing the iteration event
+    # so the count includes the iteration we just recorded.
+    if not verdict.ok and not verdict.impossible:
+        try:
+            from .reflect import detect_thrashing, _DEFAULT_THRASH_THRESHOLD
+            import os as _os_thr
+            # Resolve effective threshold: per-task > env > module default.
+            _thr_task = get_task(config, project_id, task_id)
+            _thr_per_task = None
+            if _thr_task is not None and _thr_task.predictions is not None:
+                _thr_per_task = _thr_task.predictions.thrash_threshold
+            if _thr_per_task is not None:
+                _thr_effective = _thr_per_task
+            else:
+                _env_thr = _os_thr.environ.get("CLAWPM_THRASH_THRESHOLD", "").strip()
+                if _env_thr:
+                    try:
+                        _thr_effective = int(_env_thr)
+                    except ValueError:
+                        _thr_effective = _DEFAULT_THRASH_THRESHOLD
+                else:
+                    _thr_effective = _DEFAULT_THRASH_THRESHOLD
+            if detect_thrashing(
+                config.portfolio_root, task_id, project_id,
+                threshold=_thr_effective,
+            ):
+                _thrash_reason = (
+                    "THRASHING detected on task " + task_id + ": "
+                    + str(_thr_effective) + " consecutive not-ok iterations "
+                    + "with no rubric progress. "
+                    + "Last verdict: " + verdict.reason[:200] + ". "
+                    + "Agent stopped; operator should triage."
+                )
+                verdict = JudgeVerdict(
+                    ok=False,
+                    reason=_thrash_reason,
+                    stop_condition_tripped=True,
+                )
+        except OSError:
+            # Best-effort: thrash detection failure must not block output.
+            pass
 
     output = map_verdict_to_hook_output(verdict)
     click.echo(_json_hook.dumps(output))
