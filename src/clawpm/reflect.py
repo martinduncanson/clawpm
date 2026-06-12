@@ -496,6 +496,80 @@ def count_iterations_for_task(
     return count
 
 
+
+
+_DEFAULT_THRASH_THRESHOLD = 4  # conservative default; overridable via env
+
+
+def detect_thrashing(
+    portfolio_root: Path,
+    task_id: str,
+    project_id: str,
+    threshold: int = _DEFAULT_THRASH_THRESHOLD,
+) -> bool:
+    """Return True when the task is thrashing (looping without progress).
+
+    **Signal (CLAWP-062):** thrashing = the last ``threshold`` iteration_event
+    records for this task are ALL ``ok=False`` AND ``impossible=False``.  An
+    ``ok=True`` or ``impossible=True`` event resets the consecutive counter to
+    zero -- the agent made progress (ok) or declared impossibility (handled by
+    the impossible path), so neither is stalled spinning.
+
+    What clawpm DOES track per-iteration: the full verdict (ok/impossible/
+    reason).  What it does NOT track: which individual success_criteria are
+    satisfied, or which files were modified.  The iteration-without-progress
+    signal above is therefore the strongest deterministic detector available
+    with the current JSONL schema.  Per-file-mod tracking does not exist in
+    the iteration history, so the criterion is framed purely around verdict
+    progression.
+
+    Threshold is taken AS PROVIDED by the caller -- this function is pure
+    with respect to configuration. The caller owns the per-task > env >
+    default precedence (see ``hook_eval_stop`` in cli.py, the single source
+    of truth). The ``threshold`` default here is a bare fallback for direct
+    callers/tests, NOT a resolution step. The only adjustment applied is a
+    ``threshold < 1`` clamp (a safety guard, not config resolution).
+
+    Returns False when the reflection file does not exist (no iterations yet).
+    """
+    import json as _json_dt
+
+    if threshold < 1:
+        threshold = 1
+
+    ref_file = _reflections_dir(portfolio_root) / f"{task_id}.jsonl"
+    if not ref_file.exists():
+        return False
+
+    # Collect iteration events for this project, in order.
+    events: list[dict] = []
+    for line in ref_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = _json_dt.loads(line)
+        except _json_dt.JSONDecodeError:
+            continue
+        if rec.get("event") != "iteration_event":
+            continue
+        if rec.get("project_id") != project_id:
+            continue
+        events.append(rec)
+
+    if len(events) < threshold:
+        return False
+
+    # Walk the last ``threshold`` events.  Any ok=True or impossible=True
+    # breaks the consecutive-not-ok run.
+    tail = events[-threshold:]
+    for ev in tail:
+        v = ev.get("verdict", {})
+        if v.get("ok") is True or v.get("impossible") is True:
+            return False
+    return True
+
+
 def _compute_deltas(
     predictions: Predictions,
     actuals: Actuals,

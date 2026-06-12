@@ -304,6 +304,8 @@ class Predictions:
     predicted_iterations: int | None = None
     # Phase 1.6 — attribution: who filled in these predictions?
     filled_by: str | None = None  # "agent" | "operator" | "operator-edited" | "retroactive" | None
+    # CLAWP-062 -- per-task thrashing threshold. None = use global env/default.
+    thrash_threshold: int | None = None
 
     def __post_init__(self) -> None:
         # Normalise success_criteria — accept str | dict | SuccessCriterion
@@ -333,6 +335,7 @@ class Predictions:
             "pre_mortem": self.pre_mortem,
             "predicted_iterations": self.predicted_iterations,
             "filled_by": self.filled_by,
+            "thrash_threshold": self.thrash_threshold,
         }
 
     @classmethod
@@ -362,6 +365,7 @@ class Predictions:
             pre_mortem=data.get("pre_mortem"),
             predicted_iterations=data.get("predicted_iterations"),
             filled_by=data.get("filled_by"),
+            thrash_threshold=data.get("thrash_threshold"),
         )
 
     def is_empty(self) -> bool:
