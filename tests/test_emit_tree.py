@@ -267,12 +267,17 @@ class TestParseEmitDocument:
         with pytest.raises(EmitValidationError, match="Duplicate leaf refs"):
             parse_emit_document(raw)
 
-    def test_unresolved_parent_ref_rejected(self):
+    def test_nonnull_parent_ref_rejected_fail_closed(self):
+        """v1 has no in-document nesting — a non-null parent_ref must FAIL-CLOSED,
+        not silently flatten the leaf under the root (CLAWP-064)."""
         raw = {
             **FLAT_TREE_DOC,
-            "leaves": [{**FLAT_TREE_DOC["leaves"][0], "parent_ref": "MISSING_REF"}],
+            "leaves": [{**FLAT_TREE_DOC["leaves"][0], "parent_ref": "L2"}],
         }
-        with pytest.raises(EmitValidationError, match="parent_ref"):
+        with pytest.raises(
+            EmitValidationError,
+            match="hierarchical nesting via parent_ref is not supported",
+        ):
             parse_emit_document(raw)
 
     def test_invalid_delegability_rejected(self):
@@ -390,6 +395,49 @@ class TestEmitTreeNewRoot:
         sc_list = preds.get("success_criteria", [])
         assert len(sc_list) == 1
         assert sc_list[0]["criterion"] == "Tests pass"
+
+    def test_root_predictions_persist(self, temp_portfolio):
+        """New-root predictions must be rendered into the root _task.md, not lost."""
+        config = temp_portfolio["config"]
+        tasks_dir = temp_portfolio["tasks_dir"]
+
+        raw = {
+            "schema_version": 1,
+            "root": {
+                "title": "Root with predictions",
+                "predictions": {
+                    "duration_min": 480,
+                    "complexity": "l",
+                    "confidence": 4,
+                    "approach": "incremental rollout",
+                },
+            },
+            "leaves": [
+                {
+                    "ref": "RP1",
+                    "parent_ref": None,
+                    "title": "Leaf under predicted root",
+                    "leaf_key": "rootpred-RP1",
+                    "success_criteria": [],
+                    "scope": [],
+                    "stop_conditions": [],
+                    "delegability": "agent",
+                    "predictions": {},
+                }
+            ],
+        }
+        doc = parse_emit_document(raw)
+        result = emit_tree(config, "emittest", doc)
+
+        root_task_text = (tasks_dir / result.root_id / "_task.md").read_text(encoding="utf-8")
+        parts = root_task_text.split("---", 2)
+        fm = yaml.safe_load(parts[1])
+        preds = fm.get("predictions")
+        assert preds is not None, "root predictions silently lost"
+        assert preds.get("duration_min") == 480
+        assert preds.get("complexity") == "l"
+        assert preds.get("confidence") == 4
+        assert preds.get("approach") == "incremental rollout"
 
     def test_rubric_derivable_per_leaf(self, temp_portfolio):
         """SC2: emit-rubric CLI renders criteria for each emitted leaf."""
@@ -609,13 +657,34 @@ class TestEmitTreeAttachTo:
 
 
 class TestEmitTreeGates:
+    def test_reject_match_exact_only(self, temp_portfolio):
+        """CLAWP-053: core matches the reject ledger by EXACT case-insensitive
+        title only. A rejected title that is a PREFIX of a leaf title must NOT
+        drop the leaf (fuzzy matching is the planner's job, not core's)."""
+        config = temp_portfolio["config"]
+        from clawpm.tasks import change_task_state
+
+        # A prefix-but-not-equal rejected title: "Leaf" is a prefix of "Leaf one"
+        prefix_task = add_task(config, "emittest", "Leaf")
+        assert prefix_task is not None
+        change_task_state(config, "emittest", prefix_task.id, TaskState.REJECTED, rationale="won't do")
+
+        doc = parse_emit_document(FLAT_TREE_DOC)
+        result = emit_tree(config, "emittest", doc)
+        # Prefix match must NOT reject any leaf
+        assert result.rejected == [], (
+            f"prefix-only reject title falsely dropped leaves: {result.rejected}"
+        )
+        # All 3 leaves still emitted
+        assert len(result.emitted) == 4  # root + 3 leaves
+
     def test_reject_match_aborts(self, temp_portfolio):
-        """CLAWP-053: leaves matching the reject ledger are reported back."""
+        """CLAWP-053: leaves EXACTLY matching the reject ledger are reported back."""
         config = temp_portfolio["config"]
         tasks_dir = temp_portfolio["tasks_dir"]
 
-        # Create a rejected task with a matching title
-        rejected_task = add_task(config, "emittest", "Leaf one")
+        # Create a rejected task with an EXACT matching title (case-insensitive)
+        rejected_task = add_task(config, "emittest", "leaf one")  # differs only by case
         assert rejected_task is not None
         from clawpm.tasks import change_task_state
         change_task_state(config, "emittest", rejected_task.id, TaskState.REJECTED, rationale="won't do")

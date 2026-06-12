@@ -222,6 +222,17 @@ def _parse_leaf(raw: Any, idx: int) -> LeafSpec:
         # Generate a stable key from ref if not provided — callers SHOULD supply one
         leaf_key = ref
 
+    # v1 does NOT support in-document hierarchical nesting. parent_ref is
+    # accepted in the schema (forward-compat) but a non-null value must
+    # FAIL-CLOSED rather than be silently flattened under the root. True
+    # nesting is tracked as CLAWP-064.
+    parent_ref = raw.get("parent_ref")
+    if parent_ref is not None:
+        raise EmitValidationError(
+            "in-document hierarchical nesting via parent_ref is not supported "
+            "in v1 — use root.attach_to to add depth across calls (see CLAWP-064)"
+        )
+
     return LeafSpec(
         ref=ref,
         parent_ref=raw.get("parent_ref"),
@@ -324,14 +335,9 @@ def parse_emit_document(raw: dict[str, Any]) -> EmitTreeDocument:
         dupes = [r for r in refs if refs.count(r) > 1]
         raise EmitValidationError(f"Duplicate leaf refs: {sorted(set(dupes))!r}")
 
-    # parent_refs resolve
-    ref_set = set(refs)
-    for lf in leaves:
-        if lf.parent_ref is not None and lf.parent_ref not in ref_set:
-            raise EmitValidationError(
-                f"Leaf {lf.ref!r} has parent_ref={lf.parent_ref!r} "
-                "which is not a ref in this document"
-            )
+    # NOTE: non-null parent_ref is rejected fail-closed in _parse_leaf (v1 has
+    # no in-document nesting; CLAWP-064). By here every leaf.parent_ref is None,
+    # so there is nothing further to resolve.
 
     return EmitTreeDocument(
         schema_version=sv,
@@ -368,10 +374,11 @@ def _check_reject_match(
     rejected: list[dict] = []
     for lf in leaves:
         for rejected_task in rejected_tasks:
-            # Exact or prefix title match (case-insensitive) — deterministic string check
-            leaf_title_lower = lf.title.lower()
-            task_title_lower = rejected_task.title.lower()
-            if leaf_title_lower == task_title_lower or leaf_title_lower.startswith(task_title_lower):
+            # EXACT case-insensitive match only — core is deterministic. Fuzzy /
+            # "resembling" matching is the planner skill's job (CLAWP-053), not
+            # core's; a prefix match here would false-positive on short rejected
+            # titles and silently drop a legitimate leaf.
+            if lf.title.lower() == rejected_task.title.lower():
                 rejected.append({
                     "leaf_ref": lf.ref,
                     "leaf_title": lf.title,
@@ -404,27 +411,15 @@ def _check_constitution(
         return []
 
 
-def _check_id_collisions(
-    config: PortfolioConfig,
-    project_id: str,
-    parent_id: str,
-    leaves: list[LeafSpec],
-) -> list[dict]:
-    """Predict the subtask IDs that would be minted and check for collisions.
+def _existing_child_nums(tasks_dir: Path, parent_id: str) -> set[int]:
+    """Union-scan the existing child ordinals for ``parent_id``.
 
-    Returns list of collision dicts. Empty = no collisions.
-    Read-only — mirrors add_subtask's union-scan logic but does not write.
+    Mirrors add_subtask's id-generator union: parent dir glob + done/ + blocked/
+    + the parent's persisted ``children:`` frontmatter list. Read-only; shared by
+    the collision pre-check (phase 2) and the staging id-mint (phase 3) so the
+    two can never disagree.
     """
-    from .tasks import get_tasks_dir
-    import re
-
-    tasks_dir = get_tasks_dir(config, project_id)
-    if not tasks_dir:
-        return []
-
-    # Find current max child ID for this parent
     existing_nums: set[int] = set()
-    parent_dir = tasks_dir / parent_id
 
     def _record(tid: str) -> None:
         try:
@@ -433,6 +428,7 @@ def _check_id_collisions(
         except (IndexError, ValueError):
             pass
 
+    parent_dir = tasks_dir / parent_id
     if parent_dir.exists():
         for f in parent_dir.glob(f"{parent_id}-*.md"):
             _record(f.stem)
@@ -441,10 +437,8 @@ def _check_id_collisions(
             for f in state_dir.glob(f"{parent_id}-*.md"):
                 _record(f.stem)
 
-    # Also check the parent task's frontmatter children list
-    parent_task_file = tasks_dir / f"{parent_id}.md"
-    parent_task_dir_file = tasks_dir / parent_id / "_task.md"
-    for pf in (parent_task_file, parent_task_dir_file):
+    # Also union the parent task's persisted frontmatter children list.
+    for pf in (tasks_dir / f"{parent_id}.md", tasks_dir / parent_id / "_task.md"):
         if pf.exists():
             try:
                 text = pf.read_text(encoding="utf-8")
@@ -457,6 +451,28 @@ def _check_id_collisions(
                                 _record(cid)
             except Exception:
                 pass
+
+    return existing_nums
+
+
+def _check_id_collisions(
+    config: PortfolioConfig,
+    project_id: str,
+    parent_id: str,
+    leaves: list[LeafSpec],
+) -> list[dict]:
+    """Predict the subtask IDs that would be minted and check for collisions.
+
+    Returns list of collision dicts. Empty = no collisions.
+    Read-only — mirrors add_subtask's union-scan logic but does not write.
+    """
+    from .tasks import get_tasks_dir
+
+    tasks_dir = get_tasks_dir(config, project_id)
+    if not tasks_dir:
+        return []
+
+    existing_nums = _existing_child_nums(tasks_dir, parent_id)
 
     # Predict IDs for leaves in order
     collisions: list[dict] = []
@@ -521,6 +537,26 @@ def _resolve_idempotency(
 # ---------------------------------------------------------------------------
 
 
+def _build_predictions_block(
+    predictions: Predictions | None,
+    success_criteria: list[SuccessCriterion] | None = None,
+) -> dict[str, Any] | None:
+    """Render a cleaned predictions frontmatter block, or None if empty.
+
+    Shared by leaf and new-root rendering. ``success_criteria`` (when given)
+    is attached onto the predictions dict — the leaf carries its rubric
+    separately from ``predictions``; the root carries it inline.
+    """
+    sc = success_criteria or []
+    if predictions is None or (predictions.is_empty() and not sc):
+        return None
+    pred_dict = (predictions or Predictions()).to_dict()
+    if sc:
+        pred_dict["success_criteria"] = [c.to_yaml() for c in sc]
+    cleaned = {k: v for k, v in pred_dict.items() if v is not None and v != []}
+    return cleaned or None
+
+
 def _render_task_content(
     task_id: str,
     title: str,
@@ -529,11 +565,16 @@ def _render_task_content(
     baseline_ref: str,
     prd_ref: str | None = None,
     children: list[str] | None = None,
+    predictions: Predictions | None = None,
 ) -> str:
     """Render the markdown content for a single task file.
 
     Mirrors exactly what add_task / add_subtask write, extended with
     CLAWP-054 and CLAWP-055 fields.
+
+    ``leaf`` carries the per-leaf contract (when staging a leaf). ``predictions``
+    is used for the new-root task (which has no leaf) so root predictions are
+    not silently lost.
     """
     frontmatter: dict[str, Any] = {
         "id": task_id,
@@ -568,15 +609,14 @@ def _render_task_content(
         # leaf_key for idempotent re-emit
         frontmatter["leaf_key"] = leaf.leaf_key
         # predictions including success_criteria
-        if not leaf.predictions.is_empty() or leaf.success_criteria:
-            pred = leaf.predictions
-            # Attach success_criteria to predictions block
-            pred_dict = pred.to_dict()
-            if leaf.success_criteria:
-                pred_dict["success_criteria"] = [sc.to_yaml() for sc in leaf.success_criteria]
-            cleaned = {k: v for k, v in pred_dict.items() if v is not None and v != []}
-            if cleaned:
-                frontmatter["predictions"] = cleaned
+        pred_block = _build_predictions_block(leaf.predictions, leaf.success_criteria)
+        if pred_block:
+            frontmatter["predictions"] = pred_block
+    else:
+        # New-root task — thread its predictions through so they persist.
+        pred_block = _build_predictions_block(predictions)
+        if pred_block:
+            frontmatter["predictions"] = pred_block
 
     fm_yaml = yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True).strip()
     content = (
@@ -767,47 +807,10 @@ def emit_tree(
         prd_title_slug = "-".join(filter(None, prd_title_slug.split("-")))[:40]
         research_id = f"{project_id}-research-prd-{prd_title_slug}"
 
-    # Predict child IDs in leaf order (same logic as add_subtask)
-    existing_nums: set[int] = set()
-    parent_dir = tasks_dir / parent_id
-    if parent_dir.exists():
-        for f in parent_dir.glob(f"{parent_id}-*.md"):
-            try:
-                num_str = f.stem.split("-")[-1].replace(".progress", "")
-                existing_nums.add(int(num_str))
-            except (IndexError, ValueError):
-                pass
-    for state_dir in (tasks_dir / "done", tasks_dir / "blocked"):
-        if state_dir.exists():
-            for f in state_dir.glob(f"{parent_id}-*.md"):
-                try:
-                    num_str = f.stem.split("-")[-1].replace(".progress", "")
-                    existing_nums.add(int(num_str))
-                except (IndexError, ValueError):
-                    pass
-
-    # Also union with persisted children list on the parent
-    for pf in (tasks_dir / f"{parent_id}.md", tasks_dir / parent_id / "_task.md"):
-        if pf.exists():
-            try:
-                text = pf.read_text(encoding="utf-8")
-                if text.startswith("---"):
-                    parts = text.split("---", 2)
-                    if len(parts) >= 3:
-                        fm = yaml.safe_load(parts[1]) or {}
-                        for cid in (fm.get("children") or []):
-                            if isinstance(cid, str) and cid.startswith(parent_id + "-"):
-                                try:
-                                    existing_nums.add(int(cid.split("-")[-1]))
-                                except (IndexError, ValueError):
-                                    pass
-            except Exception:
-                pass
-
-    # Also include already-emitted keys' numbers so re-emit doesn't collide
-    for lf in doc.leaves:
-        if lf.leaf_key in already_emitted_keys:
-            pass  # already on disk; their IDs are in existing_nums via glob
+    # Predict child IDs in leaf order using the same union-scan add_subtask uses.
+    # already-emitted (idempotent) leaves are already on disk, so their ordinals
+    # are captured by the parent-dir glob inside the helper.
+    existing_nums = _existing_child_nums(tasks_dir, parent_id)
 
     next_num = (max(existing_nums) if existing_nums else 0) + 1
     leaf_id_map: dict[str, str] = {}  # ref → task_id
@@ -853,6 +856,7 @@ def emit_tree(
                 baseline_ref=baseline_ref,
                 prd_ref=research_id,
                 children=child_ids,
+                predictions=doc.root.predictions,
             )
             staging_parent_task = staging_parent_dir / "_task.md"
             _atomic_write(staging_parent_task, root_content)
