@@ -2430,6 +2430,9 @@ def tasks_dispatch(
     # Blocked on drift unless --confirm-stale is passed.
     # Skipped gracefully when: no scope, no baseline_ref, non-git project,
     # or the baseline sha can't be verified (fail-open — never crash dispatch).
+    # CLAWP-063: ERROR-class skips (git failure / unverifiable ref) emit a
+    # 'drift-not-checked' warning so the operator knows the check didn't run.
+    # EXPECTED-class skips (no scope, no baseline, ts: marker, non-git) stay silent.
     if not confirm_stale:
         from .baseline import detect_scope_drift
         _proj_for_drift = get_project(config, project_id)
@@ -2452,6 +2455,17 @@ def tasks_dispatch(
                 fmt=fmt,
             )
             sys.exit(1)
+        elif (
+            _drift_result["status"] == "skipped"
+            and _drift_result.get("skip_class") == "error"
+        ):
+            # Fail-open intact: dispatch proceeds, but the operator must know the
+            # check didn't run so they can investigate the git/ref failure.
+            click.echo(
+                f"[WARNING] [drift-not-checked] task {task_id!r}: drift gate skipped "
+                f"due to git error - {_drift_result.get('reason', 'unknown error')}. "
+                "Proceeding with dispatch (fail-open). Verify the baseline_ref manually."
+            )
 
     # CLAWP-039: validate the lease TTL BEFORE writing any settings (Codex P2),
     # so a bad --lease-ttl never leaves the target half-dispatched.
