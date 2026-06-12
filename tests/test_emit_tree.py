@@ -199,6 +199,92 @@ NESTED_TREE_DOC = {
     ],
 }
 
+# Multi-level tree: root -> A -> A.1 (2 levels deep under root, 3 levels total)
+MULTILEVEL_TREE_DOC = {
+    "schema_version": 1,
+    "root": {"title": "Root task for multilevel tree"},
+    "leaves": [
+        {
+            "ref": "A",
+            "parent_ref": None,
+            "title": "Intermediate A (parent of A.1)",
+            "leaf_key": "multilevel-A",
+            "success_criteria": [],
+            "scope": ["src/a/**"],
+            "stop_conditions": [],
+            "delegability": "agent",
+            "predictions": {"duration_min": 60, "complexity": "s", "confidence": 3},
+        },
+        {
+            "ref": "A.1",
+            "parent_ref": "A",
+            "title": "Grandchild A.1 under A",
+            "leaf_key": "multilevel-A.1",
+            "success_criteria": [
+                {"criterion": "Tests pass", "gradeable_signal": "pytest exit 0", "comparator": "eq:0"}
+            ],
+            "scope": ["src/a/sub/**"],
+            "stop_conditions": ["build breaks"],
+            "delegability": "agent",
+            "predictions": {"duration_min": 30, "complexity": "s", "confidence": 4},
+        },
+        {
+            "ref": "B",
+            "parent_ref": None,
+            "title": "Sibling B (flat under root)",
+            "leaf_key": "multilevel-B",
+            "success_criteria": [],
+            "scope": [],
+            "stop_conditions": [],
+            "delegability": "either",
+            "predictions": {},
+        },
+    ],
+}
+
+# Three-level deep tree: root -> P -> P.1 -> P.1.a
+THREELEVEL_TREE_DOC = {
+    "schema_version": 1,
+    "root": {"title": "Root for three-level tree"},
+    "leaves": [
+        {
+            "ref": "P",
+            "parent_ref": None,
+            "title": "Level-1 parent P",
+            "leaf_key": "threelevel-P",
+            "success_criteria": [],
+            "scope": [],
+            "stop_conditions": [],
+            "delegability": "agent",
+            "predictions": {},
+        },
+        {
+            "ref": "P.1",
+            "parent_ref": "P",
+            "title": "Level-2 child P.1",
+            "leaf_key": "threelevel-P.1",
+            "success_criteria": [],
+            "scope": [],
+            "stop_conditions": [],
+            "delegability": "agent",
+            "predictions": {},
+        },
+        {
+            "ref": "P.1.a",
+            "parent_ref": "P.1",
+            "title": "Level-3 grandchild P.1.a",
+            "leaf_key": "threelevel-P.1.a",
+            "success_criteria": [
+                {"criterion": "Done", "gradeable_signal": "tests green", "comparator": "eq:0"}
+            ],
+            "scope": ["src/deep/**"],
+            "stop_conditions": [],
+            "delegability": "agent",
+            "predictions": {},
+        },
+    ],
+}
+
 
 # ---------------------------------------------------------------------------
 # Phase 1 — Parse + Validate tests
@@ -267,17 +353,85 @@ class TestParseEmitDocument:
         with pytest.raises(EmitValidationError, match="Duplicate leaf refs"):
             parse_emit_document(raw)
 
-    def test_nonnull_parent_ref_rejected_fail_closed(self):
-        """v1 has no in-document nesting — a non-null parent_ref must FAIL-CLOSED,
-        not silently flatten the leaf under the root (CLAWP-064)."""
+    def test_parent_ref_resolving_to_sibling_is_accepted(self):
+        """CLAWP-064: a non-null parent_ref that resolves to another leaf's ref
+        is now ACCEPTED (in-document nesting is supported)."""
         raw = {
             **FLAT_TREE_DOC,
-            "leaves": [{**FLAT_TREE_DOC["leaves"][0], "parent_ref": "L2"}],
+            "leaves": [
+                FLAT_TREE_DOC["leaves"][1],  # L2 — parent
+                {**FLAT_TREE_DOC["leaves"][0], "parent_ref": "L2"},  # L1 child of L2
+            ],
+        }
+        doc = parse_emit_document(raw)
+        assert doc.leaves[1].parent_ref == "L2"
+
+    def test_parent_ref_pointing_to_unknown_ref_rejected(self):
+        """CLAWP-064: parent_ref must resolve to another leaf in the same document;
+        an unknown ref is rejected fail-closed."""
+        raw = {
+            **FLAT_TREE_DOC,
+            "leaves": [{**FLAT_TREE_DOC["leaves"][0], "parent_ref": "NO_SUCH_REF"}],
         }
         with pytest.raises(
             EmitValidationError,
-            match="hierarchical nesting via parent_ref is not supported",
+            match="parent_ref.*NO_SUCH_REF",
         ):
+            parse_emit_document(raw)
+
+    def test_parent_ref_cycle_rejected(self):
+        """CLAWP-064: a parent_ref cycle (A->B->A) must be rejected fail-closed."""
+        raw = {
+            "schema_version": 1,
+            "root": {"title": "Cycle test"},
+            "leaves": [
+                {
+                    "ref": "A",
+                    "parent_ref": "B",
+                    "title": "A points to B",
+                    "leaf_key": "cycle-A",
+                    "success_criteria": [],
+                    "scope": [],
+                    "stop_conditions": [],
+                    "delegability": "agent",
+                    "predictions": {},
+                },
+                {
+                    "ref": "B",
+                    "parent_ref": "A",
+                    "title": "B points to A",
+                    "leaf_key": "cycle-B",
+                    "success_criteria": [],
+                    "scope": [],
+                    "stop_conditions": [],
+                    "delegability": "agent",
+                    "predictions": {},
+                },
+            ],
+        }
+        with pytest.raises(EmitValidationError, match="[Cc]ycle"):
+            parse_emit_document(raw)
+
+    def test_parent_ref_self_cycle_rejected(self):
+        """CLAWP-064: a leaf whose parent_ref == its own ref must be rejected."""
+        raw = {
+            "schema_version": 1,
+            "root": {"title": "Self-cycle test"},
+            "leaves": [
+                {
+                    "ref": "SELF",
+                    "parent_ref": "SELF",
+                    "title": "Points to itself",
+                    "leaf_key": "self-cycle",
+                    "success_criteria": [],
+                    "scope": [],
+                    "stop_conditions": [],
+                    "delegability": "agent",
+                    "predictions": {},
+                },
+            ],
+        }
+        with pytest.raises(EmitValidationError, match="[Cc]ycle|self"):
             parse_emit_document(raw)
 
     def test_invalid_delegability_rejected(self):
@@ -1037,3 +1191,265 @@ class TestEmitTreeCLI:
         assert result.exit_code == 1
         err = json.loads(result.output)
         assert err["error"] == "emit_error"
+
+
+# ---------------------------------------------------------------------------
+# CLAWP-064 — In-document hierarchical nesting (multi-level parent_ref)
+# ---------------------------------------------------------------------------
+
+
+class TestEmitTreeMultilevel:
+    """SC1+SC2: multi-level parent_ref nesting — root -> A -> A.1 (2-level deep)."""
+
+    def test_multilevel_tree_parses_correctly(self):
+        """Parse: leaves with valid parent_ref resolve; leaf_id ordering is correct."""
+        doc = parse_emit_document(MULTILEVEL_TREE_DOC)
+        assert len(doc.leaves) == 3
+        # A has no parent_ref (direct child of root)
+        a = next(lf for lf in doc.leaves if lf.ref == "A")
+        assert a.parent_ref is None
+        # A.1 points to A
+        a1 = next(lf for lf in doc.leaves if lf.ref == "A.1")
+        assert a1.parent_ref == "A"
+        # B has no parent_ref
+        b = next(lf for lf in doc.leaves if lf.ref == "B")
+        assert b.parent_ref is None
+
+    def test_multilevel_tree_persists_full_hierarchy(self, temp_portfolio):
+        """SC1: full hierarchy emitted atomically; each non-leaf carries
+        correct parent/children frontmatter at EVERY level."""
+        config = temp_portfolio["config"]
+        tasks_dir = temp_portfolio["tasks_dir"]
+
+        doc = parse_emit_document(MULTILEVEL_TREE_DOC)
+        result = emit_tree(config, "emittest", doc)
+
+        assert not result.dry_run
+        root_id = result.root_id
+
+        # Root directory must exist
+        root_dir = tasks_dir / root_id
+        assert root_dir.is_dir(), f"Root dir missing: {root_dir}"
+        assert (root_dir / "_task.md").exists()
+
+        # Root children: A-style ID (root-001) and B-style (root-002 or similar)
+        # A is a parent itself so it must be a directory under root_dir
+        root_fm = yaml.safe_load(
+            (root_dir / "_task.md").read_text(encoding="utf-8").split("---", 2)[1]
+        )
+        root_children = root_fm.get("children", [])
+        # Root has exactly 2 direct children (A and B)
+        assert len(root_children) == 2, f"Root should have 2 children, got: {root_children}"
+
+        # Find A's task ID (the one that itself has children)
+        a_id = None
+        b_id = None
+        for cid in root_children:
+            cdir = root_dir / cid
+            if cdir.is_dir():
+                a_id = cid  # A is a directory because it has child A.1
+            else:
+                # B is a flat file since it has no children
+                cfile = root_dir / f"{cid}.md"
+                if cfile.exists():
+                    b_id = cid
+
+        assert a_id is not None, f"Could not find A's directory task ID in {root_children}"
+        assert b_id is not None, f"Could not find B's flat task ID in {root_children}"
+
+        # A's directory task
+        a_dir = root_dir / a_id
+        a_task_file = a_dir / "_task.md"
+        assert a_task_file.exists(), f"A's _task.md missing at {a_task_file}"
+        a_fm = yaml.safe_load(a_task_file.read_text(encoding="utf-8").split("---", 2)[1])
+
+        # A's parent must be root
+        assert a_fm.get("parent") == root_id, (
+            f"A.parent should be {root_id}, got {a_fm.get('parent')}"
+        )
+        # A must have exactly one child (A.1)
+        a_children = a_fm.get("children", [])
+        assert len(a_children) == 1, f"A should have 1 child, got: {a_children}"
+
+        # A.1 ID is the grandchild
+        a1_id = a_children[0]
+        assert a1_id.startswith(a_id + "-"), (
+            f"Grandchild ID {a1_id!r} should start with '{a_id}-' (matches clawpm convention)"
+        )
+
+        # A.1 must be a leaf file inside A's directory
+        a1_file = a_dir / f"{a1_id}.md"
+        assert a1_file.exists(), f"Grandchild file missing: {a1_file}"
+        a1_fm = yaml.safe_load(a1_file.read_text(encoding="utf-8").split("---", 2)[1])
+
+        # A.1's parent must be A (not root)
+        assert a1_fm.get("parent") == a_id, (
+            f"A.1.parent should be {a_id}, got {a1_fm.get('parent')}"
+        )
+        # A.1 carries its contract (success_criteria, scope)
+        assert a1_fm.get("scope") == ["src/a/sub/**"]
+        assert a1_fm.get("stop_conditions") == ["build breaks"]
+        preds = a1_fm.get("predictions", {})
+        sc_list = preds.get("success_criteria", [])
+        assert len(sc_list) == 1
+        assert sc_list[0]["criterion"] == "Tests pass"
+
+        # B must be a flat file (no children), parent = root
+        b_file = root_dir / f"{b_id}.md"
+        assert b_file.exists(), f"B file missing: {b_file}"
+        b_fm = yaml.safe_load(b_file.read_text(encoding="utf-8").split("---", 2)[1])
+        assert b_fm.get("parent") == root_id
+
+        # Total emitted: root + A + A.1 + B = 4
+        assert len(result.emitted) == 4, (
+            f"Expected 4 emitted tasks (root+A+A1+B), got {len(result.emitted)}"
+        )
+
+    def test_multilevel_atomicity_no_partial_on_crash(self, temp_portfolio):
+        """SC1 atomicity: a crash mid-stage leaves NO partial tree on disk."""
+        config = temp_portfolio["config"]
+        tasks_dir = temp_portfolio["tasks_dir"]
+
+        doc = parse_emit_document(MULTILEVEL_TREE_DOC)
+        call_count = [0]
+        original_atomic_write = __import__(
+            "clawpm.emit_tree", fromlist=["_atomic_write"]
+        )._atomic_write
+
+        def failing_atomic_write(path, content):
+            call_count[0] += 1
+            if call_count[0] >= 3:
+                raise OSError("Simulated crash during multilevel staging")
+            original_atomic_write(path, content)
+
+        with patch("clawpm.emit_tree._atomic_write", side_effect=failing_atomic_write):
+            with pytest.raises((OSError, Exception)):
+                emit_tree(config, "emittest", doc)
+
+        # No staging remnants
+        staging_dirs = list(tasks_dir.glob(".emit-*"))
+        assert staging_dirs == [], f"Stale staging dirs: {staging_dirs}"
+
+        # No tasks on disk
+        from clawpm.tasks import list_tasks
+        assert list_tasks(config, "emittest") == []
+
+    def test_multilevel_rollup_gating_at_every_level(self, temp_portfolio):
+        """SC2: parent-rollup gating works at every level.
+        A cannot be DONE while A.1 is open; root cannot be DONE while A or B open."""
+        config = temp_portfolio["config"]
+
+        doc = parse_emit_document(MULTILEVEL_TREE_DOC)
+        result = emit_tree(config, "emittest", doc)
+
+        from clawpm.tasks import parent_rollup_status, get_task
+        root_id = result.root_id
+
+        root_task = get_task(config, "emittest", root_id)
+        assert root_task is not None
+        root_status = parent_rollup_status(config, "emittest", root_task)
+        assert not root_status["ready"], "Root should not be ready while children open"
+
+        # Find A (the directory child)
+        a_id = next(
+            cid for cid in root_task.children
+            if (config.project_roots[0] / "emit-test" / ".project" / "tasks" / root_id / cid).is_dir()
+        )
+        a_task = get_task(config, "emittest", a_id)
+        assert a_task is not None
+        a_status = parent_rollup_status(config, "emittest", a_task)
+        assert not a_status["ready"], "A should not be ready while A.1 is open"
+
+    def test_multilevel_flat_regression_unchanged(self, temp_portfolio):
+        """Regression: a document with all parent_ref=None still works exactly as v1."""
+        config = temp_portfolio["config"]
+        tasks_dir = temp_portfolio["tasks_dir"]
+
+        doc = parse_emit_document(FLAT_TREE_DOC)
+        result = emit_tree(config, "emittest", doc)
+
+        assert not result.dry_run
+        root_dir = tasks_dir / result.root_id
+        assert root_dir.is_dir()
+        leaf_files = list(root_dir.glob(f"{result.root_id}-*.md"))
+        assert len(leaf_files) == 3
+        assert len(result.emitted) == 4  # root + 3 direct children
+
+    def test_three_level_tree_persists_correctly(self, temp_portfolio):
+        """SC1+SC2: three-level nesting (root -> P -> P.1 -> P.1.a) lands fully."""
+        config = temp_portfolio["config"]
+        tasks_dir = temp_portfolio["tasks_dir"]
+
+        doc = parse_emit_document(THREELEVEL_TREE_DOC)
+        result = emit_tree(config, "emittest", doc)
+
+        root_id = result.root_id
+        root_dir = tasks_dir / root_id
+        assert root_dir.is_dir()
+
+        root_fm = yaml.safe_load(
+            (root_dir / "_task.md").read_text(encoding="utf-8").split("---", 2)[1]
+        )
+        # Root has exactly 1 direct child (P)
+        assert len(root_fm.get("children", [])) == 1
+        p_id = root_fm["children"][0]
+
+        # P is a directory
+        p_dir = root_dir / p_id
+        assert p_dir.is_dir(), f"P should be a directory: {p_dir}"
+        p_fm = yaml.safe_load(
+            (p_dir / "_task.md").read_text(encoding="utf-8").split("---", 2)[1]
+        )
+        assert p_fm.get("parent") == root_id
+        assert len(p_fm.get("children", [])) == 1
+        p1_id = p_fm["children"][0]
+        assert p1_id.startswith(p_id + "-")
+
+        # P.1 is also a directory (it has P.1.a as child)
+        p1_dir = p_dir / p1_id
+        assert p1_dir.is_dir(), f"P.1 should be a directory: {p1_dir}"
+        p1_fm = yaml.safe_load(
+            (p1_dir / "_task.md").read_text(encoding="utf-8").split("---", 2)[1]
+        )
+        assert p1_fm.get("parent") == p_id
+        assert len(p1_fm.get("children", [])) == 1
+        p1a_id = p1_fm["children"][0]
+        assert p1a_id.startswith(p1_id + "-")
+
+        # P.1.a is a leaf file
+        p1a_file = p1_dir / f"{p1a_id}.md"
+        assert p1a_file.exists(), f"P.1.a leaf missing: {p1a_file}"
+        p1a_fm = yaml.safe_load(
+            p1a_file.read_text(encoding="utf-8").split("---", 2)[1]
+        )
+        assert p1a_fm.get("parent") == p1_id
+        assert p1a_fm.get("scope") == ["src/deep/**"]
+
+        # Total: root + P + P.1 + P.1.a = 4
+        assert len(result.emitted) == 4
+
+    def test_parent_ref_invalid_resolves_rejected(self):
+        """CLAWP-064: parent_ref pointing to unknown ref is caught at parse time.
+        Re-imports EmitValidationError to guard against module-reload side-effects
+        from TestEmitTreeZeroLLM::test_emit_import_graph_excludes_judges."""
+        from clawpm.emit_tree import EmitValidationError as _EVE
+        from clawpm.emit_tree import parse_emit_document as _parse
+        raw = {
+            "schema_version": 1,
+            "root": {"title": "Bad ref test"},
+            "leaves": [
+                {
+                    "ref": "X",
+                    "parent_ref": "NONEXISTENT",
+                    "title": "X has bad parent_ref",
+                    "leaf_key": "bad-ref-X",
+                    "success_criteria": [],
+                    "scope": [],
+                    "stop_conditions": [],
+                    "delegability": "agent",
+                    "predictions": {},
+                }
+            ],
+        }
+        with pytest.raises(_EVE, match="parent_ref.*NONEXISTENT"):
+            _parse(raw)
