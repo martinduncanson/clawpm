@@ -160,6 +160,33 @@ def require_portfolio(ctx: click.Context):
     return config
 
 
+def _read_patterns_file(path: str, option_name: str, fmt) -> list[str]:
+    """Read one-glob-pattern-per-line from *path*.
+
+    Blank lines and lines starting with '#' are skipped.  Patterns are
+    returned VERBATIM -- no shell or CRT glob-expansion is performed.
+
+    This is the Windows-safe filing path for --scope, --predict-scope,
+    and --out-of-scope: the file argument is a plain filesystem path, so
+    it never becomes a glob token in argv and cannot be CRT-expanded.
+
+    emit-tree JSON via stdin is already immune (the JSON blob is a single
+    quoted argument, not a glob-valued token).
+
+    Exits with error if *path* does not exist.
+    """
+    p = Path(path)
+    if not p.exists():
+        output_error(
+            "scope_file_not_found",
+            f"{option_name}: file not found: {path}",
+            fmt=fmt,
+        )
+        sys.exit(1)
+    lines = p.read_text(encoding="utf-8").splitlines()
+    return [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
+
+
 def require_project(ctx: click.Context, project_id: str | None, required: bool = True, auto_init: bool = True) -> tuple[str | None, str]:
     """Resolve project from explicit arg, global flag, cwd, or context.
 
@@ -1399,6 +1426,7 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
 @click.option("--complexity", "-c", type=click.Choice(["s", "m", "l", "xl"]), help="New complexity")
 @click.option("--body", "-b", help="New body content (replaces description before ## sections)")
 @click.option("--scope", "-s", "scope", multiple=True, help="File glob patterns claimed by this task (can specify multiple)")
+@click.option("--scope-file", "scope_file", default=None, type=click.Path(), help="Read scope glob patterns from file (one per line). Windows-safe: bypasses CRT argv glob-expansion. Use instead of --scope when patterns contain wildcards.")
 @click.option("--parallel-group", "parallel_group", type=int, default=None, help="Batch ordinal for parallel dispatch (CLAWP-021). Use --clear-parallel-group to remove.")
 @click.option("--clear-parallel-group", "clear_parallel_group", is_flag=True, default=False, help="Remove parallel_group from the task — opts out of batch dispatch.")
 # --- Prediction flags (all optional) ---
@@ -1406,6 +1434,7 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
 @click.option("--predict-complexity", "predict_complexity", type=click.Choice(["s", "m", "l", "xl"]), default=None, help="Predicted complexity")
 @click.option("--predict-files-changed", "predict_files_changed", type=int, default=None, help="Predicted number of files changed")
 @click.option("--predict-scope", "predict_scope", multiple=True, help="Predicted file glob scope (can specify multiple)")
+@click.option("--predict-scope-file", "predict_scope_file", default=None, type=click.Path(), help="Read predicted-scope patterns from file (one per line). Windows-safe alternative to --predict-scope for glob patterns.")
 @click.option("--predict-frameworks", "predict_frameworks", multiple=True, help="Predicted frameworks/libraries to touch (can specify multiple)")
 @click.option("--predict-pitfalls", "predict_pitfalls", default=None, help="Anticipated problematic areas (free text)")
 @click.option("--hypothesis", "hypothesis", default=None, help="Goal/hypothesis: 'if I do X, then Y will improve'")
@@ -1416,9 +1445,10 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
 @click.option("--confidence", "confidence", type=int, default=None, help="Operator confidence 1-5 (1=wild guess, 5=done this before)")
 @click.option("--reference-task", "reference_tasks", multiple=True, help="Prior task IDs used as reference class (repeatable)")
 @click.option("--pre-mortem", "pre_mortem", default=None, help="'If this task fails, the most likely cause is...'")
-@click.option("--predict-iterations", "predict_iterations", type=int, default=None, help="Predicted iterate→grade→revise cycles (CLAWP-019). Default None; 1 means 'expected to land in one pass'.")
+@click.option("--predict-iterations", "predict_iterations", type=int, default=None, help="Predicted iterate->grade->revise cycles (CLAWP-019). Default None; 1 means 'expected to land in one pass'.")
 # --- CLAWP-054 dispatch contract fields ---
 @click.option("--out-of-scope", "out_of_scope", multiple=True, help="Boundary items the executor MUST NOT touch (repeatable).")
+@click.option("--out-of-scope-file", "out_of_scope_file", default=None, type=click.Path(), help="Read out-of-scope patterns from file (one per line). Windows-safe alternative to --out-of-scope for glob patterns.")
 @click.option("--stop-condition", "stop_conditions", multiple=True, help="Escape-hatch conditions (repeatable).")
 @click.option(
     "--delegability", "delegability",
@@ -1436,12 +1466,14 @@ def tasks_edit(
     complexity: str | None,
     body: str | None,
     scope: tuple[str, ...],
+    scope_file: str | None,
     parallel_group: int | None,
     clear_parallel_group: bool,
     predict_duration: str | None,
     predict_complexity: str | None,
     predict_files_changed: int | None,
     predict_scope: tuple[str, ...],
+    predict_scope_file: str | None,
     predict_frameworks: tuple[str, ...],
     predict_pitfalls: str | None,
     hypothesis: str | None,
@@ -1453,6 +1485,7 @@ def tasks_edit(
     pre_mortem: str | None,
     predict_iterations: int | None,
     out_of_scope: tuple[str, ...] = (),
+    out_of_scope_file: str | None = None,
     stop_conditions: tuple[str, ...] = (),
     delegability: str | None = None,
 ) -> None:
@@ -1467,6 +1500,15 @@ def tasks_edit(
     if confidence is not None and not (1 <= confidence <= 5):
         output_error("bad_confidence", f"--confidence must be 1-5, got {confidence}", fmt=fmt)
         sys.exit(1)
+
+    # Merge file-sourced patterns (literal, no CRT expansion) with inline flags.
+    # File patterns are appended so --scope and --scope-file coexist naturally.
+    if scope_file:
+        scope = tuple(list(scope) + _read_patterns_file(scope_file, "--scope-file", fmt))
+    if predict_scope_file:
+        predict_scope = tuple(list(predict_scope) + _read_patterns_file(predict_scope_file, "--predict-scope-file", fmt))
+    if out_of_scope_file:
+        out_of_scope = tuple(list(out_of_scope) + _read_patterns_file(out_of_scope_file, "--out-of-scope-file", fmt))
 
     has_predictions = any([
         predict_duration is not None,
@@ -1485,9 +1527,9 @@ def tasks_edit(
         predict_iterations is not None,
     ])
 
-    if not any([title, priority is not None, complexity, body, scope, has_predictions, parallel_group is not None, clear_parallel_group,
-                 out_of_scope, stop_conditions, delegability is not None]):
-        output_error("no_changes", "Specify at least one field to edit (--title, --priority, --complexity, --body, --scope, --parallel-group, --clear-parallel-group, --predict-*, --out-of-scope, --stop-condition, or --delegability)", fmt=fmt)
+    if not any([title, priority is not None, complexity, body, scope, scope_file, has_predictions, parallel_group is not None, clear_parallel_group,
+                 out_of_scope, out_of_scope_file, stop_conditions, delegability is not None]):
+        output_error("no_changes", "Specify at least one field to edit (--title, --priority, --complexity, --body, --scope, --scope-file, --parallel-group, --clear-parallel-group, --predict-*, --out-of-scope, --out-of-scope-file, --stop-condition, or --delegability)", fmt=fmt)
         sys.exit(1)
 
     if parallel_group is not None and clear_parallel_group:
@@ -1979,6 +2021,7 @@ def tasks_decompose(
 @click.option("--complexity", "-c", type=click.Choice(["s", "m", "l", "xl"]), help="Complexity")
 @click.option("--depends", "-d", multiple=True, help="Dependencies (can specify multiple)")
 @click.option("--scope", multiple=True, help="File glob patterns claimed by this task (can specify multiple)")
+@click.option("--scope-file", "scope_file", default=None, type=click.Path(), help="Read scope glob patterns from file (one per line). Windows-safe: bypasses CRT argv glob-expansion. Use instead of --scope when patterns contain wildcards.")
 @click.option("--parallel-group", "parallel_group", type=int, default=None, help="Batch ordinal for parallel dispatch (CLAWP-021). Tasks sharing a group dispatch together; group N+1 waits for group N.")
 @click.option("--agent-profile", "agent_profile", default=None, help="Capability/skill profile (CLAWP-038). Recorded on the task and propagated to reflection/iteration events so calibration can segment predicted-vs-actual by profile.")
 @click.option("--parent", "parent_id", help="Parent task ID (creates subtask)")
@@ -1991,6 +2034,7 @@ def tasks_decompose(
 @click.option("--predict-complexity", "predict_complexity", type=click.Choice(["s", "m", "l", "xl"]), default=None, help="Predicted complexity")
 @click.option("--predict-files-changed", "predict_files_changed", type=int, default=None, help="Predicted number of files changed")
 @click.option("--predict-scope", "predict_scope", multiple=True, help="Predicted file glob scope (can specify multiple)")
+@click.option("--predict-scope-file", "predict_scope_file", default=None, type=click.Path(), help="Read predicted-scope patterns from file (one per line). Windows-safe alternative to --predict-scope for glob patterns.")
 @click.option("--predict-frameworks", "predict_frameworks", multiple=True, help="Predicted frameworks/libraries to touch (can specify multiple)")
 @click.option("--predict-pitfalls", "predict_pitfalls", default=None, help="Anticipated problematic areas (free text)")
 @click.option("--hypothesis", "hypothesis", default=None, help="Goal/hypothesis: 'if I do X, then Y will improve'")
@@ -2001,7 +2045,7 @@ def tasks_decompose(
 @click.option("--confidence", "confidence", type=int, default=None, help="Operator confidence 1-5 (1=wild guess, 5=done this before)")
 @click.option("--reference-task", "reference_tasks", multiple=True, help="Prior task IDs used as reference class (repeatable)")
 @click.option("--pre-mortem", "pre_mortem", default=None, help="'If this task fails, the most likely cause is...'")
-@click.option("--predict-iterations", "predict_iterations", type=int, default=None, help="Predicted iterate→grade→revise cycles (CLAWP-019). Default None; 1 means 'expected to land in one pass'.")
+@click.option("--predict-iterations", "predict_iterations", type=int, default=None, help="Predicted iterate->grade->revise cycles (CLAWP-019). Default None; 1 means 'expected to land in one pass'.")
 # --- Phase 1.6 attribution flag ---
 @click.option(
     "--predicted-by", "predicted_by",
@@ -2011,6 +2055,7 @@ def tasks_decompose(
 )
 # --- CLAWP-054 dispatch contract fields ---
 @click.option("--out-of-scope", "out_of_scope", multiple=True, help="Boundary items the executor MUST NOT touch (repeatable; file globs or named topics). Rendered verbatim in the agent preamble.")
+@click.option("--out-of-scope-file", "out_of_scope_file", default=None, type=click.Path(), help="Read out-of-scope patterns from file (one per line). Windows-safe alternative to --out-of-scope for glob patterns.")
 @click.option("--stop-condition", "stop_conditions", multiple=True, help="Escape-hatch condition: if triggered, executor must STOP and report back (repeatable, free text).")
 @click.option(
     "--delegability", "delegability",
@@ -2028,6 +2073,7 @@ def tasks_add(
     complexity: str | None,
     depends: tuple[str, ...],
     scope: tuple[str, ...],
+    scope_file: str | None,
     parallel_group: int | None,
     agent_profile: str | None,
     parent_id: str | None,
@@ -2039,6 +2085,7 @@ def tasks_add(
     predict_complexity: str | None,
     predict_files_changed: int | None,
     predict_scope: tuple[str, ...],
+    predict_scope_file: str | None,
     predict_frameworks: tuple[str, ...],
     predict_pitfalls: str | None,
     hypothesis: str | None,
@@ -2051,6 +2098,7 @@ def tasks_add(
     predict_iterations: int | None,
     predicted_by: str | None,
     out_of_scope: tuple[str, ...] = (),
+    out_of_scope_file: str | None = None,
     stop_conditions: tuple[str, ...] = (),
     delegability: str | None = None,
 ) -> None:
@@ -2064,6 +2112,14 @@ def tasks_add(
         sys.exit(1)
 
     project_id, _ = require_project(ctx, project_id)
+
+    # Merge file-sourced patterns (literal, no CRT expansion) with inline flags.
+    if scope_file:
+        scope = tuple(list(scope) + _read_patterns_file(scope_file, "--scope-file", fmt))
+    if predict_scope_file:
+        predict_scope = tuple(list(predict_scope) + _read_patterns_file(predict_scope_file, "--predict-scope-file", fmt))
+    if out_of_scope_file:
+        out_of_scope = tuple(list(out_of_scope) + _read_patterns_file(out_of_scope_file, "--out-of-scope-file", fmt))
 
     # Determine body content
     task_body = ""
