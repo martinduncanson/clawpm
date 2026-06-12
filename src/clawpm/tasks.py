@@ -714,6 +714,9 @@ def add_task(
     predictions: Predictions | None = None,
     parallel_group: int | None = None,
     agent_profile: str | None = None,
+    out_of_scope: list[str] | None = None,
+    stop_conditions: list[str] | None = None,
+    delegability: str | None = None,
 ) -> Task | None:
     """Add a new task to a project."""
     tasks_dir = get_tasks_dir(config, project_id)
@@ -805,6 +808,13 @@ def add_task(
 
     if agent_profile:
         frontmatter["agent_profile"] = agent_profile
+    # CLAWP-054 — contract fields
+    if out_of_scope:
+        frontmatter["out_of_scope"] = out_of_scope
+    if stop_conditions:
+        frontmatter["stop_conditions"] = stop_conditions
+    if delegability and delegability != "either":
+        frontmatter["delegability"] = delegability
 
     if predictions and not predictions.is_empty():
         pred_dict = predictions.to_dict()
@@ -857,6 +867,9 @@ def edit_task(
     predictions: Predictions | None = None,
     parallel_group: int | None = None,
     clear_parallel_group: bool = False,
+    out_of_scope: list[str] | None = None,
+    stop_conditions: list[str] | None = None,
+    delegability: str | None = None,
 ) -> Task | None:
     """Edit task metadata (frontmatter) and optionally title/body."""
     task = get_task(config, project_id, task_id)
@@ -901,6 +914,22 @@ def edit_task(
                 k: v for k, v in pred_dict.items()
                 if v is not None and v != []
             }
+    # CLAWP-054 — contract fields
+    if out_of_scope is not None:
+        if out_of_scope:
+            frontmatter["out_of_scope"] = out_of_scope
+        else:
+            frontmatter.pop("out_of_scope", None)
+    if stop_conditions is not None:
+        if stop_conditions:
+            frontmatter["stop_conditions"] = stop_conditions
+        else:
+            frontmatter.pop("stop_conditions", None)
+    if delegability is not None:
+        if delegability != "either":
+            frontmatter["delegability"] = delegability
+        else:
+            frontmatter.pop("delegability", None)
 
     # Update title in content (first # heading)
     if title is not None:
@@ -1143,3 +1172,4 @@ def add_subtask(
         _append_child_to_parent_frontmatter(parent.file_path, subtask_id)
 
     return Task.from_file(file_path)
+

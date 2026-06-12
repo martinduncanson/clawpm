@@ -97,6 +97,7 @@ class JudgeVerdict:
     ok: bool
     reason: str
     impossible: bool = False
+    stop_condition_tripped: bool = False  # CLAWP-054: escape-hatch condition fired
 
     def __post_init__(self) -> None:
         if self.ok and self.impossible:
@@ -105,11 +106,22 @@ class JudgeVerdict:
                 "use parse() if you need to coerce contradictory judge "
                 "output into a safe not-ok verdict."
             )
+        # CLAWP-054 invariants
+        if self.ok and self.stop_condition_tripped:
+            raise ValueError(
+                "JudgeVerdict cannot be both ok=True and stop_condition_tripped=True."
+            )
+        if self.impossible and self.stop_condition_tripped:
+            raise ValueError(
+                "JudgeVerdict cannot be both impossible=True and stop_condition_tripped=True."
+            )
 
     def to_dict(self) -> dict:
         d: dict = {"ok": self.ok, "reason": self.reason}
         if self.impossible:
             d["impossible"] = True
+        if self.stop_condition_tripped:
+            d["stop_condition_tripped"] = True
         return d
 
     @classmethod
@@ -199,7 +211,24 @@ class JudgeVerdict:
                     f"impossible=true. Original reason: {reason}"
                 ),
             )
-        return cls(ok=ok, reason=reason, impossible=impossible)
+        # CLAWP-054: parse stop_condition_tripped
+        raw_trip = data.get("stop_condition_tripped", False)
+        if not isinstance(raw_trip, bool):
+            # non-bool: conservative default False (don't silently trip)
+            raw_trip = False
+        if raw_trip and ok:
+            # contradiction: ok + trip. return plain block.
+            return cls(
+                ok=False,
+                reason="JUDGE_CONTRADICTION: ok=true AND stop_condition_tripped=true",
+            )
+        if raw_trip and impossible:
+            # contradiction: impossible + trip. return plain block.
+            return cls(
+                ok=False,
+                reason="JUDGE_CONTRADICTION: impossible=true AND stop_condition_tripped=true",
+            )
+        return cls(ok=ok, reason=reason, impossible=impossible, stop_condition_tripped=raw_trip)
 
 
 JudgeInvoker = Callable[[str], str]
@@ -722,6 +751,15 @@ def map_verdict_to_hook_output(verdict: JudgeVerdict) -> dict:
             "continue": True,
             "systemMessage": f"clawpm rubric satisfied: {verdict.reason}",
         }
+    # CLAWP-054: escape-hatch stop condition — let the agent stop, operator triages
+    if verdict.stop_condition_tripped:
+        return {
+            "continue": True,
+            "systemMessage": (
+                f"clawpm STOP_CONDITION_TRIPPED — executor declared an escape-hatch "
+                f"condition; operator should triage: {verdict.reason}"
+            ),
+        }
     if verdict.impossible:
         # Surface impossibility but DO let the agent stop — otherwise the
         # session loops forever on an unachievable goal. The systemMessage
@@ -741,3 +779,6 @@ def map_verdict_to_hook_output(verdict: JudgeVerdict) -> dict:
         "decision": "block",
         "reason": f"clawpm rubric not satisfied: {verdict.reason}",
     }
+
+
+
