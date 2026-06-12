@@ -2644,6 +2644,124 @@ def tasks_teardown_dispatch(
     )
 
 
+@tasks.command("emit-tree")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
+@click.option("--dry-run", is_flag=True, default=False, help="Run all gates and report what would be written; write nothing.")
+@click.option("--strict", is_flag=True, default=False, help="Hard-fail on won't-do / constitution violations instead of report-back.")
+@click.pass_context
+def tasks_emit_tree(
+    ctx: click.Context,
+    project_id: str | None,
+    dry_run: bool,
+    strict: bool,
+) -> None:
+    """Persist a fully-contracted task-tree atomically (CLAWP-056).
+
+    Reads a JSON tree document from stdin. Validates all gates (reject-match,
+    constitution, ID-collision, baseline-resolution) before writing anything,
+    then stages and promotes the entire subtree atomically. Zero LLM calls.
+
+    \\b
+    Input document shape (schema_version: 1):
+      {
+        "schema_version": 1,
+        "project": "my-project",
+        "root": { "title": "New root task" },
+        "prd": { "title": "Goal PRD", "type": "spike", "tags": ["prd"],
+                 "body_markdown": "## Problem\\n..." },
+        "leaves": [
+          { "ref": "L1", "parent_ref": null, "title": "Subtask 1",
+            "success_criteria": [{"criterion": "Tests pass", "gradeable_signal": "pytest exit 0",
+                                   "comparator": "eq:0"}],
+            "scope": ["src/**"], "out_of_scope": ["docs/**"],
+            "stop_conditions": ["test suite red"], "delegability": "agent",
+            "predictions": {"duration_min": 120, "complexity": "m", "confidence": 3},
+            "leaf_key": "L1-stable-key" }
+        ]
+      }
+
+    Output envelope (--format json):
+      { "status": "ok", "data": { "root_id": "...", "emitted": [...],
+        "research_id": "...", "baseline_ref": "...", "rejected": [...],
+        "constitution_violations": [...], "dry_run": false } }
+    """
+    import json as _json
+    from .emit_tree import parse_emit_document, emit_tree, EmitValidationError
+
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+
+    # Read JSON from stdin
+    try:
+        raw_text = click.get_text_stream("stdin").read()
+    except Exception as exc:
+        output_error("stdin_read_error", f"Failed to read stdin: {exc}", fmt=fmt)
+        sys.exit(1)
+
+    if not raw_text or not raw_text.strip():
+        output_error("empty_input", "No input document provided on stdin", fmt=fmt)
+        sys.exit(1)
+
+    try:
+        raw_doc = _json.loads(raw_text)
+    except _json.JSONDecodeError as exc:
+        output_error("json_parse_error", f"stdin is not valid JSON: {exc}", fmt=fmt)
+        sys.exit(1)
+
+    if not isinstance(raw_doc, dict):
+        output_error("invalid_input", "Input document must be a JSON object", fmt=fmt)
+        sys.exit(1)
+
+    # Override project from document if not set on CLI
+    if not project_id:
+        project_id = raw_doc.get("project")
+    project_id, _ = require_project(ctx, project_id)
+
+    # Phase 1 — parse + validate
+    try:
+        doc = parse_emit_document(raw_doc)
+    except EmitValidationError as exc:
+        output_error("validation_error", str(exc), fmt=fmt)
+        sys.exit(1)
+
+    # Use project from CLI preference over document
+    doc_project = doc.project
+    # (project_id already resolved; doc.project used only as fallback above)
+
+    # Phases 2–4 — gate barrier + stage + promote
+    try:
+        result = emit_tree(
+            config=config,
+            project_id=project_id,
+            doc=doc,
+            dry_run=dry_run,
+            strict=strict,
+        )
+    except EmitValidationError as exc:
+        output_error("emit_error", str(exc), fmt=fmt)
+        sys.exit(1)
+    except Exception as exc:
+        output_error("emit_error", f"Unexpected error during emission: {exc}", fmt=fmt)
+        sys.exit(1)
+
+    if dry_run:
+        msg = (
+            f"Dry-run complete for project '{project_id}': "
+            f"{len(doc.leaves)} leaf(ves) would be emitted under {result.root_id}"
+            + (f"; {len(result.rejected)} rejected" if result.rejected else "")
+            + (f"; {len(result.constitution_violations)} constitution violation(s)" if result.constitution_violations else "")
+            + ". No writes performed."
+        )
+    else:
+        msg = (
+            f"Emitted {len(result.emitted)} task(s) under {result.root_id}"
+            + (f" [PRD: {result.research_id}]" if result.research_id else "")
+            + (f"; {len(result.rejected)} leaf(ves) skipped (won't-do)" if result.rejected else "")
+        )
+
+    output_success(msg, data=result.to_dict(), fmt=fmt)
+
+
 @tasks.command("split")
 @click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
 @click.argument("task_id")
