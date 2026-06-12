@@ -222,20 +222,19 @@ def _parse_leaf(raw: Any, idx: int) -> LeafSpec:
         # Generate a stable key from ref if not provided — callers SHOULD supply one
         leaf_key = ref
 
-    # v1 does NOT support in-document hierarchical nesting. parent_ref is
-    # accepted in the schema (forward-compat) but a non-null value must
-    # FAIL-CLOSED rather than be silently flattened under the root. True
-    # nesting is tracked as CLAWP-064.
+    # parent_ref: when non-null, this leaf is a child of another leaf in the
+    # same document (CLAWP-064 in-document nesting). Validation that parent_ref
+    # resolves to an existing sibling ref is done in parse_emit_document after
+    # all leaves are collected.
     parent_ref = raw.get("parent_ref")
-    if parent_ref is not None:
+    if parent_ref is not None and not isinstance(parent_ref, str):
         raise EmitValidationError(
-            "in-document hierarchical nesting via parent_ref is not supported "
-            "in v1 — use root.attach_to to add depth across calls (see CLAWP-064)"
+            f"leaves[{idx}] (ref={ref!r}) parent_ref must be a string or null"
         )
 
     return LeafSpec(
         ref=ref,
-        parent_ref=raw.get("parent_ref"),
+        parent_ref=parent_ref,
         title=title,
         success_criteria=success_criteria,
         scope=scope,
@@ -335,9 +334,45 @@ def parse_emit_document(raw: dict[str, Any]) -> EmitTreeDocument:
         dupes = [r for r in refs if refs.count(r) > 1]
         raise EmitValidationError(f"Duplicate leaf refs: {sorted(set(dupes))!r}")
 
-    # NOTE: non-null parent_ref is rejected fail-closed in _parse_leaf (v1 has
-    # no in-document nesting; CLAWP-064). By here every leaf.parent_ref is None,
-    # so there is nothing further to resolve.
+    # parent_ref resolution and cycle detection (CLAWP-064).
+    # Every non-null parent_ref must match another leaf's ref in the document.
+    ref_set = set(refs)
+    for lf in leaves:
+        if lf.parent_ref is not None:
+            if lf.parent_ref == lf.ref:
+                raise EmitValidationError(
+                    f"Leaf ref={lf.ref!r} has a self-cycle: parent_ref points to itself"
+                )
+            if lf.parent_ref not in ref_set:
+                raise EmitValidationError(
+                    f"Leaf ref={lf.ref!r} has parent_ref={lf.parent_ref!r} "
+                    "which does not match any other leaf's ref in this document"
+                )
+
+    # Cycle detection: topological sort via Kahn's algorithm.
+    # Build adjacency: parent_ref -> child.
+    in_degree = {lf.ref: 0 for lf in leaves}
+    children_of: dict[str, list[str]] = {lf.ref: [] for lf in leaves}
+    for lf in leaves:
+        if lf.parent_ref is not None:
+            in_degree[lf.ref] += 1
+            children_of[lf.parent_ref].append(lf.ref)
+
+    queue = [r for r, d in in_degree.items() if d == 0]
+    processed = 0
+    while queue:
+        node = queue.pop(0)
+        processed += 1
+        for child in children_of[node]:
+            in_degree[child] -= 1
+            if in_degree[child] == 0:
+                queue.append(child)
+
+    if processed != len(leaves):
+        raise EmitValidationError(
+            "Cycle detected in parent_ref graph: all leaves in a document must form "
+            "a DAG (directed acyclic graph) rooted at leaves with parent_ref=null"
+        )
 
     return EmitTreeDocument(
         schema_version=sv,
@@ -778,10 +813,13 @@ def emit_tree(
             + str(blocking_violations)
         )
 
-    # ID collision pre-check (only needed when attach_to existing task;
-    # new-root creates the parent fresh so children start from 001 with
-    # no collision risk from existing tasks — but we still check.)
-    collisions = _check_id_collisions(config, project_id, parent_id, leaves_to_emit)
+    # ID collision pre-check (only needed for root-level children;
+    # inner-node children start fresh so no collision risk from existing tasks).
+    # Only check root-level leaves (those with parent_ref=None or whose
+    # parent_ref points to another leaf — the root-level check is sufficient
+    # because inner nodes are newly created in this same emit).
+    root_level_leaves = [lf for lf in leaves_to_emit if lf.parent_ref is None]
+    collisions = _check_id_collisions(config, project_id, parent_id, root_level_leaves)
     if collisions:
         raise EmitValidationError(
             f"Emission aborted: ID collisions detected: "
@@ -812,18 +850,82 @@ def emit_tree(
         prd_title_slug = "-".join(filter(None, prd_title_slug.split("-")))[:40]
         research_id = f"{project_id}-research-prd-{prd_title_slug}"
 
-    # Predict child IDs in leaf order using the same union-scan add_subtask uses.
-    # already-emitted (idempotent) leaves are already on disk, so their ordinals
-    # are captured by the parent-dir glob inside the helper.
-    existing_nums = _existing_child_nums(tasks_dir, parent_id)
+    # -----------------------------------------------------------------------
+    # CLAWP-064: Topological ID minting (top-down, parents before children).
+    #
+    # We need to know which refs have children in the emit set, so we can
+    # promote those leaves to directory tasks.  We also need to mint IDs
+    # level-by-level so that a child's ID can be derived from its parent's
+    # already-minted ID (matching clawpm's existing PARENT-NNN-MMM convention).
+    #
+    # Algorithm:
+    #   1. Build a map: ref -> list of children (from leaves_to_emit only)
+    #   2. Topological sort via Kahn's (same as parse validation, but now using
+    #      the filtered leaves_to_emit set)
+    #   3. Assign task IDs in topo order: root-level leaves get IDs under
+    #      parent_id; inner-leaf children get IDs under their parent's minted ID.
+    # -----------------------------------------------------------------------
 
-    next_num = (max(existing_nums) if existing_nums else 0) + 1
-    leaf_id_map: dict[str, str] = {}  # ref → task_id
-    child_ids: list[str] = []
+    # Build parent→children map within the filtered leaves_to_emit set.
+    emit_refs = {lf.ref for lf in leaves_to_emit}
+    children_by_ref: dict[str, list[str]] = {lf.ref: [] for lf in leaves_to_emit}
     for lf in leaves_to_emit:
-        leaf_id_map[lf.ref] = f"{parent_id}-{next_num:03d}"
-        child_ids.append(f"{parent_id}-{next_num:03d}")
-        next_num += 1
+        if lf.parent_ref is not None and lf.parent_ref in emit_refs:
+            children_by_ref[lf.parent_ref].append(lf.ref)
+
+    # Which refs have at least one child in the emit set (must become dir tasks)
+    has_children: set[str] = {ref for ref, kids in children_by_ref.items() if kids}
+
+    # Topological sort of leaves_to_emit
+    in_degree_emit: dict[str, int] = {}
+    for lf in leaves_to_emit:
+        effective_parent = lf.parent_ref if lf.parent_ref in emit_refs else None
+        in_degree_emit[lf.ref] = 1 if effective_parent is not None else 0
+
+    topo_queue = [lf.ref for lf in leaves_to_emit if in_degree_emit[lf.ref] == 0]
+    topo_order: list[str] = []
+    while topo_queue:
+        node = topo_queue.pop(0)
+        topo_order.append(node)
+        for child_ref in children_by_ref[node]:
+            in_degree_emit[child_ref] -= 1
+            if in_degree_emit[child_ref] == 0:
+                topo_queue.append(child_ref)
+
+    # ref → LeafSpec lookup
+    leaf_by_ref: dict[str, LeafSpec] = {lf.ref: lf for lf in leaves_to_emit}
+
+    # Mint IDs top-down.  For each leaf in topo order:
+    #   - root-level (parent_ref=None or parent_ref not in emit set): child of parent_id
+    #   - nested (parent_ref in emit set): child of parent's minted ID
+    # Track per-node next ordinal separately (each new ID space starts fresh).
+    leaf_id_map: dict[str, str] = {}  # ref -> minted task ID
+    next_ordinal: dict[str, int] = {}  # minted-parent-id -> next ordinal
+
+    # Seed root-level ordinal from existing children on disk.
+    existing_nums = _existing_child_nums(tasks_dir, parent_id)
+    next_ordinal[parent_id] = (max(existing_nums) if existing_nums else 0) + 1
+
+    for ref in topo_order:
+        lf = leaf_by_ref[ref]
+        effective_parent_id = (
+            leaf_id_map[lf.parent_ref]
+            if lf.parent_ref is not None and lf.parent_ref in emit_refs
+            else parent_id
+        )
+        if effective_parent_id not in next_ordinal:
+            # Newly-created inner node: ordinal starts at 1 (no existing children)
+            next_ordinal[effective_parent_id] = 1
+        ordinal = next_ordinal[effective_parent_id]
+        next_ordinal[effective_parent_id] = ordinal + 1
+        leaf_id_map[ref] = f"{effective_parent_id}-{ordinal:03d}"
+
+    # Direct children of parent_id (for root's children list + attach_to update)
+    child_ids: list[str] = [
+        leaf_id_map[lf.ref]
+        for lf in leaves_to_emit
+        if (lf.parent_ref is None or lf.parent_ref not in emit_refs)
+    ]
 
     # Build staging directory on same FS as tasks_dir
     staging_uuid = uuid.uuid4().hex[:12]
@@ -848,7 +950,6 @@ def emit_tree(
             _atomic_write(staging_research_file, research_content)
 
         # Stage new root task (if not attach_to)
-        new_root_task: Task | None = None
         if not doc.root.attach_to:
             # Stage root as a directory task (it will have children)
             staging_parent_dir = staging_dir / parent_id
@@ -866,26 +967,83 @@ def emit_tree(
             staging_parent_task = staging_parent_dir / "_task.md"
             _atomic_write(staging_parent_task, root_content)
 
-        # Stage leaf task files
-        # For new-root: stage inside staging_dir / parent_id /
-        # For attach_to: stage directly in staging_dir / (we'll rename per-file into live dir)
-        if not doc.root.attach_to:
-            leaf_staging_base = staging_dir / parent_id
-        else:
-            leaf_staging_base = staging_dir / "_attach"
-            leaf_staging_base.mkdir()
+        # -----------------------------------------------------------------------
+        # Stage all leaf task files (multi-level, topo order).
+        #
+        # For new-root:
+        #   staging_dir/<parent_id>/                   ← root dir (already staged)
+        #   staging_dir/<parent_id>/<child>.md         ← direct leaf child
+        #   staging_dir/<parent_id>/<child>/           ← inner-node child (has kids)
+        #   staging_dir/<parent_id>/<child>/_task.md
+        #   staging_dir/<parent_id>/<child>/<grandchild>.md
+        #   ... and so on recursively
+        #
+        # For attach_to:
+        #   staging_dir/_attach/<child>.md
+        #   staging_dir/_attach/<child>/               ← if inner node
+        #   staging_dir/_attach/<child>/_task.md
+        #   staging_dir/_attach/<child>/<grandchild>.md
+        # -----------------------------------------------------------------------
 
-        for lf in leaves_to_emit:
-            child_id = leaf_id_map[lf.ref]
-            leaf_content = _render_task_content(
-                task_id=child_id,
-                title=lf.title,
-                parent_id=parent_id,
-                leaf=lf,
-                baseline_ref=baseline_ref,
+        # Determine the base dir inside the staging root where direct children land.
+        if not doc.root.attach_to:
+            staging_base = staging_dir / parent_id
+        else:
+            staging_base = staging_dir / "_attach"
+            staging_base.mkdir()
+
+        # Stage each leaf in topo order.  We need to know each leaf's children
+        # to decide whether it becomes a directory task.
+        for ref in topo_order:
+            lf = leaf_by_ref[ref]
+            task_id = leaf_id_map[ref]
+            effective_parent_id = (
+                leaf_id_map[lf.parent_ref]
+                if lf.parent_ref is not None and lf.parent_ref in emit_refs
+                else parent_id
             )
-            staging_leaf_file = leaf_staging_base / f"{child_id}.md"
-            _atomic_write(staging_leaf_file, leaf_content)
+
+            # Where does this leaf's file land in the staging tree?
+            # Root-level leaves land in staging_base.
+            # Nested leaves land inside their parent's staging sub-directory.
+            if lf.parent_ref is None or lf.parent_ref not in emit_refs:
+                staging_parent_subdir = staging_base
+            else:
+                # Parent is another leaf — its staging dir is inside staging_base
+                # (or deeper). We need to locate it by walking up.
+                staging_parent_subdir = _staging_dir_for_task(
+                    staging_base, leaf_id_map[lf.parent_ref], parent_id
+                )
+
+            leaf_direct_children = [
+                leaf_id_map[child_ref] for child_ref in children_by_ref[ref]
+            ]
+            is_inner = ref in has_children
+
+            if is_inner:
+                # This leaf becomes a directory task (_task.md inside a subdir)
+                leaf_subdir = staging_parent_subdir / task_id
+                leaf_subdir.mkdir(parents=True, exist_ok=True)
+                leaf_content = _render_task_content(
+                    task_id=task_id,
+                    title=lf.title,
+                    parent_id=effective_parent_id,
+                    leaf=lf,
+                    baseline_ref=baseline_ref,
+                    children=leaf_direct_children,
+                )
+                _atomic_write(leaf_subdir / "_task.md", leaf_content)
+            else:
+                # Leaf node — plain .md file
+                leaf_content = _render_task_content(
+                    task_id=task_id,
+                    title=lf.title,
+                    parent_id=effective_parent_id,
+                    leaf=lf,
+                    baseline_ref=baseline_ref,
+                )
+                staging_parent_subdir.mkdir(parents=True, exist_ok=True)
+                _atomic_write(staging_parent_subdir / f"{task_id}.md", leaf_content)
 
         # -----------------------------------------------------------------------
         # Phase 4 — Promote (atomic rename)
@@ -894,7 +1052,9 @@ def emit_tree(
         emitted_tasks: list[Task] = []
 
         if not doc.root.attach_to:
-            # New-root: rename the whole staging parent dir into tasks_dir in one shot
+            # New-root: rename the whole staging parent dir into tasks_dir in one shot.
+            # All levels of the hierarchy are inside staging_dir/<parent_id>/ and
+            # move atomically as a single rename.
             live_parent_dir = tasks_dir / parent_id
             if live_parent_dir.exists():
                 raise EmitValidationError(
@@ -903,25 +1063,12 @@ def emit_tree(
                 )
             (staging_dir / parent_id).rename(live_parent_dir)
 
-            # Read the promoted task files
-            root_task_file = live_parent_dir / "_task.md"
-            if root_task_file.exists():
-                from .models import Task as _Task
-                try:
-                    new_root_task = _Task.from_file(root_task_file)
-                except Exception:
-                    pass
-            for lf in leaves_to_emit:
-                child_id = leaf_id_map[lf.ref]
-                promoted_leaf = live_parent_dir / f"{child_id}.md"
-                if promoted_leaf.exists():
-                    from .models import Task as _Task2
-                    try:
-                        emitted_tasks.append(_Task2.from_file(promoted_leaf))
-                    except Exception:
-                        pass
+            # Read the promoted task files (depth-first collect) — includes root
+            # _task.md and all children at every level.
+            _collect_emitted_tasks(live_parent_dir, parent_id, emitted_tasks)
+
         else:
-            # attach_to: ensure parent is a directory task; rename each child file
+            # attach_to: ensure parent is a directory task.
             parent_task = get_task(config, project_id, parent_id)
             if not parent_task:
                 raise EmitValidationError(
@@ -938,24 +1085,31 @@ def emit_tree(
 
             live_parent_dir = parent_task.file_path.parent  # type: ignore[union-attr]
 
-            # Promote children first (crash-safe: children land before parent
-            # child-list references them — per the spec ordering)
-            for lf in leaves_to_emit:
-                child_id = leaf_id_map[lf.ref]
-                src = leaf_staging_base / f"{child_id}.md"
-                dst = live_parent_dir / f"{child_id}.md"
-                src.rename(dst)
-                from .models import Task as _Task3
-                if dst.exists():
+            # Promote each top-level child subtree atomically (file or dir rename).
+            # Children land before the parent child-list is updated — crash-safe
+            # ordering preserved from v1.
+            for cid in child_ids:
+                src_file = staging_base / f"{cid}.md"
+                src_dir = staging_base / cid
+                if src_dir.exists():
+                    # Inner node — rename entire subtree directory
+                    dst_dir = live_parent_dir / cid
+                    src_dir.rename(dst_dir)
+                    _collect_emitted_tasks(dst_dir, cid, emitted_tasks)
+                elif src_file.exists():
+                    # Leaf node — rename single file
+                    dst_file = live_parent_dir / f"{cid}.md"
+                    src_file.rename(dst_file)
+                    from .models import Task as _Task4
                     try:
-                        emitted_tasks.append(_Task3.from_file(dst))
+                        emitted_tasks.append(_Task4.from_file(dst_file))
                     except Exception:
                         pass
 
-            # Last: atomically update parent's children list
+            # Last: update parent's children list (after files are in place)
             if parent_task.file_path:
-                for child_id in child_ids:
-                    _append_child_to_parent_frontmatter(parent_task.file_path, child_id)
+                for cid in child_ids:
+                    _append_child_to_parent_frontmatter(parent_task.file_path, cid)
 
                 # Also stamp prd_ref on parent if we have one
                 if research_id:
@@ -1007,11 +1161,11 @@ def emit_tree(
         # Work-log failure never blocks the result
         pass
 
-    # Build result
-    emitted_dicts = []
-    if new_root_task:
-        emitted_dicts.append(new_root_task.to_dict())
-    emitted_dicts.extend(t.to_dict() for t in emitted_tasks)
+    # Build result — emitted_tasks was populated by _collect_emitted_tasks
+    # (new-root path) or by individual file reads (attach_to path).
+    # new_root_task is set only for new-root; it was already added to emitted_tasks
+    # via _collect_emitted_tasks, so we do NOT re-add it here.
+    emitted_dicts = [t.to_dict() for t in emitted_tasks]
 
     return EmitResult(
         root_id=parent_id,
@@ -1027,6 +1181,77 @@ def emit_tree(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _staging_dir_for_task(staging_base: Path, task_id: str, root_parent_id: str) -> Path:
+    """Locate the staging directory for a given task_id inside staging_base.
+
+    Used during multi-level staging to find where a nested leaf's parent
+    directory lives inside the staging tree. The task_id is always of the form
+    <root>-NNN or <root>-NNN-MMM[-...], so we can reconstruct the path by
+    walking the ID segments and resolving each directory level inside
+    staging_base.
+
+    Examples (staging_base = .emit-xxx/<root_parent_id>/):
+      task_id = ROOT-001       -> staging_base/ROOT-001/
+      task_id = ROOT-001-002   -> staging_base/ROOT-001/ROOT-001-002/
+    """
+    # The task_id is relative to root_parent_id. All intermediate directories
+    # nest directly — e.g. ROOT-001-002 lives at staging_base/ROOT-001/ROOT-001-002/.
+    # We derive the path by stripping successively shorter suffixes.
+    segments = task_id.split("-")
+    # root_parent_id itself is NOT inside staging_base as a directory —
+    # staging_base IS the root_parent_id directory.
+    # We need to figure out: how many levels deep is task_id from staging_base?
+    # strategy: walk the ancestor chain from task_id up to (but not including) root_parent_id.
+    ancestors: list[str] = []
+    current = task_id
+    while True:
+        # Strip the last ordinal segment to get the parent ID
+        parts = current.rsplit("-", 1)
+        if len(parts) < 2:
+            break
+        parent = parts[0]
+        if parent == root_parent_id:
+            # task_id is a direct child of root_parent_id
+            break
+        ancestors.append(parent)
+        current = parent
+
+    # ancestors is in child-to-parent order; reverse to get root-to-child
+    ancestors.reverse()
+    # Build the path: staging_base / ancestor1 / ancestor2 / ... / task_id
+    path = staging_base
+    for anc in ancestors:
+        path = path / anc
+    return path / task_id
+
+
+def _collect_emitted_tasks(live_dir: Path, task_id: str, out: list) -> None:
+    """Recursively collect all Task objects from a promoted directory tree.
+
+    Reads _task.md files (for directory tasks) and *.md leaf files (excluding
+    _task.md) at every level beneath live_dir, appending Task objects to out.
+    """
+    from .models import Task as _TaskC
+
+    # Read the _task.md at this level if present
+    task_file = live_dir / "_task.md"
+    if task_file.exists():
+        try:
+            out.append(_TaskC.from_file(task_file))
+        except Exception:
+            pass
+
+    # Recurse into subdirectories (direct children that became dir tasks)
+    for entry in live_dir.iterdir():
+        if entry.is_dir():
+            _collect_emitted_tasks(entry, entry.name, out)
+        elif entry.is_file() and entry.name != "_task.md" and entry.suffix == ".md":
+            try:
+                out.append(_TaskC.from_file(entry))
+            except Exception:
+                pass
 
 
 def _atomic_write(path: Path, content: str) -> None:
