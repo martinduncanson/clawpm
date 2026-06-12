@@ -462,6 +462,10 @@ class Task:
     out_of_scope: list[str] = field(default_factory=list)
     stop_conditions: list[str] = field(default_factory=list)
     delegability: str = "either"  # "agent" | "human" | "either"
+    # CLAWP-055 — per-task baseline marker. Stamped at task-creation time.
+    # Opaque string: git short-SHA when the project is a git repo, else a
+    # "ts:<ISO8601-UTC>" timestamp. None for legacy tasks (backward-compat).
+    baseline_ref: str | None = None
 
     @property
     def is_parent(self) -> bool:
@@ -588,6 +592,15 @@ class Task:
             deleg_raw if deleg_raw in ("agent", "human", "either") else "either"
         )
 
+        # CLAWP-055 — baseline_ref: opaque string stamped at task creation.
+        # None for legacy tasks — backward-compat default.
+        baseline_ref_raw = frontmatter.get("baseline_ref")
+        baseline_ref: str | None = (
+            baseline_ref_raw
+            if isinstance(baseline_ref_raw, str) and baseline_ref_raw.strip()
+            else None
+        )
+
         return cls(
             id=frontmatter.get("id", path.stem.replace(".progress", "")),
             title=title,
@@ -611,6 +624,7 @@ class Task:
             out_of_scope=out_of_scope,
             stop_conditions=stop_conditions,
             delegability=delegability,
+            baseline_ref=baseline_ref,
         )
 
     @property
@@ -662,6 +676,8 @@ class Task:
             "out_of_scope": self.out_of_scope,
             "stop_conditions": self.stop_conditions,
             "delegability": self.delegability,
+            # CLAWP-055 — baseline ref (opaque; None for legacy tasks)
+            "baseline_ref": self.baseline_ref,
         }
         body = self.body
         if body:
