@@ -2366,6 +2366,12 @@ _FALLBACK_POLICIES = ["requeue", "route-secondary", "escalate-to-human", "fail"]
     default="requeue", show_default=True,
     help="CLAWP-039: what to do with the task if its lease expires.",
 )
+@click.option(
+    "--confirm-stale", "confirm_stale", is_flag=True, default=False,
+    help="CLAWP-055: acknowledge that the task's in-scope files have changed since "
+         "the baseline_ref was stamped, and proceed with dispatch anyway. Without "
+         "this flag, dispatch is blocked when drift is detected.",
+)
 @click.pass_context
 def tasks_dispatch(
     ctx: click.Context,
@@ -2379,6 +2385,7 @@ def tasks_dispatch(
     refute_votes: int,
     lease_ttl: int | None,
     fallback_policy: str,
+    confirm_stale: bool,
 ) -> None:
     """Emit hook-wired .claude/settings.local.json for a dispatched subagent (CLAWP-018).
 
@@ -2417,6 +2424,34 @@ def tasks_dispatch(
             fmt=fmt,
         )
         sys.exit(1)
+
+    # CLAWP-055: pre-dispatch drift reconciliation.
+    # Check whether in-scope paths changed since the task's baseline_ref.
+    # Blocked on drift unless --confirm-stale is passed.
+    # Skipped gracefully when: no scope, no baseline_ref, non-git project,
+    # or the baseline sha can't be verified (fail-open — never crash dispatch).
+    if not confirm_stale:
+        from .baseline import detect_scope_drift
+        _proj_for_drift = get_project(config, project_id)
+        _repo_for_drift = getattr(_proj_for_drift, "repo_path", None) if _proj_for_drift else None
+        _drift_result = detect_scope_drift(
+            repo_path=_repo_for_drift,
+            scope=getattr(task, "scope", []),
+            baseline_ref=getattr(task, "baseline_ref", None),
+        )
+        if _drift_result["status"] == "drifted":
+            changed = _drift_result.get("changed_files", [])
+            output_error(
+                "stale_baseline",
+                f"Task {task_id!r} was specified against baseline "
+                f"{_drift_result.get('baseline_ref')!r} but {len(changed)} in-scope "
+                f"file(s) have changed since then: {changed[:5]}"
+                + (" (+ more)" if len(changed) > 5 else "")
+                + ". Reconcile the task spec with the current codebase, then re-run "
+                "dispatch, or pass --confirm-stale to proceed anyway.",
+                fmt=fmt,
+            )
+            sys.exit(1)
 
     # CLAWP-039: validate the lease TTL BEFORE writing any settings (Codex P2),
     # so a bad --lease-ttl never leaves the target half-dispatched.

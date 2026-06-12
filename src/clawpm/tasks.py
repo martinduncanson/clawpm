@@ -787,11 +787,23 @@ def add_task(
         next_num = max(existing_nums, default=-1) + 1
         task_id = f"{prefix}-{next_num:03d}"
 
+    # CLAWP-055 — resolve baseline_ref for the project.
+    # Import locally to avoid a circular dependency (baseline imports nothing
+    # from clawpm).  The project settings carry repo_path; fall back gracefully
+    # when settings are unavailable or the project is not a git repo.
+    from .baseline import resolve_baseline_ref
+    from .discovery import get_project as _get_project_for_baseline
+
+    _proj_settings = _get_project_for_baseline(config, project_id)
+    _repo_path = getattr(_proj_settings, "repo_path", None) if _proj_settings else None
+    _baseline_ref = resolve_baseline_ref(_repo_path)
+
     # Build frontmatter
     frontmatter = {
         "id": task_id,
         "priority": priority,
         "created": date.today().isoformat(),
+        "baseline_ref": _baseline_ref,
     }
 
     if complexity:
