@@ -120,6 +120,7 @@ def detect_scope_drift(
     if not scope:
         return {
             "status": "skipped",
+            "skip_class": "expected",
             "reason": "no scope defined — cannot determine path drift",
             "baseline_ref": baseline_ref,
             "changed_files": [],
@@ -129,6 +130,7 @@ def detect_scope_drift(
     if not baseline_ref:
         return {
             "status": "skipped",
+            "skip_class": "expected",
             "reason": "no baseline_ref on task (legacy task — skipping drift check)",
             "baseline_ref": None,
             "changed_files": [],
@@ -138,6 +140,7 @@ def detect_scope_drift(
     if baseline_ref.startswith("ts:"):
         return {
             "status": "skipped",
+            "skip_class": "expected",
             "reason": "baseline_ref is a timestamp marker (non-git project) — skipping git diff",
             "baseline_ref": baseline_ref,
             "changed_files": [],
@@ -147,6 +150,7 @@ def detect_scope_drift(
     if not repo_path or not repo_path.exists():
         return {
             "status": "skipped",
+            "skip_class": "expected",
             "reason": "repo_path is absent — cannot check drift",
             "baseline_ref": baseline_ref,
             "changed_files": [],
@@ -155,6 +159,7 @@ def detect_scope_drift(
     if not (repo_path / ".git").exists():
         return {
             "status": "skipped",
+            "skip_class": "expected",
             "reason": "repo_path is not a git repository — skipping drift check",
             "baseline_ref": baseline_ref,
             "changed_files": [],
@@ -162,7 +167,7 @@ def detect_scope_drift(
 
     # Validate that baseline_ref resolves in the repo before running the diff.
     # An unknown ref (e.g. force-pushed away) degrades to "skipped" rather
-    # than crashing.
+    # than crashing — classified as ERROR because the check wanted to run.
     try:
         chk = subprocess.run(
             ["git", "rev-parse", "--verify", baseline_ref],
@@ -176,6 +181,7 @@ def detect_scope_drift(
     except (OSError, subprocess.TimeoutExpired):
         return {
             "status": "skipped",
+            "skip_class": "error",
             "reason": f"git rev-parse failed for baseline_ref={baseline_ref!r}",
             "baseline_ref": baseline_ref,
             "changed_files": [],
@@ -183,6 +189,7 @@ def detect_scope_drift(
     if chk.returncode != 0:
         return {
             "status": "skipped",
+            "skip_class": "error",
             "reason": f"baseline_ref={baseline_ref!r} not found in repo — may have been force-pushed away",
             "baseline_ref": baseline_ref,
             "changed_files": [],
@@ -205,6 +212,7 @@ def detect_scope_drift(
     except (OSError, subprocess.TimeoutExpired):
         return {
             "status": "skipped",
+            "skip_class": "error",
             "reason": "git diff subprocess failed — degrading to skipped (fail-open)",
             "baseline_ref": baseline_ref,
             "changed_files": [],
@@ -212,6 +220,7 @@ def detect_scope_drift(
     if result.returncode != 0:
         return {
             "status": "skipped",
+            "skip_class": "error",
             "reason": f"git diff returned exit code {result.returncode} — skipping",
             "baseline_ref": baseline_ref,
             "changed_files": [],
