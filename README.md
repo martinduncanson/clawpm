@@ -602,7 +602,7 @@ Looking for a seed portfolio? See `examples/portfolio/` — drop-in fixtures wit
 <your project repo>/.project/             ← per-project state (committed to repo)
 ├── settings.toml                         ← project ID, repo_path, prefix
 ├── spec.md                               ← project goals/spec (you author)
-├── constitution.toml                     ← named invariants (you declare)
+├── constitution.yaml                     ← named invariants (you declare)
 └── tasks/
     ├── CLAWP-001.md                      ← open tasks live FLAT here
     ├── CLAWP-002.progress.md             ← in-progress
@@ -653,7 +653,7 @@ You almost never need `--project` if you `cd` into the project first.
 The planner skill uses graph tools for recon and blast-radius estimation in decompose:
 
 - **codegraph** — default for code projects. Indexed AST graph; `codegraph_context`, `codegraph_impact`, `codegraph_callers`, `codegraph_trace` are the primary recon tools. Already configured in this repo (see `.codegraph/`).
-- **graphify** — for mixed corpora (code + docs + PDFs + SQL schemas); Leiden community detection; edge provenance. Preferred for knowledge-work objectives where codegraph can't serve. Run `install-gate` before adoption; pending bake-off with the codegraph default.
+- **graphify** — for mixed corpora (code + docs + PDFs + SQL schemas + audio/video in one graph); Leiden community detection (deterministic, no inference); edge provenance. The grapher for knowledge-work objectives codegraph can't serve — **adopted for that slot now**, runnable on **local Qwen** (custom provider, no cloud key, no egress). Leiden clustering needs no model; only non-code extraction and optional community naming use the LLM. (The codegraph-vs-graphify bake-off only governs whether graphify *replaces codegraph as the code default* — not its mixed-corpus availability.) `install-gate` before first use in a new context.
 - **Neither available** — the skill surfaces the gap and proposes remediation (`codegraph init -i` / install graphify) and tags every effort/risk estimate as UNGROUNDED. It does not silently present vibe estimates as grounded.
 
 Graph facts complement semantic fan-out (Explore subagents) — they are not substitutes. Topology findings (dead code, reachability) carry a staleness caveat; never rest a security or correctness claim on the graph alone.
