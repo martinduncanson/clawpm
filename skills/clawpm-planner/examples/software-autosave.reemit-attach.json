@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "project": "planner-demo",
+  "root": { "attach_to": "PLANN-001" },
+  "leaves": [
+    {
+      "ref": "L1",
+      "parent_ref": null,
+      "leaf_key": "autosave::debounced-client-save",
+      "title": "User edits autosave without pressing save",
+      "success_criteria": [
+        { "criterion": "Edits persist after a 2s idle with no manual save", "gradeable_signal": "integration test fires draft PUT", "comparator": "eq:1 draft row" }
+      ],
+      "scope": ["src/editor/autosave/**"],
+      "delegability": "agent",
+      "predictions": { "duration_min": 120, "complexity": "m", "confidence": 3, "filled_by": "agent" }
+    },
+    {
+      "ref": "L4",
+      "parent_ref": null,
+      "leaf_key": "autosave::offline-queue",
+      "title": "Autosave queues writes while offline and flushes on reconnect",
+      "success_criteria": [
+        { "criterion": "Edits made offline persist after reconnect", "gradeable_signal": "e2e: go offline, edit, reconnect, assert draft saved", "comparator": "eq:draft-text" }
+      ],
+      "scope": ["src/editor/autosave/queue.ts"],
+      "delegability": "agent",
+      "predictions": { "duration_min": 100, "complexity": "m", "confidence": 2, "filled_by": "agent" }
+    }
+  ]
+}

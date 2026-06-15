@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "project": "planner-demo",
+  "root": {
+    "title": "Competitor-pricing analysis report",
+    "predictions": {
+      "complexity": "m",
+      "confidence": 3,
+      "approach": "Each leaf is a self-contained, verifiable section of the final brief — gather -> normalise -> synthesise. Knowledge-work, no code.",
+      "filled_by": "agent"
+    }
+  },
+  "prd": {
+    "title": "PRD: Competitor-pricing analysis report",
+    "type": "investigation",
+    "tags": ["prd", "planner", "competitive-intelligence"],
+    "body_markdown": "## Objective\nDeliver a decision-ready brief comparing our pricing against the top 5 competitors, with a recommended positioning move.\n\n## Why\nSales reports we are losing mid-market deals on perceived price. Leadership needs a grounded view before the Q3 pricing review.\n\n## Constraints\n- Cite a primary source (public pricing page / filing) for every number; no unsourced figures.\n- Normalise to a common unit (price per seat / month, USD) so tiers compare like-for-like.\n- One page of recommendation max — leadership reads the exec summary first.\n\n## Out of scope\n- Building a live pricing-monitor tool.\n- Win/loss interviews (separate workstream).\n\n## Success definition\nA reviewer can trace every comparison cell to a cited source, and the recommendation names one concrete positioning move with its expected trade-off.\n\n## Chosen approach\nThree vertical slices: (1) sourced pricing dataset, (2) normalised comparison matrix, (3) synthesis + recommendation. Each is independently checkable.\n\n## Open questions\n- Which 5 competitors are in-scope — confirm the set with sales.\n- Reference currency / FX date.\n\n## Traceability\nGround consulted: corpus is web pricing pages + a sales brief, not code. codegraph does not apply; graphify (mixed-corpora) NOT installed -> structural grounding UNAVAILABLE. Remediation proposed: install graphify for the source corpus, or accept manual sourcing with per-cell citations (chosen here). Effort below tagged UNGROUNDED (no graph).\n"
+  },
+  "leaves": [
+    {
+      "ref": "K1",
+      "parent_ref": null,
+      "leaf_key": "compbrief::sourced-pricing-dataset",
+      "title": "Sourced pricing dataset for the 5 competitors",
+      "success_criteria": [
+        {
+          "criterion": "Every competitor's published tiers captured with a primary-source citation",
+          "gradeable_signal": "dataset has >=5 competitors, each row carries a source URL + access date",
+          "comparator": "gte:5 competitors, 100% cited"
+        }
+      ],
+      "scope": ["deliverable: pricing-dataset.csv", "research: competitor pricing pages"],
+      "out_of_scope": ["normalisation (K2)", "recommendation (K3)"],
+      "stop_conditions": [
+        "If a competitor hides pricing behind 'contact sales', STOP and flag it as a data gap rather than estimating."
+      ],
+      "delegability": "either",
+      "predictions": {
+        "duration_min": 120,
+        "complexity": "m",
+        "confidence": 3,
+        "approach": "Pull each competitor's pricing page, record tiers verbatim + citation. UNGROUNDED effort — no graph consulted.",
+        "pre_mortem": "Most likely failure: a competitor's pricing is region-gated and not comparable.",
+        "filled_by": "agent"
+      }
+    },
+    {
+      "ref": "K2",
+      "parent_ref": null,
+      "leaf_key": "compbrief::normalised-comparison-matrix",
+      "title": "Normalised like-for-like comparison matrix",
+      "success_criteria": [
+        {
+          "criterion": "All prices normalised to USD per seat per month at a stated FX date",
+          "gradeable_signal": "matrix has one common unit; every cell traces to a K1 dataset row",
+          "comparator": "eq:100% cells sourced"
+        }
+      ],
+      "scope": ["deliverable: comparison-matrix.md"],
+      "out_of_scope": ["raw data collection (K1)"],
+      "stop_conditions": [
+        "If two competitors' tiers are structurally incomparable (usage vs seat), STOP and surface the modelling choice to the operator."
+      ],
+      "delegability": "agent",
+      "predictions": {
+        "duration_min": 90,
+        "complexity": "m",
+        "confidence": 3,
+        "approach": "Map each tier to USD/seat/month at a fixed FX date; annotate assumptions. UNGROUNDED effort — no graph consulted.",
+        "pre_mortem": "Most likely failure: annual-vs-monthly discounting distorts the comparison.",
+        "filled_by": "agent"
+      }
+    },
+    {
+      "ref": "K3",
+      "parent_ref": null,
+      "leaf_key": "compbrief::synthesis-recommendation",
+      "title": "Synthesis and one-page recommendation",
+      "success_criteria": [
+        {
+          "criterion": "Recommendation names one concrete positioning move with its expected trade-off",
+          "gradeable_signal": "exec summary states a single move + the trade-off, each claim citing K2 cells",
+          "comparator": "eq:1 named move"
+        }
+      ],
+      "scope": ["deliverable: exec-summary.md", "deliverable: full-brief.md"],
+      "out_of_scope": ["dataset (K1)", "matrix (K2)"],
+      "stop_conditions": [
+        "If the matrix shows no defensible positioning gap, STOP and report 'no change recommended' rather than inventing one."
+      ],
+      "delegability": "human",
+      "predictions": {
+        "duration_min": 90,
+        "complexity": "m",
+        "confidence": 2,
+        "approach": "Read the matrix, identify the gap, write the exec summary + one-page rec. Human leaf — judgment-heavy, not auto-dispatched.",
+        "pre_mortem": "Most likely failure: recommendation is generic ('lower price') without a defensible trade-off.",
+        "filled_by": "agent"
+      }
+    }
+  ]
+}

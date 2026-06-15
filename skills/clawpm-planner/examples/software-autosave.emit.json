@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "project": "planner-demo",
+  "root": {
+    "title": "Draft autosave for the note editor",
+    "predictions": {
+      "complexity": "m",
+      "confidence": 3,
+      "approach": "Debounced client save -> idempotent PUT -> restore-on-open; one vertical slice per user-visible guarantee.",
+      "filled_by": "agent"
+    }
+  },
+  "prd": {
+    "title": "PRD: Draft autosave for the note editor",
+    "type": "spike",
+    "tags": ["prd", "planner", "autosave"],
+    "body_markdown": "## Objective\nA user editing a note never loses unsaved work: edits persist automatically and survive a reload or crash.\n\n## Why\nSupport reports recurring lost-work complaints after accidental tab closes. Manual Ctrl-S is the only persistence path today.\n\n## Constraints\n- No new infra; reuse the existing notes store and PUT endpoint.\n- Saves must be idempotent (no duplicate-draft rows on retry).\n- No regression to the explicit-save path.\n\n## Out of scope\n- Multi-device real-time sync / OT-CRDT merge.\n- Version history / undo timeline.\n\n## Success definition\nA user can edit, reload mid-edit, and resume from the last autosaved state with zero manual action; explicit save still works.\n\n## Chosen approach\nDebounce edits client-side (2s idle), PUT a draft keyed by note-id (idempotent upsert), and rehydrate the editor from the latest draft on open. Three vertical slices, each independently verifiable end-to-end.\n\n## Open questions\n- Debounce interval (2s assumed) — confirm against typing telemetry.\n- Draft retention window before GC.\n\n## Traceability\nGround consulted: codegraph unavailable on this demo corpus -> effort/risk below are tagged UNGROUNDED (no graph). Remediation proposed: `codegraph init -i` on the editor repo before dispatch.\n"
+  },
+  "leaves": [
+    {
+      "ref": "L1",
+      "parent_ref": null,
+      "leaf_key": "autosave::debounced-client-save",
+      "title": "User edits autosave without pressing save",
+      "success_criteria": [
+        {
+          "criterion": "Edits persist after a 2s idle with no manual save",
+          "gradeable_signal": "integration test: type, wait 2s, assert a draft PUT fired and store row exists",
+          "comparator": "eq:1 draft row"
+        },
+        {
+          "criterion": "Rapid edits do not spam the endpoint",
+          "gradeable_signal": "test: 10 keystrokes in 1s yields <=1 PUT after debounce",
+          "comparator": "lte:1"
+        }
+      ],
+      "scope": ["src/editor/autosave/**", "src/editor/Editor.tsx"],
+      "out_of_scope": ["src/sync/**", "version history"],
+      "stop_conditions": [
+        "If the notes PUT endpoint is not idempotent, STOP and report — slice L2 must land first."
+      ],
+      "delegability": "agent",
+      "predictions": {
+        "duration_min": 120,
+        "complexity": "m",
+        "confidence": 3,
+        "approach": "Debounce hook around the editor change event; fire PUT on idle. UNGROUNDED effort — no graph consulted.",
+        "pre_mortem": "Most likely failure: debounce races with explicit save and double-writes.",
+        "filled_by": "agent"
+      },
+      "agent_profile": "frontend"
+    },
+    {
+      "ref": "L2",
+      "parent_ref": null,
+      "leaf_key": "autosave::idempotent-draft-upsert",
+      "title": "Draft saves are idempotent on retry",
+      "success_criteria": [
+        {
+          "criterion": "Re-sending the same draft does not create a duplicate row",
+          "gradeable_signal": "test: PUT same draft twice, assert one row",
+          "comparator": "eq:1"
+        }
+      ],
+      "scope": ["src/api/notes/draft.ts", "src/store/drafts.ts"],
+      "out_of_scope": ["client debounce logic (L1)"],
+      "stop_conditions": [
+        "If the store has no unique key for (note_id, user_id), STOP and surface a schema decision to the operator."
+      ],
+      "delegability": "either",
+      "predictions": {
+        "duration_min": 90,
+        "complexity": "m",
+        "confidence": 3,
+        "approach": "Upsert keyed on note_id+user_id. UNGROUNDED effort — no graph consulted.",
+        "pre_mortem": "Most likely failure: concurrent autosave + explicit save lost-update.",
+        "filled_by": "agent"
+      }
+    },
+    {
+      "ref": "L3",
+      "parent_ref": null,
+      "leaf_key": "autosave::restore-on-open",
+      "title": "Editor restores the latest draft on open",
+      "success_criteria": [
+        {
+          "criterion": "Reopening a note with a newer draft rehydrates the draft, not the saved version",
+          "gradeable_signal": "e2e: edit, reload, assert editor shows last autosaved text",
+          "comparator": "eq:draft-text"
+        }
+      ],
+      "scope": ["src/editor/Editor.tsx", "src/editor/load.ts"],
+      "out_of_scope": ["conflict-resolution UI"],
+      "stop_conditions": [
+        "If both a draft and a newer explicit save exist, STOP and confirm precedence with the operator before guessing."
+      ],
+      "delegability": "agent",
+      "predictions": {
+        "duration_min": 75,
+        "complexity": "s",
+        "confidence": 4,
+        "approach": "On load, fetch latest draft; if newer than saved, hydrate from draft. UNGROUNDED effort — no graph consulted.",
+        "pre_mortem": "Most likely failure: stale draft shadows a legitimate newer explicit save.",
+        "filled_by": "agent"
+      }
+    }
+  ]
+}
