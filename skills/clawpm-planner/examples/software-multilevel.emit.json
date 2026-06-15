@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "project": "planner-demo",
+  "root": {
+    "title": "Collaborative comments on notes",
+    "predictions": {
+      "complexity": "l",
+      "confidence": 3,
+      "approach": "Two milestones (threads, notifications); the threads milestone has a nested reply-nesting slice. Depth via CLAWP-064 in-document parent_ref. UNGROUNDED effort - no graph consulted.",
+      "filled_by": "agent"
+    }
+  },
+  "prd": {
+    "title": "PRD: Collaborative comments on notes",
+    "type": "spike",
+    "tags": ["prd", "planner", "comments"],
+    "body_markdown": "## Objective\nUsers can comment on a note, reply to comments, and be notified when someone comments on a note they follow.\n\n## Why\nNotes are shared but feedback happens out-of-band in chat, losing the link to the note. Inline comments keep the conversation anchored.\n\n## Constraints\n- Reuse the existing notes store and auth; no new service.\n- Notifications go through the existing notification bus.\n\n## Out of scope\n- Real-time presence / typing indicators.\n- Rich-text / attachments in comments (plain text v1).\n\n## Success definition\nA user can post a comment, reply to it (nested), and a follower receives a notification - each independently verifiable end to end.\n\n## Chosen approach\nMilestone A: comment threads (post + nested replies). Milestone B: notifications on new comments. The reply-nesting slice (A.1) is a child of the threads milestone because it only makes sense once flat threads exist.\n\n## Traceability\nGround consulted: codegraph unavailable on this demo corpus -> effort/risk tagged UNGROUNDED (no graph). Remediation proposed: `codegraph init -i` on the editor repo before dispatch.\nMilestones: root -> A (threads) -> A.1 (reply nesting); root -> B (notifications).\n"
+  },
+  "leaves": [
+    {
+      "ref": "A",
+      "parent_ref": null,
+      "leaf_key": "comments::threads-milestone",
+      "title": "Comment threads: post and read flat comments on a note",
+      "success_criteria": [
+        {
+          "criterion": "A user can post a comment on a note and all users see it on reload",
+          "gradeable_signal": "e2e: post a comment, reload as another user, assert it renders",
+          "comparator": "eq:visible"
+        }
+      ],
+      "scope": ["src/comments/**", "src/notes/CommentPanel.tsx"],
+      "out_of_scope": ["nested replies (A.1)", "notifications (B)"],
+      "stop_conditions": [
+        "If the notes store has no per-note child collection, STOP and surface the schema decision."
+      ],
+      "delegability": "agent",
+      "predictions": {
+        "duration_min": 180,
+        "complexity": "m",
+        "confidence": 3,
+        "approach": "Comment model keyed by note_id; panel lists + posts. UNGROUNDED effort - no graph consulted.",
+        "pre_mortem": "Most likely failure: comment ordering races under concurrent posts.",
+        "filled_by": "agent"
+      },
+      "agent_profile": "fullstack"
+    },
+    {
+      "ref": "A1",
+      "parent_ref": "A",
+      "leaf_key": "comments::reply-nesting",
+      "title": "Reply nesting: a comment can be a reply to another comment",
+      "success_criteria": [
+        {
+          "criterion": "A reply renders indented under its parent comment to at least 1 level",
+          "gradeable_signal": "e2e: reply to a comment, assert the reply nests under the parent",
+          "comparator": "eq:nested"
+        }
+      ],
+      "scope": ["src/comments/thread.ts", "src/notes/CommentPanel.tsx"],
+      "out_of_scope": ["unlimited-depth threading (cap at a sane depth)"],
+      "stop_conditions": [
+        "If flat threads (A) are not yet posting/reading, STOP - this slice builds on A."
+      ],
+      "delegability": "agent",
+      "predictions": {
+        "duration_min": 120,
+        "complexity": "m",
+        "confidence": 2,
+        "approach": "Add parent_comment_id; render tree to a depth cap. UNGROUNDED effort - no graph consulted.",
+        "pre_mortem": "Most likely failure: deep nesting blows out the panel layout.",
+        "filled_by": "agent"
+      }
+    },
+    {
+      "ref": "B",
+      "parent_ref": null,
+      "leaf_key": "comments::notifications-milestone",
+      "title": "Comment notifications: a follower is notified on a new comment",
+      "success_criteria": [
+        {
+          "criterion": "A user following a note receives a notification when someone comments",
+          "gradeable_signal": "integration test: comment as user X, assert follower Y gets a notification event",
+          "comparator": "eq:1 notification"
+        }
+      ],
+      "scope": ["src/comments/notify.ts", "src/notifications/**"],
+      "out_of_scope": ["email digest (separate workstream)", "nested replies (A.1)"],
+      "stop_conditions": [
+        "If the notification bus has no per-user fan-out, STOP and surface the integration gap."
+      ],
+      "delegability": "either",
+      "predictions": {
+        "duration_min": 90,
+        "complexity": "m",
+        "confidence": 3,
+        "approach": "On comment create, emit a notification to note followers via the existing bus. UNGROUNDED effort - no graph consulted.",
+        "pre_mortem": "Most likely failure: self-notification when the commenter follows their own note.",
+        "filled_by": "agent"
+      }
+    }
+  ]
+}

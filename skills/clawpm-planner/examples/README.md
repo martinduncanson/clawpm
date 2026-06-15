@@ -19,6 +19,7 @@ cat <file>.json | clawpm tasks emit-tree               # emit for real
 | `software-autosave.emit.json` | "Add draft autosave to the note editor" | software | m | parent + 3 vertical-slice leaves, each with rubric + scope/out_of_scope/stop/delegability + predictions, linked PRD |
 | `knowledge-competitor-brief.emit.json` | "Produce a competitor-pricing analysis report" | knowledge-work | m | parent + 3 vertical-slice leaves whose `scope` are **named deliverables**, not file globs; PRD; NO code-audit assumptions; graph-absent remediation tagged in the PRD |
 | `software-autosave.reemit-attach.json` | re-emit of the same software tree via `attach_to` | software | — | idempotency: matching `leaf_key` is skipped, only the new leaf emits |
+| `software-multilevel.emit.json` | "Collaborative comments on notes" | software | l | **multi-level** tree (CLAWP-064 in-document `parent_ref`): root -> A -> A.1, plus sibling B; each leaf with rubric + scope/out_of_scope/stop/delegability; whole tree promotes atomically |
 
 ## Validation transcript (live CLI, 2026-06-12)
 
@@ -105,3 +106,64 @@ $ echo '{... leaf titled "Add real-time multi-device sync" ...}' | clawpm tasks 
 
 The skill's **vet** stage does the *fuzzy/resembling* match against the ledger
 before emit; core does the final **exact** match as a backstop and reports it.
+
+### 7. Multi-level emit (CLAWP-064 in-document nesting) — depth-3 tree, atomic
+
+Satisfies success-criterion 3's multi-level case with real evidence. CLAWP-064
+landed in-document nesting: a leaf whose `parent_ref` matches another leaf's `ref`
+becomes that leaf's child (arbitrary depth; IDs `ROOT-NNN-MMM`; the whole tree
+promotes atomically). `software-multilevel.emit.json` declares root ->
+A (`ref:"A"`) -> A.1 (`ref:"A1", parent_ref:"A"`), plus sibling B
+(`ref:"B", parent_ref:null`).
+
+```
+$ cat software-multilevel.emit.json | clawpm tasks emit-tree --dry-run
+{ "status": "ok",
+  "message": "Dry-run complete for project 'planner-demo': 3 leaf(ves) would be emitted under PLANN-001. No writes performed.",
+  "data": { "root_id": "PLANN-001", "rejected": [], "constitution_violations": [], "dry_run": true } }
+
+$ cat software-multilevel.emit.json | clawpm tasks emit-tree
+{ "status": "ok",
+  "message": "Emitted 4 task(s) under PLANN-001 [PRD: planner-demo-research-prd-prd-collaborative-comments-on-notes]", ... }
+```
+
+On-disk structure proves the 3 levels (A is a *directory* task because it has a
+nested child; A.1 sits under it):
+
+```
+PLANN-001/_task.md                                  # root  — children: [PLANN-001-001, PLANN-001-002]
+PLANN-001/PLANN-001-001/_task.md                    # A     — parent: PLANN-001,     children: [PLANN-001-001-001]
+PLANN-001/PLANN-001-001/PLANN-001-001-001.md        # A.1   — parent: PLANN-001-001  (depth 3)
+PLANN-001/PLANN-001-002.md                          # B     — parent: PLANN-001       (sibling, flat)
+```
+
+Parent links verified at every level from the promoted frontmatter:
+
+```yaml
+# root PLANN-001/_task.md
+id: PLANN-001
+children: [PLANN-001-001, PLANN-001-002]
+prd_ref: planner-demo-research-prd-prd-collaborative-comments-on-notes
+
+# A  PLANN-001-001/_task.md
+id: PLANN-001-001
+parent: PLANN-001
+children: [PLANN-001-001-001]
+leaf_key: comments::threads-milestone   # full contract: scope/out_of_scope/stop/delegability/rubric
+
+# A.1  PLANN-001-001/PLANN-001-001-001.md
+id: PLANN-001-001-001
+parent: PLANN-001-001                    # nested under A, not the root
+leaf_key: comments::reply-nesting
+
+# B  PLANN-001-002.md
+id: PLANN-001-002
+parent: PLANN-001                        # sibling of A at level 1
+leaf_key: comments::notifications-milestone
+```
+
+**Note on the depth knob:** this single-call multi-level emit is the CLAWP-064
+in-document path (preferred when you're planning the whole tree at once). The
+layered `attach_to` path documented in `references/scale-dial.md` remains valid and
+is the right tool for *growing* an existing tree across separate planning passes
+(and for idempotent re-emit — see section 4).

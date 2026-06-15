@@ -5,9 +5,10 @@ breaks"); the **Explore fan-out = judgment** ("is this wrong / worth doing"). Th
 are complementary — the graph **never** replaces the semantic fan-out. Recon and
 decompose consult the graph; vet settles structural claims with it.
 
-## Default — codegraph
+## Default for CODE - codegraph
 
-MIT, Windows-native, already live in the clawpm repo. Structural facts in
+codegraph is the default for **code** graphing: proven, deterministic-AST,
+lean. MIT, Windows-native, already live in the clawpm repo. Structural facts in
 sub-millisecond reads. Uses:
 
 - `codegraph_context` → **recon** orientation (what's here, what's central).
@@ -19,14 +20,35 @@ sub-millisecond reads. Uses:
 Check health with `codegraph_status`. **Watcher lag:** the index debounces ~500ms
 behind writes — don't query immediately after an edit in the same turn.
 
-## Mixed / knowledge-work corpora — graphify
+## Mixed-corpus / knowledge-work - graphify (available NOW)
 
-Graphs code **and** docs/PDF/SQL-schema/infra (Leiden community detection, edge
-provenance). Prefer when the objective's ground is a **non-code corpus** — the
-project-agnostic case codegraph can't serve (e.g. a research-brief objective).
-Heavier (an LLM index layer spends host tokens); non-code edges are
-model-dependent. **Run `install-gate` before adopting it**; bake-off pending
-(UPSKI-012). Until then, graphify is a *suggested* path, not a hard requirement.
+graphify is the **mixed-corpus / knowledge-work** grapher, and the **only**
+option that graphs code + docs + PDF + SQL + infra + audio/video in ONE graph
+(codegraph is code-only). Use it whenever the objective's ground is a non-code or
+mixed corpus - the project-agnostic case codegraph can't serve (e.g. a
+research-brief or competitor-analysis objective). It is available **now** - not
+gated.
+
+**It does NOT require a cloud / Gemini key** (verified from graphify's README):
+
+- **Code graphing is fully local** - tree-sitter, no model, runs offline.
+- **Audio/video transcribe locally** - faster-whisper.
+- **Non-code (docs/PDF/images) needs a model, but runs on LOCAL inference** via
+  `--backend ollama` (`OLLAMA_BASE_URL` / `OLLAMA_MODEL`, e.g. a local Qwen3) -
+  fully local, **no cloud key, no data egress**.
+- Invoked via its own **`/graphify` skill inside a session**, it uses the session
+  model - **no key at all**.
+
+**Recommended default for clawpm: local-Ollama backend** (free, private,
+local-first). Honest caveat: local-model non-code extraction is **lower-quality
+than frontier** - acceptable for **orientation / blast-radius-grade** graphs
+(graph = facts-for-structure; the model still judges correctness at the site).
+The backend is a config knob - switch it up if extraction quality matters for a
+given corpus. **Run `install-gate` before first use.**
+
+**What UPSKI-012 actually gates:** ONLY whether graphify *replaces codegraph as
+the code default* - **not** graphify's availability for knowledge-work. For
+mixed/non-code corpora, graphify is the right tool today, full stop.
 
 ## Neither available — the required remediation behaviour
 
