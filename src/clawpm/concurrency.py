@@ -143,6 +143,45 @@ def _release(fh: IO[str]) -> None:
             pass
 
 
+@contextmanager
+def file_lock(lock_path: Path) -> Iterator[None]:
+    """Hold an exclusive advisory lock across an arbitrary critical section.
+
+    Distinct from ``locked_append``: this guards a code block, not an append
+    write.  The lock file is a dedicated sentinel — never a data file.
+
+    Granularity is per-project (per tasks-dir):
+    ``lock_path`` should be ``<tasks_dir>/.clawpm-tasks.lock``.  This serialises
+    mutations *within one project's task tree* while letting different projects
+    proceed concurrently.
+
+    **DEADLOCK SAFETY:** ``fcntl.flock`` / ``msvcrt.locking`` are NOT reentrant
+    across two handles to the same path within one process.  Never enter a nested
+    ``file_lock`` on the same lock path while already holding it; the inner
+    acquire will self-deadlock.  Keep each critical section flat — do not call
+    functions that re-enter ``file_lock`` on the same path.
+
+    Usage::
+
+        with file_lock(tasks_dir / ".clawpm-tasks.lock"):
+            # scan → create critical section
+            ...
+
+    Raises:
+        OSError: if the lock cannot be acquired (same behaviour as ``_acquire``).
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock_path, "a+", encoding="utf-8")  # create-or-open; "a+" keeps existing content
+    try:
+        _acquire(fh)
+        try:
+            yield
+        finally:
+            _release(fh)
+    finally:
+        fh.close()
+
+
 def append_jsonl_line(path: Path, line: str, encoding: str = "utf-8") -> None:
     """Atomic-append helper for the canonical JSONL writer pattern.
 

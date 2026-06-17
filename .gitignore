@@ -13,6 +13,9 @@ htmlcov/
 logs/
 uv.lock
 
+# Runtime lock sentinel (CLAWP-051) — never committed, never tracked
+.clawpm-tasks.lock
+
 .project/
 .agent/
 .claude/

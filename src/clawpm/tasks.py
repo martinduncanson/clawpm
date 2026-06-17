@@ -9,6 +9,7 @@ from pathlib import Path
 
 import yaml
 
+from .concurrency import file_lock
 from .models import Task, TaskState, TaskComplexity, Predictions, PortfolioConfig
 from .discovery import get_project_dir, find_project_dir_fallback
 
@@ -379,10 +380,18 @@ def change_task_state(
             # Return None to signal failure - caller should check and report
             return None
 
+    # CLAWP-051 — hold the per-project lock around each move so concurrent
+    # state transitions on the same task serialise cleanly.  Inside the lock,
+    # re-validate the source still exists before moving — if another session
+    # already moved it, fail with a clear error rather than an opaque
+    # FileNotFoundError or a crash.
+    # DEADLOCK SAFETY: this block is flat; no re-entrant file_lock calls.
+    _lock_path = tasks_dir / ".clawpm-tasks.lock"
+
     if is_directory_task:
         # For directory-based tasks, move the entire directory
         task_dir = current_path.parent
-        
+
         if new_state == TaskState.OPEN:
             new_dir = tasks_dir / task_id
         elif new_state == TaskState.PROGRESS:
@@ -408,12 +417,18 @@ def change_task_state(
         if task_dir.resolve() == new_dir.resolve():
             return task
 
-        # Move the directory
-        shutil.move(str(task_dir), str(new_dir))
+        # Move the directory (serialised — re-validate source inside the lock)
+        with file_lock(_lock_path):
+            if not task_dir.exists():
+                raise FileNotFoundError(
+                    f"Task directory '{task_dir}' no longer exists — "
+                    "it may have been moved by a concurrent session."
+                )
+            shutil.move(str(task_dir), str(new_dir))
 
         # Reload and return
         return Task.from_file(new_dir / "_task.md")
-    
+
     # Regular file-based task
     if new_state == TaskState.OPEN:
         new_path = tasks_dir / f"{task_id}.md"
@@ -438,8 +453,14 @@ def change_task_state(
     if current_path.resolve() == new_path.resolve():
         return task
 
-    # Move the file
-    shutil.move(str(current_path), str(new_path))
+    # Move the file (serialised — re-validate source inside the lock)
+    with file_lock(_lock_path):
+        if not current_path.exists():
+            raise FileNotFoundError(
+                f"Task file '{current_path}' no longer exists — "
+                "it may have been moved by a concurrent session."
+            )
+        shutil.move(str(current_path), str(new_path))
 
     # Reload and return
     return Task.from_file(new_path)
@@ -733,64 +754,8 @@ def add_task(
         tasks_dir = project_dot_dir / "tasks"
         tasks_dir.mkdir(parents=True, exist_ok=True)
 
-    # Generate task ID if not provided
-    if not task_id:
-        # CLAWP-048: resolve a portfolio-unique prefix (explicit task_prefix ->
-        # inferred from existing tasks -> collision-free derivation) instead of
-        # the naive id.upper()[:5], which collides across near-name-twin ids.
-        from .discovery import get_project
-
-        _settings = get_project(config, project_id)
-        prefix = assign_task_prefix(
-            project_id,
-            tasks_dir,
-            config,
-            explicit_prefix=getattr(_settings, "task_prefix", None) if _settings else None,
-        )
-
-        # Find highest existing task number.
-        # We must check BOTH .md files and parent-task directories (e.g. OPENW-004/)
-        # because split tasks convert the file to a directory.  The *.md glob misses
-        # directories, so without this check add_task would re-issue the same number.
-        # Subtask files (OPENW-004-001.md) live *inside* parent dirs; they don't
-        # appear at the scan-dir level, so they won't pollute top-level numbering.
-        # CLAWP-047: the prefix can ITSELF contain a hyphen — project id
-        # "arb-prd" -> prefix "ARB-P" — so the old `f.stem.split("-")[1]`
-        # grabbed the wrong segment ("P"), raised ValueError, skipped EVERY
-        # matching file, and collapsed every new task to {prefix}-000, silently
-        # overwriting prior tasks. Match the trailing number with an anchored
-        # regex instead (the in-progress `.progress` suffix is part of the
-        # stem) — the same shape the directory scan below already uses, so the
-        # two scans can't disagree.
-        _dir_pat = re.compile(rf"^{re.escape(prefix)}-(\d+)$")
-        _file_pat = re.compile(rf"^{re.escape(prefix)}-(\d+)(?:\.progress)?$")
-
-        existing_nums = []
-
-        for scan_dir in [tasks_dir, tasks_dir / "done", tasks_dir / "blocked"]:
-            if not scan_dir.exists():
-                continue
-            # .md files at this level. Subtask files ({prefix}-000-001.md) live
-            # inside parent dirs, not here, and the anchored pattern excludes
-            # them regardless, so they never pollute top-level numbering.
-            for f in scan_dir.glob(f"{prefix}-*.md"):
-                m = _file_pat.match(f.stem)
-                if m:
-                    existing_nums.append(int(m.group(1)))
-            # Parent-task directories at this level
-            for entry in scan_dir.iterdir():
-                if entry.is_dir():
-                    m = _dir_pat.match(entry.name)
-                    if m:
-                        existing_nums.append(int(m.group(1)))
-
-        next_num = max(existing_nums, default=-1) + 1
-        task_id = f"{prefix}-{next_num:03d}"
-
-    # CLAWP-055 — resolve baseline_ref for the project.
-    # Import locally to avoid a circular dependency (baseline imports nothing
-    # from clawpm).  The project settings carry repo_path; fall back gracefully
-    # when settings are unavailable or the project is not a git repo.
+    # CLAWP-055 — resolve baseline_ref BEFORE entering the lock: this may
+    # invoke a git subprocess, which must not be held inside a critical section.
     from .baseline import resolve_baseline_ref
     from .discovery import get_project as _get_project_for_baseline
 
@@ -798,47 +763,108 @@ def add_task(
     _repo_path = getattr(_proj_settings, "repo_path", None) if _proj_settings else None
     _baseline_ref = resolve_baseline_ref(_repo_path)
 
-    # Build frontmatter
-    frontmatter = {
-        "id": task_id,
-        "priority": priority,
-        "created": date.today().isoformat(),
-        "baseline_ref": _baseline_ref,
-    }
+    # CLAWP-051 — per-project file lock serialises ID allocation (scan→write)
+    # and explicit-ID creates so two concurrent sessions in the same project
+    # can't derive the same next_num (TOCTOU) or clobber each other's create.
+    # Granularity: one lock file per tasks-dir — different projects run freely.
+    # DEADLOCK SAFETY: do NOT call any function that re-enters file_lock on
+    # the same lock_path from within this block.
+    _lock_path = tasks_dir / ".clawpm-tasks.lock"
+    with file_lock(_lock_path):
+        # Generate task ID if not provided (inside lock: scan is now serialised)
+        if not task_id:
+            # CLAWP-048: resolve a portfolio-unique prefix (explicit task_prefix ->
+            # inferred from existing tasks -> collision-free derivation) instead of
+            # the naive id.upper()[:5], which collides across near-name-twin ids.
+            from .discovery import get_project
 
-    if complexity:
-        frontmatter["complexity"] = complexity.value
+            _settings = get_project(config, project_id)
+            prefix = assign_task_prefix(
+                project_id,
+                tasks_dir,
+                config,
+                explicit_prefix=getattr(_settings, "task_prefix", None) if _settings else None,
+            )
 
-    if depends:
-        frontmatter["depends"] = depends
+            # Find highest existing task number.
+            # We must check BOTH .md files and parent-task directories (e.g. OPENW-004/)
+            # because split tasks convert the file to a directory.  The *.md glob misses
+            # directories, so without this check add_task would re-issue the same number.
+            # Subtask files (OPENW-004-001.md) live *inside* parent dirs; they don't
+            # appear at the scan-dir level, so they won't pollute top-level numbering.
+            # CLAWP-047: the prefix can ITSELF contain a hyphen — project id
+            # "arb-prd" -> prefix "ARB-P" — so the old `f.stem.split("-")[1]`
+            # grabbed the wrong segment ("P"), raised ValueError, skipped EVERY
+            # matching file, and collapsed every new task to {prefix}-000, silently
+            # overwriting prior tasks. Match the trailing number with an anchored
+            # regex instead (the in-progress `.progress` suffix is part of the
+            # stem) — the same shape the directory scan below already uses, so the
+            # two scans can't disagree.
+            _dir_pat = re.compile(rf"^{re.escape(prefix)}-(\d+)$")
+            _file_pat = re.compile(rf"^{re.escape(prefix)}-(\d+)(?:\.progress)?$")
 
-    if scope:
-        frontmatter["scope"] = scope
+            existing_nums = []
 
-    if parallel_group is not None:
-        frontmatter["parallel_group"] = parallel_group
+            for scan_dir in [tasks_dir, tasks_dir / "done", tasks_dir / "blocked"]:
+                if not scan_dir.exists():
+                    continue
+                # .md files at this level. Subtask files ({prefix}-000-001.md) live
+                # inside parent dirs, not here, and the anchored pattern excludes
+                # them regardless, so they never pollute top-level numbering.
+                for f in scan_dir.glob(f"{prefix}-*.md"):
+                    m = _file_pat.match(f.stem)
+                    if m:
+                        existing_nums.append(int(m.group(1)))
+                # Parent-task directories at this level
+                for entry in scan_dir.iterdir():
+                    if entry.is_dir():
+                        m = _dir_pat.match(entry.name)
+                        if m:
+                            existing_nums.append(int(m.group(1)))
 
-    if agent_profile:
-        frontmatter["agent_profile"] = agent_profile
-    # CLAWP-054 — contract fields
-    if out_of_scope:
-        frontmatter["out_of_scope"] = out_of_scope
-    if stop_conditions:
-        frontmatter["stop_conditions"] = stop_conditions
-    if delegability and delegability != "either":
-        frontmatter["delegability"] = delegability
+            next_num = max(existing_nums, default=-1) + 1
+            task_id = f"{prefix}-{next_num:03d}"
 
-    if predictions and not predictions.is_empty():
-        pred_dict = predictions.to_dict()
-        # Strip None / empty-list values to keep the file clean
-        frontmatter["predictions"] = {
-            k: v for k, v in pred_dict.items()
-            if v is not None and v != []
+        # Build frontmatter
+        frontmatter = {
+            "id": task_id,
+            "priority": priority,
+            "created": date.today().isoformat(),
+            "baseline_ref": _baseline_ref,
         }
 
+        if complexity:
+            frontmatter["complexity"] = complexity.value
 
-    # Build content
-    content = f"""---
+        if depends:
+            frontmatter["depends"] = depends
+
+        if scope:
+            frontmatter["scope"] = scope
+
+        if parallel_group is not None:
+            frontmatter["parallel_group"] = parallel_group
+
+        if agent_profile:
+            frontmatter["agent_profile"] = agent_profile
+        # CLAWP-054 — contract fields
+        if out_of_scope:
+            frontmatter["out_of_scope"] = out_of_scope
+        if stop_conditions:
+            frontmatter["stop_conditions"] = stop_conditions
+        if delegability and delegability != "either":
+            frontmatter["delegability"] = delegability
+
+        if predictions and not predictions.is_empty():
+            pred_dict = predictions.to_dict()
+            # Strip None / empty-list values to keep the file clean
+            frontmatter["predictions"] = {
+                k: v for k, v in pred_dict.items()
+                if v is not None and v != []
+            }
+
+        # Build content
+        content = f"""---
 {yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True).strip()}
 ---
 # {title}
@@ -853,16 +879,16 @@ def add_task(
 
 """
 
-    # Write file — explicit utf-8 so Unicode titles (e.g. →, –, emoji) don't
-    # raise UnicodeEncodeError on Windows where the default locale is cp1252.
-    file_path = tasks_dir / f"{task_id}.md"
-    tmp_path = file_path.with_suffix(".tmp")
-    try:
-        tmp_path.write_text(content, encoding="utf-8")
-        tmp_path.replace(file_path)
-    except Exception:
-        tmp_path.unlink(missing_ok=True)
-        raise
+        # Write file — explicit utf-8 so Unicode titles (e.g. →, –, emoji) don't
+        # raise UnicodeEncodeError on Windows where the default locale is cp1252.
+        file_path = tasks_dir / f"{task_id}.md"
+        tmp_path = file_path.with_suffix(".tmp")
+        try:
+            tmp_path.write_text(content, encoding="utf-8")
+            tmp_path.replace(file_path)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
 
     return Task.from_file(file_path)
 
