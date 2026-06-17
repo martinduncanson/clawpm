@@ -33,9 +33,10 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import IO, Iterator
+from typing import Callable, IO, Iterator, TypeVar
 
 
 # Byte range we lock on Windows. Locking 1 byte at offset 0 is the canonical
@@ -180,6 +181,54 @@ def file_lock(lock_path: Path) -> Iterator[None]:
             _release(fh)
     finally:
         fh.close()
+
+
+_T = TypeVar("_T")
+
+# Windows error codes for the transient sharing/access faults an antivirus
+# scanner or the search indexer briefly raises against a freshly written or
+# renamed file: ERROR_ACCESS_DENIED (5) and ERROR_SHARING_VIOLATION (32). An
+# atomic rename (``os.replace`` / ``shutil.move``) issued the instant after a
+# write can hit these even with the per-project lock held — the lock serialises
+# *clawpm's* writers, but a third-party scanner holds its own handle. The fix is
+# a bounded retry, NOT a wider lock.
+_TRANSIENT_WINERRORS = frozenset({5, 32})
+
+
+def _is_transient_fs_error(exc: BaseException) -> bool:
+    """True for the transient Windows sharing/access errors worth retrying.
+
+    Deliberately narrow: a ``winerror`` in the sharing/access set, or a
+    ``PermissionError`` on win32. Everything else (FileExistsError,
+    FileNotFoundError, cross-device EXDEV, real EACCES on POSIX) is a genuine
+    condition the caller must see — never retried.
+    """
+    if not isinstance(exc, OSError):
+        return False
+    if getattr(exc, "winerror", None) in _TRANSIENT_WINERRORS:
+        return True
+    return isinstance(exc, PermissionError) and sys.platform == "win32"
+
+
+def retry_transient(
+    fn: Callable[..., _T], *args: object, attempts: int = 5, base_delay: float = 0.02
+) -> _T:
+    """Call ``fn(*args)``, retrying ONLY on transient FS sharing/access faults.
+
+    For atomic renames/moves performed under concurrent access on Windows
+    (CLAWP-051). Re-raises immediately on any non-transient error and after the
+    final attempt; backs off exponentially (``base_delay`` × 2ⁿ) between tries.
+    Sleeps only on failure, so the happy path is unaffected.
+    """
+    for attempt in range(attempts):
+        try:
+            return fn(*args)
+        except OSError as exc:
+            if attempt == attempts - 1 or not _is_transient_fs_error(exc):
+                raise
+            time.sleep(base_delay * (2**attempt))
+    # Unreachable: the loop either returns or raises on the final attempt.
+    raise AssertionError("retry_transient exhausted without returning or raising")
 
 
 def append_jsonl_line(path: Path, line: str, encoding: str = "utf-8") -> None:

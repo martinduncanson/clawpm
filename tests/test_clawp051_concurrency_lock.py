@@ -35,7 +35,7 @@ from pathlib import Path
 
 import pytest
 
-from clawpm.concurrency import file_lock
+from clawpm.concurrency import file_lock, retry_transient, _is_transient_fs_error
 from clawpm.discovery import load_portfolio_config
 from clawpm.models import TaskState
 from clawpm.tasks import add_subtask, add_task, change_task_state, get_task
@@ -443,11 +443,11 @@ class TestAddSubtaskContention:
         os.environ["CLAWPM_PORTFOLIO"] = str(tmp_path)
         config = load_portfolio_config(tmp_path)
 
-        # Create the parent task first (in-process, single session) and trigger
-        # the auto-split so the parent directory exists before workers spawn.
-        # (split_task is not under file_lock — concurrent splits race; we avoid
-        # that by doing one serial subtask creation here to settle the directory
-        # structure, then spawning concurrent workers against the already-split parent.)
+        # Create the parent task first (in-process) and seed one subtask to
+        # settle the directory layout deterministically before workers spawn.
+        # NOTE: as of the CLAWP-051 fix, parent resolution + split run INSIDE
+        # the per-project lock, so concurrent splits are race-safe even without
+        # this seed; the seed is kept only for a deterministic starting state.
         parent = add_task(config, project_id, "Parent for decompose")
         assert parent is not None
         parent_id = parent.id
@@ -581,3 +581,69 @@ class TestFileLockPrimitive:
         for _ in range(5):
             with file_lock(lock_path):
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Test: retry_transient — bounded retry on transient Windows FS faults
+# ---------------------------------------------------------------------------
+
+
+class TestRetryTransient:
+    """The retry helper that wraps the atomic rename/move sites (CLAWP-051)."""
+
+    def test_returns_value_on_first_success(self):
+        calls = []
+
+        def _ok():
+            calls.append(1)
+            return "done"
+
+        assert retry_transient(_ok) == "done"
+        assert len(calls) == 1  # no retry on success
+
+    def test_retries_transient_then_succeeds(self):
+        """A transient sharing/access fault is retried until it clears."""
+        state = {"n": 0}
+
+        def _flaky():
+            state["n"] += 1
+            if state["n"] < 3:
+                exc = PermissionError("sharing violation")
+                exc.winerror = 32  # ERROR_SHARING_VIOLATION
+                raise exc
+            return "ok"
+
+        assert retry_transient(_flaky, attempts=5, base_delay=0.001) == "ok"
+        assert state["n"] == 3
+
+    def test_non_transient_error_propagates_immediately(self):
+        """A logical error (e.g. FileExistsError) must NOT be retried."""
+        state = {"n": 0}
+
+        def _boom():
+            state["n"] += 1
+            raise FileExistsError("already exists")
+
+        with pytest.raises(FileExistsError):
+            retry_transient(_boom, attempts=5, base_delay=0.001)
+        assert state["n"] == 1  # raised on first attempt, never retried
+
+    def test_transient_exhaustion_reraises(self):
+        """If the transient never clears, the last exception is re-raised."""
+        def _always():
+            exc = PermissionError("locked forever")
+            exc.winerror = 5  # ERROR_ACCESS_DENIED
+            raise exc
+
+        with pytest.raises(PermissionError):
+            retry_transient(_always, attempts=3, base_delay=0.001)
+
+    def test_classifier_narrowness(self):
+        """_is_transient_fs_error only matches the intended fault classes."""
+        sharing = OSError()
+        sharing.winerror = 32
+        assert _is_transient_fs_error(sharing) is True
+        # FileExistsError / FileNotFoundError are real conditions, never transient
+        assert _is_transient_fs_error(FileExistsError("x")) is False
+        assert _is_transient_fs_error(FileNotFoundError("x")) is False
+        assert _is_transient_fs_error(ValueError("not even OSError")) is False

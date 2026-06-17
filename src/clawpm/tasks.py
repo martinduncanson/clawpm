@@ -9,7 +9,7 @@ from pathlib import Path
 
 import yaml
 
-from .concurrency import file_lock
+from .concurrency import file_lock, retry_transient
 from .models import Task, TaskState, TaskComplexity, Predictions, PortfolioConfig
 from .discovery import get_project_dir, find_project_dir_fallback
 
@@ -323,7 +323,9 @@ def _write_rejection_frontmatter(
     tmp = file_path.with_suffix(".tmp")
     try:
         tmp.write_text(new_text, encoding="utf-8")
-        tmp.replace(file_path)
+        # Retry transient Windows sharing/access faults — this rewrites a file
+        # that concurrent sessions contend on under the lock (CLAWP-051).
+        retry_transient(tmp.replace, file_path)
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
@@ -440,8 +442,8 @@ def change_task_state(
                 _task_md = task_dir / "_task.md"
                 _write_rejection_frontmatter(_task_md, rationale.strip(), supersedes)  # type: ignore[arg-type]
 
-            # (e) Move
-            shutil.move(str(task_dir), str(new_dir))
+            # (e) Move (retry transient Windows sharing/access faults — CLAWP-051)
+            retry_transient(shutil.move, str(task_dir), str(new_dir))
 
             # (f) Reload and return INSIDE the lock (Finding 5).
             return Task.from_file(new_dir / "_task.md")
@@ -494,8 +496,8 @@ def change_task_state(
         if new_state == TaskState.REJECTED:
             _write_rejection_frontmatter(current_path, rationale.strip(), supersedes)  # type: ignore[arg-type]
 
-        # (e) Move
-        shutil.move(str(current_path), str(new_path))
+        # (e) Move (retry transient Windows sharing/access faults — CLAWP-051)
+        retry_transient(shutil.move, str(current_path), str(new_path))
 
         # (f) Reload and return INSIDE the lock (Finding 5).
         return Task.from_file(new_path)
@@ -933,7 +935,8 @@ def add_task(
         tmp_path = file_path.with_suffix(".tmp")
         try:
             tmp_path.write_text(content, encoding="utf-8")
-            tmp_path.replace(file_path)
+            # Retry transient Windows sharing/access faults on the rename (CLAWP-051)
+            retry_transient(tmp_path.replace, file_path)
         except Exception:
             tmp_path.unlink(missing_ok=True)
             raise
@@ -1133,7 +1136,10 @@ def _append_child_to_parent_frontmatter(
     tmp = parent_path.with_suffix(parent_path.suffix + ".tmp")
     try:
         tmp.write_text(new_text, encoding="utf-8")
-        tmp.replace(parent_path)
+        # Retry transient Windows sharing/access faults — every subtask worker
+        # rewrites this same parent _task.md under the lock, so the rename hits
+        # post-write handle contention from the OS/AV scanner (CLAWP-051).
+        retry_transient(tmp.replace, parent_path)
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
@@ -1159,37 +1165,34 @@ def add_subtask(
     if not tasks_dir:
         return None
     
-    # Get or create parent as directory
-    parent = get_task(config, project_id, parent_id)
-    if not parent:
-        return None
-    
-    # Split parent if not already a directory
-    if parent.file_path and parent.file_path.name != "_task.md":
-        parent = split_task(config, project_id, parent_id)
-        if not parent:
-            return None
-    
-    # Find parent directory
-    parent_dir = parent.file_path.parent if parent.file_path else None
-    if not parent_dir:
-        return None
-    
-    # CLAWP-051 Finding 6 — wrap the allocate-and-create critical section in
-    # file_lock so concurrent sessions decomposing the same parent can't mint
-    # the same subtask ID and clobber each other.
-    # This mirrors the add_task fix.  add_subtask does NOT accept an explicit
-    # subtask_id, so all IDs are generated-under-lock and no explicit-ID
-    # clobber guard is needed here.
+    # CLAWP-051 Finding 6 — wrap the ENTIRE parent-resolution + allocate-and-create
+    # in file_lock so concurrent sessions decomposing the same parent can't mint
+    # the same subtask ID, clobber each other, OR read a half-written parent.
+    # The parent read + split MUST be inside the lock too: a sibling worker
+    # rewriting the parent's _task.md (frontmatter append) mid-rename would
+    # otherwise make get_task here transiently return None and drop the subtask
+    # (observed under contention). Serialising the read also serialises concurrent
+    # splits, so the flat→directory conversion is race-free without a test seed.
     #
-    # DEADLOCK SAFETY: add_subtask is always called as a standalone operation —
-    # it is never invoked from within an already-held file_lock on the same
-    # _lock_path.  Verified: split_task (called above if parent is a flat file)
-    # does not acquire file_lock, and no other caller nests add_subtask inside
-    # a file_lock block.  _append_child_to_parent_frontmatter is a plain
-    # file read/write with no lock — safe to call inside the critical section.
+    # DEADLOCK SAFETY: add_subtask is always a standalone operation — never
+    # invoked from within an already-held file_lock on the same _lock_path.
+    # Verified lock-free (safe to call inside the critical section): get_task
+    # (fs scan), split_task (flat→dir move, no file_lock), and
+    # _append_child_to_parent_frontmatter (plain read/write, no file_lock).
     _lock_path = tasks_dir / ".clawpm-tasks.lock"
     with file_lock(_lock_path):
+        # Resolve the parent as a directory INSIDE the lock (read + optional split).
+        parent = get_task(config, project_id, parent_id)
+        if not parent:
+            return None
+        if parent.file_path and parent.file_path.name != "_task.md":
+            parent = split_task(config, project_id, parent_id)
+            if not parent:
+                return None
+        parent_dir = parent.file_path.parent if parent.file_path else None
+        if not parent_dir:
+            return None
+
         # Generate subtask ID. Codex round-2 P2 fix: union three sources so a
         # migrated/deleted earlier child can't have its id silently reused:
         #   (1) files still in the parent directory (open / progress)
@@ -1262,7 +1265,8 @@ def add_subtask(
         tmp_path = file_path.with_suffix(".tmp")
         try:
             tmp_path.write_text(content, encoding="utf-8")
-            tmp_path.replace(file_path)
+            # Retry transient Windows sharing/access faults on the rename (CLAWP-051)
+            retry_transient(tmp_path.replace, file_path)
         except Exception:
             tmp_path.unlink(missing_ok=True)
             raise
