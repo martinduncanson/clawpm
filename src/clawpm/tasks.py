@@ -352,46 +352,40 @@ def change_task_state(
     current_path = task.file_path
     is_directory_task = current_path.name == "_task.md"
 
-    # CLAWP-053 — rationale is required for REJECTED; validate before any
-    # filesystem mutation so the task file is never left in a partial state.
+    # CLAWP-053 — rationale is required for REJECTED; validate BEFORE acquiring
+    # any lock and BEFORE any filesystem mutation so we fail fast without side
+    # effects.  This pure-validation check has no FS mutation, so it is safe
+    # (and cheaper) to run outside the critical section.
     if new_state == TaskState.REJECTED:
         if not rationale or not rationale.strip():
             raise ValueError(
                 "A non-empty rationale is required when rejecting a task. "
                 "Pass rationale='<reason>' to change_task_state()."
             )
-        # Write rationale (and optional supersedes) into the task file
-        # frontmatter before moving it to the rejected/ directory.
-        _write_rejection_frontmatter(current_path, rationale.strip(), supersedes)
 
-    # Check for incomplete subtasks when marking parent as done. A missing
-    # child ref counts as UNSATISFIED (mirrors cascade_unblock_dependents'
-    # dangling-dep handling) — see parent_rollup_status.
+    # CLAWP-051 — hold the per-project lock around the ENTIRE
+    # read→validate→mutate→reload transaction, not just the final move.
+    # Findings 1+4+5 (Codex review): pulling all five steps inside a single
+    # critical section prevents three distinct races:
+    #   (1) REJECTED frontmatter rewrite before lock (Finding 1)
+    #   (4) parent rollup check evaluated before lock (Finding 4)
+    #   (5) Task.from_file reload after lock release (Finding 5)
     #
-    # CLAWP-037 codex round-4 fix: do NOT short-circuit on task.children
-    # being empty — a child manually created with `parent: <id>` frontmatter
-    # may exist without being in the parent's persisted list, and we still
-    # need to gate on it. parent_rollup_status runs the parent-ref scan
-    # across all state dirs; for tasks with no children at all the scan
-    # finds nothing and returns ready=True immediately.
-    if new_state == TaskState.DONE and not force:
-        status = parent_rollup_status(config, project_id, task)
-        if not status["ready"]:
-            # Return None to signal failure - caller should check and report
-            return None
-
-    # CLAWP-051 — hold the per-project lock around each move so concurrent
-    # state transitions on the same task serialise cleanly.  Inside the lock,
-    # re-validate the source still exists before moving — if another session
-    # already moved it, fail with a clear error rather than an opaque
-    # FileNotFoundError or a crash.
-    # DEADLOCK SAFETY: this block is flat; no re-entrant file_lock calls.
+    # DEADLOCK SAFETY (verified — none of these callees acquire file_lock):
+    #   _write_rejection_frontmatter — plain file read/write, no lock
+    #   parent_rollup_status         — calls get_task + Task.from_file, no lock
+    #   get_task                     — filesystem scan, no lock
+    #   Task.from_file               — reads a file, no lock
+    # This block must remain flat; do not call any function that re-enters
+    # file_lock on the same _lock_path.
     _lock_path = tasks_dir / ".clawpm-tasks.lock"
 
     if is_directory_task:
         # For directory-based tasks, move the entire directory
         task_dir = current_path.parent
 
+        # Resolve the target directory before the lock (pure computation, no FS
+        # mutation; mkdir with exist_ok is idempotent so it is safe here too).
         if new_state == TaskState.OPEN:
             new_dir = tasks_dir / task_id
         elif new_state == TaskState.PROGRESS:
@@ -413,23 +407,46 @@ def change_task_state(
         else:
             return None
 
-        # Don't move if already in correct location
-        if task_dir.resolve() == new_dir.resolve():
-            return task
-
-        # Move the directory (serialised — re-validate source inside the lock)
         with file_lock(_lock_path):
+            # (a) Re-validate source exists — another session may have moved it.
             if not task_dir.exists():
                 raise FileNotFoundError(
                     f"Task directory '{task_dir}' no longer exists — "
                     "it may have been moved by a concurrent session."
                 )
+
+            # (b) Already in correct location — return without moving.
+            if task_dir.resolve() == new_dir.resolve():
+                return task
+
+            # (c) DONE + not force: re-run rollup INSIDE the lock so a child
+            #     reopened between the outer check and here doesn't produce a
+            #     false-ready parent.  (Finding 4 — directory-task branch)
+            if new_state == TaskState.DONE and not force:
+                # Re-read the task from disk so the rollup sees current children.
+                _fresh = get_task(config, project_id, task_id)
+                if _fresh is None:
+                    raise FileNotFoundError(
+                        f"Task directory '{task_dir}' no longer exists — "
+                        "it may have been moved by a concurrent session."
+                    )
+                status = parent_rollup_status(config, project_id, _fresh)
+                if not status["ready"]:
+                    return None
+
+            # (d) REJECTED: write rationale frontmatter INSIDE the lock
+            #     (Finding 1 — directory-task branch: _task.md is the target).
+            if new_state == TaskState.REJECTED:
+                _task_md = task_dir / "_task.md"
+                _write_rejection_frontmatter(_task_md, rationale.strip(), supersedes)  # type: ignore[arg-type]
+
+            # (e) Move
             shutil.move(str(task_dir), str(new_dir))
 
-        # Reload and return
-        return Task.from_file(new_dir / "_task.md")
+            # (f) Reload and return INSIDE the lock (Finding 5).
+            return Task.from_file(new_dir / "_task.md")
 
-    # Regular file-based task
+    # Regular file-based task.  Same five-step critical section as above.
     if new_state == TaskState.OPEN:
         new_path = tasks_dir / f"{task_id}.md"
     elif new_state == TaskState.PROGRESS:
@@ -449,21 +466,39 @@ def change_task_state(
     else:
         return None
 
-    # Don't move if already in correct location
-    if current_path.resolve() == new_path.resolve():
-        return task
-
-    # Move the file (serialised — re-validate source inside the lock)
     with file_lock(_lock_path):
+        # (a) Re-validate source exists.
         if not current_path.exists():
             raise FileNotFoundError(
                 f"Task file '{current_path}' no longer exists — "
                 "it may have been moved by a concurrent session."
             )
+
+        # (b) Already in correct location.
+        if current_path.resolve() == new_path.resolve():
+            return task
+
+        # (c) DONE + not force: re-run rollup inside the lock (Finding 4).
+        if new_state == TaskState.DONE and not force:
+            _fresh = get_task(config, project_id, task_id)
+            if _fresh is None:
+                raise FileNotFoundError(
+                    f"Task file '{current_path}' no longer exists — "
+                    "it may have been moved by a concurrent session."
+                )
+            status = parent_rollup_status(config, project_id, _fresh)
+            if not status["ready"]:
+                return None
+
+        # (d) REJECTED: write rationale frontmatter INSIDE the lock (Finding 1).
+        if new_state == TaskState.REJECTED:
+            _write_rejection_frontmatter(current_path, rationale.strip(), supersedes)  # type: ignore[arg-type]
+
+        # (e) Move
         shutil.move(str(current_path), str(new_path))
 
-    # Reload and return
-    return Task.from_file(new_path)
+        # (f) Reload and return INSIDE the lock (Finding 5).
+        return Task.from_file(new_path)
 
 
 def cascade_unblock_dependents(
@@ -770,6 +805,9 @@ def add_task(
     # DEADLOCK SAFETY: do NOT call any function that re-enters file_lock on
     # the same lock_path from within this block.
     _lock_path = tasks_dir / ".clawpm-tasks.lock"
+    # Capture whether this is an explicit-ID create BEFORE entering the lock
+    # so the clobber guard (Finding 2) can be applied inside atomically.
+    _explicit_id = task_id is not None
     with file_lock(_lock_path):
         # Generate task ID if not provided (inside lock: scan is now serialised)
         if not task_id:
@@ -882,6 +920,16 @@ def add_task(
         # Write file — explicit utf-8 so Unicode titles (e.g. →, –, emoji) don't
         # raise UnicodeEncodeError on Windows where the default locale is cp1252.
         file_path = tasks_dir / f"{task_id}.md"
+
+        # CLAWP-051 Finding 2 — explicit-ID clobber guard.
+        # Generated IDs are fresh-by-construction (scan under the lock above)
+        # so only the explicit-ID path needs this check.
+        if _explicit_id and file_path.exists():
+            raise FileExistsError(
+                f"Task '{task_id}' already exists at '{file_path}'. "
+                "Pass a different task_id or omit it to auto-generate one."
+            )
+
         tmp_path = file_path.with_suffix(".tmp")
         try:
             tmp_path.write_text(content, encoding="utf-8")
@@ -1127,63 +1175,78 @@ def add_subtask(
     if not parent_dir:
         return None
     
-    # Generate subtask ID. Codex round-2 P2 fix: union three sources so a
-    # migrated/deleted earlier child can't have its id silently reused:
-    #   (1) files still in the parent directory (open / progress)
-    #   (2) migrated children in tasks/done/ and tasks/blocked/
-    #   (3) the parent's persisted frontmatter children list (covers
-    #       files that were deleted outright after creation)
-    # Without (2)+(3), running `tasks decompose` again on a parent whose
-    # earlier children have all moved to done/ would re-issue `P-001`,
-    # colliding with the migrated record.
-    existing_nums: set[int] = set()
+    # CLAWP-051 Finding 6 — wrap the allocate-and-create critical section in
+    # file_lock so concurrent sessions decomposing the same parent can't mint
+    # the same subtask ID and clobber each other.
+    # This mirrors the add_task fix.  add_subtask does NOT accept an explicit
+    # subtask_id, so all IDs are generated-under-lock and no explicit-ID
+    # clobber guard is needed here.
+    #
+    # DEADLOCK SAFETY: add_subtask is always called as a standalone operation —
+    # it is never invoked from within an already-held file_lock on the same
+    # _lock_path.  Verified: split_task (called above if parent is a flat file)
+    # does not acquire file_lock, and no other caller nests add_subtask inside
+    # a file_lock block.  _append_child_to_parent_frontmatter is a plain
+    # file read/write with no lock — safe to call inside the critical section.
+    _lock_path = tasks_dir / ".clawpm-tasks.lock"
+    with file_lock(_lock_path):
+        # Generate subtask ID. Codex round-2 P2 fix: union three sources so a
+        # migrated/deleted earlier child can't have its id silently reused:
+        #   (1) files still in the parent directory (open / progress)
+        #   (2) migrated children in tasks/done/ and tasks/blocked/
+        #   (3) the parent's persisted frontmatter children list (covers
+        #       files that were deleted outright after creation)
+        # Without (2)+(3), running `tasks decompose` again on a parent whose
+        # earlier children have all moved to done/ would re-issue `P-001`,
+        # colliding with the migrated record.
+        existing_nums: set[int] = set()
 
-    def _record_num_from_id(tid: str) -> None:
-        try:
-            num_str = tid.split("-")[-1].replace(".progress", "")
-            existing_nums.add(int(num_str))
-        except (IndexError, ValueError):
-            pass
+        def _record_num_from_id(tid: str) -> None:
+            try:
+                num_str = tid.split("-")[-1].replace(".progress", "")
+                existing_nums.add(int(num_str))
+            except (IndexError, ValueError):
+                pass
 
-    for f in parent_dir.glob(f"{parent_id}-*.md"):
-        _record_num_from_id(f.stem)
-    for state_dir in (tasks_dir / "done", tasks_dir / "blocked"):
-        if state_dir.exists():
-            for f in state_dir.glob(f"{parent_id}-*.md"):
-                _record_num_from_id(f.stem)
-    for cid in (parent.children or []):
-        if cid.startswith(parent_id + "-"):
-            _record_num_from_id(cid)
+        for f in parent_dir.glob(f"{parent_id}-*.md"):
+            _record_num_from_id(f.stem)
+        for state_dir in (tasks_dir / "done", tasks_dir / "blocked"):
+            if state_dir.exists():
+                for f in state_dir.glob(f"{parent_id}-*.md"):
+                    _record_num_from_id(f.stem)
+        for cid in (parent.children or []):
+            if cid.startswith(parent_id + "-"):
+                _record_num_from_id(cid)
 
-    next_num = (max(existing_nums) if existing_nums else 0) + 1
-    subtask_id = f"{parent_id}-{next_num:03d}"
-    
-    # Build frontmatter
-    frontmatter = {
-        "id": subtask_id,
-        "priority": priority,
-        "parent": parent_id,
-        "created": date.today().isoformat(),
-    }
-    
-    if complexity:
-        frontmatter["complexity"] = complexity.value
+        next_num = (max(existing_nums) if existing_nums else 0) + 1
+        subtask_id = f"{parent_id}-{next_num:03d}"
 
-    if agent_profile:
-        frontmatter["agent_profile"] = agent_profile
-
-    # CLAWP-037 — children created via `tasks decompose` carry their own
-    # success_criteria (and other predictions) so each subtask is a
-    # verifiable goal, and the parent rolls up only when all pass.
-    if predictions and not predictions.is_empty():
-        pred_dict = predictions.to_dict()
-        frontmatter["predictions"] = {
-            k: v for k, v in pred_dict.items()
-            if v is not None and v != []
+        # Build frontmatter
+        frontmatter: dict = {
+            "id": subtask_id,
+            "priority": priority,
+            "parent": parent_id,
+            "created": date.today().isoformat(),
         }
 
-    # Build content
-    content = f"""---
+        if complexity:
+            frontmatter["complexity"] = complexity.value
+
+        if agent_profile:
+            frontmatter["agent_profile"] = agent_profile
+
+        # CLAWP-037 — children created via `tasks decompose` carry their own
+        # success_criteria (and other predictions) so each subtask is a
+        # verifiable goal, and the parent rolls up only when all pass.
+        if predictions and not predictions.is_empty():
+            pred_dict = predictions.to_dict()
+            frontmatter["predictions"] = {
+                k: v for k, v in pred_dict.items()
+                if v is not None and v != []
+            }
+
+        # Build content
+        content = f"""---
 {yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True).strip()}
 ---
 # {title}
@@ -1194,20 +1257,20 @@ def add_subtask(
 
 """
 
-    # Write file — utf-8 so Unicode in title/description survives on Windows
-    file_path = parent_dir / f"{subtask_id}.md"
-    tmp_path = file_path.with_suffix(".tmp")
-    try:
-        tmp_path.write_text(content, encoding="utf-8")
-        tmp_path.replace(file_path)
-    except Exception:
-        tmp_path.unlink(missing_ok=True)
-        raise
+        # Write file — utf-8 so Unicode in title/description survives on Windows
+        file_path = parent_dir / f"{subtask_id}.md"
+        tmp_path = file_path.with_suffix(".tmp")
+        try:
+            tmp_path.write_text(content, encoding="utf-8")
+            tmp_path.replace(file_path)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
 
-    # CLAWP-037 round-1 fix: persist the child on the parent so the rollup
-    # gate keeps it in view after the child migrates to done/ or blocked/.
-    if parent.file_path is not None:
-        _append_child_to_parent_frontmatter(parent.file_path, subtask_id)
+        # CLAWP-037 round-1 fix: persist the child on the parent so the rollup
+        # gate keeps it in view after the child migrates to done/ or blocked/.
+        if parent.file_path is not None:
+            _append_child_to_parent_frontmatter(parent.file_path, subtask_id)
 
-    return Task.from_file(file_path)
+        return Task.from_file(file_path)
 

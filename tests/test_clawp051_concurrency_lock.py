@@ -38,7 +38,7 @@ import pytest
 from clawpm.concurrency import file_lock
 from clawpm.discovery import load_portfolio_config
 from clawpm.models import TaskState
-from clawpm.tasks import add_task, change_task_state, get_task
+from clawpm.tasks import add_subtask, add_task, change_task_state, get_task
 
 
 # ---------------------------------------------------------------------------
@@ -250,30 +250,63 @@ class TestStateTransitionSerialization:
         t = change_task_state(config, project_id, task_id, TaskState.DONE, force=True)
         assert t is not None
 
-    def test_second_transition_on_moved_source_raises_clear_error(self, portfolio):
+    def test_second_transition_on_moved_source_raises_clear_error(self, portfolio, monkeypatch):
         """If the task has already been moved by one session, a second attempt
-        raises FileNotFoundError with a message mentioning concurrent session."""
+        raises FileNotFoundError with a message mentioning concurrent session.
+
+        Finding 3 fix: this test drives the PRODUCTION revalidation path in
+        change_task_state rather than raising inline.  We monkeypatch get_task
+        to return a Task whose file_path points at the original (now gone)
+        location so change_task_state itself encounters the missing-file
+        condition and raises.  Deleting the production guard makes this test
+        fail, confirming it is load-bearing.
+        """
+        import clawpm.tasks as tasks_module
+
         tmp_path, project_id, task_id, config = portfolio
 
         # First transition: moves the file to done/
         t = change_task_state(config, project_id, task_id, TaskState.DONE, force=True)
         assert t is not None
 
-        # Simulate a second session that still holds the stale current_path
-        # by directly trying to move from the original (now gone) location.
+        # Build a stale Task object whose file_path still points at the
+        # original open-state location (which no longer exists on disk).
         tasks_dir = tmp_path / "projects" / project_id / ".project" / "tasks"
-        original_path = tasks_dir / f"{task_id}.md"
-        _lock_path = tasks_dir / ".clawpm-tasks.lock"
+        stale_path = tasks_dir / f"{task_id}.md"
+        assert not stale_path.exists(), "Pre-condition: stale_path must not exist"
 
+        # Construct the stale Task from the done/ copy, but override file_path.
+        done_task = get_task(config, project_id, task_id)
+        assert done_task is not None
+
+        from clawpm.models import Task
+
+        stale_task = Task(
+            id=done_task.id,
+            title=done_task.title,
+            state=done_task.state,
+            file_path=stale_path,   # points at the vanished original location
+            priority=done_task.priority,
+            complexity=done_task.complexity,
+            depends=done_task.depends,
+            children=done_task.children,
+            parent=done_task.parent,
+        )
+
+        # Monkeypatch get_task so the production code sees the stale Task.
+        real_get_task = tasks_module.get_task
+
+        def _stale_get_task(cfg, pid, tid):
+            if pid == project_id and tid == task_id:
+                return stale_task
+            return real_get_task(cfg, pid, tid)
+
+        monkeypatch.setattr(tasks_module, "get_task", _stale_get_task)
+
+        # change_task_state must raise via the production current_path.exists()
+        # revalidation inside the lock — not from any inline test logic.
         with pytest.raises(FileNotFoundError, match="concurrent session"):
-            with file_lock(_lock_path):
-                if not original_path.exists():
-                    raise FileNotFoundError(
-                        f"Task file '{original_path}' no longer exists — "
-                        "it may have been moved by a concurrent session."
-                    )
-                import shutil
-                shutil.move(str(original_path), str(tasks_dir / f"{task_id}_copy.md"))
+            change_task_state(config, project_id, task_id, TaskState.BLOCKED)
 
     def test_sequential_transitions_on_different_tasks_succeed(self, tmp_path):
         """Two different tasks in the same project transition independently.
@@ -295,6 +328,181 @@ class TestStateTransitionSerialization:
         tb = change_task_state(config, project_id, task_b.id, TaskState.BLOCKED)
         assert ta is not None, "Task A transition failed"
         assert tb is not None, "Task B transition failed"
+
+    def test_rejected_transition_succeeds_happy_path(self, tmp_path):
+        """REJECTED transition succeeds through the restructured code (Finding 1/5 regression)."""
+        project_id = "reject-happy"
+        _make_portfolio(tmp_path, project_id)
+        os.environ["CLAWPM_PORTFOLIO"] = str(tmp_path)
+        config = load_portfolio_config(tmp_path)
+
+        task = add_task(config, project_id, "Task to reject")
+        assert task is not None
+
+        result = change_task_state(
+            config, project_id, task.id, TaskState.REJECTED,
+            rationale="Not needed any more",
+        )
+        assert result is not None, "REJECTED transition should succeed"
+        assert result.state == TaskState.REJECTED
+
+    def test_done_with_force_succeeds_happy_path(self, tmp_path):
+        """DONE (force=True) succeeds through the restructured code (Finding 4/5 regression)."""
+        project_id = "done-happy"
+        _make_portfolio(tmp_path, project_id)
+        os.environ["CLAWPM_PORTFOLIO"] = str(tmp_path)
+        config = load_portfolio_config(tmp_path)
+
+        task = add_task(config, project_id, "Task to finish")
+        assert task is not None
+
+        result = change_task_state(config, project_id, task.id, TaskState.DONE, force=True)
+        assert result is not None, "DONE (force=True) transition should succeed"
+        assert result.state == TaskState.DONE
+
+
+# ---------------------------------------------------------------------------
+# Test: explicit-ID clobber guard in add_task (Finding 2)
+# ---------------------------------------------------------------------------
+
+
+class TestExplicitIdClobberGuard:
+    """add_task with an explicit task_id that already exists raises FileExistsError
+    and does NOT overwrite the pre-existing file content."""
+
+    def test_explicit_id_existing_task_raises_and_does_not_clobber(self, tmp_path):
+        project_id = "clobber-guard"
+        _make_portfolio(tmp_path, project_id)
+        os.environ["CLAWPM_PORTFOLIO"] = str(tmp_path)
+        config = load_portfolio_config(tmp_path)
+
+        # Create the first task with an explicit ID.
+        task = add_task(config, project_id, "Original title", task_id="CLOBBER-001")
+        assert task is not None
+        assert task.id == "CLOBBER-001"
+
+        # Record the original file content so we can verify it is unchanged.
+        tasks_dir = tmp_path / "projects" / project_id / ".project" / "tasks"
+        file_path = tasks_dir / "CLOBBER-001.md"
+        original_content = file_path.read_text(encoding="utf-8")
+
+        # A second create with the same explicit ID must raise FileExistsError.
+        with pytest.raises(FileExistsError, match="CLOBBER-001"):
+            add_task(config, project_id, "Clobbering title", task_id="CLOBBER-001")
+
+        # The file content must be identical to the original — not overwritten.
+        assert file_path.read_text(encoding="utf-8") == original_content, (
+            "File was overwritten despite FileExistsError being raised"
+        )
+
+    def test_generated_ids_are_never_clobbered(self, tmp_path):
+        """Generated IDs are fresh under the lock — repeated add_task calls
+        produce distinct files even without explicit IDs."""
+        project_id = "gen-id-no-clobber"
+        _make_portfolio(tmp_path, project_id)
+        os.environ["CLAWPM_PORTFOLIO"] = str(tmp_path)
+        config = load_portfolio_config(tmp_path)
+
+        ids = [add_task(config, project_id, f"Task {i}").id for i in range(5)]  # type: ignore[union-attr]
+        assert len(set(ids)) == 5, f"Duplicate generated IDs: {ids}"
+
+
+# ---------------------------------------------------------------------------
+# Test: add_subtask contention under concurrent processes (Finding 6)
+# ---------------------------------------------------------------------------
+
+_SUBTASK_WORKER_SCRIPT = textwrap.dedent("""\
+    import sys, json
+    from pathlib import Path
+    sys.path.insert(0, r'{src_path}')
+    from clawpm.discovery import load_portfolio_config
+    from clawpm.tasks import add_subtask
+
+    portfolio_root = Path(r'{portfolio_root}')
+    project_id = '{project_id}'
+    parent_id = '{parent_id}'
+    title = sys.argv[1]
+    config = load_portfolio_config(portfolio_root)
+    task = add_subtask(config, project_id, parent_id, title)
+    if task is None:
+        print(json.dumps({{"error": "add_subtask returned None", "title": title}}))
+        sys.exit(1)
+    print(json.dumps({{"id": task.id}}))
+""")
+
+
+class TestAddSubtaskContention:
+    """N≥8 concurrent subprocesses calling add_subtask on the same parent all
+    produce unique subtask IDs and all files exist on disk (Finding 6)."""
+
+    N_WORKERS = 8
+
+    def test_concurrent_subtask_ids_are_unique(self, tmp_path):
+        project_id = "subtask-conc"
+        _make_portfolio(tmp_path, project_id)
+        os.environ["CLAWPM_PORTFOLIO"] = str(tmp_path)
+        config = load_portfolio_config(tmp_path)
+
+        # Create the parent task first (in-process, single session) and trigger
+        # the auto-split so the parent directory exists before workers spawn.
+        # (split_task is not under file_lock — concurrent splits race; we avoid
+        # that by doing one serial subtask creation here to settle the directory
+        # structure, then spawning concurrent workers against the already-split parent.)
+        parent = add_task(config, project_id, "Parent for decompose")
+        assert parent is not None
+        parent_id = parent.id
+        seed = add_subtask(config, project_id, parent_id, "seed subtask")
+        assert seed is not None, "Seed subtask creation failed"
+
+        # Spawn N concurrent workers each adding a subtask to the same parent.
+        import subprocess
+
+        src_path = str(Path(__file__).parent.parent / "src")
+        code = _SUBTASK_WORKER_SCRIPT.format(
+            src_path=src_path,
+            portfolio_root=str(tmp_path),
+            project_id=project_id,
+            parent_id=parent_id,
+        )
+        env = {**os.environ, "CLAWPM_PORTFOLIO": str(tmp_path)}
+        procs = [
+            subprocess.Popen(
+                [sys.executable, "-c", code, f"subtask-{i}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+            )
+            for i in range(self.N_WORKERS)
+        ]
+        ids: list[str] = []
+        for i, proc in enumerate(procs):
+            out, err = proc.communicate(timeout=60)
+            raw = out.decode("utf-8", errors="replace").strip()
+            if proc.returncode != 0 or not raw:
+                pytest.fail(
+                    f"Subtask worker {i} failed (rc={proc.returncode}):\n"
+                    f"stdout: {raw!r}\nstderr: {err.decode('utf-8', errors='replace')!r}"
+                )
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                pytest.fail(f"Subtask worker {i} produced non-JSON: {raw!r}")
+            if "error" in data:
+                pytest.fail(f"Subtask worker {i} add_subtask error: {data['error']}")
+            ids.append(data["id"])
+
+        assert len(ids) == self.N_WORKERS, f"Expected {self.N_WORKERS} ids, got {ids}"
+        assert len(set(ids)) == self.N_WORKERS, (
+            f"Duplicate subtask IDs detected (lock failed!): {ids}"
+        )
+
+        # All subtask files must exist on disk.
+        tasks_dir = tmp_path / "projects" / project_id / ".project" / "tasks"
+        parent_dir = tasks_dir / parent_id
+        for sid in ids:
+            assert (parent_dir / f"{sid}.md").exists(), (
+                f"Subtask file for {sid} not found under {parent_dir}"
+            )
 
 
 # ---------------------------------------------------------------------------

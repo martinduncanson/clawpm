@@ -749,13 +749,20 @@ Even when two sessions end up touching the same project's task tree concurrently
 (e.g. both call `add_task`, or both try to transition the same task), clawpm holds an
 exclusive advisory lock for the duration of each mutation:
 
-- **ID allocation (TOCTOU):** `add_task` acquires `<tasks_dir>/.clawpm-tasks.lock`
+- **ID allocation (TOCTOU) — `add_task`:** acquires `<tasks_dir>/.clawpm-tasks.lock`
   before scanning existing IDs and holds it until the new task file is written to disk.
   Two concurrent sessions see different `next_num` values and write different task IDs.
-- **State-transition moves:** each `shutil.move` in `change_task_state` is guarded by
-  the same lock.  If the source file has already been moved by another session, the
-  operation raises `FileNotFoundError` with a message naming the concurrent-session
-  cause — no opaque crash, no silent lost-update.
+  Explicit-ID creates are guarded against clobber: if the target file already exists,
+  `FileExistsError` is raised rather than silently overwriting the prior task.
+- **Subtask allocation (TOCTOU) — `add_subtask`:** acquires the same lock around the
+  scan→mint→write critical section.  Two sessions decomposing the same parent concurrently
+  see different `next_num` values and never mint the same subtask ID.
+- **State-transition moves — `change_task_state`:** the entire read→validate→mutate→reload
+  transaction is held inside a single lock acquisition.  This covers the REJECTED
+  frontmatter rewrite, the DONE/rollup re-check, the `shutil.move`, and the return-value
+  reload — all under the same critical section.  If the source file has already been moved
+  by another session, the operation raises `FileNotFoundError` with a message naming the
+  concurrent-session cause — no opaque crash, no silent lost-update.
 
 **Granularity is per-project:** the lock file lives at `<tasks_dir>/.clawpm-tasks.lock`
 and serialises mutations *within one project's task tree* only.  Different projects
