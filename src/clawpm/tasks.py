@@ -450,8 +450,10 @@ def change_task_state(
             # (e) Move (retry transient Windows sharing/access faults — CLAWP-051)
             retry_transient(shutil.move, str(task_dir), str(new_dir))
 
-            # (f) Reload and return INSIDE the lock (Finding 5).
-            return Task.from_file(new_dir / "_task.md")
+            # (f) Reload and return INSIDE the lock (Finding 5). Retry the read
+            #     too: a scanner can hit the freshly-moved file transiently even
+            #     though the move under the lock already committed (CLAWP-051).
+            return retry_transient(Task.from_file, new_dir / "_task.md")
 
     # Regular file-based task.  Same five-step critical section as above.
     if new_state == TaskState.OPEN:
@@ -504,8 +506,10 @@ def change_task_state(
         # (e) Move (retry transient Windows sharing/access faults — CLAWP-051)
         retry_transient(shutil.move, str(current_path), str(new_path))
 
-        # (f) Reload and return INSIDE the lock (Finding 5).
-        return Task.from_file(new_path)
+        # (f) Reload and return INSIDE the lock (Finding 5). Retry the read too:
+        #     a scanner can hit the freshly-moved file transiently even though
+        #     the move under the lock already committed (CLAWP-051).
+        return retry_transient(Task.from_file, new_path)
 
 
 def cascade_unblock_dependents(
@@ -948,8 +952,9 @@ def add_task(
 
         # Reload and return INSIDE the lock — consistent with change_task_state's
         # reload-under-lock contract (CLAWP-051 Finding 5). The file was just
-        # written under this lock, so the read can't race another clawpm writer.
-        return Task.from_file(file_path)
+        # written under this lock, so the read can't race another clawpm writer;
+        # retry_transient covers a scanner touching the fresh file (CLAWP-051).
+        return retry_transient(Task.from_file, file_path)
 
 
 def edit_task(
@@ -1102,7 +1107,7 @@ def split_task(
     new_path = task_dir / "_task.md"
     retry_transient(shutil.move, str(current_path), str(new_path))
 
-    return Task.from_file(new_path)
+    return retry_transient(Task.from_file, new_path)
 
 
 def _append_child_to_parent_frontmatter(
@@ -1286,5 +1291,7 @@ def add_subtask(
         if parent.file_path is not None:
             _append_child_to_parent_frontmatter(parent.file_path, subtask_id)
 
-        return Task.from_file(file_path)
+        # Reload under the lock; retry_transient covers a scanner touching the
+        # freshly-written child file even though the write committed (CLAWP-051).
+        return retry_transient(Task.from_file, file_path)
 
