@@ -35,7 +35,12 @@ from pathlib import Path
 
 import pytest
 
-from clawpm.concurrency import file_lock, retry_transient, _is_transient_fs_error
+from clawpm.concurrency import (
+    _TRANSIENT_WINERRORS,
+    _is_transient_fs_error,
+    file_lock,
+    retry_transient,
+)
 from clawpm.discovery import load_portfolio_config
 from clawpm.models import TaskState
 from clawpm.tasks import add_subtask, add_task, change_task_state, get_task
@@ -647,3 +652,16 @@ class TestRetryTransient:
         assert _is_transient_fs_error(FileExistsError("x")) is False
         assert _is_transient_fs_error(FileNotFoundError("x")) is False
         assert _is_transient_fs_error(ValueError("not even OSError")) is False
+
+    def test_generic_permission_error_is_not_transient_on_windows(self, monkeypatch):
+        """A PermissionError without a transient winerror is NOT retried (regression).
+
+        Before the fix, any PermissionError on win32 was treated as transient.
+        Now only the known sharing/access winerror codes are. A generic
+        PermissionError carries winerror=None (OSError subclasses always have the
+        attribute on Windows; it's None when unset), so it must fail fast.
+        """
+        monkeypatch.setattr(sys, "platform", "win32")
+        generic_permission_err = PermissionError("Permanent ACL issue")
+        assert getattr(generic_permission_err, "winerror", None) not in _TRANSIENT_WINERRORS
+        assert _is_transient_fs_error(generic_permission_err) is False

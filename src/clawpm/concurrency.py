@@ -198,16 +198,18 @@ _TRANSIENT_WINERRORS = frozenset({5, 32})
 def _is_transient_fs_error(exc: BaseException) -> bool:
     """True for the transient Windows sharing/access errors worth retrying.
 
-    Deliberately narrow: a ``winerror`` in the sharing/access set, or a
-    ``PermissionError`` on win32. Everything else (FileExistsError,
-    FileNotFoundError, cross-device EXDEV, real EACCES on POSIX) is a genuine
+    Deliberately narrow: a ``winerror`` in the sharing/access set.
+    Everything else (FileExistsError, FileNotFoundError, cross-device EXDEV,
+    real EACCES on POSIX, or a permanent PermissionError) is a genuine
     condition the caller must see — never retried.
     """
     if not isinstance(exc, OSError):
         return False
+    # Only retry on specific, known-transient Windows error codes.
+    # A generic PermissionError could be a permanent ACL issue and should fail fast.
     if getattr(exc, "winerror", None) in _TRANSIENT_WINERRORS:
         return True
-    return isinstance(exc, PermissionError) and sys.platform == "win32"
+    return False
 
 
 def retry_transient(
