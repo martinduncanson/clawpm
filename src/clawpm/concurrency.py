@@ -15,8 +15,8 @@ the JSONL becomes unparseable from the interleave point onward.
 
 This module provides ``locked_append``, a context manager that wraps an
 append-mode file handle with an exclusive advisory lock:
-- POSIX: ``fcntl.flock`` with ``LOCK_EX``
-- Windows: ``msvcrt.locking`` with ``LK_LOCK`` (blocks with retry)
+- POSIX: ``fcntl.flock`` with ``LOCK_EX`` (or a ``LOCK_NB`` poll when bounded)
+- Windows: ``msvcrt.locking`` with ``LK_NBLCK`` polled in a backoff loop
 
 The lock is **advisory** — only writers using this helper observe it. Any
 external process bypassing the helper can still cause corruption. That's
@@ -46,6 +46,17 @@ from typing import Callable, IO, Iterator, TypeVar
 _LOCK_OFFSET = 0
 _LOCK_LENGTH = 1
 
+# Default ceiling (seconds) for acquiring a contended lock. Windows' msvcrt
+# ``LK_LOCK`` mode retries only 10×1s then raises — too short for a large parent
+# rollup on a slow/AV-scanned filesystem, where a concurrent writer would get a
+# spurious acquisition failure instead of waiting, defeating the multi-session
+# safety this lock exists for (Codex review). We poll ``LK_NBLCK`` ourselves up
+# to this bound so a waiter genuinely waits, while still erroring on a truly
+# stuck lock rather than hanging forever.
+_LOCK_ACQUIRE_TIMEOUT = 120.0
+# Cap on the poll backoff between acquisition attempts.
+_LOCK_POLL_MAX = 0.5
+
 
 if sys.platform == "win32":
     import msvcrt
@@ -70,9 +81,9 @@ def locked_append(path: Path, encoding: str = "utf-8") -> Iterator[IO[str]]:
     Parent directory is created if missing.
 
     Raises:
-        OSError: if the lock cannot be acquired (Windows ``msvcrt.locking``
-        retries 10 times with 1-second delays before raising; POSIX
-        ``fcntl.flock`` blocks indefinitely unless interrupted).
+        OSError: if the lock cannot be acquired within ``_LOCK_ACQUIRE_TIMEOUT``
+        (both platforms poll a non-blocking acquire up to that ceiling; see
+        ``_acquire``).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -98,27 +109,59 @@ def locked_append(path: Path, encoding: str = "utf-8") -> Iterator[IO[str]]:
         fh.close()
 
 
-def _acquire(fh: IO[str]) -> None:
-    """Acquire exclusive lock on the file handle.
+def _acquire(fh: IO[str], timeout: float | None = _LOCK_ACQUIRE_TIMEOUT) -> None:
+    """Acquire exclusive lock on the file handle, waiting up to ``timeout`` secs.
 
     Platform dispatch:
-    - Windows: ``msvcrt.locking(fd, LK_LOCK, n)`` locks ``n`` bytes from the
-      current file position. We seek to offset 0 first so the lock range is
-      deterministic across writers; then seek back to EOF for the append.
-    - POSIX: ``fcntl.flock(fd, LOCK_EX)`` is whole-file. No position trickery.
+    - Windows: poll ``msvcrt.locking(fd, LK_NBLCK, n)`` — the NON-blocking mode,
+      which fails immediately if the range is held — in a backoff loop we
+      control, rather than ``LK_LOCK`` whose internal 10×1s cap would surface a
+      spurious failure on a long-held lock (Codex review). We seek to offset 0
+      first so the lock range is deterministic across writers; then seek back to
+      EOF for the append.
+    - POSIX: ``fcntl.flock(fd, LOCK_EX)`` blocks whole-file. With a ``timeout``
+      we poll ``LOCK_EX | LOCK_NB`` instead so the wait is bounded; ``timeout``
+      of None blocks indefinitely (the historical behaviour).
+
+    Raises ``OSError`` if the lock can't be acquired within ``timeout``.
     """
     if sys.platform == "win32":
-        # Save EOF position; the file was opened in "a" mode so position is EOF.
+        # Save EOF position; the file was opened in "a"/"a+" mode so pos is EOF.
         eof = fh.tell()
         fh.seek(_LOCK_OFFSET)
         try:
-            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, _LOCK_LENGTH)
+            deadline = None if timeout is None else time.monotonic() + timeout
+            delay = 0.02
+            while True:
+                try:
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, _LOCK_LENGTH)
+                    return
+                except OSError:
+                    # Range held by another handle. LK_NBLCK fails fast, so we
+                    # own the retry cadence and the overall ceiling.
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise
+                    time.sleep(min(delay, _LOCK_POLL_MAX))
+                    delay = min(delay * 2, _LOCK_POLL_MAX)
         finally:
-            # Restore EOF position regardless of locking success, so the caller's
-            # write() goes to the right place if we re-raise.
+            # Restore EOF position regardless of outcome, so the caller's write()
+            # goes to the right place if we re-raise.
             fh.seek(eof)
     else:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        if timeout is None:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            return
+        deadline = time.monotonic() + timeout
+        delay = 0.02
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(min(delay, _LOCK_POLL_MAX))
+                delay = min(delay * 2, _LOCK_POLL_MAX)
 
 
 def _release(fh: IO[str]) -> None:
@@ -145,7 +188,9 @@ def _release(fh: IO[str]) -> None:
 
 
 @contextmanager
-def file_lock(lock_path: Path) -> Iterator[None]:
+def file_lock(
+    lock_path: Path, timeout: float | None = _LOCK_ACQUIRE_TIMEOUT
+) -> Iterator[None]:
     """Hold an exclusive advisory lock across an arbitrary critical section.
 
     Distinct from ``locked_append``: this guards a code block, not an append
@@ -168,13 +213,18 @@ def file_lock(lock_path: Path) -> Iterator[None]:
             # scan → create critical section
             ...
 
+    ``timeout`` bounds how long a contended acquire waits (default
+    ``_LOCK_ACQUIRE_TIMEOUT``); pass None to wait indefinitely on POSIX. The
+    wait is a poll loop, so a long-held lock (large rollup, slow/AV filesystem)
+    is waited out rather than failing at Windows' 10s ``LK_LOCK`` cap.
+
     Raises:
-        OSError: if the lock cannot be acquired (same behaviour as ``_acquire``).
+        OSError: if the lock cannot be acquired within ``timeout``.
     """
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fh = open(lock_path, "a+", encoding="utf-8")  # create-or-open; "a+" keeps existing content
     try:
-        _acquire(fh)
+        _acquire(fh, timeout)
         try:
             yield
         finally:

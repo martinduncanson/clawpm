@@ -821,6 +821,61 @@ class TestFileLockPrimitive:
             with file_lock(lock_path):
                 pass
 
+    def test_contended_acquire_waits_then_succeeds(self, tmp_path):
+        """A second acquirer waits for a held lock and succeeds once released —
+        the poll loop must not fail early (Codex review: Windows LK_LOCK's 10s
+        cap previously surfaced a spurious OSError on long-held locks).
+        """
+        import threading
+
+        lock_path = tmp_path / ".clawpm-tasks.lock"
+        held = threading.Event()
+        release = threading.Event()
+
+        def holder():
+            with file_lock(lock_path):
+                held.set()
+                release.wait(10)
+
+        t = threading.Thread(target=holder)
+        t.start()
+        try:
+            assert held.wait(5), "holder thread failed to acquire the lock"
+            # Release the lock shortly; the main acquirer should wait it out.
+            threading.Timer(0.4, release.set).start()
+            acquired = []
+            with file_lock(lock_path, timeout=5):
+                acquired.append(True)
+            assert acquired == [True], "second acquirer should succeed after release"
+        finally:
+            release.set()
+            t.join(10)
+
+    def test_contended_acquire_times_out(self, tmp_path):
+        """If the lock stays held past the timeout, acquire raises OSError rather
+        than hanging forever (bounded ceiling — Codex review)."""
+        import threading
+
+        lock_path = tmp_path / ".clawpm-tasks.lock"
+        held = threading.Event()
+        release = threading.Event()
+
+        def holder():
+            with file_lock(lock_path):
+                held.set()
+                release.wait(5)
+
+        t = threading.Thread(target=holder)
+        t.start()
+        try:
+            assert held.wait(5), "holder thread failed to acquire the lock"
+            with pytest.raises(OSError):
+                with file_lock(lock_path, timeout=0.3):
+                    pass
+        finally:
+            release.set()
+            t.join(10)
+
 
 # ---------------------------------------------------------------------------
 # Test: retry_transient — bounded retry on transient Windows FS faults
