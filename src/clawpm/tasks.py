@@ -946,7 +946,10 @@ def add_task(
             tmp_path.unlink(missing_ok=True)
             raise
 
-    return Task.from_file(file_path)
+        # Reload and return INSIDE the lock — consistent with change_task_state's
+        # reload-under-lock contract (CLAWP-051 Finding 5). The file was just
+        # written under this lock, so the read can't race another clawpm writer.
+        return Task.from_file(file_path)
 
 
 def edit_task(
@@ -1093,10 +1096,12 @@ def split_task(
     task_dir = parent_dir / task_id
     task_dir.mkdir(exist_ok=True)
     
-    # Move file to _task.md inside directory
+    # Move file to _task.md inside directory (retry transient Windows
+    # sharing/access faults on the rename — consistent with the other CLAWP-051
+    # moves; split_task runs inside add_subtask's per-project lock).
     new_path = task_dir / "_task.md"
-    shutil.move(str(current_path), str(new_path))
-    
+    retry_transient(shutil.move, str(current_path), str(new_path))
+
     return Task.from_file(new_path)
 
 

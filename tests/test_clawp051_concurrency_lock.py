@@ -412,6 +412,41 @@ class TestStateTransitionSerialization:
                 rationale="rejecting a directory task",
             )
 
+    def test_split_task_move_retries_transient_fault(self, tmp_path, monkeypatch):
+        """split_task's flat->dir move is wrapped in retry_transient, so a single
+        transient Windows sharing fault on the rename is retried, not surfaced
+        (CLAWP-051 — verifies the retry is wired at the call site, not just the
+        helper in isolation).
+        """
+        import clawpm.tasks as tasks_module
+        from clawpm.tasks import split_task
+
+        project_id = "split-retry"
+        _make_portfolio(tmp_path, project_id)
+        os.environ["CLAWPM_PORTFOLIO"] = str(tmp_path)
+        config = load_portfolio_config(tmp_path)
+
+        task = add_task(config, project_id, "Task to split")
+        assert task is not None
+
+        real_move = tasks_module.shutil.move
+        calls = {"n": 0}
+
+        def _flaky_move(src, dst, *a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                err = OSError("transient sharing violation")
+                err.winerror = 32  # ERROR_SHARING_VIOLATION
+                raise err
+            return real_move(src, dst, *a, **k)
+
+        monkeypatch.setattr(tasks_module.shutil, "move", _flaky_move)
+
+        result = split_task(config, project_id, task.id)
+        assert result is not None
+        assert result.file_path is not None and result.file_path.name == "_task.md"
+        assert calls["n"] == 2, "expected exactly one retry after the transient fault"
+
 
 # ---------------------------------------------------------------------------
 # Test: explicit-ID clobber guard in add_task (Finding 2)
