@@ -440,6 +440,11 @@ def change_task_state(
             #     (Finding 1 — directory-task branch: _task.md is the target).
             if new_state == TaskState.REJECTED:
                 _task_md = task_dir / "_task.md"
+                if not _task_md.exists():
+                    raise FileNotFoundError(
+                        f"Task metadata '{_task_md}' no longer exists — "
+                        "it may have been moved by a concurrent session."
+                    )
                 _write_rejection_frontmatter(_task_md, rationale.strip(), supersedes)  # type: ignore[arg-type]
 
             # (e) Move (retry transient Windows sharing/access faults — CLAWP-051)

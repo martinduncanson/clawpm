@@ -365,6 +365,53 @@ class TestStateTransitionSerialization:
         assert result is not None, "DONE (force=True) transition should succeed"
         assert result.state == TaskState.DONE
 
+    def test_directory_task_rejected_missing_task_md_raises_clear_error(self, tmp_path, monkeypatch):
+        """Directory-task REJECTED with a vanished _task.md raises the friendly
+        concurrent-session error, not an opaque FileNotFoundError.
+
+        The pre-lock get_task resolves the directory task while _task.md exists;
+        a concurrent session then removes the metadata file before step (d)
+        rewrites its frontmatter. The in-lock _task.md.exists() guard must turn
+        the would-be opaque read failure into the same clear message steps
+        (a)/(c) raise. Removing the guard makes this test fail.
+        """
+        import clawpm.tasks as tasks_module
+
+        project_id = "reject-dir"
+        _make_portfolio(tmp_path, project_id)
+        os.environ["CLAWPM_PORTFOLIO"] = str(tmp_path)
+        config = load_portfolio_config(tmp_path)
+
+        parent = add_task(config, project_id, "Parent task")
+        assert parent is not None
+        # Adding a subtask promotes the parent to a directory task (parent/_task.md).
+        child = add_subtask(config, project_id, parent.id, "Child task")
+        assert child is not None
+
+        parent_task = get_task(config, project_id, parent.id)
+        assert parent_task is not None and parent_task.file_path is not None
+        assert parent_task.file_path.name == "_task.md", (
+            "Pre-condition: parent must be a directory task"
+        )
+
+        # Concurrent session removes the metadata file after pre-lock resolution.
+        parent_task.file_path.unlink()
+
+        real_get_task = tasks_module.get_task
+
+        def _stale_get_task(cfg, pid, tid):
+            if pid == project_id and tid == parent.id:
+                return parent_task
+            return real_get_task(cfg, pid, tid)
+
+        monkeypatch.setattr(tasks_module, "get_task", _stale_get_task)
+
+        with pytest.raises(FileNotFoundError, match="concurrent session"):
+            change_task_state(
+                config, project_id, parent.id, TaskState.REJECTED,
+                rationale="rejecting a directory task",
+            )
+
 
 # ---------------------------------------------------------------------------
 # Test: explicit-ID clobber guard in add_task (Finding 2)
@@ -652,6 +699,16 @@ class TestRetryTransient:
         assert _is_transient_fs_error(FileExistsError("x")) is False
         assert _is_transient_fs_error(FileNotFoundError("x")) is False
         assert _is_transient_fs_error(ValueError("not even OSError")) is False
+
+    def test_lock_violation_winerror_is_transient(self):
+        """ERROR_LOCK_VIOLATION (33) is the same handle-contention class as 32."""
+        lock_violation = OSError()
+        lock_violation.winerror = 33
+        assert _is_transient_fs_error(lock_violation) is True
+        # A neighbouring non-transient code (e.g. 34) must still fail fast.
+        other = OSError()
+        other.winerror = 34
+        assert _is_transient_fs_error(other) is False
 
     def test_generic_permission_error_is_not_transient_on_windows(self, monkeypatch):
         """A PermissionError without a transient winerror is NOT retried (regression).

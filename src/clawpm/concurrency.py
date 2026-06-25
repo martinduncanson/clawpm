@@ -187,12 +187,14 @@ _T = TypeVar("_T")
 
 # Windows error codes for the transient sharing/access faults an antivirus
 # scanner or the search indexer briefly raises against a freshly written or
-# renamed file: ERROR_ACCESS_DENIED (5) and ERROR_SHARING_VIOLATION (32). An
-# atomic rename (``os.replace`` / ``shutil.move``) issued the instant after a
-# write can hit these even with the per-project lock held — the lock serialises
-# *clawpm's* writers, but a third-party scanner holds its own handle. The fix is
-# a bounded retry, NOT a wider lock.
-_TRANSIENT_WINERRORS = frozenset({5, 32})
+# renamed file: ERROR_ACCESS_DENIED (5), ERROR_SHARING_VIOLATION (32), and
+# ERROR_LOCK_VIOLATION (33). An atomic rename (``os.replace`` / ``shutil.move``)
+# issued the instant after a write can hit these even with the per-project lock
+# held — the lock serialises *clawpm's* writers, but a third-party scanner holds
+# its own handle. 32 and 33 are the two codes Win32 surfaces for "another handle
+# is on this file"; both are transient here. The fix is a bounded retry, NOT a
+# wider lock.
+_TRANSIENT_WINERRORS = frozenset({5, 32, 33})
 
 
 def _is_transient_fs_error(exc: BaseException) -> bool:
