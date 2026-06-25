@@ -200,15 +200,24 @@ _TRANSIENT_WINERRORS = frozenset({5, 32, 33})
 def _is_transient_fs_error(exc: BaseException) -> bool:
     """True for the transient Windows sharing/access errors worth retrying.
 
-    Deliberately narrow: a ``winerror`` in the sharing/access set.
-    Everything else (FileExistsError, FileNotFoundError, cross-device EXDEV,
-    real EACCES on POSIX, or a permanent PermissionError) is a genuine
-    condition the caller must see — never retried.
+    Deliberately narrow: retried iff ``winerror`` is in the sharing/access set
+    {5, 32, 33}. Everything else (FileExistsError, FileNotFoundError,
+    cross-device EXDEV, real EACCES on POSIX, or a PermissionError whose
+    ``winerror`` is absent/None or outside the set) is a genuine condition the
+    caller must see — never retried.
+
+    Known ambiguity (accepted trade-off): ERROR_ACCESS_DENIED (5) is raised both
+    transiently by an AV scanner/indexer holding a freshly renamed file AND by a
+    *permanent* ACL denial. The two are indistinguishable from the error alone,
+    so a permanent deny surfacing as winerror 5 gets a bounded retry (≤ attempts,
+    ~exponential backoff) before the real exception propagates correctly. The
+    bounded cost is worth catching the common transient case; the caller still
+    sees the genuine failure.
     """
     if not isinstance(exc, OSError):
         return False
-    # Only retry on specific, known-transient Windows error codes.
-    # A generic PermissionError could be a permanent ACL issue and should fail fast.
+    # Retry only on the specific known-transient Windows codes. A PermissionError
+    # with no transient winerror (e.g. winerror=None, or POSIX EACCES) fails fast.
     if getattr(exc, "winerror", None) in _TRANSIENT_WINERRORS:
         return True
     return False
