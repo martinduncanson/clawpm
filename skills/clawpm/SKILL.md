@@ -768,8 +768,13 @@ exclusive advisory lock for the duration of each mutation:
 and serialises mutations *within one project's task tree* only.  Different projects
 run entirely independently.
 
-**Lock implementation:** `fcntl.flock(LOCK_EX)` on POSIX, `msvcrt.locking(LK_LOCK)`
-on Windows.  Both are advisory and cross-process.  No third-party dependency.
+**Lock implementation:** a non-blocking acquire polled in a backoff loop up to a
+configurable timeout (~120s) — `fcntl.flock(LOCK_EX | LOCK_NB)` on POSIX,
+`msvcrt.locking(LK_NBLCK)` on Windows — so a long-held lock (large rollup,
+slow/AV-scanned filesystem) is waited out rather than failing at Windows'
+hard 10s `LK_LOCK` cap.  Only genuine lock-contention errnos are retried; a
+permanent fault on the sentinel fails fast.  Both are advisory and
+cross-process.  No third-party dependency.
 
 **Deadlock safety:** the lock is never held across subprocess calls or I/O-heavy
 operations (e.g. `resolve_baseline_ref`'s git subprocess runs before acquiring).

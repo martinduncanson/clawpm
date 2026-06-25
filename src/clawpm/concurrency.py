@@ -31,6 +31,7 @@ Why not portalocker?
 
 from __future__ import annotations
 
+import errno
 import os
 import sys
 import time
@@ -56,6 +57,15 @@ _LOCK_LENGTH = 1
 _LOCK_ACQUIRE_TIMEOUT = 120.0
 # Cap on the poll backoff between acquisition attempts.
 _LOCK_POLL_MAX = 0.5
+# Errnos that mean "the lock is held by someone else, try again" — the only
+# errors the acquire poll loop should retry. Anything else (EBADF, EINVAL, a
+# permanent permission fault on the sentinel itself) is a genuine failure that
+# must surface immediately, NOT spin for the full timeout (Grok review). POSIX
+# LOCK_NB raises EAGAIN/EWOULDBLOCK (→ BlockingIOError); Windows msvcrt LK_NBLCK
+# raises EACCES or EDEADLK on a held range.
+_LOCK_CONTENTION_ERRNOS = frozenset({
+    errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK, errno.EDEADLK,
+})
 
 
 if sys.platform == "win32":
@@ -136,9 +146,11 @@ def _acquire(fh: IO[str], timeout: float | None = _LOCK_ACQUIRE_TIMEOUT) -> None
                 try:
                     msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, _LOCK_LENGTH)
                     return
-                except OSError:
-                    # Range held by another handle. LK_NBLCK fails fast, so we
-                    # own the retry cadence and the overall ceiling.
+                except OSError as exc:
+                    # Retry ONLY genuine contention; a permanent fault on the
+                    # sentinel must fail fast, not spin for the whole timeout.
+                    if exc.errno not in _LOCK_CONTENTION_ERRNOS:
+                        raise
                     if deadline is not None and time.monotonic() >= deadline:
                         raise
                     time.sleep(min(delay, _LOCK_POLL_MAX))
@@ -157,7 +169,11 @@ def _acquire(fh: IO[str], timeout: float | None = _LOCK_ACQUIRE_TIMEOUT) -> None
             try:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 return
-            except OSError:
+            except OSError as exc:
+                # Retry ONLY genuine contention (EAGAIN/EWOULDBLOCK); any other
+                # error is a real failure that must surface immediately.
+                if exc.errno not in _LOCK_CONTENTION_ERRNOS:
+                    raise
                 if time.monotonic() >= deadline:
                     raise
                 time.sleep(min(delay, _LOCK_POLL_MAX))
