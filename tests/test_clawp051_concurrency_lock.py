@@ -447,6 +447,82 @@ class TestStateTransitionSerialization:
         assert result.file_path is not None and result.file_path.name == "_task.md"
         assert calls["n"] == 2, "expected exactly one retry after the transient fault"
 
+    def test_done_noop_rerun_still_runs_rollup_gate(self, tmp_path, monkeypatch):
+        """Re-marking an already-`done/` task done (no force) re-runs the rollup
+        gate BEFORE the no-op same-location return (Codex regression: the lock
+        restructure must not let the early return skip the gate).
+        """
+        import clawpm.tasks as tasks_module
+
+        project_id = "done-noop-gate"
+        _make_portfolio(tmp_path, project_id)
+        os.environ["CLAWPM_PORTFOLIO"] = str(tmp_path)
+        config = load_portfolio_config(tmp_path)
+
+        task = add_task(config, project_id, "Parent")
+        assert task is not None
+        # Force it into done/ (force bypasses the gate).
+        assert change_task_state(config, project_id, task.id, TaskState.DONE, force=True) is not None
+
+        # A rollup that now rejects: re-marking done (no force) must return None
+        # because the gate runs before the no-op return. Before the fix the
+        # same-location early return fired first and returned the task.
+        monkeypatch.setattr(
+            tasks_module, "parent_rollup_status",
+            lambda cfg, pid, t: {"ready": False, "reason": "child reopened"},
+        )
+        result = change_task_state(config, project_id, task.id, TaskState.DONE)
+        assert result is None, "rollup gate must run before the no-op same-location return"
+
+    def test_rejected_noop_rerun_updates_rationale(self, tmp_path):
+        """Re-rejecting an already-`rejected/` task with a corrected rationale
+        rewrites the frontmatter before the no-op return (Codex regression: the
+        metadata write must not be skipped by the same-location early return).
+        """
+        project_id = "reject-noop-update"
+        _make_portfolio(tmp_path, project_id)
+        os.environ["CLAWPM_PORTFOLIO"] = str(tmp_path)
+        config = load_portfolio_config(tmp_path)
+
+        task = add_task(config, project_id, "To reject")
+        assert task is not None
+        assert change_task_state(
+            config, project_id, task.id, TaskState.REJECTED, rationale="first reason"
+        ) is not None
+
+        # Re-reject with a corrected rationale — already in rejected/, so the move
+        # is a no-op, but the metadata write must still happen.
+        change_task_state(
+            config, project_id, task.id, TaskState.REJECTED, rationale="corrected reason"
+        )
+
+        rejected_file = (
+            tmp_path / "projects" / project_id / ".project" / "tasks"
+            / "rejected" / f"{task.id}.md"
+        )
+        assert rejected_file.exists()
+        text = rejected_file.read_text(encoding="utf-8")
+        assert "corrected reason" in text, "rationale correction must persist on no-op re-reject"
+
+    def test_explicit_id_clobber_guard_checks_all_locations(self, tmp_path):
+        """The explicit-ID clobber guard catches an ID that exists in a non-open
+        state (e.g. done/), not only a flat open file (Codex regression).
+        """
+        project_id = "clobber-all-loc"
+        _make_portfolio(tmp_path, project_id)
+        os.environ["CLAWPM_PORTFOLIO"] = str(tmp_path)
+        config = load_portfolio_config(tmp_path)
+
+        task = add_task(config, project_id, "Original", task_id="DUP-001")
+        assert task is not None
+        # Move it out of the flat open location into done/.
+        assert change_task_state(config, project_id, "DUP-001", TaskState.DONE, force=True) is not None
+
+        # A second create with the same explicit ID must still raise, even though
+        # no flat open file exists — the task lives in done/.
+        with pytest.raises(FileExistsError, match="DUP-001"):
+            add_task(config, project_id, "Duplicate", task_id="DUP-001")
+
 
 # ---------------------------------------------------------------------------
 # Test: explicit-ID clobber guard in add_task (Finding 2)

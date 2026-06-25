@@ -417,13 +417,12 @@ def change_task_state(
                     "it may have been moved by a concurrent session."
                 )
 
-            # (b) Already in correct location — return without moving.
-            if task_dir.resolve() == new_dir.resolve():
-                return task
-
             # (c) DONE + not force: re-run rollup INSIDE the lock so a child
             #     reopened between the outer check and here doesn't produce a
-            #     false-ready parent.  (Finding 4 — directory-task branch)
+            #     false-ready parent (Finding 4). This runs BEFORE the no-op
+            #     return so a reopened child still gates an already-`done/`
+            #     parent (Codex review: the gate must precede the same-location
+            #     early return, matching pre-CLAWP-051 ordering).
             if new_state == TaskState.DONE and not force:
                 # Re-read the task from disk so the rollup sees current children.
                 _fresh = get_task(config, project_id, task_id)
@@ -436,8 +435,10 @@ def change_task_state(
                 if not status["ready"]:
                     return None
 
-            # (d) REJECTED: write rationale frontmatter INSIDE the lock
-            #     (Finding 1 — directory-task branch: _task.md is the target).
+            # (d) REJECTED: write rationale frontmatter INSIDE the lock (Finding
+            #     1 — directory-task branch: _task.md is the target). Runs BEFORE
+            #     the no-op return so rerunning with a corrected rationale /
+            #     supersedes still updates the ledger (Codex review).
             if new_state == TaskState.REJECTED:
                 _task_md = task_dir / "_task.md"
                 if not _task_md.exists():
@@ -446,6 +447,12 @@ def change_task_state(
                         "it may have been moved by a concurrent session."
                     )
                 _write_rejection_frontmatter(_task_md, rationale.strip(), supersedes)  # type: ignore[arg-type]
+
+            # (b) Already in correct location — skip the MOVE only; the gate (c)
+            #     and metadata write (d) above have already run. Reload so the
+            #     return reflects any frontmatter just written.
+            if task_dir.resolve() == new_dir.resolve():
+                return retry_transient(Task.from_file, task_dir / "_task.md")
 
             # (e) Move (retry transient Windows sharing/access faults — CLAWP-051)
             retry_transient(shutil.move, str(task_dir), str(new_dir))
@@ -483,11 +490,9 @@ def change_task_state(
                 "it may have been moved by a concurrent session."
             )
 
-        # (b) Already in correct location.
-        if current_path.resolve() == new_path.resolve():
-            return task
-
-        # (c) DONE + not force: re-run rollup inside the lock (Finding 4).
+        # (c) DONE + not force: re-run rollup inside the lock (Finding 4). Runs
+        #     BEFORE the no-op return so a reopened child still gates an
+        #     already-`done/` parent (Codex review).
         if new_state == TaskState.DONE and not force:
             _fresh = get_task(config, project_id, task_id)
             if _fresh is None:
@@ -500,8 +505,15 @@ def change_task_state(
                 return None
 
         # (d) REJECTED: write rationale frontmatter INSIDE the lock (Finding 1).
+        #     Runs BEFORE the no-op return so rerunning with a corrected
+        #     rationale / supersedes still updates the ledger (Codex review).
         if new_state == TaskState.REJECTED:
             _write_rejection_frontmatter(current_path, rationale.strip(), supersedes)  # type: ignore[arg-type]
+
+        # (b) Already in correct location — skip the MOVE only; the gate (c) and
+        #     metadata write (d) above have already run. Reload for a fresh view.
+        if current_path.resolve() == new_path.resolve():
+            return retry_transient(Task.from_file, current_path)
 
         # (e) Move (retry transient Windows sharing/access faults — CLAWP-051)
         retry_transient(shutil.move, str(current_path), str(new_path))
@@ -933,11 +945,15 @@ def add_task(
         file_path = tasks_dir / f"{task_id}.md"
 
         # CLAWP-051 Finding 2 — explicit-ID clobber guard.
-        # Generated IDs are fresh-by-construction (scan under the lock above)
-        # so only the explicit-ID path needs this check.
-        if _explicit_id and file_path.exists():
+        # Generated IDs are fresh-by-construction (scan under the lock above) so
+        # only the explicit-ID path needs this check. Use get_task (same all-
+        # locations scan get_task itself uses) rather than just file_path.exists()
+        # so an ID already present in ANY state — progress/done/blocked/rejected
+        # or as a directory task — is caught, not only a flat open file (Codex
+        # review). get_task acquires no lock, so this is safe inside file_lock.
+        if _explicit_id and get_task(config, project_id, task_id) is not None:
             raise FileExistsError(
-                f"Task '{task_id}' already exists at '{file_path}'. "
+                f"Task '{task_id}' already exists. "
                 "Pass a different task_id or omit it to auto-generate one."
             )
 
