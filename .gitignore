@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 *.pyo
 .venv/
+.venv-test/
 .env
 *.egg-info/
 dist/
@@ -13,6 +14,9 @@ htmlcov/
 logs/
 uv.lock
 
+# Runtime lock sentinel (CLAWP-051) — never committed, never tracked
+.clawpm-tasks.lock
+
 .project/
 .agent/
 .claude/
@@ -21,3 +25,8 @@ temp/
 # Example portfolio fixtures need .project/ committed for onboarding
 !examples/**/.project/
 !examples/**/.project/**
+
+# ...but never the runtime lock sentinel, even under examples (CLAWP-051). This
+# must come AFTER the negation above, or running clawpm against an example
+# portfolio leaves the sentinel committable (Codex review).
+examples/**/.project/**/.clawpm-tasks.lock
