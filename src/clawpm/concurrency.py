@@ -232,7 +232,12 @@ def retry_transient(
     (CLAWP-051). Re-raises immediately on any non-transient error and after the
     final attempt; backs off exponentially (``base_delay`` × 2ⁿ) between tries.
     Sleeps only on failure, so the happy path is unaffected.
+
+    ``fn`` is always invoked at least once: a non-positive ``attempts`` is
+    clamped to 1 so the contract ("calls fn, retrying only transients") holds
+    rather than falling through to the unreachable guard below (Grok review).
     """
+    attempts = max(1, attempts)
     for attempt in range(attempts):
         try:
             return fn(*args)

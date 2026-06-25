@@ -106,12 +106,16 @@ def list_tasks(
     return tasks
 
 
-def get_task(config: PortfolioConfig, project_id: str, task_id: str) -> Task | None:
-    """Get a specific task by ID."""
-    tasks_dir = get_tasks_dir(config, project_id)
-    if not tasks_dir:
-        return None
+def _candidate_task_paths(tasks_dir: Path, task_id: str) -> list[Path]:
+    """All on-disk locations a task with ``task_id`` could occupy.
 
+    Single source of truth for both ``get_task`` (which parses each) and the
+    explicit-ID clobber guard in ``add_task`` (which only needs existence).
+    Keeping the location set in one place stops the two from drifting — the
+    clobber guard must check exactly where ``get_task`` would later find the
+    task, or a duplicate could be created in a location the guard didn't probe
+    (CLAWP-051 Finding 2 / Codex review).
+    """
     # Extract parent ID from subtask ID (e.g., CLAWP-TEST-001 -> CLAWP-TEST)
     # Subtask IDs have format: PARENT-NNN where NNN is numeric
     parent_id = None
@@ -154,7 +158,16 @@ def get_task(config: PortfolioConfig, project_id: str, task_id: str) -> Task | N
             tasks_dir / parent_id / task_id / "_task.md",
         ])
 
-    for path in possible_paths:
+    return possible_paths
+
+
+def get_task(config: PortfolioConfig, project_id: str, task_id: str) -> Task | None:
+    """Get a specific task by ID."""
+    tasks_dir = get_tasks_dir(config, project_id)
+    if not tasks_dir:
+        return None
+
+    for path in _candidate_task_paths(tasks_dir, task_id):
         if path.exists():
             try:
                 task = Task.from_file(path)
@@ -450,9 +463,18 @@ def change_task_state(
 
             # (b) Already in correct location — skip the MOVE only; the gate (c)
             #     and metadata write (d) above have already run. Reload so the
-            #     return reflects any frontmatter just written.
+            #     return reflects any frontmatter just written. Guard _task.md
+            #     here too: step (a) only checked task_dir.exists(), so a
+            #     concurrent session removing just _task.md must surface the
+            #     friendly message, not a raw FileNotFoundError (Codex/Grok).
             if task_dir.resolve() == new_dir.resolve():
-                return retry_transient(Task.from_file, task_dir / "_task.md")
+                _task_md = task_dir / "_task.md"
+                if not _task_md.exists():
+                    raise FileNotFoundError(
+                        f"Task metadata '{_task_md}' no longer exists — "
+                        "it may have been moved by a concurrent session."
+                    )
+                return retry_transient(Task.from_file, _task_md)
 
             # (e) Move (retry transient Windows sharing/access faults — CLAWP-051)
             retry_transient(shutil.move, str(task_dir), str(new_dir))
@@ -946,12 +968,15 @@ def add_task(
 
         # CLAWP-051 Finding 2 — explicit-ID clobber guard.
         # Generated IDs are fresh-by-construction (scan under the lock above) so
-        # only the explicit-ID path needs this check. Use get_task (same all-
-        # locations scan get_task itself uses) rather than just file_path.exists()
-        # so an ID already present in ANY state — progress/done/blocked/rejected
-        # or as a directory task — is caught, not only a flat open file (Codex
-        # review). get_task acquires no lock, so this is safe inside file_lock.
-        if _explicit_id and get_task(config, project_id, task_id) is not None:
+        # only the explicit-ID path needs this check. Probe EXISTENCE across the
+        # same location set get_task searches — not get_task itself — so an ID
+        # already present in ANY state (progress/done/blocked/rejected or as a
+        # directory task) is caught even if its file is currently unparseable;
+        # a presence check, unlike get_task's parse-and-continue scan, can't be
+        # fooled into clobbering a corrupt prior file (Codex review).
+        if _explicit_id and any(
+            p.exists() for p in _candidate_task_paths(tasks_dir, task_id)
+        ):
             raise FileExistsError(
                 f"Task '{task_id}' already exists. "
                 "Pass a different task_id or omit it to auto-generate one."

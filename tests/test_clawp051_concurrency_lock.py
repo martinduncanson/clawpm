@@ -523,6 +523,82 @@ class TestStateTransitionSerialization:
         with pytest.raises(FileExistsError, match="DUP-001"):
             add_task(config, project_id, "Duplicate", task_id="DUP-001")
 
+    def test_clobber_guard_catches_unparseable_existing_file(self, tmp_path, monkeypatch):
+        """The explicit-ID clobber guard probes existence, so a corrupt/
+        unparseable file for that ID still blocks a clobber even though get_task
+        (parse-and-continue) treats it as absent (Codex/Grok regression: the
+        guard must not depend on a successful parse).
+        """
+        import clawpm.tasks as tasks_module
+
+        project_id = "clobber-corrupt"
+        _make_portfolio(tmp_path, project_id)
+        os.environ["CLAWPM_PORTFOLIO"] = str(tmp_path)
+        config = load_portfolio_config(tmp_path)
+
+        task = add_task(config, project_id, "Original", task_id="CORRUPT-001")
+        assert task is not None
+        corrupt_path = (
+            tmp_path / "projects" / project_id / ".project" / "tasks" / "CORRUPT-001.md"
+        )
+        assert corrupt_path.exists()
+
+        # Simulate corruption: Task.from_file raises for this path, so get_task
+        # (which swallows parse errors and continues) reports the task absent.
+        real_from_file = tasks_module.Task.from_file
+
+        def _flaky_from_file(path, *a, **k):
+            if Path(path) == corrupt_path:
+                raise ValueError("unparseable frontmatter")
+            return real_from_file(path, *a, **k)
+
+        monkeypatch.setattr(tasks_module.Task, "from_file", staticmethod(_flaky_from_file))
+
+        assert get_task(config, project_id, "CORRUPT-001") is None, (
+            "pre-condition: corrupt file is unparseable, get_task reports absent"
+        )
+        # The guard must still block the clobber via the existence probe.
+        with pytest.raises(FileExistsError, match="CORRUPT-001"):
+            add_task(config, project_id, "Clobber", task_id="CORRUPT-001")
+
+    def test_directory_task_noop_missing_task_md_raises_clear_error(self, tmp_path, monkeypatch):
+        """The directory-task no-op (already-in-location) reload guards _task.md,
+        surfacing the friendly concurrent-session error if it vanished rather
+        than a raw FileNotFoundError (Codex/Grok regression for the no-op path).
+        """
+        import clawpm.tasks as tasks_module
+
+        project_id = "noop-missing-md"
+        _make_portfolio(tmp_path, project_id)
+        os.environ["CLAWPM_PORTFOLIO"] = str(tmp_path)
+        config = load_portfolio_config(tmp_path)
+
+        parent = add_task(config, project_id, "Parent")
+        assert parent is not None
+        child = add_subtask(config, project_id, parent.id, "Child")
+        assert child is not None
+
+        parent_task = get_task(config, project_id, parent.id)
+        assert parent_task is not None and parent_task.file_path is not None
+        assert parent_task.file_path.name == "_task.md"
+
+        # Concurrent session removes _task.md after the pre-lock get_task resolved it.
+        parent_task.file_path.unlink()
+
+        real_get_task = tasks_module.get_task
+
+        def _stale_get_task(cfg, pid, tid):
+            if pid == project_id and tid == parent.id:
+                return parent_task
+            return real_get_task(cfg, pid, tid)
+
+        monkeypatch.setattr(tasks_module, "get_task", _stale_get_task)
+
+        # Mark OPEN — the parent dir is already at the OPEN location, so this hits
+        # the no-op same-location branch, which must guard the missing _task.md.
+        with pytest.raises(FileNotFoundError, match="concurrent session"):
+            change_task_state(config, project_id, parent.id, TaskState.OPEN)
+
 
 # ---------------------------------------------------------------------------
 # Test: explicit-ID clobber guard in add_task (Finding 2)
@@ -820,6 +896,21 @@ class TestRetryTransient:
         other = OSError()
         other.winerror = 34
         assert _is_transient_fs_error(other) is False
+
+    def test_nonpositive_attempts_clamped_to_one_call(self):
+        """attempts <= 0 is clamped to 1 so fn is still invoked exactly once and
+        the post-loop unreachable guard is never hit (Grok review)."""
+        calls = {"n": 0}
+
+        def _fn():
+            calls["n"] += 1
+            return "ok"
+
+        assert retry_transient(_fn, attempts=0) == "ok"
+        assert calls["n"] == 1
+        calls["n"] = 0
+        assert retry_transient(_fn, attempts=-5) == "ok"
+        assert calls["n"] == 1
 
     def test_generic_permission_error_is_not_transient_on_windows(self, monkeypatch):
         """A PermissionError without a transient winerror is NOT retried (regression).
