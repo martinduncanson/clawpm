@@ -438,8 +438,8 @@ def add_mission_mini_goal(
         # rewrite fails, roll the task frontmatter back to keep the two files
         # consistent rather than leaving the task tagged but absent from the
         # mission (Grok review).
-        mission.mini_goals.append(MissionMiniGoal(id=task_id, actor=actor))
         try:
+            mission.mini_goals.append(MissionMiniGoal(id=task_id, actor=actor))
             _rewrite_mission(mission)
         except Exception as exc:
             rb = task.file_path.with_suffix(".rollback.tmp")
