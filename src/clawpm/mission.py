@@ -397,8 +397,10 @@ def add_mission_mini_goal(
                 f"{mission_id!r}."
             )
 
-        # Update the task's frontmatter (re-resolved under the lock so the write
-        # can't land on a path a concurrent change_task_state vacated).
+        # Update the task's frontmatter. get_task above resolved it under the
+        # lock; this exists() check is a cheap defensive guard (all mutators
+        # serialise on this lock, so it shouldn't fire — but it keeps the write
+        # honest against future refactors / external tampering).
         if task.file_path is None or not task.file_path.exists():
             raise ValueError(
                 f"Task {task_id} vanished — it may have been moved by a "

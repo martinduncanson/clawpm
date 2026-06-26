@@ -138,8 +138,9 @@ def create_app() -> FastAPI:
                     raise
 
                 # Optionally unblock — INSIDE the lock (reentrancy-safe via
-                # change_task_state's own acquire) so the BLOCKED decision is
-                # fresh, not read from a snapshot taken before the append. The
+                # change_task_state's own acquire). task.state was read by the
+                # get_task above under this same lock, so no concurrent writer can
+                # have changed it since (the lock serialises all mutators). The
                 # append is already durable, so unblock is best-effort: a failure
                 # is surfaced, not allowed to flip the response to success=False.
                 unblocked = False

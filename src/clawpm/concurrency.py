@@ -101,9 +101,10 @@ def locked_append(path: Path, encoding: str = "utf-8") -> Iterator[IO[str]]:
     Parent directory is created if missing.
 
     Raises:
-        OSError: if the lock cannot be acquired within ``_LOCK_ACQUIRE_TIMEOUT``
-        (both platforms poll a non-blocking acquire up to that ceiling; see
-        ``_acquire``).
+        LockTimeout: (a subclass of ``OSError``) if the lock cannot be acquired
+        within ``_LOCK_ACQUIRE_TIMEOUT`` — both platforms poll a non-blocking
+        acquire up to that ceiling; see ``_acquire``. Callers catching bare
+        ``OSError`` still match.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -291,9 +292,13 @@ def file_lock(
         try:
             yield
         finally:
-            depths[key] -= 1
-            if depths[key] <= 0:
+            # Decrement via .get so a missing key can't raise KeyError, mirroring
+            # the acquire path's pop(..., None) (Grok review).
+            d = depths.get(key, 0) - 1
+            if d <= 0:
                 depths.pop(key, None)
+            else:
+                depths[key] = d
         return
 
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -311,12 +316,17 @@ def file_lock(
         depths[key] = 1
         yield
     finally:
-        if acquired:
-            try:
-                _release(fh)
-            finally:
-                depths.pop(key, None)
-        fh.close()
+        # Guarantee fh.close() even if _release raises (it swallows OSError, but
+        # a future change / non-OSError must not leak the handle): close is the
+        # backstop that releases the OS lock regardless (Grok review).
+        try:
+            if acquired:
+                try:
+                    _release(fh)
+                finally:
+                    depths.pop(key, None)
+        finally:
+            fh.close()
 
 
 _T = TypeVar("_T")
