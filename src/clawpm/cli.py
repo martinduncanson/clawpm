@@ -5,11 +5,13 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import click
 
 from . import __version__
+from .concurrency import LockTimeout
 from .models import (
     ProjectStatus,
     SuccessCriterion,
@@ -109,6 +111,31 @@ except (AttributeError, ValueError, OSError) as _stdio_exc:  # pragma: no cover
             f"clawpm: {__name__} stdio reconfigure to utf-8 failed "
             f"({_stdio_exc!r}); non-ASCII output may crash on a cp1252 console\n"
         )
+
+
+@contextmanager
+def _mutation_errors(fmt, error_code: str):
+    """Map a task-tree / mission mutator's exception contract to a clean
+    ``output_error`` + ``exit(1)`` instead of a raw traceback (CLAWP-067).
+
+    The mutators (change_task_state, add_task, add_subtask, split_task,
+    edit_task, mission ops) raise ``LockTimeout`` when the per-project lock is
+    contended past its timeout, and ``ValueError`` for validation / corrupt-
+    frontmatter refusals. Wrap each CLI mutation call in this so every command
+    surfaces a structured error rather than a stack trace.
+    """
+    try:
+        yield
+    except LockTimeout as exc:
+        output_error(
+            "lock_timeout",
+            f"Could not acquire the project lock (another session may be busy): {exc}",
+            fmt=fmt,
+        )
+        sys.exit(1)
+    except ValueError as exc:
+        output_error(error_code, str(exc), fmt=fmt)
+        sys.exit(1)
 
 
 # Global format option
@@ -1566,22 +1593,23 @@ def tasks_edit(
 
     # --clear-parallel-group: explicit removal. --parallel-group N: set.
     # 0 is now a valid group ordinal (sorts first); use --clear- to remove.
-    task = edit_task(
-        config,
-        project_id,
-        task_id,
-        title=title,
-        priority=priority,
-        complexity=cmplx,
-        scope=scope_list,
-        body=body,
-        predictions=predictions,
-        parallel_group=parallel_group,
-        clear_parallel_group=clear_parallel_group,
-        out_of_scope=list(out_of_scope) if out_of_scope else None,
-        stop_conditions=list(stop_conditions) if stop_conditions else None,
-        delegability=delegability,
-    )
+    with _mutation_errors(fmt, "edit_failed"):
+        task = edit_task(
+            config,
+            project_id,
+            task_id,
+            title=title,
+            priority=priority,
+            complexity=cmplx,
+            scope=scope_list,
+            body=body,
+            predictions=predictions,
+            parallel_group=parallel_group,
+            clear_parallel_group=clear_parallel_group,
+            out_of_scope=list(out_of_scope) if out_of_scope else None,
+            stop_conditions=list(stop_conditions) if stop_conditions else None,
+            delegability=delegability,
+        )
 
     if not task:
         output_error("task_not_found", f"No task with id '{task_id}' in project '{project_id}'", fmt=fmt)
@@ -1668,11 +1696,12 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
     # Capture task predictions before state transition (needed for reflection)
     pre_transition_task = get_task(config, project_id, task_id)
 
-    task = change_task_state(
-        config, project_id, task_id, state,
-        note=note, force=force,
-        rationale=rationale, supersedes=supersedes,
-    )
+    with _mutation_errors(fmt, "state_change_failed"):
+        task = change_task_state(
+            config, project_id, task_id, state,
+            note=note, force=force,
+            rationale=rationale, supersedes=supersedes,
+        )
 
     if not task:
         output_error("task_not_found", f"No task with id '{task_id}' in project '{project_id}'", fmt=fmt)
@@ -1991,11 +2020,12 @@ def tasks_decompose(
             success_criteria=list(criteria),
             filled_by="agent" if criteria else None,
         )
-        child = add_subtask(
-            config, project_id, parent_id, title,
-            complexity=cmplx, description="",
-            agent_profile=ap, predictions=preds,
-        )
+        with _mutation_errors(fmt, "decompose_failed"):
+            child = add_subtask(
+                config, project_id, parent_id, title,
+                complexity=cmplx, description="",
+                agent_profile=ap, predictions=preds,
+            )
         if not child:
             output_error(
                 "decompose_failed",
@@ -2185,37 +2215,38 @@ def tasks_add(
     )
 
     # Create subtask if parent specified
-    if parent_id:
-        parent_id = expand_task_id(parent_id, project_id)
-        task = add_subtask(
-            config,
-            project_id,
-            parent_id,
-            title,
-            priority=priority,
-            complexity=cmplx,
-            description=task_body,
-            agent_profile=agent_profile,
-        )
-    else:
-        deps = list(depends) if depends else None
-        task = add_task(
-            config,
-            project_id,
-            title,
-            task_id=task_id,
-            priority=priority,
-            complexity=cmplx,
-            depends=deps,
-            scope=scope_list,
-            description=task_body,
-            predictions=predictions,
-            parallel_group=parallel_group,
-            agent_profile=agent_profile,
-            out_of_scope=list(out_of_scope) if out_of_scope else None,
-            stop_conditions=list(stop_conditions) if stop_conditions else None,
-            delegability=delegability,
-        )
+    with _mutation_errors(fmt, "add_failed"):
+        if parent_id:
+            parent_id = expand_task_id(parent_id, project_id)
+            task = add_subtask(
+                config,
+                project_id,
+                parent_id,
+                title,
+                priority=priority,
+                complexity=cmplx,
+                description=task_body,
+                agent_profile=agent_profile,
+            )
+        else:
+            deps = list(depends) if depends else None
+            task = add_task(
+                config,
+                project_id,
+                title,
+                task_id=task_id,
+                priority=priority,
+                complexity=cmplx,
+                depends=deps,
+                scope=scope_list,
+                description=task_body,
+                predictions=predictions,
+                parallel_group=parallel_group,
+                agent_profile=agent_profile,
+                out_of_scope=list(out_of_scope) if out_of_scope else None,
+                stop_conditions=list(stop_conditions) if stop_conditions else None,
+                delegability=delegability,
+            )
 
     if not task:
         # Give a more useful hint: check if the project exists locally but has
@@ -2844,7 +2875,8 @@ def tasks_split(ctx: click.Context, project_id: str | None, task_id: str) -> Non
     project_id, _ = require_project(ctx, project_id)
     task_id = expand_task_id(task_id, project_id)
 
-    task = split_task(config, project_id, task_id)
+    with _mutation_errors(fmt, "split_failed"):
+        task = split_task(config, project_id, task_id)
 
     if not task:
         output_error("split_failed", f"Failed to split task '{task_id}'", fmt=fmt)
@@ -4419,6 +4451,9 @@ def mission_add_goal(
         mission = add_mission_mini_goal(
             config, project_id, mission_id, task_id, actor=actor
         )
+    except LockTimeout as exc:
+        output_error("lock_timeout", f"Could not acquire the project lock: {exc}", fmt=fmt)
+        sys.exit(1)
     except ValueError as exc:
         output_error("mission_add_goal_failed", str(exc), fmt=fmt)
         sys.exit(1)
@@ -4451,6 +4486,9 @@ def mission_state(
 
     try:
         mission = set_mission_status(config, project_id, mission_id, new_status)
+    except LockTimeout as exc:
+        output_error("lock_timeout", f"Could not acquire the project lock: {exc}", fmt=fmt)
+        sys.exit(1)
     except ValueError as exc:
         output_error("mission_state_failed", str(exc), fmt=fmt)
         sys.exit(1)

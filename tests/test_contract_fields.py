@@ -168,6 +168,30 @@ class TestOutOfScopeField:
 
         assert task.file_path.read_text(encoding="utf-8") == bad
 
+    def test_cli_edit_corrupt_frontmatter_is_clean_error(self, temp_portfolio):
+        """`clawpm tasks edit` maps edit_task's ValueError (unparseable
+        frontmatter) to output_error + exit(1), not a raw traceback (CLAWP-067
+        uniform caller-contract handling)."""
+        config = load_portfolio_config(temp_portfolio)
+        task = add_task(config, "test-proj", "Editable")
+        assert task is not None and task.file_path is not None
+        task.file_path.write_text(
+            "---\nthis: [bad\n---\n# Editable\n\nbody\n", encoding="utf-8"
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["tasks", "edit", task.id, "--project", "test-proj", "--priority", "2"],
+            env={"CLAWPM_PORTFOLIO": str(temp_portfolio)},
+        )
+        assert result.exit_code == 1
+        # The ValueError must NOT leak as an uncaught traceback.
+        assert not isinstance(result.exception, ValueError), (
+            f"ValueError leaked instead of a clean error: {result.exception!r}"
+        )
+        assert "unparseable" in result.output or "edit_failed" in result.output
+
     def test_to_dict_includes_out_of_scope(self, temp_portfolio):
         """to_dict exposes out_of_scope for agent introspection."""
         config = load_portfolio_config(temp_portfolio)
