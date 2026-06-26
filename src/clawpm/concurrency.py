@@ -277,7 +277,13 @@ def file_lock(
     Raises:
         LockTimeout: if the lock cannot be acquired within ``timeout``.
     """
-    key = os.path.abspath(str(lock_path))
+    # normcase + abspath so the reentrancy key is CANONICAL: two call sites that
+    # spell the same lock path differently (Windows drive-case, / vs \, an
+    # unresolved vs resolved prefix) must map to the SAME key, or a nested acquire
+    # (add_subtask → split_task) would see depth 0, take the real-acquire path,
+    # and self-deadlock on the non-reentrant OS lock (Grok review). normcase is a
+    # no-op on POSIX.
+    key = os.path.normcase(os.path.abspath(str(lock_path)))
     depths = _held_depths()
     if depths.get(key, 0) > 0:
         # Reentrant acquire on this thread — the OS lock is already held.
@@ -298,8 +304,14 @@ def file_lock(
         try:
             yield
         finally:
-            depths.pop(key, None)
-            _release(fh)
+            # Release the OS lock, THEN drop the depth marker — and pop in an
+            # inner finally so the marker is cleared even if _release somehow
+            # raised. fh.close() (outer finally) is the backstop: closing the
+            # handle releases the OS lock too, so we never strand a held lock.
+            try:
+                _release(fh)
+            finally:
+                depths.pop(key, None)
     finally:
         fh.close()
 

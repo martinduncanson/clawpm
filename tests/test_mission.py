@@ -635,3 +635,43 @@ class TestMissionCLI:
         assert r.exit_code == 0, r.output
         reloaded = get_mission(config, "test", m.id)
         assert reloaded.status == "complete"
+
+
+def test_concurrent_mini_goal_adds_no_lost_update(temp_portfolio):
+    """Two concurrent add_mission_mini_goal calls for DIFFERENT tasks on the
+    SAME mission must BOTH persist. The whole read→validate→write→rewrite runs
+    under the per-project lock, so neither rewrite drops the other's mini-goal
+    (CLAWP-066 / Codex review — pre-fix the later stale rewrite lost one)."""
+    import threading
+
+    config = temp_portfolio["config"]
+    m = add_mission(config, "test", "Concurrent", "obj", deadline_days=7)
+    t1 = add_task(config, "test", "Task one")
+    t2 = add_task(config, "test", "Task two")
+    assert t1 is not None and t2 is not None
+
+    barrier = threading.Barrier(2)
+    errors: list = []
+
+    def link(task_id):
+        try:
+            barrier.wait(5)  # maximise overlap into the critical section
+            add_mission_mini_goal(config, "test", m.id, task_id)
+        except Exception as exc:  # noqa: BLE001 — surfaced via the list
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=link, args=(t1.id,)),
+        threading.Thread(target=link, args=(t2.id,)),
+    ]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(10)
+
+    assert not errors, f"unexpected errors during concurrent link: {errors}"
+    reloaded = get_mission(config, "test", m.id)
+    ids = {g.id for g in reloaded.mini_goals}
+    assert ids == {t1.id, t2.id}, (
+        f"lost update — mission lists {ids}, expected both {t1.id} and {t2.id}"
+    )

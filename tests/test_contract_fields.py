@@ -132,6 +132,26 @@ class TestOutOfScopeField:
         assert updated is not None
         assert updated.out_of_scope == ["src/legacy/**"]
 
+    def test_edit_task_refuses_unparseable_frontmatter(self, temp_portfolio):
+        """edit_task raises instead of silently corrupting when the existing
+        frontmatter is unparseable. get_task/Task.from_file read leniently
+        (degraded Task), so edit_task is reached; its stricter re-parse must
+        refuse rather than rebuild a double-frontmatter, field-wiped file
+        (CLAWP-066 / Grok review)."""
+        config = load_portfolio_config(temp_portfolio)
+        task = add_task(config, "test-proj", "Corruptible task")
+        assert task is not None and task.file_path is not None
+
+        # Invalid YAML frontmatter (unbalanced flow sequence).
+        bad = "---\nthis: [unbalanced\n---\n# Corruptible task\n\nbody\n"
+        task.file_path.write_text(bad, encoding="utf-8")
+
+        with pytest.raises(ValueError, match="unparseable"):
+            edit_task(config, "test-proj", task.id, priority=2)
+
+        # File left untouched — no clobber.
+        assert task.file_path.read_text(encoding="utf-8") == bad
+
     def test_to_dict_includes_out_of_scope(self, temp_portfolio):
         """to_dict exposes out_of_scope for agent introspection."""
         config = load_portfolio_config(temp_portfolio)

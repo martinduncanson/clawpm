@@ -137,11 +137,24 @@ def create_app() -> FastAPI:
                     tmp.unlink(missing_ok=True)
                     raise
 
-            # Optionally unblock
-            if req.unblock and task.state == TaskState.BLOCKED:
-                change_task_state(config, project_id, task_id, TaskState.PROGRESS)
+                # Optionally unblock — INSIDE the lock (reentrancy-safe via
+                # change_task_state's own acquire) so the BLOCKED decision is
+                # fresh, not read from a snapshot taken before the append. The
+                # append is already durable, so unblock is best-effort: a failure
+                # is surfaced, not allowed to flip the response to success=False.
+                unblocked = False
+                unblock_error = None
+                if req.unblock and task.state == TaskState.BLOCKED:
+                    try:
+                        change_task_state(config, project_id, task_id, TaskState.PROGRESS)
+                        unblocked = True
+                    except Exception as ue:
+                        unblock_error = str(ue)
 
-            return {"success": True, "timestamp": timestamp}
+            result = {"success": True, "timestamp": timestamp, "unblocked": unblocked}
+            if unblock_error:
+                result["unblock_error"] = unblock_error
+            return result
         except Exception as e:
             return {"success": False, "error": str(e)}
 
