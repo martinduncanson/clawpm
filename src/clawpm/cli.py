@@ -1784,9 +1784,16 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
         try:
             cascade_results = cascade_unblock_dependents(config, project_id, task_id)
         except (OSError, KeyError) as exc:
-            # Filesystem or graph errors leave the cascade in a partial
-            # state but must NOT block the user's done. Surface the
-            # error in the response so it's visible — don't silently drop.
+            # The primary state change already committed (it ran under the
+            # _mutation_errors contract above). This dependency cascade is a
+            # BEST-EFFORT secondary step: a filesystem/graph error — INCLUDING a
+            # LockTimeout or FileNotFoundError from a cascaded change_task_state —
+            # must NOT fail the user's (already durable) done. This DELIBERATELY
+            # diverges from the CLAWP-067 exit-1 contract: the error is surfaced
+            # in the response data so it's visible (fail-open WITH a marker, not
+            # fail-silent) and the operator can retry the unblock — failing the
+            # command here would misreport the successful done as failed.
+            # (CLAWP-067 review: intentional, not an oversight.)
             cascade_errors.append({"error_class": type(exc).__name__, "message": str(exc)})
 
         for cr in cascade_results:
