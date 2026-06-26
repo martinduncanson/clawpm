@@ -192,6 +192,27 @@ class TestOutOfScopeField:
         )
         assert "unparseable" in result.output or "edit_failed" in result.output
 
+    def test_cli_add_duplicate_id_is_clean_error(self, temp_portfolio):
+        """`clawpm tasks add --id X` on an existing id maps add_task's
+        FileExistsError (explicit-id clobber guard) to a clean error, not a raw
+        traceback — the mutator contract is wider than ValueError/LockTimeout
+        (CLAWP-067)."""
+        config = load_portfolio_config(temp_portfolio)
+        first = add_task(config, "test-proj", "First", task_id="DUP-CLI-1")
+        assert first is not None
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["tasks", "add", "--title", "Second", "--id", "DUP-CLI-1", "--project", "test-proj"],
+            env={"CLAWPM_PORTFOLIO": str(temp_portfolio)},
+        )
+        assert result.exit_code == 1
+        assert not isinstance(result.exception, FileExistsError), (
+            f"FileExistsError leaked instead of a clean error: {result.exception!r}"
+        )
+        assert "already_exists" in result.output or "already exists" in result.output
+
     def test_to_dict_includes_out_of_scope(self, temp_portfolio):
         """to_dict exposes out_of_scope for agent introspection."""
         config = load_portfolio_config(temp_portfolio)

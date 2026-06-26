@@ -119,10 +119,15 @@ def _mutation_errors(fmt, error_code: str):
     ``output_error`` + ``exit(1)`` instead of a raw traceback (CLAWP-067).
 
     The mutators (change_task_state, add_task, add_subtask, split_task,
-    edit_task, mission ops) raise ``LockTimeout`` when the per-project lock is
-    contended past its timeout, and ``ValueError`` for validation / corrupt-
-    frontmatter refusals. Wrap each CLI mutation call in this so every command
-    surfaces a structured error rather than a stack trace.
+    edit_task, mission ops) raise a known set:
+      - ``LockTimeout``       — per-project lock contended past its timeout
+      - ``FileExistsError``   — explicit-id clobber guard (add_task)
+      - ``FileNotFoundError`` — source moved by a concurrent session
+      - ``ValueError``        — validation / corrupt-frontmatter refusal
+    Each maps to a structured error. Anything OUTSIDE this contract (an
+    unexpected OSError, a genuine bug) is deliberately NOT caught — it should
+    surface as a traceback rather than be masked behind a misleading "failed"
+    message (fail-open != fail-silent).
     """
     try:
         yield
@@ -132,6 +137,12 @@ def _mutation_errors(fmt, error_code: str):
             f"Could not acquire the project lock (another session may be busy): {exc}",
             fmt=fmt,
         )
+        sys.exit(1)
+    except FileExistsError as exc:
+        output_error("already_exists", str(exc), fmt=fmt)
+        sys.exit(1)
+    except FileNotFoundError as exc:
+        output_error("not_found", str(exc), fmt=fmt)
         sys.exit(1)
     except ValueError as exc:
         output_error(error_code, str(exc), fmt=fmt)
@@ -4257,33 +4268,29 @@ def agent_dispatch(
     if parent_id:
         parent_id = expand_task_id(parent_id, project_id)
 
-    try:
-        result = dispatch_agent(
-            config=config,
-            project_id=project_id,
-            prompt=prompt,
-            success_criteria=list(rubric_criteria),
-            parent_id=parent_id,
-            judge_cmd_override=judge_cmd_override,
-            title=title,
-            init_codegraph=not no_codegraph,
-            confirm_close=confirm_close,
-            refute_votes=refute_votes,
-            agent_profile=agent_profile,
-        )
-    except LockTimeout as exc:
-        # dispatch_agent indirectly calls the task-tree mutators (add_task,
-        # change_task_state), so a contended project lock surfaces here too
-        # (Codex review). Map it to the same contract as the direct sites.
-        output_error(
-            "lock_timeout",
-            f"Could not acquire the project lock (another session may be busy): {exc}",
-            fmt=fmt,
-        )
-        sys.exit(1)
-    except (AgentDispatchError, ValueError) as exc:
-        output_error("agent_dispatch_failed", str(exc), fmt=fmt)
-        sys.exit(1)
+    # dispatch_agent indirectly calls the task-tree mutators (add_task,
+    # change_task_state), so the mutator contract (LockTimeout / FileExists /
+    # FileNotFound / ValueError) can surface here too — route it through the same
+    # helper (DRY, Grok review). AgentDispatchError is dispatch-specific and is
+    # caught inside the wrapper so it gets its own code.
+    with _mutation_errors(fmt, "agent_dispatch_failed"):
+        try:
+            result = dispatch_agent(
+                config=config,
+                project_id=project_id,
+                prompt=prompt,
+                success_criteria=list(rubric_criteria),
+                parent_id=parent_id,
+                judge_cmd_override=judge_cmd_override,
+                title=title,
+                init_codegraph=not no_codegraph,
+                confirm_close=confirm_close,
+                refute_votes=refute_votes,
+                agent_profile=agent_profile,
+            )
+        except AgentDispatchError as exc:
+            output_error("agent_dispatch_failed", str(exc), fmt=fmt)
+            sys.exit(1)
 
     # Surface the verdict-derived headline in the success message so
     # text-mode operators see at-a-glance whether the dispatch passed
