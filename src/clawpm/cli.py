@@ -4268,29 +4268,38 @@ def agent_dispatch(
     if parent_id:
         parent_id = expand_task_id(parent_id, project_id)
 
-    # dispatch_agent indirectly calls the task-tree mutators (add_task,
-    # change_task_state), so the mutator contract (LockTimeout / FileExists /
-    # FileNotFound / ValueError) can surface here too — route it through the same
-    # helper (DRY, Grok review). AgentDispatchError is dispatch-specific and is
-    # caught inside the wrapper so it gets its own code.
-    with _mutation_errors(fmt, "agent_dispatch_failed"):
-        try:
-            result = dispatch_agent(
-                config=config,
-                project_id=project_id,
-                prompt=prompt,
-                success_criteria=list(rubric_criteria),
-                parent_id=parent_id,
-                judge_cmd_override=judge_cmd_override,
-                title=title,
-                init_codegraph=not no_codegraph,
-                confirm_close=confirm_close,
-                refute_votes=refute_votes,
-                agent_profile=agent_profile,
-            )
-        except AgentDispatchError as exc:
-            output_error("agent_dispatch_failed", str(exc), fmt=fmt)
-            sys.exit(1)
+    # NB: do NOT route dispatch through the broad _mutation_errors contract.
+    # dispatch_agent's surface is far wider than a task-tree mutator — it creates
+    # worktrees and runs git subprocesses — so a FileNotFoundError here can mean
+    # "git not on PATH", NOT "task moved by a concurrent session". The broad
+    # FileNotFoundError->not_found / FileExistsError->already_exists mapping would
+    # mask a genuine environment failure (Codex review). Catch only the mutator
+    # LockTimeout that genuinely propagates from add_task/change_task_state, plus
+    # dispatch's own AgentDispatchError/ValueError; let anything else surface.
+    try:
+        result = dispatch_agent(
+            config=config,
+            project_id=project_id,
+            prompt=prompt,
+            success_criteria=list(rubric_criteria),
+            parent_id=parent_id,
+            judge_cmd_override=judge_cmd_override,
+            title=title,
+            init_codegraph=not no_codegraph,
+            confirm_close=confirm_close,
+            refute_votes=refute_votes,
+            agent_profile=agent_profile,
+        )
+    except LockTimeout as exc:
+        output_error(
+            "lock_timeout",
+            f"Could not acquire the project lock (another session may be busy): {exc}",
+            fmt=fmt,
+        )
+        sys.exit(1)
+    except (AgentDispatchError, ValueError) as exc:
+        output_error("agent_dispatch_failed", str(exc), fmt=fmt)
+        sys.exit(1)
 
     # Surface the verdict-derived headline in the success message so
     # text-mode operators see at-a-glance whether the dispatch passed
