@@ -34,10 +34,20 @@ from __future__ import annotations
 import errno
 import os
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, IO, Iterator, TypeVar
+
+
+class LockTimeout(TimeoutError):
+    """Raised when a lock cannot be acquired within its timeout.
+
+    Subclasses ``TimeoutError`` (hence ``OSError``), so existing callers that
+    catch ``OSError`` keep working, while the message carries the lock path and
+    timeout for diagnostics instead of a bare errno (CLAWP-066 / Grok review).
+    """
 
 
 # Byte range we lock on Windows. Locking 1 byte at offset 0 is the canonical
@@ -91,15 +101,16 @@ def locked_append(path: Path, encoding: str = "utf-8") -> Iterator[IO[str]]:
     Parent directory is created if missing.
 
     Raises:
-        OSError: if the lock cannot be acquired within ``_LOCK_ACQUIRE_TIMEOUT``
-        (both platforms poll a non-blocking acquire up to that ceiling; see
-        ``_acquire``).
+        LockTimeout: (a subclass of ``OSError``) if the lock cannot be acquired
+        within ``_LOCK_ACQUIRE_TIMEOUT`` — both platforms poll a non-blocking
+        acquire up to that ceiling; see ``_acquire``. Callers catching bare
+        ``OSError`` still match.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
 
     fh = open(path, "a", encoding=encoding)
     try:
-        _acquire(fh)
+        _acquire(fh, lock_desc=str(path))
         try:
             yield fh
             # Flush + fsync BEFORE releasing the lock so the durable write
@@ -119,7 +130,11 @@ def locked_append(path: Path, encoding: str = "utf-8") -> Iterator[IO[str]]:
         fh.close()
 
 
-def _acquire(fh: IO[str], timeout: float | None = _LOCK_ACQUIRE_TIMEOUT) -> None:
+def _acquire(
+    fh: IO[str],
+    timeout: float | None = _LOCK_ACQUIRE_TIMEOUT,
+    lock_desc: str = "lock",
+) -> None:
     """Acquire exclusive lock on the file handle, waiting up to ``timeout`` secs.
 
     Platform dispatch:
@@ -133,7 +148,8 @@ def _acquire(fh: IO[str], timeout: float | None = _LOCK_ACQUIRE_TIMEOUT) -> None
       we poll ``LOCK_EX | LOCK_NB`` instead so the wait is bounded; ``timeout``
       of None blocks indefinitely (the historical behaviour).
 
-    Raises ``OSError`` if the lock can't be acquired within ``timeout``.
+    Raises ``LockTimeout`` (a subclass of ``OSError``) if the lock can't be
+    acquired within ``timeout``; any non-contention ``OSError`` propagates as-is.
     """
     if sys.platform == "win32":
         # Save EOF position; the file was opened in "a"/"a+" mode so pos is EOF.
@@ -152,7 +168,10 @@ def _acquire(fh: IO[str], timeout: float | None = _LOCK_ACQUIRE_TIMEOUT) -> None
                     if exc.errno not in _LOCK_CONTENTION_ERRNOS:
                         raise
                     if deadline is not None and time.monotonic() >= deadline:
-                        raise
+                        raise LockTimeout(
+                            f"could not acquire {lock_desc} within {timeout}s "
+                            "(held by another session)"
+                        ) from exc
                     time.sleep(min(delay, _LOCK_POLL_MAX))
                     delay = min(delay * 2, _LOCK_POLL_MAX)
         finally:
@@ -175,7 +194,10 @@ def _acquire(fh: IO[str], timeout: float | None = _LOCK_ACQUIRE_TIMEOUT) -> None
                 if exc.errno not in _LOCK_CONTENTION_ERRNOS:
                     raise
                 if time.monotonic() >= deadline:
-                    raise
+                    raise LockTimeout(
+                        f"could not acquire {lock_desc} within {timeout}s "
+                        "(held by another session)"
+                    ) from exc
                 time.sleep(min(delay, _LOCK_POLL_MAX))
                 delay = min(delay * 2, _LOCK_POLL_MAX)
 
@@ -203,6 +225,24 @@ def _release(fh: IO[str]) -> None:
             pass
 
 
+# Per-THREAD reentrancy bookkeeping: maps the normalised lock path to the
+# nesting depth this thread currently holds. The OS lock (msvcrt/fcntl) is
+# acquired only at depth 0->1; nested acquires of the SAME path on the SAME
+# thread just bump the depth. This makes file_lock reentrant within a thread
+# (so a locked mutator can call another locked helper on the same path without
+# self-deadlock — e.g. add_subtask -> split_task) while cross-thread and
+# cross-process contention is still serialised by the OS lock (CLAWP-066).
+_held_locks = threading.local()
+
+
+def _held_depths() -> dict[str, int]:
+    depths = getattr(_held_locks, "depths", None)
+    if depths is None:
+        depths = {}
+        _held_locks.depths = depths
+    return depths
+
+
 @contextmanager
 def file_lock(
     lock_path: Path, timeout: float | None = _LOCK_ACQUIRE_TIMEOUT
@@ -217,11 +257,13 @@ def file_lock(
     mutations *within one project's task tree* while letting different projects
     proceed concurrently.
 
-    **DEADLOCK SAFETY:** ``fcntl.flock`` / ``msvcrt.locking`` are NOT reentrant
-    across two handles to the same path within one process.  Never enter a nested
-    ``file_lock`` on the same lock path while already holding it; the inner
-    acquire will self-deadlock.  Keep each critical section flat — do not call
-    functions that re-enter ``file_lock`` on the same path.
+    **REENTRANCY (CLAWP-066):** reentrant per-thread on the same lock path. A
+    function holding the lock may call another function that re-enters
+    ``file_lock`` on the same path — the nested acquire just bumps a thread-local
+    depth and the OS lock is released only when the outermost block exits. This
+    is what lets ``add_subtask`` (locked) call ``split_task`` (also locked) on
+    the same path without deadlock. Cross-thread and cross-process callers still
+    contend on the OS lock as normal.
 
     Usage::
 
@@ -235,18 +277,66 @@ def file_lock(
     is waited out rather than failing at Windows' 10s ``LK_LOCK`` cap.
 
     Raises:
-        OSError: if the lock cannot be acquired within ``timeout``.
+        LockTimeout: if the lock cannot be acquired within ``timeout``.
     """
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(lock_path, "a+", encoding="utf-8")  # create-or-open; "a+" keeps existing content
-    try:
-        _acquire(fh, timeout)
+    # normcase + abspath so the reentrancy key is CANONICAL: two call sites that
+    # spell the same lock path differently (Windows drive-case, / vs \, an
+    # unresolved vs resolved prefix) must map to the SAME key, or a nested acquire
+    # (add_subtask → split_task) would see depth 0, take the real-acquire path,
+    # and self-deadlock on the non-reentrant OS lock (Grok review). normcase is a
+    # no-op on POSIX.
+    raw = str(lock_path)
+    if not os.path.isabs(raw):
+        # An absolute path is REQUIRED: os.path.abspath() of a relative path is
+        # cwd-dependent, so two nested acquires under different working dirs would
+        # key differently and the inner would deadlock on the non-reentrant OS
+        # lock. All real callers derive the path from get_tasks_dir (absolute);
+        # enforce the invariant loudly rather than risk a silent deadlock, which
+        # makes the reentrancy key canonical-by-construction (Grok review).
+        raise ValueError(f"file_lock requires an absolute lock_path, got {raw!r}")
+    key = os.path.normcase(os.path.abspath(raw))
+    depths = _held_depths()
+    if depths.get(key, 0) > 0:
+        # Reentrant acquire on this thread — the OS lock is already held.
+        depths[key] += 1
         try:
             yield
         finally:
-            _release(fh)
+            # Decrement via .get so a missing key can't raise KeyError, mirroring
+            # the acquire path's pop(..., None) (Grok review).
+            d = depths.get(key, 0) - 1
+            if d <= 0:
+                depths.pop(key, None)
+            else:
+                depths[key] = d
+        return
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock_path, "a+", encoding="utf-8")  # create-or-open; "a+" keeps existing content
+    # Single try whose finally keys off `acquired`: the depth marker is set only
+    # after _acquire succeeds, and the matching release+pop is guaranteed by the
+    # same finally — so there is no window (even for an async exception between
+    # statements) where depth>0 is left stranded over a released/absent OS lock
+    # (Grok review). pop is in an inner finally so it runs even if _release
+    # raised; fh.close() backstops the OS release.
+    acquired = False
+    try:
+        _acquire(fh, timeout, lock_desc=key)
+        acquired = True
+        depths[key] = 1
+        yield
     finally:
-        fh.close()
+        # Guarantee fh.close() even if _release raises (it swallows OSError, but
+        # a future change / non-OSError must not leak the handle): close is the
+        # backstop that releases the OS lock regardless (Grok review).
+        try:
+            if acquired:
+                try:
+                    _release(fh)
+                finally:
+                    depths.pop(key, None)
+        finally:
+            fh.close()
 
 
 _T = TypeVar("_T")

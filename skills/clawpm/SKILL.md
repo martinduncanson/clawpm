@@ -778,7 +778,12 @@ cross-process.  No third-party dependency.
 
 **Deadlock safety:** the lock is never held across subprocess calls or I/O-heavy
 operations (e.g. `resolve_baseline_ref`'s git subprocess runs before acquiring).
-Critical sections are flat — no nested `file_lock` on the same path.
+`file_lock` is **reentrant per-thread** (CLAWP-066): a locked mutator may call
+another locked helper on the same path (e.g. `add_subtask` → `split_task`) — the
+nested acquire bumps a thread-local depth and the OS lock releases only when the
+outermost block exits. Cross-thread/cross-process callers still serialise on the
+OS lock. All task-tree mutators (`change_task_state`, `add_task`, `add_subtask`,
+`split_task`, `edit_task`, mission/serve task writes) hold the lock.
 
 **The `.clawpm-tasks.lock` file** is a runtime sentinel.  It is gitignored and never
 committed; it does not interfere with task-ID scanning (it doesn't match task globs).

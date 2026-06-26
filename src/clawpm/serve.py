@@ -103,28 +103,59 @@ def create_app() -> FastAPI:
             from datetime import datetime
             from .models import TaskState
 
-            task = get_task(config, project_id, task_id)
-            if not task or not task.file_path:
-                return {"success": False, "error": "task_not_found"}
+            from .tasks import get_tasks_dir
+            from .concurrency import file_lock, retry_transient
 
-            # Append response to task file
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
             response_line = f"\n{timestamp} [Web UI]: {req.response}"
 
-            content = task.file_path.read_text(encoding="utf-8")
+            tasks_dir = get_tasks_dir(config, project_id)
+            if not tasks_dir:
+                return {"success": False, "error": "no_tasks_dir"}
 
-            # Add Responses section if not exists
-            if "## Responses" not in content:
-                content += "\n\n## Responses\n"
+            # CLAWP-066: append under the per-project lock with an atomic
+            # tmp+replace, re-resolving the task inside the lock so the write
+            # serialises against (and can't be clobbered by) a concurrent
+            # change_task_state move.
+            with file_lock(tasks_dir / ".clawpm-tasks.lock"):
+                task = get_task(config, project_id, task_id)
+                if not task or not task.file_path or not task.file_path.exists():
+                    return {"success": False, "error": "task_not_found"}
 
-            content += response_line
-            task.file_path.write_text(content, encoding="utf-8")
+                content = task.file_path.read_text(encoding="utf-8")
 
-            # Optionally unblock
-            if req.unblock and task.state == TaskState.BLOCKED:
-                change_task_state(config, project_id, task_id, TaskState.PROGRESS)
+                # Add Responses section if not exists
+                if "## Responses" not in content:
+                    content += "\n\n## Responses\n"
 
-            return {"success": True, "timestamp": timestamp}
+                content += response_line
+                tmp = task.file_path.with_suffix(".tmp")
+                try:
+                    tmp.write_text(content, encoding="utf-8")
+                    retry_transient(tmp.replace, task.file_path)
+                except Exception:
+                    tmp.unlink(missing_ok=True)
+                    raise
+
+                # Optionally unblock — INSIDE the lock (reentrancy-safe via
+                # change_task_state's own acquire). task.state was read by the
+                # get_task above under this same lock, so no concurrent writer can
+                # have changed it since (the lock serialises all mutators). The
+                # append is already durable, so unblock is best-effort: a failure
+                # is surfaced, not allowed to flip the response to success=False.
+                unblocked = False
+                unblock_error = None
+                if req.unblock and task.state == TaskState.BLOCKED:
+                    try:
+                        change_task_state(config, project_id, task_id, TaskState.PROGRESS)
+                        unblocked = True
+                    except Exception as ue:
+                        unblock_error = str(ue)
+
+            result = {"success": True, "timestamp": timestamp, "unblocked": unblocked}
+            if unblock_error:
+                result["unblock_error"] = unblock_error
+            return result
         except Exception as e:
             return {"success": False, "error": str(e)}
 

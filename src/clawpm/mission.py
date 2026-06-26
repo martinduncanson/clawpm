@@ -351,72 +351,113 @@ def add_mission_mini_goal(
     if actor not in ("agent", "human"):
         raise ValueError(f"actor must be 'agent' or 'human', got {actor!r}")
 
-    mission = get_mission(config, project_id, mission_id)
-    if mission is None:
-        raise ValueError(f"Mission not found: {mission_id}")
+    from .tasks import get_task, get_tasks_dir
+    from .concurrency import file_lock, retry_transient
+    tasks_dir = get_tasks_dir(config, project_id)
+    if not tasks_dir:
+        raise ValueError(f"Project {project_id} has no tasks dir")
 
-    # Codex round-2 P2 fix: idempotency check MUST run before the cap.
-    # Re-running add-goal for a task already linked to this mission
-    # should be a no-op, not a cap violation. Otherwise automation
-    # retries break once the mission fills up.
-    from .tasks import get_task
-    task = get_task(config, project_id, task_id)
-    if task is None:
-        raise ValueError(f"Task not found: {task_id}")
-    if any(g.id == task_id for g in mission.mini_goals):
-        return mission  # idempotent re-link to the SAME mission
+    # CLAWP-066 / Codex review: run the ENTIRE read→validate→write→rewrite under
+    # the per-project lock. A task-only lock left two races open: (a) two links
+    # to the SAME mission read a stale mini_goals list and the later
+    # _rewrite_mission drops the earlier mini-goal; (b) two links of the SAME
+    # task to DIFFERENT missions both pass the cross-mission check before either
+    # write. Serialising mission read + cap + ownership check + task write +
+    # mission rewrite together closes both. get_mission/get_task/_rewrite_mission
+    # take no lock, so this single critical section is safe.
+    with file_lock(tasks_dir / ".clawpm-tasks.lock"):
+        mission = get_mission(config, project_id, mission_id)
+        if mission is None:
+            raise ValueError(f"Mission not found: {mission_id}")
 
-    if len(mission.mini_goals) >= 10:
-        raise ValueError(
-            f"Mission {mission_id} already has 10 mini-goals (hard cap). "
-            "Split into a follow-up mission instead."
+        task = get_task(config, project_id, task_id)
+        if task is None:
+            raise ValueError(f"Task not found: {task_id}")
+
+        # Idempotency check MUST precede the cap: re-running add-goal for a task
+        # already linked to THIS mission is a no-op, not a cap violation.
+        if any(g.id == task_id for g in mission.mini_goals):
+            return mission
+
+        if len(mission.mini_goals) >= 10:
+            raise ValueError(
+                f"Mission {mission_id} already has 10 mini-goals (hard cap). "
+                "Split into a follow-up mission instead."
+            )
+
+        # Refuse cross-mission relink — checked here against the freshly-read
+        # task UNDER the lock, so two concurrent links of the same task to
+        # different missions can't both pass (Codex review).
+        if task.parent_mission and task.parent_mission != mission_id:
+            raise ValueError(
+                f"Task {task_id} is already a mini-goal of mission "
+                f"{task.parent_mission!r}. Unlink it from there first "
+                f"(edit the task frontmatter or remove the mini_goals entry "
+                f"on the prior mission file) before re-linking to "
+                f"{mission_id!r}."
+            )
+
+        # Update the task's frontmatter. get_task above resolved it under the
+        # lock; this exists() check is a cheap defensive guard (all mutators
+        # serialise on this lock, so it shouldn't fire — but it keeps the write
+        # honest against future refactors / external tampering).
+        if task.file_path is None or not task.file_path.exists():
+            raise ValueError(
+                f"Task {task_id} vanished — it may have been moved by a "
+                "concurrent session; retry the mini-goal link."
+            )
+        text = task.file_path.read_text(encoding="utf-8")
+        if not text.startswith("---"):
+            raise ValueError(f"Task {task_id} has no frontmatter")
+        parts = text.split("---", 2)
+        if len(parts) < 3:
+            raise ValueError(f"Task {task_id} frontmatter malformed")
+        try:
+            fm = yaml.safe_load(parts[1]) or {}
+        except yaml.YAMLError as exc:
+            raise ValueError(f"Task {task_id} frontmatter unparseable: {exc}") from exc
+        fm["parent_mission"] = mission_id
+        fm["actor"] = actor
+        new_text = (
+            "---\n"
+            + yaml.dump(fm, default_flow_style=False, allow_unicode=True).rstrip()
+            + "\n---"
+            + parts[2]
         )
+        original_text = text  # for rollback if the mission rewrite fails
+        tmp = task.file_path.with_suffix(".tmp")
+        try:
+            tmp.write_text(new_text, encoding="utf-8")
+            retry_transient(tmp.replace, task.file_path)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
 
-    # Codex round-1 P2 fix: refuse cross-mission relink. If the task is
-    # already a mini-goal of a DIFFERENT mission, silent overwrite would
-    # leave the prior mission's mini_goals list pointing at a task that
-    # now belongs elsewhere — and the same task would be counted by both
-    # missions in their separate status reports. Surface the conflict
-    # so the operator decides: unlink from the prior mission explicitly,
-    # then re-link here.
-    if task.parent_mission and task.parent_mission != mission_id:
-        raise ValueError(
-            f"Task {task_id} is already a mini-goal of mission "
-            f"{task.parent_mission!r}. Unlink it from there first "
-            f"(edit the task frontmatter or remove the mini_goals entry "
-            f"on the prior mission file) before re-linking to "
-            f"{mission_id!r}."
-        )
-
-    # Update the task's frontmatter
-    if task.file_path is None:
-        raise ValueError(f"Task {task_id} has no file path")
-    text = task.file_path.read_text(encoding="utf-8")
-    if not text.startswith("---"):
-        raise ValueError(f"Task {task_id} has no frontmatter")
-    parts = text.split("---", 2)
-    if len(parts) < 3:
-        raise ValueError(f"Task {task_id} frontmatter malformed")
-    try:
-        fm = yaml.safe_load(parts[1]) or {}
-    except yaml.YAMLError as exc:
-        raise ValueError(f"Task {task_id} frontmatter unparseable: {exc}")
-    fm["parent_mission"] = mission_id
-    fm["actor"] = actor
-    new_text = (
-        "---\n"
-        + yaml.dump(fm, default_flow_style=False, allow_unicode=True).rstrip()
-        + "\n---"
-        + parts[2]
-    )
-    tmp = task.file_path.with_suffix(".tmp")
-    tmp.write_text(new_text, encoding="utf-8")
-    tmp.replace(task.file_path)
-
-    # Update the mission's frontmatter
-    mission.mini_goals.append(MissionMiniGoal(id=task_id, actor=actor))
-    _rewrite_mission(mission)
-    return mission
+        # Append to the mission + rewrite INSIDE the lock so the persisted
+        # mini_goals list reflects every concurrent add (no lost update — Codex).
+        # The task-write and mission-write are NOT a single atomic unit (general
+        # 2-phase atomicity across mutators is CLAWP-067); so if the mission
+        # rewrite fails, roll the task frontmatter back to keep the two files
+        # consistent rather than leaving the task tagged but absent from the
+        # mission (Grok review).
+        try:
+            mission.mini_goals.append(MissionMiniGoal(id=task_id, actor=actor))
+            _rewrite_mission(mission)
+        except Exception as exc:
+            rb = task.file_path.with_suffix(".rollback.tmp")
+            try:
+                rb.write_text(original_text, encoding="utf-8")
+                retry_transient(rb.replace, task.file_path)
+            except Exception:
+                rb.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"Mission rewrite failed and the task {task_id} frontmatter "
+                    "rollback also failed; task and mission files may diverge "
+                    "(task tagged, mission missing the mini-goal) — reconcile "
+                    "manually."
+                ) from exc
+            raise  # rollback succeeded; surface the original mission-write error
+        return mission
 
 
 def _rewrite_mission(mission: Mission) -> None:
@@ -438,9 +479,16 @@ def _rewrite_mission(mission: Mission) -> None:
         + "\n---"
         + parts[2]
     )
+    from .concurrency import retry_transient
     tmp = mission.file_path.with_suffix(".tmp")
-    tmp.write_text(new_text, encoding="utf-8")
-    tmp.replace(mission.file_path)
+    try:
+        tmp.write_text(new_text, encoding="utf-8")
+        # Retry transient sharing/access faults + clean up the tmp on failure,
+        # matching the task-side write hardening (Grok review).
+        retry_transient(tmp.replace, mission.file_path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def mission_status(
@@ -555,9 +603,20 @@ def set_mission_status(
         raise ValueError(
             f"new_status must be active|complete|failed|cancelled, got {new_status!r}"
         )
-    mission = get_mission(config, project_id, mission_id)
-    if mission is None:
-        raise ValueError(f"Mission not found: {mission_id}")
-    mission.status = new_status
-    _rewrite_mission(mission)
-    return mission
+    from .tasks import get_tasks_dir
+    from .concurrency import file_lock
+    tasks_dir = get_tasks_dir(config, project_id)
+    if not tasks_dir:
+        raise ValueError(f"Project {project_id} has no tasks dir")
+    # Serialise with add_mission_mini_goal on the same per-project lock (CLAWP-066
+    # / Codex review): _rewrite_mission persists BOTH status and mini_goals, so we
+    # must re-read the mission INSIDE the lock and set status on the fresh object
+    # — otherwise a status change racing an add-goal would rewrite a stale
+    # mini_goals list and drop the just-linked task.
+    with file_lock(tasks_dir / ".clawpm-tasks.lock"):
+        mission = get_mission(config, project_id, mission_id)
+        if mission is None:
+            raise ValueError(f"Mission not found: {mission_id}")
+        mission.status = new_status
+        _rewrite_mission(mission)
+        return mission
