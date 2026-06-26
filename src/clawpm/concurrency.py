@@ -148,7 +148,8 @@ def _acquire(
       we poll ``LOCK_EX | LOCK_NB`` instead so the wait is bounded; ``timeout``
       of None blocks indefinitely (the historical behaviour).
 
-    Raises ``OSError`` if the lock can't be acquired within ``timeout``.
+    Raises ``LockTimeout`` (a subclass of ``OSError``) if the lock can't be
+    acquired within ``timeout``; any non-contention ``OSError`` propagates as-is.
     """
     if sys.platform == "win32":
         # Save EOF position; the file was opened in "a"/"a+" mode so pos is EOF.
@@ -284,7 +285,16 @@ def file_lock(
     # (add_subtask → split_task) would see depth 0, take the real-acquire path,
     # and self-deadlock on the non-reentrant OS lock (Grok review). normcase is a
     # no-op on POSIX.
-    key = os.path.normcase(os.path.abspath(str(lock_path)))
+    raw = str(lock_path)
+    if not os.path.isabs(raw):
+        # An absolute path is REQUIRED: os.path.abspath() of a relative path is
+        # cwd-dependent, so two nested acquires under different working dirs would
+        # key differently and the inner would deadlock on the non-reentrant OS
+        # lock. All real callers derive the path from get_tasks_dir (absolute);
+        # enforce the invariant loudly rather than risk a silent deadlock, which
+        # makes the reentrancy key canonical-by-construction (Grok review).
+        raise ValueError(f"file_lock requires an absolute lock_path, got {raw!r}")
+    key = os.path.normcase(os.path.abspath(raw))
     depths = _held_depths()
     if depths.get(key, 0) > 0:
         # Reentrant acquire on this thread — the OS lock is already held.
