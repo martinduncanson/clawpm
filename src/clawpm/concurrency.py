@@ -34,10 +34,20 @@ from __future__ import annotations
 import errno
 import os
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, IO, Iterator, TypeVar
+
+
+class LockTimeout(TimeoutError):
+    """Raised when a lock cannot be acquired within its timeout.
+
+    Subclasses ``TimeoutError`` (hence ``OSError``), so existing callers that
+    catch ``OSError`` keep working, while the message carries the lock path and
+    timeout for diagnostics instead of a bare errno (CLAWP-066 / Grok review).
+    """
 
 
 # Byte range we lock on Windows. Locking 1 byte at offset 0 is the canonical
@@ -99,7 +109,7 @@ def locked_append(path: Path, encoding: str = "utf-8") -> Iterator[IO[str]]:
 
     fh = open(path, "a", encoding=encoding)
     try:
-        _acquire(fh)
+        _acquire(fh, lock_desc=str(path))
         try:
             yield fh
             # Flush + fsync BEFORE releasing the lock so the durable write
@@ -119,7 +129,11 @@ def locked_append(path: Path, encoding: str = "utf-8") -> Iterator[IO[str]]:
         fh.close()
 
 
-def _acquire(fh: IO[str], timeout: float | None = _LOCK_ACQUIRE_TIMEOUT) -> None:
+def _acquire(
+    fh: IO[str],
+    timeout: float | None = _LOCK_ACQUIRE_TIMEOUT,
+    lock_desc: str = "lock",
+) -> None:
     """Acquire exclusive lock on the file handle, waiting up to ``timeout`` secs.
 
     Platform dispatch:
@@ -152,7 +166,10 @@ def _acquire(fh: IO[str], timeout: float | None = _LOCK_ACQUIRE_TIMEOUT) -> None
                     if exc.errno not in _LOCK_CONTENTION_ERRNOS:
                         raise
                     if deadline is not None and time.monotonic() >= deadline:
-                        raise
+                        raise LockTimeout(
+                            f"could not acquire {lock_desc} within {timeout}s "
+                            "(held by another session)"
+                        ) from exc
                     time.sleep(min(delay, _LOCK_POLL_MAX))
                     delay = min(delay * 2, _LOCK_POLL_MAX)
         finally:
@@ -175,7 +192,10 @@ def _acquire(fh: IO[str], timeout: float | None = _LOCK_ACQUIRE_TIMEOUT) -> None
                 if exc.errno not in _LOCK_CONTENTION_ERRNOS:
                     raise
                 if time.monotonic() >= deadline:
-                    raise
+                    raise LockTimeout(
+                        f"could not acquire {lock_desc} within {timeout}s "
+                        "(held by another session)"
+                    ) from exc
                 time.sleep(min(delay, _LOCK_POLL_MAX))
                 delay = min(delay * 2, _LOCK_POLL_MAX)
 
@@ -203,6 +223,24 @@ def _release(fh: IO[str]) -> None:
             pass
 
 
+# Per-THREAD reentrancy bookkeeping: maps the normalised lock path to the
+# nesting depth this thread currently holds. The OS lock (msvcrt/fcntl) is
+# acquired only at depth 0->1; nested acquires of the SAME path on the SAME
+# thread just bump the depth. This makes file_lock reentrant within a thread
+# (so a locked mutator can call another locked helper on the same path without
+# self-deadlock — e.g. add_subtask -> split_task) while cross-thread and
+# cross-process contention is still serialised by the OS lock (CLAWP-066).
+_held_locks = threading.local()
+
+
+def _held_depths() -> dict[str, int]:
+    depths = getattr(_held_locks, "depths", None)
+    if depths is None:
+        depths = {}
+        _held_locks.depths = depths
+    return depths
+
+
 @contextmanager
 def file_lock(
     lock_path: Path, timeout: float | None = _LOCK_ACQUIRE_TIMEOUT
@@ -217,11 +255,13 @@ def file_lock(
     mutations *within one project's task tree* while letting different projects
     proceed concurrently.
 
-    **DEADLOCK SAFETY:** ``fcntl.flock`` / ``msvcrt.locking`` are NOT reentrant
-    across two handles to the same path within one process.  Never enter a nested
-    ``file_lock`` on the same lock path while already holding it; the inner
-    acquire will self-deadlock.  Keep each critical section flat — do not call
-    functions that re-enter ``file_lock`` on the same path.
+    **REENTRANCY (CLAWP-066):** reentrant per-thread on the same lock path. A
+    function holding the lock may call another function that re-enters
+    ``file_lock`` on the same path — the nested acquire just bumps a thread-local
+    depth and the OS lock is released only when the outermost block exits. This
+    is what lets ``add_subtask`` (locked) call ``split_task`` (also locked) on
+    the same path without deadlock. Cross-thread and cross-process callers still
+    contend on the OS lock as normal.
 
     Usage::
 
@@ -235,15 +275,30 @@ def file_lock(
     is waited out rather than failing at Windows' 10s ``LK_LOCK`` cap.
 
     Raises:
-        OSError: if the lock cannot be acquired within ``timeout``.
+        LockTimeout: if the lock cannot be acquired within ``timeout``.
     """
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(lock_path, "a+", encoding="utf-8")  # create-or-open; "a+" keeps existing content
-    try:
-        _acquire(fh, timeout)
+    key = os.path.abspath(str(lock_path))
+    depths = _held_depths()
+    if depths.get(key, 0) > 0:
+        # Reentrant acquire on this thread — the OS lock is already held.
+        depths[key] += 1
         try:
             yield
         finally:
+            depths[key] -= 1
+            if depths[key] <= 0:
+                depths.pop(key, None)
+        return
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock_path, "a+", encoding="utf-8")  # create-or-open; "a+" keeps existing content
+    try:
+        _acquire(fh, timeout, lock_desc=key)
+        depths[key] = 1
+        try:
+            yield
+        finally:
+            depths.pop(key, None)
             _release(fh)
     finally:
         fh.close()

@@ -386,13 +386,11 @@ def change_task_state(
     #   (4) parent rollup check evaluated before lock (Finding 4)
     #   (5) Task.from_file reload after lock release (Finding 5)
     #
-    # DEADLOCK SAFETY (verified — none of these callees acquire file_lock):
-    #   _write_rejection_frontmatter — plain file read/write, no lock
-    #   parent_rollup_status         — calls get_task + Task.from_file, no lock
-    #   get_task                     — filesystem scan, no lock
-    #   Task.from_file               — reads a file, no lock
-    # This block must remain flat; do not call any function that re-enters
-    # file_lock on the same _lock_path.
+    # REENTRANCY (CLAWP-066): file_lock is now reentrant per-thread, so a callee
+    # that re-acquires the same lock path (e.g. split_task) nests safely instead
+    # of self-deadlocking. The historical "keep this block flat" rule is no
+    # longer a correctness requirement — it remains good hygiene for readability,
+    # but nesting the same-path lock is safe.
     _lock_path = tasks_dir / ".clawpm-tasks.lock"
 
     if is_directory_task:
@@ -1015,106 +1013,115 @@ def edit_task(
     delegability: str | None = None,
 ) -> Task | None:
     """Edit task metadata (frontmatter) and optionally title/body."""
-    task = get_task(config, project_id, task_id)
-    if not task or not task.file_path:
+    tasks_dir = get_tasks_dir(config, project_id)
+    if not tasks_dir:
         return None
 
-    text = task.file_path.read_text(encoding="utf-8")
+    # CLAWP-066: edit_task is a task-tree mutator like change_task_state/add_task,
+    # so it holds the per-project lock across the whole read→modify→write→reload
+    # to serialise against concurrent state moves / splits (was previously an
+    # unlocked, non-retried in-place rewrite). file_lock is reentrant per-thread.
+    with file_lock(tasks_dir / ".clawpm-tasks.lock"):
+        task = get_task(config, project_id, task_id)
+        if not task or not task.file_path:
+            return None
 
-    # Parse frontmatter and content
-    frontmatter: dict = {}
-    content = text
+        text = task.file_path.read_text(encoding="utf-8")
 
-    if text.startswith("---"):
-        parts = text.split("---", 2)
-        if len(parts) >= 3:
-            try:
-                frontmatter = yaml.safe_load(parts[1]) or {}
-                content = parts[2]
-            except yaml.YAMLError:
-                pass
+        # Parse frontmatter and content
+        frontmatter: dict = {}
+        content = text
 
-    # Update frontmatter fields
-    if priority is not None:
-        frontmatter["priority"] = priority
-    if complexity is not None:
-        frontmatter["complexity"] = complexity.value
-    if scope is not None:
-        if scope:
-            frontmatter["scope"] = scope
-        else:
-            frontmatter.pop("scope", None)
-    if clear_parallel_group:
-        frontmatter.pop("parallel_group", None)
-    elif parallel_group is not None:
-        frontmatter["parallel_group"] = parallel_group
-    if predictions is not None:
-        if predictions.is_empty():
-            frontmatter.pop("predictions", None)
-        else:
-            pred_dict = predictions.to_dict()
-            frontmatter["predictions"] = {
-                k: v for k, v in pred_dict.items()
-                if v is not None and v != []
-            }
-    # CLAWP-054 — contract fields
-    if out_of_scope is not None:
-        if out_of_scope:
-            frontmatter["out_of_scope"] = out_of_scope
-        else:
-            frontmatter.pop("out_of_scope", None)
-    if stop_conditions is not None:
-        if stop_conditions:
-            frontmatter["stop_conditions"] = stop_conditions
-        else:
-            frontmatter.pop("stop_conditions", None)
-    if delegability is not None:
-        if delegability != "either":
-            frontmatter["delegability"] = delegability
-        else:
-            frontmatter.pop("delegability", None)
+        if text.startswith("---"):
+            parts = text.split("---", 2)
+            if len(parts) >= 3:
+                try:
+                    frontmatter = yaml.safe_load(parts[1]) or {}
+                    content = parts[2]
+                except yaml.YAMLError:
+                    pass
 
-    # Update title in content (first # heading)
-    if title is not None:
-        lines = content.split("\n")
-        replaced = False
-        for i, line in enumerate(lines):
-            if line.startswith("# "):
-                lines[i] = f"# {title}"
-                replaced = True
-                break
-        if not replaced:
-            lines.insert(0, f"# {title}")
-        content = "\n".join(lines)
+        # Update frontmatter fields
+        if priority is not None:
+            frontmatter["priority"] = priority
+        if complexity is not None:
+            frontmatter["complexity"] = complexity.value
+        if scope is not None:
+            if scope:
+                frontmatter["scope"] = scope
+            else:
+                frontmatter.pop("scope", None)
+        if clear_parallel_group:
+            frontmatter.pop("parallel_group", None)
+        elif parallel_group is not None:
+            frontmatter["parallel_group"] = parallel_group
+        if predictions is not None:
+            if predictions.is_empty():
+                frontmatter.pop("predictions", None)
+            else:
+                pred_dict = predictions.to_dict()
+                frontmatter["predictions"] = {
+                    k: v for k, v in pred_dict.items()
+                    if v is not None and v != []
+                }
+        # CLAWP-054 — contract fields
+        if out_of_scope is not None:
+            if out_of_scope:
+                frontmatter["out_of_scope"] = out_of_scope
+            else:
+                frontmatter.pop("out_of_scope", None)
+        if stop_conditions is not None:
+            if stop_conditions:
+                frontmatter["stop_conditions"] = stop_conditions
+            else:
+                frontmatter.pop("stop_conditions", None)
+        if delegability is not None:
+            if delegability != "either":
+                frontmatter["delegability"] = delegability
+            else:
+                frontmatter.pop("delegability", None)
 
-    # Replace body (everything between title and ## sections)
-    if body is not None:
-        lines = content.split("\n")
-        title_idx = None
-        section_idx = None
-        for i, line in enumerate(lines):
-            if line.startswith("# ") and title_idx is None:
-                title_idx = i
-            elif line.startswith("## ") and title_idx is not None:
-                section_idx = i
-                break
+        # Update title in content (first # heading)
+        if title is not None:
+            lines = content.split("\n")
+            replaced = False
+            for i, line in enumerate(lines):
+                if line.startswith("# "):
+                    lines[i] = f"# {title}"
+                    replaced = True
+                    break
+            if not replaced:
+                lines.insert(0, f"# {title}")
+            content = "\n".join(lines)
 
-        if title_idx is not None:
-            before = lines[:title_idx + 1]
-            after = lines[section_idx:] if section_idx is not None else []
-            content = "\n".join(before) + f"\n\n{body}\n\n" + "\n".join(after)
+        # Replace body (everything between title and ## sections)
+        if body is not None:
+            lines = content.split("\n")
+            title_idx = None
+            section_idx = None
+            for i, line in enumerate(lines):
+                if line.startswith("# ") and title_idx is None:
+                    title_idx = i
+                elif line.startswith("## ") and title_idx is not None:
+                    section_idx = i
+                    break
 
-    # Rebuild file — utf-8 always so Unicode content survives on Windows
-    new_text = f"---\n{yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True).strip()}\n---\n{content}"
-    tmp_path = task.file_path.with_suffix(".tmp")
-    try:
-        tmp_path.write_text(new_text, encoding="utf-8")
-        tmp_path.replace(task.file_path)
-    except Exception:
-        tmp_path.unlink(missing_ok=True)
-        raise
+            if title_idx is not None:
+                before = lines[:title_idx + 1]
+                after = lines[section_idx:] if section_idx is not None else []
+                content = "\n".join(before) + f"\n\n{body}\n\n" + "\n".join(after)
 
-    return Task.from_file(task.file_path)
+        # Rebuild file — utf-8 always so Unicode content survives on Windows
+        new_text = f"---\n{yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True).strip()}\n---\n{content}"
+        tmp_path = task.file_path.with_suffix(".tmp")
+        try:
+            tmp_path.write_text(new_text, encoding="utf-8")
+            retry_transient(tmp_path.replace, task.file_path)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
+
+        return retry_transient(Task.from_file, task.file_path)
 
 
 def split_task(
@@ -1127,28 +1134,36 @@ def split_task(
     Converts TASK-ID.md → TASK-ID/_task.md
     Works from any state directory (tasks/, done/, blocked/).
     """
-    task = get_task(config, project_id, task_id)
-    if not task or not task.file_path:
+    tasks_dir = get_tasks_dir(config, project_id)
+    if not tasks_dir:
         return None
-    
-    # Already a directory-based task
-    if task.file_path.name == "_task.md":
-        return task
-    
-    current_path = task.file_path
-    parent_dir = current_path.parent
-    
-    # Create task directory in same location as current file
-    task_dir = parent_dir / task_id
-    task_dir.mkdir(exist_ok=True)
-    
-    # Move file to _task.md inside directory (retry transient Windows
-    # sharing/access faults on the rename — consistent with the other CLAWP-051
-    # moves; split_task runs inside add_subtask's per-project lock).
-    new_path = task_dir / "_task.md"
-    retry_transient(shutil.move, str(current_path), str(new_path))
 
-    return retry_transient(Task.from_file, new_path)
+    # CLAWP-066: hold the per-project lock around the whole resolve→mutate→reload.
+    # file_lock is reentrant per-thread, so this is safe whether split_task is
+    # called directly (CLI / emit_tree — acquires for real) or from inside
+    # add_subtask's critical section (nested re-acquire on the same path).
+    with file_lock(tasks_dir / ".clawpm-tasks.lock"):
+        task = get_task(config, project_id, task_id)
+        if not task or not task.file_path:
+            return None
+
+        # Already a directory-based task
+        if task.file_path.name == "_task.md":
+            return task
+
+        current_path = task.file_path
+        parent_dir = current_path.parent
+
+        # Create task directory in same location as current file
+        task_dir = parent_dir / task_id
+        task_dir.mkdir(exist_ok=True)
+
+        # Move file to _task.md inside directory (retry transient Windows
+        # sharing/access faults on the rename — consistent with the other moves).
+        new_path = task_dir / "_task.md"
+        retry_transient(shutil.move, str(current_path), str(new_path))
+
+        return retry_transient(Task.from_file, new_path)
 
 
 def _append_child_to_parent_frontmatter(
@@ -1230,11 +1245,11 @@ def add_subtask(
     # (observed under contention). Serialising the read also serialises concurrent
     # splits, so the flat→directory conversion is race-free without a test seed.
     #
-    # DEADLOCK SAFETY: add_subtask is always a standalone operation — never
-    # invoked from within an already-held file_lock on the same _lock_path.
-    # Verified lock-free (safe to call inside the critical section): get_task
-    # (fs scan), split_task (flat→dir move, no file_lock), and
-    # _append_child_to_parent_frontmatter (plain read/write, no file_lock).
+    # REENTRANCY (CLAWP-066): split_task now ALSO acquires this same per-project
+    # lock. That is safe because file_lock is reentrant per-thread — split_task's
+    # acquire here nests on the depth this block already holds rather than
+    # self-deadlocking. get_task (fs scan) and _append_child_to_parent_frontmatter
+    # (plain read/write) take no lock.
     _lock_path = tasks_dir / ".clawpm-tasks.lock"
     with file_lock(_lock_path):
         # Resolve the parent as a directory INSIDE the lock (read + optional split).

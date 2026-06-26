@@ -103,22 +103,39 @@ def create_app() -> FastAPI:
             from datetime import datetime
             from .models import TaskState
 
-            task = get_task(config, project_id, task_id)
-            if not task or not task.file_path:
-                return {"success": False, "error": "task_not_found"}
+            from .tasks import get_tasks_dir
+            from .concurrency import file_lock, retry_transient
 
-            # Append response to task file
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
             response_line = f"\n{timestamp} [Web UI]: {req.response}"
 
-            content = task.file_path.read_text(encoding="utf-8")
+            tasks_dir = get_tasks_dir(config, project_id)
+            if not tasks_dir:
+                return {"success": False, "error": "no_tasks_dir"}
 
-            # Add Responses section if not exists
-            if "## Responses" not in content:
-                content += "\n\n## Responses\n"
+            # CLAWP-066: append under the per-project lock with an atomic
+            # tmp+replace, re-resolving the task inside the lock so the write
+            # serialises against (and can't be clobbered by) a concurrent
+            # change_task_state move.
+            with file_lock(tasks_dir / ".clawpm-tasks.lock"):
+                task = get_task(config, project_id, task_id)
+                if not task or not task.file_path or not task.file_path.exists():
+                    return {"success": False, "error": "task_not_found"}
 
-            content += response_line
-            task.file_path.write_text(content, encoding="utf-8")
+                content = task.file_path.read_text(encoding="utf-8")
+
+                # Add Responses section if not exists
+                if "## Responses" not in content:
+                    content += "\n\n## Responses\n"
+
+                content += response_line
+                tmp = task.file_path.with_suffix(".tmp")
+                try:
+                    tmp.write_text(content, encoding="utf-8")
+                    retry_transient(tmp.replace, task.file_path)
+                except Exception:
+                    tmp.unlink(missing_ok=True)
+                    raise
 
             # Optionally unblock
             if req.unblock and task.state == TaskState.BLOCKED:

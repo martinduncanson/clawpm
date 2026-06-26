@@ -388,30 +388,48 @@ def add_mission_mini_goal(
             f"{mission_id!r}."
         )
 
-    # Update the task's frontmatter
+    # Update the task's frontmatter under the per-project lock (CLAWP-066) so it
+    # serialises against a concurrent change_task_state move; re-resolve the task
+    # INSIDE the lock so the write can't land on a path another session vacated.
     if task.file_path is None:
         raise ValueError(f"Task {task_id} has no file path")
-    text = task.file_path.read_text(encoding="utf-8")
-    if not text.startswith("---"):
-        raise ValueError(f"Task {task_id} has no frontmatter")
-    parts = text.split("---", 2)
-    if len(parts) < 3:
-        raise ValueError(f"Task {task_id} frontmatter malformed")
-    try:
-        fm = yaml.safe_load(parts[1]) or {}
-    except yaml.YAMLError as exc:
-        raise ValueError(f"Task {task_id} frontmatter unparseable: {exc}")
-    fm["parent_mission"] = mission_id
-    fm["actor"] = actor
-    new_text = (
-        "---\n"
-        + yaml.dump(fm, default_flow_style=False, allow_unicode=True).rstrip()
-        + "\n---"
-        + parts[2]
-    )
-    tmp = task.file_path.with_suffix(".tmp")
-    tmp.write_text(new_text, encoding="utf-8")
-    tmp.replace(task.file_path)
+    from .tasks import get_tasks_dir
+    from .concurrency import file_lock, retry_transient
+    tasks_dir = get_tasks_dir(config, project_id)
+    if not tasks_dir:
+        raise ValueError(f"Project {project_id} has no tasks dir")
+    with file_lock(tasks_dir / ".clawpm-tasks.lock"):
+        fresh = get_task(config, project_id, task_id)
+        if fresh is None or fresh.file_path is None or not fresh.file_path.exists():
+            raise ValueError(
+                f"Task {task_id} vanished — it may have been moved by a "
+                "concurrent session; retry the mini-goal link."
+            )
+        text = fresh.file_path.read_text(encoding="utf-8")
+        if not text.startswith("---"):
+            raise ValueError(f"Task {task_id} has no frontmatter")
+        parts = text.split("---", 2)
+        if len(parts) < 3:
+            raise ValueError(f"Task {task_id} frontmatter malformed")
+        try:
+            fm = yaml.safe_load(parts[1]) or {}
+        except yaml.YAMLError as exc:
+            raise ValueError(f"Task {task_id} frontmatter unparseable: {exc}")
+        fm["parent_mission"] = mission_id
+        fm["actor"] = actor
+        new_text = (
+            "---\n"
+            + yaml.dump(fm, default_flow_style=False, allow_unicode=True).rstrip()
+            + "\n---"
+            + parts[2]
+        )
+        tmp = fresh.file_path.with_suffix(".tmp")
+        try:
+            tmp.write_text(new_text, encoding="utf-8")
+            retry_transient(tmp.replace, fresh.file_path)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
 
     # Update the mission's frontmatter
     mission.mini_goals.append(MissionMiniGoal(id=task_id, actor=actor))

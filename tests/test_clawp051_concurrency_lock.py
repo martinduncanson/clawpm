@@ -38,12 +38,13 @@ import pytest
 from clawpm.concurrency import (
     _TRANSIENT_WINERRORS,
     _is_transient_fs_error,
+    LockTimeout,
     file_lock,
     retry_transient,
 )
 from clawpm.discovery import load_portfolio_config
 from clawpm.models import TaskState
-from clawpm.tasks import add_subtask, add_task, change_task_state, get_task
+from clawpm.tasks import add_subtask, add_task, change_task_state, get_task, split_task
 
 
 # ---------------------------------------------------------------------------
@@ -869,12 +870,109 @@ class TestFileLockPrimitive:
         t.start()
         try:
             assert held.wait(5), "holder thread failed to acquire the lock"
-            with pytest.raises(OSError):
+            with pytest.raises(LockTimeout):
                 with file_lock(lock_path, timeout=0.3):
                     pass
         finally:
             release.set()
             t.join(10)
+
+    def test_reentrant_same_thread_same_path(self, tmp_path):
+        """Nested file_lock on the same path in one thread must NOT deadlock
+        (CLAWP-066 reentrancy — pre-fix this would hang/self-deadlock)."""
+        lock_path = tmp_path / ".clawpm-tasks.lock"
+        order = []
+        with file_lock(lock_path, timeout=2):
+            order.append("outer")
+            with file_lock(lock_path, timeout=2):
+                order.append("inner")
+            order.append("after-inner")
+        assert order == ["outer", "inner", "after-inner"]
+        # After the outermost release the lock is fully free again.
+        with file_lock(lock_path, timeout=2):
+            order.append("reacquired")
+        assert order[-1] == "reacquired"
+
+    def test_reentrant_holds_os_lock_until_outermost_exit(self, tmp_path):
+        """A nested inner release must NOT free the OS lock — a competing thread
+        can only acquire after the OUTERMOST block exits (CLAWP-066)."""
+        import threading
+
+        lock_path = tmp_path / ".clawpm-tasks.lock"
+        other_acquired = threading.Event()
+        start_competitor = threading.Event()
+
+        def competitor():
+            start_competitor.wait(5)
+            with file_lock(lock_path, timeout=5):
+                other_acquired.set()
+
+        t = threading.Thread(target=competitor)
+        t.start()
+        try:
+            with file_lock(lock_path, timeout=2):
+                with file_lock(lock_path, timeout=2):
+                    pass  # inner exit — OS lock must remain held
+                # Release the competitor now; it must NOT get in while we hold outer.
+                start_competitor.set()
+                assert not other_acquired.wait(0.6), (
+                    "OS lock was released at the inner exit, not the outermost"
+                )
+            # Outermost released — competitor should now acquire.
+            assert other_acquired.wait(5), "competitor never acquired after release"
+        finally:
+            start_competitor.set()
+            t.join(10)
+
+    def test_split_task_acquires_project_lock(self, tmp_path):
+        """A direct split_task blocks while another thread holds the project
+        lock, then completes once released — proof it now acquires the lock and
+        serialises against other mutators (CLAWP-066)."""
+        import threading
+
+        project_id = "split-lock"
+        _make_portfolio(tmp_path, project_id)
+        os.environ["CLAWPM_PORTFOLIO"] = str(tmp_path)
+        config = load_portfolio_config(tmp_path)
+
+        task = add_task(config, project_id, "To split")
+        assert task is not None
+        tasks_dir = tmp_path / "projects" / project_id / ".project" / "tasks"
+        lock_path = tasks_dir / ".clawpm-tasks.lock"
+
+        held = threading.Event()
+        release = threading.Event()
+
+        def holder():
+            with file_lock(lock_path):
+                held.set()
+                release.wait(5)
+
+        t = threading.Thread(target=holder)
+        assert split_task is not None
+        t.start()
+
+        done = threading.Event()
+        result_box: dict = {}
+
+        def splitter():
+            result_box["r"] = split_task(config, project_id, task.id)
+            done.set()
+
+        s = threading.Thread(target=splitter)
+        try:
+            assert held.wait(5), "holder failed to take the lock"
+            s.start()
+            # While the lock is held elsewhere, the split must be blocked.
+            assert not done.wait(0.6), "split_task did not block on the held lock"
+            release.set()
+            assert done.wait(10), "split_task did not complete after release"
+            assert result_box["r"] is not None
+            assert result_box["r"].file_path.name == "_task.md"
+        finally:
+            release.set()
+            t.join(10)
+            s.join(10)
 
 
 # ---------------------------------------------------------------------------
