@@ -2214,10 +2214,13 @@ def tasks_add(
         filled_by=filled_by,
     )
 
+    # Resolve the parent id (pure string op) OUTSIDE the mutation wrapper, so the
+    # wrapper only spans the actual mutator call (matches every other site).
+    if parent_id:
+        parent_id = expand_task_id(parent_id, project_id)
     # Create subtask if parent specified
     with _mutation_errors(fmt, "add_failed"):
         if parent_id:
-            parent_id = expand_task_id(parent_id, project_id)
             task = add_subtask(
                 config,
                 project_id,
@@ -2842,6 +2845,13 @@ def tasks_emit_tree(
         output_error("emit_error", str(exc), fmt=fmt)
         sys.exit(1)
     except Exception as exc:
+        # emit-tree is a single transactional multi-op (stage → promote, which
+        # may call split_task and thus raise LockTimeout). It intentionally
+        # presents ONE error surface ("emit_error") for any internal failure
+        # — including lock contention — rather than the per-command-specific
+        # codes _mutation_errors emits, because a partial emit is reported as a
+        # unit. This already maps to a clean error (no raw traceback), so it does
+        # not use _mutation_errors (CLAWP-067 review).
         output_error("emit_error", f"Unexpected error during emission: {exc}", fmt=fmt)
         sys.exit(1)
 
@@ -4261,7 +4271,17 @@ def agent_dispatch(
             refute_votes=refute_votes,
             agent_profile=agent_profile,
         )
-    except AgentDispatchError as exc:
+    except LockTimeout as exc:
+        # dispatch_agent indirectly calls the task-tree mutators (add_task,
+        # change_task_state), so a contended project lock surfaces here too
+        # (Codex review). Map it to the same contract as the direct sites.
+        output_error(
+            "lock_timeout",
+            f"Could not acquire the project lock (another session may be busy): {exc}",
+            fmt=fmt,
+        )
+        sys.exit(1)
+    except (AgentDispatchError, ValueError) as exc:
         output_error("agent_dispatch_failed", str(exc), fmt=fmt)
         sys.exit(1)
 
@@ -4447,16 +4467,10 @@ def mission_add_goal(
     project_id, _ = require_project(ctx, project_id)
     task_id = expand_task_id(task_id, project_id)
 
-    try:
+    with _mutation_errors(fmt, "mission_add_goal_failed"):
         mission = add_mission_mini_goal(
             config, project_id, mission_id, task_id, actor=actor
         )
-    except LockTimeout as exc:
-        output_error("lock_timeout", f"Could not acquire the project lock: {exc}", fmt=fmt)
-        sys.exit(1)
-    except ValueError as exc:
-        output_error("mission_add_goal_failed", str(exc), fmt=fmt)
-        sys.exit(1)
 
     output_success(
         f"Linked {task_id} to {mission_id} as {actor}",
@@ -4484,14 +4498,8 @@ def mission_state(
     config = require_portfolio(ctx)
     project_id, _ = require_project(ctx, project_id)
 
-    try:
+    with _mutation_errors(fmt, "mission_state_failed"):
         mission = set_mission_status(config, project_id, mission_id, new_status)
-    except LockTimeout as exc:
-        output_error("lock_timeout", f"Could not acquire the project lock: {exc}", fmt=fmt)
-        sys.exit(1)
-    except ValueError as exc:
-        output_error("mission_state_failed", str(exc), fmt=fmt)
-        sys.exit(1)
 
     output_success(
         f"Mission {mission_id} -> {new_status}",
