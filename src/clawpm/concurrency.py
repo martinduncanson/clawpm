@@ -298,21 +298,24 @@ def file_lock(
 
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fh = open(lock_path, "a+", encoding="utf-8")  # create-or-open; "a+" keeps existing content
+    # Single try whose finally keys off `acquired`: the depth marker is set only
+    # after _acquire succeeds, and the matching release+pop is guaranteed by the
+    # same finally — so there is no window (even for an async exception between
+    # statements) where depth>0 is left stranded over a released/absent OS lock
+    # (Grok review). pop is in an inner finally so it runs even if _release
+    # raised; fh.close() backstops the OS release.
+    acquired = False
     try:
         _acquire(fh, timeout, lock_desc=key)
+        acquired = True
         depths[key] = 1
-        try:
-            yield
-        finally:
-            # Release the OS lock, THEN drop the depth marker — and pop in an
-            # inner finally so the marker is cleared even if _release somehow
-            # raised. fh.close() (outer finally) is the backstop: closing the
-            # handle releases the OS lock too, so we never strand a held lock.
+        yield
+    finally:
+        if acquired:
             try:
                 _release(fh)
             finally:
                 depths.pop(key, None)
-    finally:
         fh.close()
 
 

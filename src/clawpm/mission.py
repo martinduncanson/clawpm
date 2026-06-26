@@ -422,6 +422,7 @@ def add_mission_mini_goal(
             + "\n---"
             + parts[2]
         )
+        original_text = text  # for rollback if the mission rewrite fails
         tmp = task.file_path.with_suffix(".tmp")
         try:
             tmp.write_text(new_text, encoding="utf-8")
@@ -430,10 +431,30 @@ def add_mission_mini_goal(
             tmp.unlink(missing_ok=True)
             raise
 
-        # Append to the mission + rewrite INSIDE the lock so the mini_goals list
-        # we persist reflects every concurrent add (no lost update — Codex).
+        # Append to the mission + rewrite INSIDE the lock so the persisted
+        # mini_goals list reflects every concurrent add (no lost update — Codex).
+        # The task-write and mission-write are NOT a single atomic unit (general
+        # 2-phase atomicity across mutators is CLAWP-067); so if the mission
+        # rewrite fails, roll the task frontmatter back to keep the two files
+        # consistent rather than leaving the task tagged but absent from the
+        # mission (Grok review).
         mission.mini_goals.append(MissionMiniGoal(id=task_id, actor=actor))
-        _rewrite_mission(mission)
+        try:
+            _rewrite_mission(mission)
+        except Exception as exc:
+            rb = task.file_path.with_suffix(".rollback.tmp")
+            try:
+                rb.write_text(original_text, encoding="utf-8")
+                retry_transient(rb.replace, task.file_path)
+            except Exception:
+                rb.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"Mission rewrite failed and the task {task_id} frontmatter "
+                    "rollback also failed; task and mission files may diverge "
+                    "(task tagged, mission missing the mini-goal) — reconcile "
+                    "manually."
+                ) from exc
+            raise  # rollback succeeded; surface the original mission-write error
         return mission
 
 
@@ -580,9 +601,20 @@ def set_mission_status(
         raise ValueError(
             f"new_status must be active|complete|failed|cancelled, got {new_status!r}"
         )
-    mission = get_mission(config, project_id, mission_id)
-    if mission is None:
-        raise ValueError(f"Mission not found: {mission_id}")
-    mission.status = new_status
-    _rewrite_mission(mission)
-    return mission
+    from .tasks import get_tasks_dir
+    from .concurrency import file_lock
+    tasks_dir = get_tasks_dir(config, project_id)
+    if not tasks_dir:
+        raise ValueError(f"Project {project_id} has no tasks dir")
+    # Serialise with add_mission_mini_goal on the same per-project lock (CLAWP-066
+    # / Codex review): _rewrite_mission persists BOTH status and mini_goals, so we
+    # must re-read the mission INSIDE the lock and set status on the fresh object
+    # — otherwise a status change racing an add-goal would rewrite a stale
+    # mini_goals list and drop the just-linked task.
+    with file_lock(tasks_dir / ".clawpm-tasks.lock"):
+        mission = get_mission(config, project_id, mission_id)
+        if mission is None:
+            raise ValueError(f"Mission not found: {mission_id}")
+        mission.status = new_status
+        _rewrite_mission(mission)
+        return mission

@@ -675,3 +675,77 @@ def test_concurrent_mini_goal_adds_no_lost_update(temp_portfolio):
     assert ids == {t1.id, t2.id}, (
         f"lost update — mission lists {ids}, expected both {t1.id} and {t2.id}"
     )
+
+
+def test_mini_goal_rolls_back_task_on_mission_rewrite_failure(temp_portfolio, monkeypatch):
+    """If _rewrite_mission fails after the task frontmatter was written, the task
+    write is rolled back so the two files don't diverge — the task must NOT be
+    left tagged with parent_mission while absent from the mission file
+    (CLAWP-066 / Grok review)."""
+    import clawpm.mission as mission_mod
+
+    config = temp_portfolio["config"]
+    m = add_mission(config, "test", "Rollback", "obj", deadline_days=7)
+    t = add_task(config, "test", "Task to link")
+    assert t is not None and t.file_path is not None
+
+    original = t.file_path.read_text(encoding="utf-8")
+    assert "parent_mission" not in original
+
+    def boom(_mission):
+        raise RuntimeError("simulated mission rewrite failure")
+
+    monkeypatch.setattr(mission_mod, "_rewrite_mission", boom)
+
+    with pytest.raises(RuntimeError, match="simulated mission rewrite"):
+        add_mission_mini_goal(config, "test", m.id, t.id)
+
+    # Task frontmatter rolled back — no parent_mission stranded.
+    after = get_task(config, "test", t.id)
+    assert after is not None and not after.parent_mission
+    # Mission file must not list the task either.
+    reloaded = get_mission(config, "test", m.id)
+    assert t.id not in {g.id for g in reloaded.mini_goals}
+
+
+def test_status_change_concurrent_with_add_goal_no_drop(temp_portfolio):
+    """A mission status change racing an add-goal must not drop the newly linked
+    mini-goal. set_mission_status and add_mission_mini_goal serialise on the same
+    per-project lock and each re-reads the mission inside it, so whichever runs
+    second carries the other's write (CLAWP-066 / Codex review)."""
+    import threading
+
+    config = temp_portfolio["config"]
+    m = add_mission(config, "test", "Race", "obj", deadline_days=7)
+    t = add_task(config, "test", "Linked task")
+    assert t is not None
+
+    barrier = threading.Barrier(2)
+    errors: list = []
+
+    def add_goal():
+        try:
+            barrier.wait(5)
+            add_mission_mini_goal(config, "test", m.id, t.id)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def set_status():
+        try:
+            barrier.wait(5)
+            set_mission_status(config, "test", m.id, "complete")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=add_goal), threading.Thread(target=set_status)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(10)
+
+    assert not errors, f"unexpected errors: {errors}"
+    reloaded = get_mission(config, "test", m.id)
+    assert reloaded.status == "complete", "status change was lost"
+    assert t.id in {g.id for g in reloaded.mini_goals}, (
+        "mini-goal dropped by a concurrent status rewrite"
+    )

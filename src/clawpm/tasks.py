@@ -1034,19 +1034,27 @@ def edit_task(
 
         if text.startswith("---"):
             parts = text.split("---", 2)
-            if len(parts) >= 3:
-                try:
-                    frontmatter = yaml.safe_load(parts[1]) or {}
-                    content = parts[2]
-                except yaml.YAMLError as exc:
-                    # Do NOT swallow: leaving content=text (the original,
-                    # frontmatter-bearing bytes) and an empty frontmatter would
-                    # rebuild a double-frontmatter, field-wiped file. Refuse to
-                    # edit a task whose frontmatter we can't parse (Grok review).
-                    raise ValueError(
-                        f"Task {task_id} frontmatter is unparseable; refusing "
-                        f"to edit (would corrupt the file): {exc}"
-                    ) from exc
+            if len(parts) < 3:
+                # Starts with --- but has no closing fence. Falling through with
+                # frontmatter={}, content=text would rebuild a double-frontmatter,
+                # metadata-wiped file (same hazard as the unparseable case below).
+                # Refuse rather than corrupt (Codex review).
+                raise ValueError(
+                    f"Task {task_id} has an unterminated frontmatter fence; "
+                    "refusing to edit (would corrupt the file)."
+                )
+            try:
+                frontmatter = yaml.safe_load(parts[1]) or {}
+                content = parts[2]
+            except yaml.YAMLError as exc:
+                # Do NOT swallow: leaving content=text (the original,
+                # frontmatter-bearing bytes) and an empty frontmatter would
+                # rebuild a double-frontmatter, field-wiped file. Refuse to
+                # edit a task whose frontmatter we can't parse (Grok review).
+                raise ValueError(
+                    f"Task {task_id} frontmatter is unparseable; refusing "
+                    f"to edit (would corrupt the file): {exc}"
+                ) from exc
 
         # Update frontmatter fields
         if priority is not None:
