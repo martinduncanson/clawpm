@@ -226,6 +226,25 @@ def test_wrong_method_is_envelope_405(client):
     _assert_error_envelope(resp, 405)
 
 
+def test_wrong_method_preserves_allow_header(client):
+    # The envelope reshaping must not drop the standard method-discovery header.
+    resp = client.get("/api/issues")
+    assert resp.status_code == 405
+    assert "allow" in {k.lower() for k in resp.headers}
+
+
+def test_read_route_internal_error_is_500_envelope(portfolio, monkeypatch):
+    from clawpm import serve
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(serve, "discover_projects", _boom)
+    client = TestClient(create_app(), raise_server_exceptions=False)
+    resp = client.get("/api/projects")
+    _assert_error_envelope(resp, 500, "internal_error")
+
+
 # -------------------------------------------- CLI graceful degradation ----
 
 def test_serve_without_web_extra_exits_gracefully(monkeypatch):

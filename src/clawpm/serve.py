@@ -31,6 +31,7 @@ not a network service.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -43,6 +44,8 @@ from .discovery import load_portfolio_config, discover_projects, get_project
 from .tasks import list_tasks
 from .worklog import tail_entries
 
+
+logger = logging.getLogger(__name__)
 
 WEB_DIR = Path(__file__).parent / "web"
 TEMPLATES_DIR = WEB_DIR / "templates"
@@ -93,9 +96,12 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_exc_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+        # Forward exc.headers so standard method-discovery headers (e.g. the
+        # `Allow` header on a routing 405) survive the envelope reshaping.
         return JSONResponse(
             status_code=exc.status_code,
             content=_error_body(exc.status_code, exc.detail),
+            headers=exc.headers,
         )
 
     @app.exception_handler(RequestValidationError)
@@ -107,6 +113,10 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(Exception)
     async def _unhandled_handler(request: Request, exc: Exception) -> JSONResponse:
+        # Fail loud on the server (full traceback to the `clawpm serve` console)
+        # while keeping the client-facing envelope opaque — fail-open must not
+        # mean fail-silent.
+        logger.exception("Unhandled error serving %s %s", request.method, request.url.path)
         return JSONResponse(
             status_code=500,
             content={"error": {"code": "internal_error", "message": "internal server error"}},
