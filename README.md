@@ -6,7 +6,7 @@ Filesystem-first, deterministic operating substrate for autonomous work. Multi-p
 
 [![ClawHub](https://img.shields.io/badge/ClawHub-clawpm-blue)](https://clawhub.ai/malphas-gh/clawpm)
 
-> **Status:** actively dogfooded. The core loop (add/start/done, scope, work-log, reflection) is stable. The agentic layer — rubric + Stop-hook judge, `tasks dispatch` / `agent dispatch`, crash-safe leases, baseline + drift detection, thrashing detection, `reflect summarize`/`suggest` — is shipped and tested. The planner layer (`clawpm-planner` skill + `tasks emit-tree`) is shipped. `clawpm serve` (web UI) is utilitarian. Python 3.11+. No database, no daemon.
+> **Status:** actively dogfooded. The core loop (add/start/done, scope, work-log, reflection) is stable. The agentic layer — rubric + Stop-hook judge, `tasks dispatch` / `agent dispatch`, crash-safe leases, baseline + drift detection, thrashing detection, `reflect summarize`/`suggest` — is shipped and tested. The planner layer (`clawpm-planner` skill + `tasks emit-tree`) is shipped. `clawpm serve` (web UI) is a read-only dashboard behind the optional `web` extra. Python 3.11+. No database, no daemon.
 
 ---
 
@@ -343,7 +343,7 @@ clawpm reflect summarize    # update the calibration corpus
 | `clawpm context` | — | Full agent context (spec, tasks, log, git, issues) |
 | `clawpm use <id>` | — | Set project context |
 | `clawpm conflicts --task <id>` | — | Pre-flight check for scope overlap |
-| `clawpm serve` | — | Start web dashboard at http://127.0.0.1:8080 |
+| `clawpm serve` | — | Start read-only web dashboard at http://127.0.0.1:8080 (needs the `web` extra: `pip install 'clawpm[web]'`) |
 
 Short task IDs work everywhere: `42` expands to `CLAWP-042` based on project prefix.
 
@@ -563,7 +563,11 @@ clawpm inbox                       # Inter-agent messaging
 
 ### Web dashboard
 
+Read-only view over the portfolio (projects, tasks, blockers, work-log). All
+state changes go through the CLI. Requires the optional `web` extra:
+
 ```bash
+pip install 'clawpm[web]'           # one-time: install fastapi + uvicorn
 clawpm serve                       # Start on http://127.0.0.1:8080
 clawpm serve --port 8888
 ```

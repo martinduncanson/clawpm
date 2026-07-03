@@ -5,7 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ClawPM Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com/htmx.org@1.9.12"></script>
     <script>
         tailwind.config = {
             theme: {
@@ -41,7 +40,7 @@
                 <h1 class="text-xl font-bold flex items-center gap-2">
                     <span class="text-2xl">🦞</span> ClawPM
                 </h1>
-                <p class="text-gray-400 text-xs mt-1">Task Management</p>
+                <p class="text-gray-400 text-xs mt-1">Read-only dashboard</p>
             </div>
 
             <!-- Stats -->
@@ -82,17 +81,17 @@
                 </a>
             </nav>
 
-            <!-- Quick Add Toggle -->
+            <!-- Read-only notice -->
             <div class="p-4 border-t border-gray-800">
-                <button onclick="toggleQuickAdd()" 
-                        class="w-full px-4 py-2 bg-claw-600 hover:bg-claw-700 rounded-lg transition-colors text-sm font-medium flex items-center justify-center gap-2">
-                    <span class="text-lg">+</span> Quick Add
-                </button>
+                <p class="text-xs text-gray-500 leading-relaxed">
+                    View only. Change state with the
+                    <code class="text-gray-300">clawpm</code> CLI.
+                </p>
             </div>
 
             <!-- Refresh -->
             <div class="p-4 pt-0">
-                <button onclick="location.reload()" 
+                <button onclick="location.reload()"
                         class="w-full px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg transition-colors text-sm text-gray-300">
                     ↻ Refresh
                 </button>
@@ -107,6 +106,7 @@
                     <span id="current-time"></span>
                 </div>
                 <div class="flex items-center gap-4">
+                    <span class="text-xs px-2 py-0.5 rounded-full bg-gray-100 text-gray-500">read-only</span>
                     <span id="status-indicator" class="flex items-center gap-2 text-sm text-gray-500">
                         <span class="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span>
                         Connected
@@ -179,82 +179,6 @@
         </main>
     </div>
 
-    <!-- Quick Add Modal -->
-    <div id="quick-add-modal" class="fixed inset-0 bg-black/50 hidden z-50 flex items-center justify-center">
-        <div class="bg-white rounded-xl shadow-2xl w-full max-w-2xl max-h-[80vh] overflow-hidden">
-            <div class="px-6 py-4 border-b border-gray-200 flex items-center justify-between">
-                <h2 class="text-lg font-semibold text-gray-900">Quick Add</h2>
-                <button onclick="toggleQuickAdd()" class="text-gray-400 hover:text-gray-600 text-2xl">&times;</button>
-            </div>
-            <div class="p-6 grid md:grid-cols-2 gap-6 overflow-auto">
-                <!-- Task Form -->
-                <div>
-                    <h3 class="text-sm font-semibold text-gray-700 mb-3 uppercase tracking-wide">New Task</h3>
-                    <form id="task-form" class="space-y-3">
-                        <select id="task-project" required
-                                class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-claw-500 focus:border-transparent"></select>
-                        <input type="text" id="task-title" placeholder="Task title" required
-                               class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-claw-500 focus:border-transparent">
-                        <div class="flex gap-2">
-                            <input type="number" id="task-priority" placeholder="Pri" value="3" min="1" max="5"
-                                   class="w-20 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-claw-500 focus:border-transparent">
-                            <select id="task-complexity"
-                                    class="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-claw-500 focus:border-transparent">
-                                <option value="s">Small</option>
-                                <option value="m" selected>Medium</option>
-                                <option value="l">Large</option>
-                                <option value="xl">XL</option>
-                            </select>
-                        </div>
-                        <textarea id="task-desc" placeholder="Description (optional)" rows="2"
-                                  class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-claw-500 focus:border-transparent"></textarea>
-                        <button type="submit"
-                                class="w-full px-4 py-2 bg-gray-900 text-white rounded-lg hover:bg-gray-800 transition-colors text-sm font-medium">
-                            Add Task
-                        </button>
-                    </form>
-                </div>
-
-                <!-- Issue Form -->
-                <div>
-                    <h3 class="text-sm font-semibold text-gray-700 mb-3 uppercase tracking-wide">New Issue</h3>
-                    <form id="issue-form" class="space-y-3">
-                        <select id="issue-project" required
-                                class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-claw-500 focus:border-transparent"></select>
-                        <div class="flex gap-2">
-                            <select id="issue-type"
-                                    class="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-claw-500 focus:border-transparent">
-                                <option value="bug">Bug</option>
-                                <option value="ux">UX</option>
-                                <option value="docs">Docs</option>
-                                <option value="feature">Feature</option>
-                            </select>
-                            <select id="issue-severity"
-                                    class="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-claw-500 focus:border-transparent">
-                                <option value="high">High</option>
-                                <option value="medium" selected>Medium</option>
-                                <option value="low">Low</option>
-                            </select>
-                        </div>
-                        <input type="text" id="issue-command" placeholder="Command (optional)"
-                               class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-claw-500 focus:border-transparent">
-                        <input type="text" id="issue-expected" placeholder="Expected result"
-                               class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-claw-500 focus:border-transparent">
-                        <input type="text" id="issue-actual" placeholder="Actual result"
-                               class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-claw-500 focus:border-transparent">
-                        <button type="submit"
-                                class="w-full px-4 py-2 bg-gray-900 text-white rounded-lg hover:bg-gray-800 transition-colors text-sm font-medium">
-                            Add Issue
-                        </button>
-                    </form>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Toast container -->
-    <div id="toast-container" class="fixed bottom-4 right-4 z-50 space-y-2"></div>
-
     <script>
         // Update time
         function updateTime() {
@@ -262,38 +186,6 @@
         }
         updateTime();
         setInterval(updateTime, 1000);
-
-        // Quick Add Modal
-        function toggleQuickAdd() {
-            const modal = document.getElementById('quick-add-modal');
-            modal.classList.toggle('hidden');
-        }
-        
-        // Close modal on escape
-        document.addEventListener('keydown', e => {
-            if (e.key === 'Escape') {
-                document.getElementById('quick-add-modal').classList.add('hidden');
-            }
-        });
-
-        // Toast notification system
-        function showToast(message, type = 'info') {
-            const container = document.getElementById('toast-container');
-            const toast = document.createElement('div');
-            const colors = {
-                success: 'bg-green-600',
-                error: 'bg-red-600',
-                info: 'bg-gray-800'
-            };
-            toast.className = `${colors[type]} text-white px-4 py-3 rounded-lg shadow-lg text-sm max-w-sm transform transition-all duration-300 translate-x-full`;
-            toast.textContent = message;
-            container.appendChild(toast);
-            requestAnimationFrame(() => toast.classList.remove('translate-x-full'));
-            setTimeout(() => {
-                toast.classList.add('translate-x-full');
-                setTimeout(() => toast.remove(), 300);
-            }, 3000);
-        }
 
         async function fetchData(url, handler) {
             try {
@@ -320,7 +212,7 @@
         fetchData('/api/blockers', data => {
             document.getElementById('stat-blockers').textContent = data.length;
             document.getElementById('blocker-count').textContent = data.length;
-            
+
             const el = document.getElementById('blockers-content');
             if (!data.length) {
                 el.innerHTML = '<p class="text-green-600 font-medium text-sm">No blockers 🎉</p>';
@@ -335,51 +227,15 @@
                         </div>
                         ${stateBadge('blocked')}
                     </div>
-                    <div class="mt-2 space-y-2">
-                        <textarea id="response-${b.task.id}" placeholder="Response..." rows="1"
-                                  class="w-full px-2 py-1.5 border border-gray-300 rounded text-sm focus:ring-2 focus:ring-red-500 focus:border-transparent"></textarea>
-                        <div class="flex items-center justify-between">
-                            <label class="flex items-center gap-1.5 text-xs text-gray-600">
-                                <input type="checkbox" id="unblock-${b.task.id}" class="rounded border-gray-300 text-red-600 focus:ring-red-500">
-                                Unblock
-                            </label>
-                            <button onclick="submitResponse('${b.project}', '${b.task.id}')"
-                                    class="px-2 py-1 bg-red-600 text-white rounded hover:bg-red-700 transition-colors text-xs font-medium">
-                                Submit
-                            </button>
-                        </div>
-                    </div>
                 </div>
             `).join('');
         });
-
-        async function submitResponse(project, taskId) {
-            const response = document.getElementById(`response-${taskId}`).value;
-            const unblock = document.getElementById(`unblock-${taskId}`).checked;
-            if (!response.trim()) return;
-            try {
-                const res = await fetch(`/api/tasks/${project}/${taskId}/respond`, {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({response, unblock})
-                });
-                const data = await res.json();
-                if (data.success) {
-                    showToast('Response submitted', 'success');
-                    setTimeout(() => location.reload(), 500);
-                } else {
-                    showToast('Failed: ' + (data.error || 'unknown'), 'error');
-                }
-            } catch (err) {
-                showToast('Error: ' + err.message, 'error');
-            }
-        }
 
         // Load active tasks
         fetchData('/api/active-tasks', data => {
             document.getElementById('stat-active').textContent = data.length;
             document.getElementById('task-count').textContent = data.length;
-            
+
             const el = document.getElementById('active-tasks');
             if (!data.length) {
                 el.innerHTML = '<p class="text-gray-400 italic text-sm">No active tasks</p>';
@@ -400,7 +256,7 @@
         fetchData('/api/projects', data => {
             document.getElementById('stat-projects').textContent = data.filter(p => p.status === 'active').length;
             document.getElementById('project-count').textContent = data.length;
-            
+
             const el = document.getElementById('projects-content');
             if (!data.length) {
                 el.innerHTML = '<p class="text-gray-400 italic text-sm">No projects</p>';
@@ -412,51 +268,10 @@
                         <span class="font-medium text-gray-900 text-sm">${p.name}</span>
                         <p class="text-xs text-gray-500">P${p.priority} · ${p.labels.join(', ') || 'No labels'}</p>
                     </div>
-                    <div class="flex items-center gap-2 flex-shrink-0">
-                        <span class="text-xs px-1.5 py-0.5 rounded ${p.status === 'active' ? 'bg-green-100 text-green-700' : 'bg-gray-200 text-gray-600'}">${p.status}</span>
-                        ${p.status === 'active' ?
-                            `<button onclick="pauseProject('${p.id}')" class="text-xs text-gray-500 hover:text-gray-700">⏸</button>` :
-                            p.status === 'paused' ?
-                            `<button onclick="resumeProject('${p.id}')" class="text-xs text-green-600 hover:text-green-700">▶</button>` : ''}
-                    </div>
+                    <span class="text-xs px-1.5 py-0.5 rounded ${p.status === 'active' ? 'bg-green-100 text-green-700' : 'bg-gray-200 text-gray-600'}">${p.status}</span>
                 </div>
             `).join('');
-            
-            // Populate dropdowns
-            const options = data.map(p => `<option value="${p.id}">${p.name}</option>`).join('');
-            document.getElementById('task-project').innerHTML = options;
-            document.getElementById('issue-project').innerHTML = options;
         });
-
-        async function pauseProject(projectId) {
-            try {
-                const res = await fetch(`/api/projects/${projectId}/pause`, {method: 'POST'});
-                const data = await res.json();
-                if (data.success) {
-                    showToast('Project paused', 'info');
-                    setTimeout(() => location.reload(), 500);
-                } else {
-                    showToast('Failed: ' + (data.error || 'unknown'), 'error');
-                }
-            } catch (err) {
-                showToast('Error: ' + err.message, 'error');
-            }
-        }
-
-        async function resumeProject(projectId) {
-            try {
-                const res = await fetch(`/api/projects/${projectId}/resume`, {method: 'POST'});
-                const data = await res.json();
-                if (data.success) {
-                    showToast('Project resumed', 'success');
-                    setTimeout(() => location.reload(), 500);
-                } else {
-                    showToast('Failed: ' + (data.error || 'unknown'), 'error');
-                }
-            } catch (err) {
-                showToast('Error: ' + err.message, 'error');
-            }
-        }
 
         // Load work log
         fetchData('/api/worklog?limit=8', data => {
@@ -477,67 +292,6 @@
                     <p class="text-xs text-gray-400 mt-0.5">${new Date(e.ts).toLocaleString()}</p>
                 </div>
             `).join('');
-        });
-
-        // Form handlers
-        document.getElementById('task-form').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const req = {
-                project: document.getElementById('task-project').value,
-                title: document.getElementById('task-title').value,
-                priority: parseInt(document.getElementById('task-priority').value),
-                complexity: document.getElementById('task-complexity').value,
-                description: document.getElementById('task-desc').value,
-            };
-            try {
-                const res = await fetch('/api/tasks', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(req)
-                });
-                const data = await res.json();
-                if (data.success) {
-                    showToast('Task created: ' + data.task.id, 'success');
-                    document.getElementById('task-form').reset();
-                    toggleQuickAdd();
-                    setTimeout(() => location.reload(), 500);
-                } else {
-                    showToast('Failed: ' + (data.error || 'unknown'), 'error');
-                }
-            } catch (err) {
-                showToast('Error: ' + err.message, 'error');
-            }
-        });
-
-        document.getElementById('issue-form').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const req = {
-                project: document.getElementById('issue-project').value,
-                type: document.getElementById('issue-type').value,
-                severity: document.getElementById('issue-severity').value,
-                command: document.getElementById('issue-command').value,
-                expected: document.getElementById('issue-expected').value,
-                actual: document.getElementById('issue-actual').value,
-                context: document.getElementById('issue-context').value,
-            };
-            try {
-                const res = await fetch('/api/issues', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(req)
-                });
-                const data = await res.json();
-                if (data.success) {
-                    showToast('Issue logged', 'success');
-                    document.getElementById('issue-form').reset();
-                    toggleQuickAdd();
-                    setTimeout(() => location.reload(), 500);
-                } else {
-                    showToast('Failed: ' + (data.error || 'unknown'), 'error');
-                }
-            } catch (err) {
-                showToast('Error: ' + err.message, 'error');
-            }
         });
     </script>
 </body>
