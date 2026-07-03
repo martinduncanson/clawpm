@@ -15,7 +15,7 @@ if sys.version_info >= (3, 11):
 else:
     import tomli as tomllib
 
-import yaml
+from .frontmatter import FrontmatterError, split_frontmatter
 
 
 class ProjectStatus(str, Enum):
@@ -500,18 +500,15 @@ class Task:
         else:
             state = TaskState.OPEN
 
-        # Parse frontmatter
-        frontmatter: dict[str, Any] = {}
-        content = text
-
-        if text.startswith("---"):
-            parts = text.split("---", 2)
-            if len(parts) >= 3:
-                try:
-                    frontmatter = yaml.safe_load(parts[1]) or {}
-                    content = parts[2].strip()
-                except yaml.YAMLError:
-                    pass
+        # Parse frontmatter (lenient: any malformation -> {} + full text as
+        # content, matching the pre-CLAWP-079 hand-rolled behaviour).
+        frontmatter: dict[str, Any]
+        try:
+            frontmatter, body = split_frontmatter(text)
+            content = body.strip()
+        except FrontmatterError:
+            frontmatter = {}
+            content = text
 
         # Extract title from first heading
         title = frontmatter.get("id", path.stem)
@@ -773,18 +770,15 @@ class Research:
         """Load research from markdown file with YAML frontmatter."""
         text = path.read_text(encoding="utf-8")
 
-        # Parse frontmatter
-        frontmatter: dict[str, Any] = {}
-        content = text
-
-        if text.startswith("---"):
-            parts = text.split("---", 2)
-            if len(parts) >= 3:
-                try:
-                    frontmatter = yaml.safe_load(parts[1]) or {}
-                    content = parts[2].strip()
-                except yaml.YAMLError:
-                    pass
+        # Parse frontmatter (lenient: any malformation -> {} + full text as
+        # content, matching the pre-CLAWP-079 hand-rolled behaviour).
+        frontmatter: dict[str, Any]
+        try:
+            frontmatter, body = split_frontmatter(text)
+            content = body.strip()
+        except FrontmatterError:
+            frontmatter = {}
+            content = text
 
         # Extract title from first heading
         title = frontmatter.get("id", path.stem)
