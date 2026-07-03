@@ -83,8 +83,10 @@ def _rewrite_frontmatter_state(file_path: Path, new_state: str) -> None:
             # Malformed; refuse to silently break the file.
             raise ValueError(f"malformed frontmatter in {file_path}") from None
         elif exc.reason == "unparseable":
-            # Preserve the raw yaml.YAMLError (this site never wrapped it).
-            raise exc.__cause__ from None
+            # Preserve the raw yaml.YAMLError split attached as __cause__ (this
+            # site never wrapped it); fall back to the FrontmatterError itself
+            # if a caller ever constructed one without a chained cause.
+            raise (exc.__cause__ or exc) from None
         else:
             raise
     else:

@@ -54,7 +54,11 @@ class FrontmatterError(ValueError):
 
 
 def parse_frontmatter(text: str) -> tuple[Any, str]:
-    """Leniently parse YAML frontmatter. Never raises.
+    """Leniently parse YAML frontmatter. Never raises on ``str`` input.
+
+    YAML parse errors are swallowed (see below); only grossly invalid,
+    non-``str`` input could raise (e.g. ``AttributeError`` from ``.startswith``),
+    which every caller avoids by passing file text.
 
     Returns ``(data, body)``:
 
