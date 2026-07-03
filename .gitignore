@@ -22,6 +22,9 @@ uv.lock
 .claude/
 temp/
 
+# Harness-dumped MCP tool-schema caches (not clawpm source)
+mcps/
+
 # Example portfolio fixtures need .project/ committed for onboarding
 !examples/**/.project/
 !examples/**/.project/**
