@@ -226,6 +226,26 @@ clawpm tasks add -t "Title" [--priority 3] [--complexity m] [--parent <id>] [-b 
 clawpm tasks edit <id> [--title "..."] [--priority N] [--complexity s|m|l|xl] [--body "..."] [--scope "glob/**"]
 clawpm tasks state <id> open|progress|done|blocked [--note "..."] [--force]
 clawpm tasks split <id>                 # Convert to parent directory for subtasks
+clawpm tasks decompose <parent-id> --child "Title" --child '{"title":"...","success_criteria":["..."],"complexity":"m"}'
+                                        # Split into child subtasks, each with its own rubric; parent
+                                        # can't be DONE until all children are (CLAWP-037)
+clawpm tasks emit-rubric <id> [--format markdown|outcome-payload]
+                                        # Render success-criteria as a graded rubric (markdown for a
+                                        # Stop-hook/human, outcome-payload for Anthropic's define_outcome)
+clawpm tasks emit-tree [--dry-run] [--strict]
+                                        # Persist a fully-contracted task-tree atomically from a JSON doc
+                                        # on stdin. Validates all gates (reject-match, constitution,
+                                        # ID-collision, baseline) before writing anything. Zero LLM calls.
+                                        # This is the clawpm-planner emission target (CLAWP-056).
+clawpm tasks dispatch <id> [--worktree] [--target-dir PATH] [--lease-ttl N]
+                          [--fallback-policy requeue|route-secondary|escalate-to-human|fail]
+                          [--confirm-close] [--refute-votes N] [--confirm-stale] [-f]
+                                        # Write hook-wired .claude/settings.local.json so a hand-launched
+                                        # subagent is Stop-hook-gated until the rubric is satisfied
+                                        # (CLAWP-018). --worktree isolates parallel dispatches.
+clawpm tasks teardown-dispatch [<id>] [--target-dir PATH] [-f]
+                                        # Remove a dispatch settings.local.json (only clawpm-written ones
+                                        # unless --force).
 ```
 
 ### Scope Conflicts
@@ -266,6 +286,73 @@ clawpm issues add --type observation --severity low --tag depth-warning --summar
 clawpm issues list [--open] [--type observation] [--tag depth-warning]
 ```
 Types: `bug | ux | docs | feature | observation`. `observation` is for neutral signals worth logging (depth warnings, ergonomic gaps, calibration deltas) that aren't bugs. `--tag` is repeatable; `issues list --tag` matches any.
+
+### Parallel batch dispatch
+```bash
+clawpm next                             # Single next task
+clawpm next --batch                     # Next parallel batch (tasks sharing the lowest
+                                        # open parallel_group; group N+1 waits for group N)
+```
+Tag siblings with `tasks add --parallel-group N` to make them dispatch together.
+
+### Agentic dispatch (parent-spawned subagent, one command)
+```bash
+clawpm agent dispatch --prompt "<subagent brief>" \
+    --rubric-criteria "Tests pass" \
+    --rubric-criteria '{"criterion":"...","gradeable_signal":"...","comparator":"..."}' \
+    [--parent <id>] [--title "..."] [--agent-profile <p>] [--confirm-close] [--refute-votes N] \
+    [--no-codegraph] [--judge-cmd-override <cmd>]
+```
+Wraps the full cycle in one call (CLAWP-024): create subtask → worktree → dispatch settings →
+subprocess `claude --print` → judge grade against the rubric → mark DONE (+ reflection event)
+or BLOCKED (+ iteration event). Contrast with `tasks dispatch`, which only writes the hooks for
+a subagent you launch yourself.
+
+### Judge primitives
+```bash
+clawpm judge tournament --rubric-file <file> \
+    --candidate <fileA> --candidate <fileB> [--candidate ...] \
+    [--label <labelA> --label <labelB>] [--judge-cmd-override <cmd>]
+```
+Pairwise comparative selection across candidate deliverables (CLAWP-044). Each pair is judged in
+both position orders to cancel position bias; ambiguous pairs keep the higher seed (pass the
+strongest-prior candidate first). The winner is SELECTED, not certified — verify it through
+`hook eval-stop`.
+
+### Leases (crash-safe dispatch)
+```bash
+clawpm lease grant --task <id> --ttl <seconds> \
+    [--fallback-policy requeue|route-secondary|escalate-to-human|fail] \
+    [--holder <id>] [--target-dir <dir>]
+clawpm lease heartbeat --task <id> [--holder <id>]   # holder is alive (wired to the dispatch hook)
+clawpm lease list [-p <project>]                     # active leases + expiry + fallback
+clawpm lease release --task <id>                     # clean completion, no fallback on later sweeps
+clawpm lease sweep [--dry-run]                        # detect expired leases, apply fallback (no daemon)
+```
+A dispatched holder heartbeats while alive; if it goes silent past the TTL, a sweep (run by
+`clawpm doctor` and on the next `tasks dispatch`) transitions the task per its fallback policy
+(CLAWP-039). `tasks dispatch --lease-ttl` grants the lease inline.
+
+### Constitution (named invariants that constrain emission)
+```bash
+clawpm constitution add -n <name> \
+    -k require_success_criteria|max_complexity|require_scope|advisory \
+    [-d "description"] [--param KEY=VALUE ...]
+clawpm constitution list
+clawpm constitution remove -n <name>
+```
+Code-checkable or advisory invariants enforced by `tasks emit-tree`'s constitution gate.
+
+### Mission (macro binary-outcome layer above tasks)
+```bash
+clawpm mission add -t "Ship-able statement" -o "YES/NO check at deadline" [-d <days>] [-b "body"]
+clawpm mission add-goal <mission-id> --task <id> [--actor agent|human]  # link a task as a mini-goal
+clawpm mission list
+clawpm mission tasks <mission-id> [--actor agent|human]
+clawpm mission status <mission-id>                                       # progress + outcome state
+clawpm mission state <mission-id> active|complete|failed|cancelled
+```
+Tasks are a mission's mini-goals; the mission is the binary outcome they serve.
 
 ### Admin
 ```bash
@@ -530,16 +617,34 @@ clawpm reflect void --all-empty-actuals --reason "corpus cleanup — no actuals 
 - Original events are never modified; the void record is a separate appended line.
 - `clawpm tasks show <id>` includes `"reflections_voided": true` when any void entry exists.
 
-### Phase 2 stubs
+### Calibration queries (shipped — CLAWP-040)
 
-The following commands are stubbed and return `{"status": "phase2_pending", ...}`:
+The calibration loop is live. These read the reflection corpus and calibrate
+estimates deterministically (no model call):
 
 ```bash
-clawpm reflect summarize        # aggregate accuracy stats across completed tasks
-clawpm reflect suggest <task>   # suggest calibrated predictions from history
-clawpm reflect history-import   # import historical sessions as reflection events
-                                #   (requires --source <dir> or CLAWPM_HISTORY_SOURCE)
+# Measurement half — aggregate actual/predicted duration ratios, bucketed by
+# complexity / confidence / agent_profile. Rows with no usable actual are
+# flagged dirty and excluded. Omit --project to span all projects.
+clawpm reflect summarize [-p <project>]
+
+# Application half — deflate an estimate by the learned ratio. Two modes:
+clawpm reflect suggest <task-id>                       # derive complexity/confidence/
+                                                       #   predicted-duration from the task
+clawpm reflect suggest --complexity m --predicted-duration 6h
+                                                       # calibrate a bare gut estimate
+#   Optional: --confidence N --agent-profile <p> --min-bucket N
+#   Falls back to the global ratio when the complexity bucket has < --min-bucket samples.
+
+# Scan session transcripts / agent logs for task mentions and return an
+# aggregate report. Source: --source <dir> or CLAWPM_HISTORY_SOURCE.
+clawpm reflect history-import [--source <dir>]
+#   Currently reports mentions only; writing reflection events back to the
+#   corpus is Phase 3 (the operator decides what to do with the report).
 ```
+
+`reflect void` (documented above) completes the group — mark bad-data events
+void without deleting them.
 
 ## Tips
 
@@ -687,20 +792,25 @@ clawpm is the task layer. Other skills/plugins handle specialised lifecycle mome
 | Task creation, before any code | **`feature-dev`** | 7-phase guided workflow (explore → ask → architect → plan → implement → review → reflect). Particularly valuable when complexity is `l`/`xl` or `predict-pitfalls` is non-empty. Seed clawpm subtasks per phase. |
 | Before commit | **`commit-commands /commit`** | Auto-drafts commit message from staged changes; we can add `Closes <task-id>` to the message and capture the SHA in `clawpm log commit` after. |
 | Between commit and push (non-trivial diff) | **PRE-REVIEW subagent** | Reviewer subagent on the diff with no other context — catches what the implementer missed in self-review. See `codex-review` §3 for the canonical rule (skip for pure docs/config or ≤50 LOC AND mechanical; never skip for auth/serialization/data-storage/silently-failing invariants). Eats ~50% of what Codex would catch, locally, for ~30-60 sec wall-clock. |
-| After commit, before PR | **`codex-review` (Codex + Gemini)** | Codex (GitHub app) is the standing bot reviewer: cross-cutting correctness, hypothesis-driven bug finding, operating-context-aware, *downstream* of the local PRE-REVIEW layer. **Gemini Code Assist is elevated to a parallel primary for impactful/complex PRs** (complexity l/xl; auth/serialization/data-storage; high blast radius; ≥~300 LOC; or operator-flagged) — run both, wait for both (`wait-for-codex.py --only codex` ‖ `--only gemini`), triage the union. Different model family = it catches bugs Codex misses, proven on recent reviews. Routine PRs stay Codex-only (PRE-REVIEW is the second surface). Selective: `.gemini/config.yaml` keeps auto-review off; BRIEF posts `/gemini review` only when the trigger fires. Full trigger + dual-wait mechanics in `codex-review` SKILL.md §5.5. Findings → `clawpm issues add`. **Deprecated:** PR-Agent (descriptive-only). **Not in pipeline:** CodeRabbit (paid, unsubscribed). |
+| After commit, before PR | **`codex-review` (four surfaces)** | The standing code-PR review set is **four surfaces** (2026-06-30): **Codex** (GitHub app bot — cross-cutting correctness, hypothesis-driven bug finding, operating-context-aware) plus three local co-primaries run via `local_review.py`: **grok-build**, **grok-composer** (two separate standing xAI surfaces), and **Antigravity** (Gemini 3.x family via the official Google Antigravity SDK, `--engine antigravity`). All four are downstream of the local PRE-REVIEW layer; different model families catch different bug shapes, and `find_divergence.py` logs per-surface findings for cross-model correlation. Full mechanics in `codex-review` SKILL.md §5.5. Findings → `clawpm issues add`. **Retired:** the Gemini Code Assist GitHub bot + free-tier CLI (sunset 2026-06-24; the Gemini *family* is restored via the Antigravity SDK, not the bot). PR-Agent (descriptive-only) and CodeRabbit (paid, unsubscribed) are not in the pipeline. |
 | Before merge (if PR is non-trivial) | **`pr-review-toolkit /review-pr`** | Six specialist agents (silent-failure-hunter, type-design-analyzer, comment-analyzer, pr-test-analyzer, code-reviewer, code-simplifier). Use selectively — silent-failure-hunter for any fix involving `try/except`, type-design-analyzer for new public types, etc. Findings → `clawpm issues add`. |
 | Confidence-scored second opinion | **`code-review`** | Multi-agent independent review with confidence scoring to filter false positives. Useful for high-stakes merges where Codex alone isn't enough. |
 | Branch cleanup | **`commit-commands /clean_gone`** | After PRs land — reaps branches whose remotes are gone. Worth running after `clawpm done` for tasks that resulted in merged PRs. |
 | Cowork session start | **`clawpm-cowork`** | Bootstraps the ephemeral Cowork VM with portfolio repo + clawpm install + context resume. |
 
-### Doctrine: layered review — surfaces scale with blast radius
+### Doctrine: layered review — independent surfaces, different model families
 
-Redundancy comes from **independent surfaces**, not from stacking bots on every PR. Two layers always run: the local PRE-REVIEW layer (Claude + `pr-review-toolkit` specialists) upstream, and a bot layer downstream. The bot layer scales with blast radius:
+Redundancy comes from **independent surfaces**, not from stacking bots on every PR. Two layers always run: the local PRE-REVIEW layer (Claude + `pr-review-toolkit` specialists) upstream, and a review layer downstream.
 
-- **Routine PRs:** Codex alone is the bot primary. PRE-REVIEW + Codex = the two independent surfaces.
-- **Impactful/complex PRs** (complexity l/xl; auth/serialization/data-storage; high blast radius — auto-deploy/schema-migration/breaking-API/security/major-dep-bump; ≥~300 LOC; or operator-flagged): **Codex + Gemini both primary, in parallel.** Run both, wait for both, triage the union. Gemini's different model family catches bugs Codex misses — demonstrated on recent impactful reviews, which is why it was elevated from on-demand to parallel-primary. Mechanics (trigger list, dual-wait via `wait-for-codex.py --only`) live in `codex-review` SKILL.md §5.5.
+The downstream layer's default for code PRs is **four surfaces** (2026-06-30), all local-or-bot and all logged for cross-model correlation:
 
-Selective by design: `.gemini/config.yaml` keeps auto-review-on-open off so Gemini is silent on trivial PRs; it's summoned (`/gemini review`) only when a trigger fires. The earlier "reviewer triangle" assumed paid CodeRabbit + PR-Agent; neither is in the pipeline now (CodeRabbit unsubscribed; PR-Agent deprecated as descriptive-only).
+- **Codex** — the GitHub-app bot (`chatgpt-codex-connector[bot]`); detect its reply via `wait-for-codex.py`, never the comments endpoint.
+- **grok-build** and **grok-composer** — two separate standing xAI surfaces, run locally via `local_review.py --engine grok` (read-only, diff embedded in the prompt).
+- **Antigravity** — the Gemini 3.x family via the official Google Antigravity SDK, `local_review.py --engine antigravity` (isolated `.venv-antigravity`, read-only, text-only).
+
+Different model families catch different bug shapes; `find_divergence.py` reports per-surface unique/divergent findings so the set can be pruned or escalated over time. Each surface's verdict is a hint — read the body and triage like Codex; none is a sole gate on recovery/ingest/spec-critical merges, which want the operator's eyes.
+
+**Retired:** the Gemini **Code Assist** GitHub bot and its free-tier CLI were sunset 2026-06-24 — do not summon `/gemini review` and do not treat that bot as a parallel primary. The Gemini *family* lives on only through the Antigravity SDK surface above. The earlier "reviewer triangle" assumed paid CodeRabbit + PR-Agent; neither is in the pipeline now (CodeRabbit unsubscribed; PR-Agent deprecated as descriptive-only). Mechanics for all surfaces live in `codex-review` SKILL.md §5.5.
 
 The "Between commit and push" gate (PRE-REVIEW) is **upstream of the bot layer**. The diff that arrives at Codex already survived a self-review pass, so the bot review shifts from "find bugs" mode to "sanity-check the implementer's stated uncertainties" mode (provided the briefing carries 3-5 named concerns per the codex-review skill's template requirement). Round-1-clean reviews become the norm.
 
