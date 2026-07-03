@@ -1035,10 +1035,11 @@ def edit_task(
                     "refusing to edit (would corrupt the file)."
                 ) from None
             else:
+                cause = exc.__cause__ or exc
                 raise ValueError(
                     f"Task {task_id} frontmatter is unparseable; refusing "
-                    f"to edit (would corrupt the file): {exc.__cause__}"
-                ) from exc.__cause__
+                    f"to edit (would corrupt the file): {cause}"
+                ) from cause
 
         # Update frontmatter fields
         if priority is not None:

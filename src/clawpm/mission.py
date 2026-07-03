@@ -412,9 +412,10 @@ def add_mission_mini_goal(
                 raise ValueError(f"Task {task_id} has no frontmatter") from None
             if exc.reason == "unterminated":
                 raise ValueError(f"Task {task_id} frontmatter malformed") from None
+            cause = exc.__cause__ or exc
             raise ValueError(
-                f"Task {task_id} frontmatter unparseable: {exc.__cause__}"
-            ) from exc.__cause__
+                f"Task {task_id} frontmatter unparseable: {cause}"
+            ) from cause
         fm["parent_mission"] = mission_id
         fm["actor"] = actor
         new_text = (
