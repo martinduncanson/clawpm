@@ -10,6 +10,7 @@ from pathlib import Path
 import yaml
 
 from .concurrency import file_lock, retry_transient
+from .frontmatter import FrontmatterError, parse_frontmatter, split_frontmatter
 from .models import Task, TaskState, TaskComplexity, Predictions, PortfolioConfig
 from .discovery import get_project_dir, find_project_dir_fallback
 
@@ -368,20 +369,10 @@ def _write_rejection_frontmatter(
     ``rationale`` and (if given) ``supersedes``.
     """
     text = file_path.read_text(encoding="utf-8")
-    if text.startswith("---"):
-        parts = text.split("---", 2)
-        if len(parts) >= 3:
-            try:
-                fm: dict = yaml.safe_load(parts[1]) or {}
-            except yaml.YAMLError:
-                fm = {}
-            body = parts[2]
-        else:
-            fm = {}
-            body = text
-    else:
-        fm = {}
-        body = text
+    # Lenient parse: unparseable YAML drops to fm={} while keeping the raw body,
+    # so the rewrite replaces the bad frontmatter rather than doubling it. An
+    # absent/unterminated fence keeps body=text and synthesises a fence below.
+    fm, body = parse_frontmatter(text)
 
     fm["rationale"] = rationale
     if supersedes:
@@ -1088,33 +1079,27 @@ def edit_task(
 
         text = task.file_path.read_text(encoding="utf-8")
 
-        # Parse frontmatter and content
-        frontmatter: dict = {}
-        content = text
-
-        if text.startswith("---"):
-            parts = text.split("---", 2)
-            if len(parts) < 3:
-                # Starts with --- but has no closing fence. Falling through with
-                # frontmatter={}, content=text would rebuild a double-frontmatter,
-                # metadata-wiped file (same hazard as the unparseable case below).
-                # Refuse rather than corrupt (Codex review).
+        # Parse frontmatter and content. An absent fence falls through with
+        # frontmatter={}, content=text (a fence is synthesised on rebuild). An
+        # unterminated or unparseable fence is refused rather than rebuilt into
+        # a double-frontmatter, metadata-wiped file (Codex / Grok review).
+        frontmatter: dict
+        try:
+            frontmatter, content = split_frontmatter(text)
+        except FrontmatterError as exc:
+            if exc.reason == "absent":
+                frontmatter, content = {}, text
+            elif exc.reason == "unterminated":
                 raise ValueError(
                     f"Task {task_id} has an unterminated frontmatter fence; "
                     "refusing to edit (would corrupt the file)."
-                )
-            try:
-                frontmatter = yaml.safe_load(parts[1]) or {}
-                content = parts[2]
-            except yaml.YAMLError as exc:
-                # Do NOT swallow: leaving content=text (the original,
-                # frontmatter-bearing bytes) and an empty frontmatter would
-                # rebuild a double-frontmatter, field-wiped file. Refuse to
-                # edit a task whose frontmatter we can't parse (Grok review).
+                ) from None
+            else:
+                cause = exc.__cause__ or exc
                 raise ValueError(
                     f"Task {task_id} frontmatter is unparseable; refusing "
-                    f"to edit (would corrupt the file): {exc}"
-                ) from exc
+                    f"to edit (would corrupt the file): {cause}"
+                ) from cause
 
         # Update frontmatter fields
         if priority is not None:
@@ -1256,15 +1241,10 @@ def _append_child_to_parent_frontmatter(
     if parent_path.name != "_task.md" or not parent_path.exists():
         return
     text = parent_path.read_text(encoding="utf-8")
-    if not text.startswith("---"):
-        return
-    parts = text.split("---", 2)
-    if len(parts) < 3:
-        return
     try:
-        fm = yaml.safe_load(parts[1]) or {}
-    except yaml.YAMLError:
-        return
+        fm, raw_body = split_frontmatter(text)
+    except FrontmatterError:
+        return  # no/malformed frontmatter — nothing to persist into
     children = fm.get("children")
     if not isinstance(children, list):
         children = []
@@ -1272,7 +1252,7 @@ def _append_child_to_parent_frontmatter(
         return  # idempotent
     children.append(child_id)
     fm["children"] = children
-    body = parts[2].lstrip("\n")
+    body = raw_body.lstrip("\n")
     new_text = (
         "---\n"
         + yaml.dump(fm, default_flow_style=False, allow_unicode=True).strip()

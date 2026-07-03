@@ -12,6 +12,7 @@ import click
 
 from . import __version__
 from .concurrency import LockTimeout
+from .frontmatter import parse_frontmatter
 from .models import (
     ProjectStatus,
     SuccessCriterion,
@@ -842,15 +843,14 @@ def project_doctor(
                 })
                 text = raw.decode("utf-8", errors="replace")
             fm_state: str | None = None
-            if text.startswith("---"):
-                import yaml as _yaml
-                parts_split = text.split("---", 2)
-                if len(parts_split) >= 3:
-                    try:
-                        fm = _yaml.safe_load(parts_split[1]) or {}
-                        fm_state = fm.get("state")
-                    except Exception:
-                        pass
+            # Defensive: one unreadable/odd file must never abort the whole
+            # doctor drift walk (matches the pre-CLAWP-079 broad guard here).
+            try:
+                fm, _ = parse_frontmatter(text)
+                if isinstance(fm, dict):
+                    fm_state = fm.get("state")
+            except Exception:
+                pass
 
             if fm_state and fm_state != location_state:
                 drift_tasks.append({

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import yaml
 
+from .frontmatter import FrontmatterError, split_frontmatter
 from .models import Research, ResearchType, ResearchStatus, PortfolioConfig
 from .discovery import get_project_dir
 
@@ -169,35 +170,30 @@ def link_research_session(
     # Read current content
     text = item.file_path.read_text(encoding="utf-8")
 
-    # Parse and update frontmatter
-    if text.startswith("---"):
-        parts = text.split("---", 2)
-        if len(parts) >= 3:
-            try:
-                frontmatter = yaml.safe_load(parts[1]) or {}
+    # Parse and update frontmatter — skip (return None) on any malformation.
+    try:
+        frontmatter, body = split_frontmatter(text)
+    except FrontmatterError:
+        return None
 
-                # Add openclaw section
-                frontmatter["openclaw"] = {
-                    "child_session_key": session_key,
-                    "spawned_at": date.today().isoformat(),
-                }
-                if run_id:
-                    frontmatter["openclaw"]["run_id"] = run_id
-                if spawned_by:
-                    frontmatter["openclaw"]["spawned_by"] = spawned_by
+    # Add openclaw section
+    frontmatter["openclaw"] = {
+        "child_session_key": session_key,
+        "spawned_at": date.today().isoformat(),
+    }
+    if run_id:
+        frontmatter["openclaw"]["run_id"] = run_id
+    if spawned_by:
+        frontmatter["openclaw"]["spawned_by"] = spawned_by
 
-                # Update status
-                frontmatter["status"] = "in-progress"
+    # Update status
+    frontmatter["status"] = "in-progress"
 
-                # Rebuild content
-                new_content = f"""---
+    # Rebuild content
+    new_content = f"""---
 {yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True).strip()}
----{parts[2]}"""
+---{body}"""
 
-                item.file_path.write_text(new_content, encoding="utf-8")
+    item.file_path.write_text(new_content, encoding="utf-8")
 
-                return Research.from_file(item.file_path)
-            except yaml.YAMLError:
-                pass
-
-    return None
+    return Research.from_file(item.file_path)

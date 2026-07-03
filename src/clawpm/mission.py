@@ -41,6 +41,7 @@ from typing import Any
 import yaml
 
 from .discovery import get_project_dir
+from .frontmatter import FrontmatterError, split_frontmatter
 from .models import PortfolioConfig, Task, TaskState
 from .tasks import list_tasks
 
@@ -123,16 +124,13 @@ class Mission:
     @classmethod
     def from_file(cls, path: Path) -> "Mission":
         text = path.read_text(encoding="utf-8")
-        frontmatter: dict[str, Any] = {}
-        content = text
-        if text.startswith("---"):
-            parts = text.split("---", 2)
-            if len(parts) >= 3:
-                try:
-                    frontmatter = yaml.safe_load(parts[1]) or {}
-                    content = parts[2].strip()
-                except yaml.YAMLError:
-                    pass
+        frontmatter: dict[str, Any]
+        try:
+            frontmatter, body = split_frontmatter(text)
+            content = body.strip()
+        except FrontmatterError:
+            frontmatter = {}
+            content = text
         title = frontmatter.get("title", path.stem)
         for line in content.split("\n"):
             if line.startswith("# "):
@@ -407,22 +405,24 @@ def add_mission_mini_goal(
                 "concurrent session; retry the mini-goal link."
             )
         text = task.file_path.read_text(encoding="utf-8")
-        if not text.startswith("---"):
-            raise ValueError(f"Task {task_id} has no frontmatter")
-        parts = text.split("---", 2)
-        if len(parts) < 3:
-            raise ValueError(f"Task {task_id} frontmatter malformed")
         try:
-            fm = yaml.safe_load(parts[1]) or {}
-        except yaml.YAMLError as exc:
-            raise ValueError(f"Task {task_id} frontmatter unparseable: {exc}") from exc
+            fm, body = split_frontmatter(text)
+        except FrontmatterError as exc:
+            if exc.reason == "absent":
+                raise ValueError(f"Task {task_id} has no frontmatter") from None
+            if exc.reason == "unterminated":
+                raise ValueError(f"Task {task_id} frontmatter malformed") from None
+            cause = exc.__cause__ or exc
+            raise ValueError(
+                f"Task {task_id} frontmatter unparseable: {cause}"
+            ) from cause
         fm["parent_mission"] = mission_id
         fm["actor"] = actor
         new_text = (
             "---\n"
             + yaml.dump(fm, default_flow_style=False, allow_unicode=True).rstrip()
             + "\n---"
-            + parts[2]
+            + body
         )
         original_text = text  # for rollback if the mission rewrite fails
         tmp = task.file_path.with_suffix(".tmp")
@@ -465,19 +465,27 @@ def _rewrite_mission(mission: Mission) -> None:
     if mission.file_path is None:
         raise ValueError("Mission has no file path")
     text = mission.file_path.read_text(encoding="utf-8")
-    if not text.startswith("---"):
-        raise ValueError("Mission file has no frontmatter")
-    parts = text.split("---", 2)
-    if len(parts) < 3:
-        raise ValueError("Mission frontmatter malformed")
-    fm = yaml.safe_load(parts[1]) or {}
+    try:
+        fm, body = split_frontmatter(text)
+    except FrontmatterError as exc:
+        if exc.reason == "absent":
+            raise ValueError("Mission file has no frontmatter") from None
+        if exc.reason == "unterminated":
+            raise ValueError("Mission frontmatter malformed") from None
+        if exc.reason == "unparseable":
+            # Preserve the pre-CLAWP-079 behaviour of propagating the raw
+            # yaml.YAMLError attached as __cause__ (this site never wrapped it);
+            # fall back to the FrontmatterError if a caller ever built one
+            # without a chained cause.
+            raise (exc.__cause__ or exc) from None
+        raise
     fm["status"] = mission.status
     fm["mini_goals"] = [g.to_dict() for g in mission.mini_goals]
     new_text = (
         "---\n"
         + yaml.dump(fm, default_flow_style=False, allow_unicode=True, sort_keys=False).rstrip()
         + "\n---"
-        + parts[2]
+        + body
     )
     from .concurrency import retry_transient
     tmp = mission.file_path.with_suffix(".tmp")

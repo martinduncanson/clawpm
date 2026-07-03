@@ -25,6 +25,7 @@ from typing import Any
 
 import yaml
 
+from .frontmatter import FrontmatterError, parse_frontmatter, split_frontmatter
 from .models import (
     Predictions,
     ResearchType,
@@ -477,13 +478,10 @@ def _existing_child_nums(tasks_dir: Path, parent_id: str) -> set[int]:
         if pf.exists():
             try:
                 text = pf.read_text(encoding="utf-8")
-                if text.startswith("---"):
-                    parts = text.split("---", 2)
-                    if len(parts) >= 3:
-                        fm = yaml.safe_load(parts[1]) or {}
-                        for cid in (fm.get("children") or []):
-                            if isinstance(cid, str) and cid.startswith(parent_id + "-"):
-                                _record(cid)
+                fm, _ = parse_frontmatter(text)
+                for cid in (fm.get("children") or []):
+                    if isinstance(cid, str) and cid.startswith(parent_id + "-"):
+                        _record(cid)
             except Exception:
                 pass
 
@@ -554,13 +552,10 @@ def _resolve_idempotency(
         for f in parent_dir.glob(f"{parent_id}-*.md"):
             try:
                 text = f.read_text(encoding="utf-8")
-                if text.startswith("---"):
-                    parts = text.split("---", 2)
-                    if len(parts) >= 3:
-                        fm = yaml.safe_load(parts[1]) or {}
-                        lk = fm.get("leaf_key")
-                        if lk and lk in leaf_keys:
-                            already_emitted.append(lk)
+                fm, _ = parse_frontmatter(text)
+                lk = fm.get("leaf_key")
+                if lk and lk in leaf_keys:
+                    already_emitted.append(lk)
             except Exception:
                 pass
 
@@ -1270,19 +1265,14 @@ def _stamp_prd_ref(task_file: Path, prd_ref: str) -> None:
     if not task_file.exists():
         return
     text = task_file.read_text(encoding="utf-8")
-    if not text.startswith("---"):
-        return
-    parts = text.split("---", 2)
-    if len(parts) < 3:
-        return
     try:
-        fm = yaml.safe_load(parts[1]) or {}
-    except yaml.YAMLError:
-        return
+        fm, raw_body = split_frontmatter(text)
+    except FrontmatterError:
+        return  # no/malformed frontmatter — nothing to stamp
     if fm.get("prd_ref") == prd_ref:
         return  # idempotent
     fm["prd_ref"] = prd_ref
-    body = parts[2].lstrip("\n")
+    body = raw_body.lstrip("\n")
     new_text = (
         "---\n"
         + yaml.dump(fm, default_flow_style=False, allow_unicode=True).strip()
