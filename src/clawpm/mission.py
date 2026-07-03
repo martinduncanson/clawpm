@@ -471,9 +471,11 @@ def _rewrite_mission(mission: Mission) -> None:
             raise ValueError("Mission file has no frontmatter") from None
         if exc.reason == "unterminated":
             raise ValueError("Mission frontmatter malformed") from None
-        # Unparseable: preserve the pre-CLAWP-079 behaviour of propagating the
-        # raw yaml.YAMLError (this site never wrapped it).
-        raise exc.__cause__
+        if exc.reason == "unparseable":
+            # Preserve the pre-CLAWP-079 behaviour of propagating the raw
+            # yaml.YAMLError (this site never wrapped it).
+            raise exc.__cause__ from None
+        raise
     fm["status"] = mission.status
     fm["mini_goals"] = [g.to_dict() for g in mission.mini_goals]
     new_text = (

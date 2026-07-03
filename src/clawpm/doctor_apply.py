@@ -82,9 +82,11 @@ def _rewrite_frontmatter_state(file_path: Path, new_state: str) -> None:
         elif exc.reason == "unterminated":
             # Malformed; refuse to silently break the file.
             raise ValueError(f"malformed frontmatter in {file_path}") from None
+        elif exc.reason == "unparseable":
+            # Preserve the raw yaml.YAMLError (this site never wrapped it).
+            raise exc.__cause__ from None
         else:
-            # Unparseable: preserve the raw yaml.YAMLError (never wrapped here).
-            raise exc.__cause__
+            raise
     else:
         fm["state"] = new_state
         new_fm_text = yaml.safe_dump(fm, default_flow_style=False, sort_keys=False)

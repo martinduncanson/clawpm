@@ -843,9 +843,14 @@ def project_doctor(
                 })
                 text = raw.decode("utf-8", errors="replace")
             fm_state: str | None = None
-            fm, _ = parse_frontmatter(text)
-            if isinstance(fm, dict):
-                fm_state = fm.get("state")
+            # Defensive: one unreadable/odd file must never abort the whole
+            # doctor drift walk (matches the pre-CLAWP-079 broad guard here).
+            try:
+                fm, _ = parse_frontmatter(text)
+                if isinstance(fm, dict):
+                    fm_state = fm.get("state")
+            except Exception:
+                pass
 
             if fm_state and fm_state != location_state:
                 drift_tasks.append({
