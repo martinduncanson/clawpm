@@ -1,0 +1,6 @@
+id = "clawpm"
+name = "clawpm"
+status = "active"
+priority = 5
+repo_path = "F:/Git/clawpm"
+labels = []
