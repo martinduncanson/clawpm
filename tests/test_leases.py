@@ -12,7 +12,6 @@ Success criteria under test:
 
 from __future__ import annotations
 
-import os
 import shutil
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -38,32 +37,8 @@ from clawpm.tasks import add_task, change_task_state, get_task
 
 
 @pytest.fixture
-def portfolio():
-    temp_dir = tempfile.mkdtemp(prefix="clawpm_lease_test_")
-    root = Path(temp_dir)
-    (root / "portfolio.toml").write_text(
-        f'portfolio_root = "{root.as_posix()}"\n'
-        f'project_roots = ["{(root / "projects").as_posix()}"]\n'
-        "[defaults]\nstatus = \"active\"\n"
-    )
-    proj = root / "projects" / "p"
-    (proj / ".project").mkdir(parents=True)
-    (proj / ".project" / "settings.toml").write_text(
-        'id = "test"\nname = "Test"\nstatus = "active"\npriority = 3\n'
-    )
-    tasks_dir = proj / ".project" / "tasks"
-    for sub in ("progress", "done", "blocked"):
-        (tasks_dir / sub).mkdir(parents=True)
-
-    old = os.environ.get("CLAWPM_PORTFOLIO")
-    os.environ["CLAWPM_PORTFOLIO"] = str(root)
-    config = load_portfolio_config(root)
-    yield {"root": root, "config": config}
-    if old:
-        os.environ["CLAWPM_PORTFOLIO"] = old
-    else:
-        os.environ.pop("CLAWPM_PORTFOLIO", None)
-    shutil.rmtree(temp_dir, ignore_errors=True)
+def portfolio(isolated_portfolio):
+    return {"root": isolated_portfolio.root, "config": isolated_portfolio.config}
 
 
 def _dispatched_task(config, in_state=TaskState.PROGRESS):
