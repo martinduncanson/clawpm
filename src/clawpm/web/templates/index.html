@@ -191,6 +191,12 @@
             try {
                 const res = await fetch(url);
                 const data = await res.json();
+                // The API returns a {"error": {...}} envelope with a 4xx/5xx
+                // status on failure; don't feed that to the success handler.
+                if (!res.ok || (data && data.error)) {
+                    console.error('Request failed', url, res.status, data && data.error);
+                    return;
+                }
                 handler(data);
             } catch (err) {
                 console.error('Failed to fetch', url, err);

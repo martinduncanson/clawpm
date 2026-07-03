@@ -132,14 +132,12 @@ def create_app() -> FastAPI:
     @app.get("/api/projects")
     def api_projects() -> list[dict]:
         config = load_portfolio_config()
-        if not config:
-            return []
         return [p.to_dict() for p in discover_projects(config)]
 
     @app.get("/api/projects/{project_id}")
     def api_project_context(project_id: str) -> dict:
         config = load_portfolio_config()
-        project = get_project(config, project_id) if config else None
+        project = get_project(config, project_id)
         if not project:
             raise ApiError(404, "not_found", f"project '{project_id}' not found")
         return project.to_dict()
@@ -147,8 +145,6 @@ def create_app() -> FastAPI:
     @app.get("/api/projects/{project_id}/tasks")
     def api_project_tasks(project_id: str, state: str | None = None) -> list[dict]:
         config = load_portfolio_config()
-        if not config:
-            return []
         if not get_project(config, project_id):
             raise ApiError(404, "not_found", f"project '{project_id}' not found")
         from .models import TaskState
@@ -165,8 +161,6 @@ def create_app() -> FastAPI:
     @app.get("/api/blockers")
     def api_blockers() -> list[dict]:
         config = load_portfolio_config()
-        if not config:
-            return []
         from .models import TaskState
 
         blockers = []
@@ -180,8 +174,6 @@ def create_app() -> FastAPI:
     @app.get("/api/active-tasks")
     def api_active_tasks() -> list[dict]:
         config = load_portfolio_config()
-        if not config:
-            return []
         from .models import TaskState
 
         active = []
@@ -198,8 +190,6 @@ def create_app() -> FastAPI:
     @app.get("/api/worklog")
     def api_worklog(project: str | None = None, limit: int = 10) -> list[dict]:
         config = load_portfolio_config()
-        if not config:
-            return []
         entries = tail_entries(config, project=project, limit=limit)
         return [e.to_dict() for e in entries]
 
