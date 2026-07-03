@@ -323,10 +323,12 @@ def get_next_task(config: PortfolioConfig, project_id: str) -> Task | None:
     candidates: list[Task] = []
     _scan_task_files(tasks_dir, candidates, None)
 
-    # Mirror list_tasks' parent-child linking so a returned directory task
-    # carries the same .children shape it would from a full listing (the
-    # frontmatter set is authoritative post-CLAWP-037; this idempotently wires
-    # in any dir-discovered open children for legacy parents).
+    # Mirror list_tasks' parent-child linking over the open subtree so a
+    # returned directory task carries its open children like a full listing
+    # would. Done children come only from the persisted frontmatter set
+    # (authoritative post-CLAWP-037); unlike list_tasks(None) this scan does
+    # not walk done/ to reverse-link legacy/manual done children — acceptable
+    # here because the next task is by definition OPEN/PROGRESS work.
     task_map = {t.id: t for t in candidates}
     for task in candidates:
         if task.parent and task.parent in task_map:
