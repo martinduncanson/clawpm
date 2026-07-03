@@ -322,6 +322,18 @@ def get_next_task(config: PortfolioConfig, project_id: str) -> Task | None:
     # recurses, so this yields exactly the non-terminal tasks.
     candidates: list[Task] = []
     _scan_task_files(tasks_dir, candidates, None)
+
+    # Mirror list_tasks' parent-child linking so a returned directory task
+    # carries the same .children shape it would from a full listing (the
+    # frontmatter set is authoritative post-CLAWP-037; this idempotently wires
+    # in any dir-discovered open children for legacy parents).
+    task_map = {t.id: t for t in candidates}
+    for task in candidates:
+        if task.parent and task.parent in task_map:
+            parent = task_map[task.parent]
+            if task.id not in parent.children:
+                parent.children.append(task.id)
+
     candidates.sort(key=lambda t: (t.priority, t.id))
 
     # Dependency satisfaction needs only the *set* of completed IDs, collected

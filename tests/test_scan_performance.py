@@ -126,6 +126,25 @@ class TestGetNextTaskDependencies:
         nxt = get_next_task(portfolio["config"], "scan")
         assert nxt is not None and nxt.id == "OPEN-2"
 
+    def test_next_dir_task_has_children_linked(self, portfolio):
+        # A directory-task parent with an open child, returned as next, must
+        # carry .children like list_tasks would (parent-linking parity).
+        tasks_dir = portfolio["tasks_dir"]
+        for f in ("OPEN-1.md", "OPEN-2.md", "OPEN-3.md"):
+            (tasks_dir / f).unlink()
+        parent = tasks_dir / "PARENT-1"
+        parent.mkdir()
+        (parent / "_task.md").write_text(
+            "---\nid: PARENT-1\npriority: 1\n---\n# parent\n", encoding="utf-8"
+        )
+        (parent / "PARENT-1-001.md").write_text(
+            "---\nid: PARENT-1-001\nparent: PARENT-1\npriority: 2\n---\n# child\n",
+            encoding="utf-8",
+        )
+        nxt = get_next_task(portfolio["config"], "scan")
+        assert nxt is not None and nxt.id == "PARENT-1"
+        assert "PARENT-1-001" in nxt.children
+
     def test_dependency_on_open_task_blocks(self, portfolio):
         # OPEN-3 depends on OPEN-1 (still open) → must be skipped. Remove the
         # higher-priority frees so OPEN-3 would be next iff its dep resolved.
