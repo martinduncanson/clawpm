@@ -34,6 +34,7 @@ from typing import Any
 
 import yaml
 
+from .frontmatter import FrontmatterError, split_frontmatter
 from .tasks import cascade_unblock_dependents
 
 
@@ -72,18 +73,22 @@ def _rewrite_frontmatter_state(file_path: Path, new_state: str) -> None:
     Uses the tmp + replace pattern from :func:`clawpm.tasks.add_task`.
     """
     text = file_path.read_text(encoding="utf-8")
-    if not text.startswith("---"):
-        # No frontmatter to rewrite — synthesize a minimal one.
-        new_text = f"---\nstate: {new_state}\n---\n\n{text}"
-    else:
-        parts = text.split("---", 2)
-        if len(parts) < 3:
+    try:
+        fm, body = split_frontmatter(text)
+    except FrontmatterError as exc:
+        if exc.reason == "absent":
+            # No frontmatter to rewrite — synthesize a minimal one.
+            new_text = f"---\nstate: {new_state}\n---\n\n{text}"
+        elif exc.reason == "unterminated":
             # Malformed; refuse to silently break the file.
-            raise ValueError(f"malformed frontmatter in {file_path}")
-        fm = yaml.safe_load(parts[1]) or {}
+            raise ValueError(f"malformed frontmatter in {file_path}") from None
+        else:
+            # Unparseable: preserve the raw yaml.YAMLError (never wrapped here).
+            raise exc.__cause__
+    else:
         fm["state"] = new_state
         new_fm_text = yaml.safe_dump(fm, default_flow_style=False, sort_keys=False)
-        new_text = f"---\n{new_fm_text}---{parts[2]}"
+        new_text = f"---\n{new_fm_text}---{body}"
 
     tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
     try:
