@@ -65,6 +65,33 @@ def _scan_task_files(location: Path, tasks: list[Task], state_filter: TaskState 
             _scan_task_files(item, tasks, state_filter)
 
 
+def _scan_locations(tasks_dir: Path, state_filter: TaskState | None) -> list[Path]:
+    """Directory silos that can contain a task in ``state_filter`` (CLAWP-080).
+
+    State is derived from the on-disk location in ``Task.from_file`` (a file
+    under ``done/`` is DONE, under ``blocked/`` is BLOCKED, etc.), so this
+    partition is exact — no file under ``done/`` is ever OPEN. Deriving the
+    scan set from the filter lets callers skip reading and YAML-parsing entire
+    silos, which matters once ``done/`` grows unboundedly with no archival.
+
+    - OPEN / PROGRESS live only in the top-level ``tasks_dir`` (progress as a
+      ``.progress.md`` sibling); the terminal silos never hold them.
+    - DONE / BLOCKED / REJECTED live only in their respective silo.
+    - No filter → the full portfolio view: main + done + blocked. ``rejected/``
+      stays excluded (CLAWP-053: a hidden terminal silo, added only on an
+      explicit REJECTED filter).
+    """
+    if state_filter == TaskState.REJECTED:
+        return [tasks_dir / "rejected"]
+    if state_filter in (TaskState.OPEN, TaskState.PROGRESS):
+        return [tasks_dir]
+    if state_filter == TaskState.DONE:
+        return [tasks_dir / "done"]
+    if state_filter == TaskState.BLOCKED:
+        return [tasks_dir / "blocked"]
+    return [tasks_dir, tasks_dir / "done", tasks_dir / "blocked"]
+
+
 def list_tasks(
     config: PortfolioConfig,
     project_id: str,
@@ -77,19 +104,7 @@ def list_tasks(
 
     tasks: list[Task] = []
 
-    # CLAWP-053: rejected/ is a terminal-state silo like done/ and blocked/.
-    # It is excluded from the default (no-filter) scan so rejected tasks never
-    # surface in open listings. It is only added when explicitly requested.
-    if state_filter == TaskState.REJECTED:
-        locations = [tasks_dir / "rejected"]
-    else:
-        locations = [
-            tasks_dir,  # Main dir - open or progress
-            tasks_dir / "done",
-            tasks_dir / "blocked",
-        ]
-
-    for location in locations:
+    for location in _scan_locations(tasks_dir, state_filter):
         _scan_task_files(location, tasks, state_filter)
 
     # Build parent-child relationships
@@ -274,15 +289,46 @@ def select_next_batch(
     return (None, [], [])
 
 
+def _done_task_ids(tasks_dir: Path) -> set[str]:
+    """IDs of all completed tasks, derived from filenames without parsing.
+
+    A task's ID is its filename stem (regular task) or its directory name
+    (a directory task's ``_task.md``) — an invariant the whole lookup layer
+    relies on (see ``_candidate_task_paths``). Everything under ``done/`` is
+    DONE by location (``Task.from_file``), so collecting membership from names
+    alone is exact and lets ``get_next_task`` resolve dependency satisfaction
+    without YAML-parsing an unboundedly-growing ``done/`` silo (CLAWP-080).
+    Done files never carry the ``.progress`` suffix (progress lives in the main
+    dir), so the stem is the bare ID.
+    """
+    done_dir = tasks_dir / "done"
+    if not done_dir.exists():
+        return set()
+    ids: set[str] = set()
+    for path in done_dir.rglob("*.md"):
+        ids.add(path.parent.name if path.name == "_task.md" else path.stem)
+    return ids
+
+
 def get_next_task(config: PortfolioConfig, project_id: str) -> Task | None:
     """Get the next task to work on (highest priority open task with satisfied dependencies)."""
-    tasks = list_tasks(config, project_id)
+    tasks_dir = get_tasks_dir(config, project_id)
+    if not tasks_dir:
+        return None
 
-    # Get IDs of completed tasks
-    done_ids = {t.id for t in tasks if t.state == TaskState.DONE}
+    # Candidates are OPEN/PROGRESS tasks, which live only in the top-level
+    # tasks dir — scanning just it skips the done/ and blocked/ silos entirely
+    # (CLAWP-080). _scan_task_files already excludes those subdirs as it
+    # recurses, so this yields exactly the non-terminal tasks.
+    candidates: list[Task] = []
+    _scan_task_files(tasks_dir, candidates, None)
+    candidates.sort(key=lambda t: (t.priority, t.id))
 
-    # Find open tasks with satisfied dependencies
-    for task in tasks:
+    # Dependency satisfaction needs only the *set* of completed IDs, collected
+    # cheaply from filenames rather than parsing every done file.
+    done_ids = _done_task_ids(tasks_dir)
+
+    for task in candidates:
         if task.state not in (TaskState.OPEN, TaskState.PROGRESS):
             continue
 
