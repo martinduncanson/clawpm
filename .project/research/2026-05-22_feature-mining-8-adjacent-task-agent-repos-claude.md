@@ -16,19 +16,9 @@ Which patterns from swarma, ralph-orchestrator, malphas/ralph, ralphy, guild, Cl
 
 ## Summary
 
-(To be filled in as research progresses)
+Feature-mining verdict across 8 adjacent task/agent repos + Claude `/goal` docs (CLAWP-015). Top adoption candidates after the Piebald `/goal` re-analysis (see Addendum): (1) rubric-shaped success-criteria + `emit-rubric` helper; (2) a Stop-hook condition evaluator so a dispatched subagent cannot terminate until its rubric is met or impossibility is independently confirmed; (3) subagent dispatch via a generated `.claude/settings.local.json` hook config; (4) outcome-iteration log -> reflection events; (5) dependency-cascade auto-unblock; (6) `parallel_group: N` batch dispatch. Positioning: clawpm becomes the persistence + dispatch layer over Anthropic's Managed Agents Outcomes pattern, locally emulated via Claude Code hooks. STEAL-FROM: swarma (hypothesis->verdict->ratchet), malphas/ralph (STOP-file + crash-recovery), guild (cascade auto-unblock + atomic claim), task-magic (dual-sync checklist). NOT adopted: pluggable network inbox transport, SQLite-for-everything, wave correlation IDs, task-YAML model-cost routing. Full per-repo detail and ranked candidates below.
 
-## Findings
-
-...
-
-## Conclusion
-
-...
-# Research: Feature mining from 8 adjacent repos + Claude /goal docs
-
-**Date:** 2026-05-22
-**Task:** CLAWP-015
+**Task:** CLAWP-015 · **Date:** 2026-05-22
 **Sources:** swarma, ralph-orchestrator, malphas/ralph, ralphy, guild, ClawTeam, task-magic, gsd-redux, + goals-short.txt, goals-long.txt, code.claude.com/docs/en/goal
 
 ## Per-repo verdict matrix

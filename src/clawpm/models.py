@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import fnmatch
+import re
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -810,6 +811,62 @@ class WorkLogEntry:
         )
 
 
+# Default age (days) after which a still-placeholder research entry is flagged.
+PLACEHOLDER_STALE_DAYS = 14
+
+# Literal stubs the progressive (``--open``) template emits. Their presence in a
+# section body means the entry was created to be filled in later and never was.
+_PLACEHOLDER_MARKERS = (
+    "(To be filled in",
+    "(Describe the research question)",
+)
+
+# A "..." on its own line, set off as its own paragraph — the ``## Findings`` /
+# ``## Conclusion`` stub. Anchored to paragraph boundaries so a genuine prose
+# ellipsis mid-sentence doesn't trip it.
+_STUB_ELLIPSIS = re.compile(r"(?:^|\n)[ \t]*\n\.\.\.[ \t]*(?:\n|$)")
+
+
+def has_placeholder_sections(content: str) -> bool:
+    """Return True if the body still carries unfilled template placeholders."""
+    for marker in _PLACEHOLDER_MARKERS:
+        if marker in content:
+            return True
+    return bool(_STUB_ELLIPSIS.search(content))
+
+
+def _parse_created(created: str | None) -> datetime | None:
+    """Best-effort parse of a frontmatter ``created`` value to a datetime."""
+    if not created:
+        return None
+    try:
+        return datetime.fromisoformat(str(created)).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def is_stale_placeholder(
+    item: "Research",
+    days: int = PLACEHOLDER_STALE_DAYS,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Return True if an open/in-progress entry is still stubbed after ``days``.
+
+    Complete and stale entries are intentionally closed and never flagged.
+    """
+    if item.status in (ResearchStatus.COMPLETE, ResearchStatus.STALE):
+        return False
+    if not has_placeholder_sections(item.content):
+        return False
+    created = _parse_created(item.created)
+    if created is None:
+        # No usable creation date — surface it rather than silently ignore.
+        return True
+    now = now or datetime.now(timezone.utc)
+    return (now - created).days >= days
+
+
 @dataclass
 class Research:
     """A research item."""
@@ -823,6 +880,16 @@ class Research:
     content: str = ""
     openclaw: dict[str, Any] | None = None
     file_path: Path | None = None
+
+    def has_placeholder(self) -> bool:
+        """True if this entry still carries unfilled template placeholders."""
+        return has_placeholder_sections(self.content)
+
+    def is_stale_placeholder(
+        self, days: int = PLACEHOLDER_STALE_DAYS, *, now: datetime | None = None
+    ) -> bool:
+        """True if this open/in-progress entry is still stubbed after ``days``."""
+        return is_stale_placeholder(self, days, now=now)
 
     @classmethod
     def from_file(cls, path: Path) -> Research:
@@ -868,6 +935,7 @@ class Research:
             "tags": self.tags,
             "created": self.created,
             "openclaw": self.openclaw,
+            "has_placeholder": self.has_placeholder(),
             "file_path": str(self.file_path) if self.file_path else None,
         }
 
