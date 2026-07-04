@@ -74,9 +74,20 @@ def test_has_placeholder_detects_ellipsis_stub():
     assert has_placeholder_sections("## Findings\n\n...\n\n## Conclusion\n\n...\n")
 
 
+def test_has_placeholder_detects_ellipsis_without_blank_line():
+    # A bare "## Findings\n...\n" stub (no extra blank line) must still count.
+    assert has_placeholder_sections("## Findings\n...\n")
+
+
 def test_has_placeholder_ignores_prose_ellipsis():
     # A genuine ellipsis mid-sentence must not be read as a stub.
     assert not has_placeholder_sections("## Summary\n\nWe tried A... then B, and shipped.\n")
+
+
+def test_has_placeholder_ignores_marker_quoted_in_prose():
+    # A filled entry that merely quotes the stub phrase mid-body isn't flagged.
+    body = "## Summary\n\nThe old note said (To be filled in) but it's now resolved.\n"
+    assert not has_placeholder_sections(body)
 
 
 def test_has_placeholder_false_on_filled_body():
@@ -129,6 +140,16 @@ def test_stale_placeholder_flags_missing_created_date():
     # No usable date + still stubbed -> surface it rather than silently ignore.
     item = _research("## Summary\n\n(To be filled in)\n", created=None)
     assert is_stale_placeholder(item)
+
+
+def test_stale_placeholder_handles_tz_aware_created():
+    # A full ISO timestamp with an offset must be honoured, not clobbered.
+    old = (datetime.now(timezone.utc) - timedelta(days=100)).isoformat()
+    item = _research("## Summary\n\n(To be filled in)\n", created=old)
+    assert is_stale_placeholder(item)
+    recent = datetime.now(timezone.utc).isoformat()
+    item2 = _research("## Summary\n\n(To be filled in)\n", created=recent)
+    assert not is_stale_placeholder(item2)
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +238,30 @@ def test_cli_add_requires_summary_or_open(temp_portfolio):
     assert result.exit_code == 1
     payload = json.loads(result.output)
     assert payload["error"] == "missing_verdict"
+
+
+def test_cli_add_findings_only_requires_verdict(temp_portfolio):
+    # --finding / --conclusion alone don't substitute for the Summary verdict.
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["--format", "json", "research", "add", "-p", "test",
+         "-t", "investigation", "--title", "No summary", "--finding", "x"],
+    )
+    assert result.exit_code == 1
+    assert json.loads(result.output)["error"] == "missing_verdict"
+
+
+def test_cli_add_open_conflicts_with_capture(temp_portfolio):
+    # --open cannot carry a verdict — the content would be silently dropped.
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["--format", "json", "research", "add", "-p", "test",
+         "-t", "investigation", "--title", "Conflict", "--open", "--summary", "verdict"],
+    )
+    assert result.exit_code == 1
+    assert json.loads(result.output)["error"] == "open_conflict"
 
 
 def test_cli_add_single_shot_succeeds(temp_portfolio):

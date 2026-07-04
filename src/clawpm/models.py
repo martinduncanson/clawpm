@@ -814,25 +814,38 @@ class WorkLogEntry:
 # Default age (days) after which a still-placeholder research entry is flagged.
 PLACEHOLDER_STALE_DAYS = 14
 
-# Literal stubs the progressive (``--open``) template emits. Their presence in a
-# section body means the entry was created to be filled in later and never was.
-_PLACEHOLDER_MARKERS = (
+# Literal stubs the progressive (``--open``) template emits at the *start* of a
+# section body. Matched only against a section body's leading text — not any
+# substring of the content — so a filled entry that merely quotes the phrase
+# isn't flagged forever.
+_PLACEHOLDER_PREFIXES = (
     "(To be filled in",
     "(Describe the research question)",
 )
 
-# A "..." on its own line, set off as its own paragraph — the ``## Findings`` /
-# ``## Conclusion`` stub. Anchored to paragraph boundaries so a genuine prose
-# ellipsis mid-sentence doesn't trip it.
-_STUB_ELLIPSIS = re.compile(r"(?:^|\n)[ \t]*\n\.\.\.[ \t]*(?:\n|$)")
+# Splits the body into section bodies on any ATX heading line, so each section's
+# content can be examined independently of the surrounding prose.
+_HEADING_SPLIT = re.compile(r"(?m)^#{1,6}[ \t].*$")
 
 
 def has_placeholder_sections(content: str) -> bool:
-    """Return True if the body still carries unfilled template placeholders."""
-    for marker in _PLACEHOLDER_MARKERS:
-        if marker in content:
+    """Return True if any section body is still an unfilled template stub.
+
+    A section counts as a placeholder when its body (the text between one
+    heading and the next) either starts with a template prefix or is nothing
+    but an ``...`` ellipsis stub. Anchoring to section bodies means a genuine
+    prose ellipsis or an incidental quote of the stub text doesn't trip it,
+    while a bare ``## Findings\n...`` stub (with or without a blank line) does.
+    """
+    for body in _HEADING_SPLIT.split(content):
+        stripped = body.strip()
+        if not stripped:
+            continue
+        if stripped == "...":
             return True
-    return bool(_STUB_ELLIPSIS.search(content))
+        if any(stripped.startswith(prefix) for prefix in _PLACEHOLDER_PREFIXES):
+            return True
+    return False
 
 
 def _parse_created(created: str | None) -> datetime | None:
@@ -840,9 +853,14 @@ def _parse_created(created: str | None) -> datetime | None:
     if not created:
         return None
     try:
-        return datetime.fromisoformat(str(created)).replace(tzinfo=timezone.utc)
+        dt = datetime.fromisoformat(str(created))
     except ValueError:
         return None
+    # Date-only / naive values are treated as UTC; an already-aware value is
+    # converted rather than having its zone silently overwritten.
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def is_stale_placeholder(

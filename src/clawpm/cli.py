@@ -5005,8 +5005,20 @@ def research_add(
 
     project_id, _ = require_project(ctx, project_id)
 
-    # Single-shot capture needs a verdict; the progressive path opts out via --open.
-    if not open_ended and not (summary or findings or conclusion):
+    # --open is the progressive (fill-in-later) path; it can't also carry a
+    # single-shot verdict, or the supplied content would be silently dropped.
+    if open_ended and (summary or findings or conclusion):
+        output_error(
+            "open_conflict",
+            "--open is for a progressive entry with no verdict yet; it cannot be "
+            "combined with --summary/--verdict, --finding, or --conclusion.",
+            fmt=fmt,
+        )
+        sys.exit(1)
+
+    # Single-shot capture needs a verdict (the Summary); --finding/--conclusion
+    # are optional additions and don't substitute for it.
+    if not open_ended and not summary:
         output_error(
             "missing_verdict",
             "research add needs --summary/--verdict (single-shot capture) or --open "
