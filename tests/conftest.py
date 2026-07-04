@@ -51,7 +51,13 @@ def isolated_portfolio(tmp_path: Path, monkeypatch) -> SimpleNamespace:
     for sub in ("progress", "done", "blocked"):
         (tasks_dir / sub).mkdir(parents=True)
 
-    monkeypatch.setenv("CLAWPM_PORTFOLIO", str(root))
+    # Pin discovery to this sandbox only: an inherited CLAWPM_PROJECT_ROOTS /
+    # CLAWPM_WORKSPACE from the runner would otherwise be appended by
+    # load_portfolio_config, letting tests discover (and --apply could mutate)
+    # real projects outside tmp_path.
+    monkeypatch.delenv("CLAWPM_PROJECT_ROOTS", raising=False)
+    monkeypatch.delenv("CLAWPM_WORKSPACE", raising=False)
+    monkeypatch.setenv("CLAWPM_PORTFOLIO", root.as_posix())
     config = load_portfolio_config(root)
 
     return SimpleNamespace(
