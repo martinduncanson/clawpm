@@ -68,6 +68,36 @@ SURPRISE_TAXONOMY: frozenset[str] = frozenset({
 })
 
 
+def normalize_tags(raw: Any) -> list[str]:
+    """Normalise a tags value into a clean list of tag strings.
+
+    CLAWP-069 — tags are lightweight cross-cutting workstream labels. To keep
+    filtering and counting predictable, they are lowercased and stripped, blank
+    entries dropped, and duplicates removed while preserving first-seen order.
+    Accepts the raw frontmatter value (list, scalar, or None) defensively so a
+    hand-edited task file can't raise on load.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        items: list[Any] = [raw]
+    elif isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        tag = item.strip().lower()
+        if not tag or tag in seen:
+            continue
+        seen.add(tag)
+        out.append(tag)
+    return out
+
+
 class ResearchType(str, Enum):
     INVESTIGATION = "investigation"
     SPIKE = "spike"
@@ -426,6 +456,11 @@ class Task:
     complexity: TaskComplexity | None = None
     depends: list[str] = field(default_factory=list)
     scope: list[str] = field(default_factory=list)
+    # CLAWP-069 — cross-cutting workstream tags. Pure metadata: read/filter
+    # only, no filesystem move (unlike state). Normalised (lowercased, deduped)
+    # via ``normalize_tags`` at load and write time. Do NOT propagate parent->
+    # child — each task carries its own tags independently.
+    tags: list[str] = field(default_factory=list)
     parent: str | None = None
     children: list[str] = field(default_factory=list)  # Populated by discovery
     created: str | None = None
@@ -609,6 +644,10 @@ class Task:
         updated_raw = frontmatter.get("updated")
         updated: str | None = str(updated_raw) if updated_raw is not None else None
 
+        # CLAWP-069 — tags: normalise defensively (lowercased, deduped, blanks
+        # dropped). Absent / non-list frontmatter → [].
+        tags = normalize_tags(frontmatter.get("tags"))
+
         # CLAWP-055 — baseline_ref: opaque string stamped at task creation.
         # None for legacy tasks — backward-compat default.
         baseline_ref_raw = frontmatter.get("baseline_ref")
@@ -626,6 +665,7 @@ class Task:
             complexity=complexity,
             depends=frontmatter.get("depends", []),
             scope=frontmatter.get("scope", []),
+            tags=tags,
             parent=frontmatter.get("parent"),
             children=children,
             created=created,
@@ -676,6 +716,7 @@ class Task:
             "complexity": self.complexity.value if self.complexity else None,
             "depends": self.depends,
             "scope": self.scope,
+            "tags": self.tags,
             "parent": self.parent,
             "children": self.children,
             "is_parent": self.is_parent,
