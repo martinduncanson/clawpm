@@ -19,16 +19,12 @@ Coverage:
 from __future__ import annotations
 
 import json
-import os
-import shutil
-import tempfile
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
 from clawpm.cli import main
-from clawpm.discovery import load_portfolio_config
 from clawpm.models import Predictions
 from clawpm.reflect import detect_thrashing, write_iteration_event
 from clawpm.tasks import add_task
@@ -40,40 +36,8 @@ from clawpm.tasks import add_task
 
 
 @pytest.fixture
-def temp_portfolio():
-    temp_dir = tempfile.mkdtemp(prefix="clawpm_thrash_test_")
-    portfolio_root = Path(temp_dir)
-    (portfolio_root / "portfolio.toml").write_text(
-        f'portfolio_root = "{portfolio_root.as_posix()}"\n'
-        f'project_roots = ["{(portfolio_root / "projects").as_posix()}"]\n'
-        "[defaults]\n"
-        'status = "active"\n',
-        encoding="utf-8",
-    )
-    projects_dir = portfolio_root / "projects"
-    projects_dir.mkdir()
-    project_dir = projects_dir / "test-project"
-    project_dir.mkdir()
-    project_meta = project_dir / ".project"
-    project_meta.mkdir()
-    (project_meta / "settings.toml").write_text(
-        'id = "test"\nname = "Test"\nstatus = "active"\npriority = 3\n',
-        encoding="utf-8",
-    )
-    tasks_dir = project_meta / "tasks"
-    tasks_dir.mkdir()
-    (tasks_dir / "done").mkdir()
-    (tasks_dir / "blocked").mkdir()
-
-    old_env = os.environ.get("CLAWPM_PORTFOLIO")
-    os.environ["CLAWPM_PORTFOLIO"] = str(portfolio_root)
-    config = load_portfolio_config(portfolio_root)
-    yield {"root": portfolio_root, "config": config}
-    if old_env:
-        os.environ["CLAWPM_PORTFOLIO"] = old_env
-    else:
-        os.environ.pop("CLAWPM_PORTFOLIO", None)
-    shutil.rmtree(temp_dir, ignore_errors=True)
+def temp_portfolio(isolated_portfolio):
+    return {"root": isolated_portfolio.root, "config": isolated_portfolio.config}
 
 
 def _write_n_not_ok(portfolio_root: Path, task_id: str, n: int) -> None:
