@@ -24,6 +24,9 @@ temp/
 # Harness-dumped MCP tool-schema caches (not clawpm source)
 mcps/
 
+# clawpm's own dispatch worktrees (CLAWP-018)
+.clawpm-worktrees/
+
 # Example portfolio fixtures need .project/ committed for onboarding
 !examples/**/.project/
 !examples/**/.project/**
