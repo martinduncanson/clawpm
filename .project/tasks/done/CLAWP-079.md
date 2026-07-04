@@ -3,6 +3,7 @@ baseline_ref: 0b307f2
 complexity: s
 created: '2026-07-03'
 id: CLAWP-079
+state: active
 predictions:
   confidence: 4
   duration_min: 120
