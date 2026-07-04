@@ -21,6 +21,15 @@ web = [
     "fastapi>=0.100.0",
     "uvicorn[standard]>=0.23.0",
 ]
+# Mirrors [dependency-groups].dev below so `pip install -e ".[dev]"` (CI, plain
+# pip) works alongside `uv sync` (which reads the PEP 735 group). Keep in sync.
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.0.0",
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.23.0",
+    "httpx>=0.24.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/martinduncanson/clawpm"
