@@ -1629,51 +1629,36 @@ def tasks_edit(
     output_success(f"Task {task_id} updated", data=task.to_dict(), fmt=fmt)
 
 
-@tasks.command("state")
-@click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
-@click.argument("task_id")
-@click.argument("new_state", type=click.Choice(["open", "progress", "done", "blocked", "rejected"]))
-@click.option("--note", "-n", help="Note about the state change")
-@click.option("--force", "-f", is_flag=True, help="Force completion even if subtasks incomplete")
-@click.option("--reflect-note", "reflect_note", default=None, help="What surprised you (stored in reflection event)")
-@click.option("--meta-reflect", "meta_reflect", default=None, help="What could have been anticipated that wasn't, and why? (stored in reflection event)")
-@click.option("--process-lesson", "process_lesson", default=None, help="What update to your prediction PROCESS would have caught this? (recursive meta-loop)")
-@click.option("--surprise", "surprise_tags", multiple=True, help=f"Surprise taxonomy tag (repeatable): {', '.join(sorted(['unknown_unknown', 'scope_drift', 'dependency', 'tooling_friction', 'complexity_misread', 'assumption_broke', 'external_blocker']))}")
-# CLAWP-053 — won't-do ledger: rationale is required when rejecting a task.
-@click.option("--rationale", "-r", "rationale", default=None,
-              help="Required when state=rejected: one-line reason this idea was considered and rejected.")
-@click.option("--supersedes", "supersedes", default=None,
-              help="Optional task-id that supersedes this rejected task (e.g. a replacement task).")
-@click.pass_context
-def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_state: str, note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...], rationale: str | None, supersedes: str | None) -> None:
-    """Change task state."""
-    fmt = get_format(ctx)
-    config = require_portfolio(ctx)
+def _do_state_change(
+    config,
+    *,
+    project_id: str,
+    task_id: str,
+    new_state: str,
+    note: str | None = None,
+    force: bool = False,
+    reflect_note: str | None = None,
+    meta_reflect: str | None = None,
+    process_lesson: str | None = None,
+    surprise_tags: tuple[str, ...] = (),
+    rationale: str | None = None,
+    supersedes: str | None = None,
+) -> dict:
+    """Transition ONE task's state and return a structured result.
 
-    # Validate surprise taxonomy tags early (before any state mutation)
-    invalid_tags = [t for t in surprise_tags if t not in SURPRISE_TAXONOMY]
-    if invalid_tags:
-        output_error(
-            "bad_surprise_tag",
-            f"Unknown surprise tag(s): {invalid_tags}. "
-            f"Valid values: {sorted(SURPRISE_TAXONOMY)}",
-            fmt=fmt,
-        )
-        sys.exit(1)
+    CLAWP-083: this is the per-task unit that single- and bulk-mode state
+    commands loop over. It NEVER renders output or calls ``sys.exit`` — the
+    caller renders — so one task's failure is isolated from the rest of a batch.
 
-    # CLAWP-053 — reject rationale must be validated before any IO
-    if new_state == "rejected" and (not rationale or not rationale.strip()):
-        output_error(
-            "rationale_required",
-            "Rejecting a task requires a non-empty --rationale. "
-            "Pass --rationale '<reason>' to record why this was considered and rejected.",
-            fmt=fmt,
-        )
-        sys.exit(1)
+    Success -> ``{"ok": True, "task_id": <expanded>, "message": ..., "data": {...}}``
+    Failure -> ``{"ok": False, "task_id": <expanded>, "error": <code>, "message": ...}``
 
-    project_id, _ = require_project(ctx, project_id)
+    Only the known mutator contract (LockTimeout / FileExistsError /
+    FileNotFoundError / ValueError) is mapped to an isolated failure result; an
+    unexpected exception still propagates as a traceback (fail-open !=
+    fail-silent), mirroring the single-task ``_mutation_errors`` contract.
+    """
     task_id = expand_task_id(task_id, project_id)
-
     state = TaskState(new_state)
 
     # CLAWP-037 — parent rollup gate. Compute readiness up front so we can
@@ -1695,28 +1680,47 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
                 + [f"{m} [missing]" for m in _status["missing"]]
             )
             if rollup_incomplete and not force:
-                output_error(
-                    "subtasks_incomplete",
-                    f"Cannot complete {task_id} - subtasks incomplete:\n  "
-                    + "\n  ".join(rollup_incomplete)
-                    + "\nUse --force to complete anyway.",
-                    fmt=fmt,
-                )
-                sys.exit(1)
+                return {
+                    "ok": False,
+                    "task_id": task_id,
+                    "error": "subtasks_incomplete",
+                    "message": (
+                        f"Cannot complete {task_id} - subtasks incomplete:\n  "
+                        + "\n  ".join(rollup_incomplete)
+                        + "\nUse --force to complete anyway."
+                    ),
+                }
 
     # Capture task predictions before state transition (needed for reflection)
     pre_transition_task = get_task(config, project_id, task_id)
 
-    with _mutation_errors(fmt, "state_change_failed"):
+    # Map the mutator contract to isolated failure results so one bad task does
+    # not abort a bulk run (CLAWP-083). Anything OUTSIDE the contract (an
+    # unexpected OSError, a genuine bug) is deliberately NOT caught — it should
+    # surface as a traceback rather than be masked behind a "failed" result.
+    try:
         task = change_task_state(
             config, project_id, task_id, state,
             note=note, force=force,
             rationale=rationale, supersedes=supersedes,
         )
+    except LockTimeout as exc:
+        return {
+            "ok": False, "task_id": task_id, "error": "lock_timeout",
+            "message": f"Could not acquire the project lock (another session may be busy): {exc}",
+        }
+    except FileExistsError as exc:
+        return {"ok": False, "task_id": task_id, "error": "already_exists", "message": str(exc)}
+    except FileNotFoundError as exc:
+        return {"ok": False, "task_id": task_id, "error": "not_found", "message": str(exc)}
+    except ValueError as exc:
+        return {"ok": False, "task_id": task_id, "error": "state_change_failed", "message": str(exc)}
 
     if not task:
-        output_error("task_not_found", f"No task with id '{task_id}' in project '{project_id}'", fmt=fmt)
-        sys.exit(1)
+        return {
+            "ok": False, "task_id": task_id, "error": "task_not_found",
+            "message": f"No task with id '{task_id}' in project '{project_id}'",
+        }
 
     # Auto-log state change
     # CLAWP-053: REJECTED is a terminal state; log as NOTE with the rationale.
@@ -1940,7 +1944,152 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_id: str, new_st
         data["dispatch_teardowns"] = teardowns
     if teardown_errors:
         data["dispatch_teardown_errors"] = teardown_errors
-    output_success(f"Task {task_id} moved to {new_state}", data=data, fmt=fmt)
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "message": f"Task {task_id} moved to {new_state}",
+        "data": data,
+    }
+
+
+def _render_state_results(
+    results: list[dict], new_state: str, project_id: str, fmt: OutputFormat,
+    *, batch: bool,
+) -> None:
+    """Render single- or bulk-mode state-change results, then exit (CLAWP-083).
+
+    ``batch`` reflects how many ids the caller SUPPLIED, not the post-dedup
+    count — so ``done X`` renders the historical single-task contract while
+    ``done X X`` (which dedups to one result) still renders the aggregate
+    envelope, keeping the output shape a function of the command line.
+
+    Single mode preserves the historical output contract exactly
+    (``output_success`` on success; ``output_error`` + ``exit(1)`` on failure).
+    Batch mode emits an aggregate envelope carrying every per-task result plus a
+    summary; the process exits non-zero if ANY task failed, and the JSON reports
+    exactly which (honest exit code + machine-readable breakdown).
+    """
+    if not batch:
+        r = results[0]
+        if r.get("ok"):
+            output_success(r["message"], data=r["data"], fmt=fmt)
+        else:
+            output_error(r["error"], r["message"], fmt=fmt)
+            sys.exit(1)
+        return
+
+    succeeded = [r for r in results if r.get("ok")]
+    failed = [r for r in results if not r.get("ok")]
+    payload = {
+        "status": "ok" if not failed else "error",
+        "message": f"{len(succeeded)}/{len(results)} task(s) moved to {new_state}",
+        "state": new_state,
+        "project": project_id,
+        "results": results,
+        "summary": {
+            "total": len(results),
+            "succeeded": len(succeeded),
+            "failed": len(failed),
+        },
+    }
+    if fmt == OutputFormat.JSON:
+        output_json(payload)
+    else:
+        for r in results:
+            if r.get("ok"):
+                click.echo(f"ok   {r['task_id']} moved to {new_state}")
+            else:
+                click.echo(f"FAIL {r['task_id']}: {r['error']} - {r['message']}")
+        click.echo(f"{len(succeeded)}/{len(results)} succeeded, {len(failed)} failed")
+    if failed:
+        sys.exit(1)
+
+
+@tasks.command("state")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
+@click.argument("task_ids", nargs=-1, required=True)
+@click.argument("new_state", type=click.Choice(["open", "progress", "done", "blocked", "rejected"]))
+@click.option("--note", "-n", help="Note about the state change (applies to ALL listed tasks)")
+@click.option("--force", "-f", is_flag=True, help="Force completion even if subtasks incomplete")
+@click.option("--reflect-note", "reflect_note", default=None, help="What surprised you (stored in reflection event; applies to ALL listed tasks)")
+@click.option("--meta-reflect", "meta_reflect", default=None, help="What could have been anticipated that wasn't, and why? (stored in reflection event)")
+@click.option("--process-lesson", "process_lesson", default=None, help="What update to your prediction PROCESS would have caught this? (recursive meta-loop)")
+@click.option("--surprise", "surprise_tags", multiple=True, help=f"Surprise taxonomy tag (repeatable): {', '.join(sorted(['unknown_unknown', 'scope_drift', 'dependency', 'tooling_friction', 'complexity_misread', 'assumption_broke', 'external_blocker']))}")
+# CLAWP-053 — won't-do ledger: rationale is required when rejecting a task.
+@click.option("--rationale", "-r", "rationale", default=None,
+              help="Required when state=rejected: one-line reason this idea was considered and rejected.")
+@click.option("--supersedes", "supersedes", default=None,
+              help="Optional task-id that supersedes this rejected task (e.g. a replacement task).")
+@click.pass_context
+def tasks_state(ctx: click.Context, project_id: str | None, task_ids: tuple[str, ...], new_state: str, note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...], rationale: str | None, supersedes: str | None) -> None:
+    """Change one or many tasks' state (CLAWP-083 bulk mode).
+
+    ``clawpm tasks state 72 73 74 done`` transitions each listed task with
+    per-task error isolation and an aggregate JSON result; the exit code is
+    non-zero if ANY transition failed. --note and the reflection flags apply to
+    ALL listed tasks. Bulk ``rejected`` is refused — each rejected task must
+    record its own --rationale in the won't-do ledger, so reject one at a time.
+    """
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+
+    # Validate surprise taxonomy tags early (flag-level; applies to all tasks)
+    invalid_tags = [t for t in surprise_tags if t not in SURPRISE_TAXONOMY]
+    if invalid_tags:
+        output_error(
+            "bad_surprise_tag",
+            f"Unknown surprise tag(s): {invalid_tags}. "
+            f"Valid values: {sorted(SURPRISE_TAXONOMY)}",
+            fmt=fmt,
+        )
+        sys.exit(1)
+
+    # CLAWP-053 — reject rationale must be validated before any IO.
+    if new_state == "rejected":
+        # CLAWP-083 interactive-input-refusal policy: rejection rationale is
+        # inherently PER-TASK (the won't-do ledger records why THIS idea was
+        # dropped). A single shared --rationale must not be smeared across a
+        # batch, so bulk rejection is refused rather than silently mis-recorded.
+        if len(task_ids) > 1:
+            output_error(
+                "bulk_reject_unsupported",
+                "Bulk rejection is not supported: each rejected task records its "
+                "own --rationale in the won't-do ledger. Reject tasks one at a time.",
+                fmt=fmt,
+            )
+            sys.exit(2)
+        if not rationale or not rationale.strip():
+            output_error(
+                "rationale_required",
+                "Rejecting a task requires a non-empty --rationale. "
+                "Pass --rationale '<reason>' to record why this was considered and rejected.",
+                fmt=fmt,
+            )
+            sys.exit(1)
+
+    project_id, _ = require_project(ctx, project_id)
+
+    # De-dup while preserving order so a repeated id in one batch does not
+    # double-fire the cascade / work-log / reflection side effects.
+    seen: set[str] = set()
+    results: list[dict] = []
+    for raw in task_ids:
+        expanded = expand_task_id(raw, project_id)
+        if expanded in seen:
+            continue
+        seen.add(expanded)
+        results.append(
+            _do_state_change(
+                config,
+                project_id=project_id, task_id=expanded, new_state=new_state,
+                note=note, force=force,
+                reflect_note=reflect_note, meta_reflect=meta_reflect,
+                process_lesson=process_lesson, surprise_tags=surprise_tags,
+                rationale=rationale, supersedes=supersedes,
+            )
+        )
+
+    _render_state_results(results, new_state, project_id, fmt, batch=len(task_ids) > 1)
 
 
 @tasks.command("decompose")
@@ -2933,116 +3082,135 @@ def quick_add(ctx: click.Context, project_id: str | None, title: str, priority: 
 
 @main.command("done")
 @click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
-@click.argument("task_id")
-@click.option("--note", "-n", help="Completion note")
+@click.argument("task_ids", nargs=-1, required=True)
+@click.option("--note", "-n", help="Completion note (applies to ALL listed tasks)")
 @click.option("--force", "-f", is_flag=True, help="Force completion even if subtasks incomplete")
 @click.option("--reflect-note", "reflect_note", default=None, help="What surprised you (stored in reflection event)")
 @click.option("--meta-reflect", "meta_reflect", default=None, help="What could have been anticipated that wasn't, and why?")
 @click.option("--process-lesson", "process_lesson", default=None, help="What update to your prediction PROCESS would have caught this?")
 @click.option("--surprise", "surprise_tags", multiple=True, help="Surprise taxonomy tag (repeatable): unknown_unknown, scope_drift, dependency, tooling_friction, complexity_misread, assumption_broke, external_blocker")
 @click.pass_context
-def quick_done(ctx: click.Context, project_id: str | None, task_id: str, note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...]) -> None:
-    """Mark a task as done (alias for 'tasks state <id> done')."""
-    ctx.invoke(tasks_state, project_id=project_id, task_id=task_id, new_state="done", note=note, force=force, reflect_note=reflect_note, meta_reflect=meta_reflect, process_lesson=process_lesson, surprise_tags=surprise_tags)
+def quick_done(ctx: click.Context, project_id: str | None, task_ids: tuple[str, ...], note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...]) -> None:
+    """Mark one or many tasks as done (alias for 'tasks state <ids...> done')."""
+    ctx.invoke(tasks_state, project_id=project_id, task_ids=task_ids, new_state="done", note=note, force=force, reflect_note=reflect_note, meta_reflect=meta_reflect, process_lesson=process_lesson, surprise_tags=surprise_tags)
 
 
 @main.command("start")
 @click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
-@click.argument("task_id")
+@click.argument("task_ids", nargs=-1, required=True)
 @click.pass_context
-def quick_start(ctx: click.Context, project_id: str | None, task_id: str) -> None:
-    """Start working on a task (alias for 'tasks state <id> progress').
+def quick_start(ctx: click.Context, project_id: str | None, task_ids: tuple[str, ...]) -> None:
+    """Start working on one or many tasks (alias for 'tasks state <ids...> progress').
 
-    Note: if the task is already in progress, prefer 'clawpm log add --action progress'
+    Note: if a task is already in progress, prefer 'clawpm log add --action progress'
     to avoid resetting the duration anchor.
     """
-    fmt = get_format(ctx)
     config = require_portfolio(ctx)
 
-    # Warn (but don't block) if the task is already in progress.
+    # Warn (but don't block) for any task already in progress.
     # Re-starting corrupts the duration anchor — the reflection layer computes
     # actuals from the *first* start event, so a re-start under-counts elapsed time.
     resolved_project_id, _ = require_project(ctx, project_id, required=False)
     if resolved_project_id:
-        try:
-            _expanded = expand_task_id(task_id, resolved_project_id)
-            _task = get_task(config, resolved_project_id, _expanded)
-            if _task and _task.state and _task.state.value == "progress":
-                click.echo(
-                    f"Warning: {_expanded} is already in progress. "
-                    "Re-starting resets the duration anchor and under-counts elapsed time. "
-                    "Use 'clawpm log add --task <id> --action progress --summary \"...\"' "
-                    "to log midway updates instead.",
-                    err=True,
-                )
-        except Exception:
-            pass  # Never let the guard break the start command
+        for tid in task_ids:
+            try:
+                _expanded = expand_task_id(tid, resolved_project_id)
+                _task = get_task(config, resolved_project_id, _expanded)
+                if _task and _task.state and _task.state.value == "progress":
+                    click.echo(
+                        f"Warning: {_expanded} is already in progress. "
+                        "Re-starting resets the duration anchor and under-counts elapsed time. "
+                        "Use 'clawpm log add --task <id> --action progress --summary \"...\"' "
+                        "to log midway updates instead.",
+                        err=True,
+                    )
+            except Exception:
+                pass  # Never let the guard break the start command
 
-    ctx.invoke(tasks_state, project_id=project_id, task_id=task_id, new_state="progress", note=None)
+    ctx.invoke(tasks_state, project_id=project_id, task_ids=task_ids, new_state="progress", note=None)
 
 
 @main.command("block")
 @click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
-@click.argument("task_id")
-@click.option("--note", "-n", help="Blocker description")
+@click.argument("task_ids", nargs=-1, required=True)
+@click.option("--note", "-n", help="Blocker description (applies to ALL listed tasks)")
 @click.option("--reflect-note", "reflect_note", default=None, help="What surprised you (stored in reflection event)")
 @click.option("--meta-reflect", "meta_reflect", default=None, help="What could have been anticipated that wasn't, and why?")
 @click.option("--process-lesson", "process_lesson", default=None, help="What update to your prediction PROCESS would have caught this?")
 @click.option("--surprise", "surprise_tags", multiple=True, help="Surprise taxonomy tag (repeatable): unknown_unknown, scope_drift, dependency, tooling_friction, complexity_misread, assumption_broke, external_blocker")
 @click.pass_context
-def quick_block(ctx: click.Context, project_id: str | None, task_id: str, note: str | None, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...]) -> None:
-    """Mark a task as blocked (alias for 'tasks state <id> blocked')."""
-    ctx.invoke(tasks_state, project_id=project_id, task_id=task_id, new_state="blocked", note=note, reflect_note=reflect_note, meta_reflect=meta_reflect, process_lesson=process_lesson, surprise_tags=surprise_tags)
+def quick_block(ctx: click.Context, project_id: str | None, task_ids: tuple[str, ...], note: str | None, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...]) -> None:
+    """Mark one or many tasks as blocked (alias for 'tasks state <ids...> blocked')."""
+    ctx.invoke(tasks_state, project_id=project_id, task_ids=task_ids, new_state="blocked", note=note, reflect_note=reflect_note, meta_reflect=meta_reflect, process_lesson=process_lesson, surprise_tags=surprise_tags)
 
 
 @main.command("unblock")
 @click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
-@click.argument("task_id")
-@click.option("--note", "-n", help="Reason the blocker was resolved")
+@click.argument("task_ids", nargs=-1, required=True)
+@click.option("--note", "-n", help="Reason the blocker was resolved (applies to ALL listed tasks)")
 @click.option("--start", "also_start", is_flag=True, help="Also transition to in-progress (blocked → progress)")
 @click.pass_context
-def quick_unblock(ctx: click.Context, project_id: str | None, task_id: str, note: str | None, also_start: bool) -> None:
-    """Move a blocked task back to open (or --start to go straight to in-progress).
+def quick_unblock(ctx: click.Context, project_id: str | None, task_ids: tuple[str, ...], note: str | None, also_start: bool) -> None:
+    """Move one or many blocked tasks back to open (or --start to go straight to in-progress).
 
     Shortcut for:
-        clawpm tasks state <id> open   (default)
-        clawpm tasks state <id> progress  (with --start)
+        clawpm tasks state <ids...> open   (default)
+        clawpm tasks state <ids...> progress  (with --start)
 
-    An 'unblock' action is logged in the work log with the provided note.
+    An 'unblock' action is logged in the work log for each task the transition
+    succeeds on. Per-task error isolation: a task that is not blocked (or does
+    not exist) fails that entry without aborting the rest of the batch.
     """
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
 
     project_id, _ = require_project(ctx, project_id)
-    full_task_id = expand_task_id(task_id, project_id)
-
-    # Verify the task is actually blocked
-    task = get_task(config, project_id, full_task_id)
-    if not task:
-        output_error("task_not_found", f"No task with id '{full_task_id}' in project '{project_id}'", fmt=fmt)
-        sys.exit(1)
-    if task.state != TaskState.BLOCKED:
-        output_error(
-            "not_blocked",
-            f"Task {full_task_id} is in state '{task.state.value}', not 'blocked'. "
-            "Use 'clawpm tasks state <id> open' to change state directly.",
-            fmt=fmt,
-        )
-        sys.exit(1)
-
-    # Transition to open (or progress if --start)
     new_state_str = "progress" if also_start else "open"
-    ctx.invoke(tasks_state, project_id=project_id, task_id=task_id, new_state=new_state_str, note=note)
 
-    # Log the explicit unblock action
-    add_entry(
-        config,
-        project=project_id,
-        action=WorkLogAction.UNBLOCK,
-        task=full_task_id,
-        summary=note or "Blocker resolved",
-        auto=True,
-    )
+    seen: set[str] = set()
+    results: list[dict] = []
+    for raw in task_ids:
+        full_task_id = expand_task_id(raw, project_id)
+        if full_task_id in seen:
+            continue
+        seen.add(full_task_id)
+
+        # Verify the task is actually blocked (per-task, isolated).
+        task = get_task(config, project_id, full_task_id)
+        if not task:
+            results.append({
+                "ok": False, "task_id": full_task_id, "error": "task_not_found",
+                "message": f"No task with id '{full_task_id}' in project '{project_id}'",
+            })
+            continue
+        if task.state != TaskState.BLOCKED:
+            results.append({
+                "ok": False, "task_id": full_task_id, "error": "not_blocked",
+                "message": (
+                    f"Task {full_task_id} is in state '{task.state.value}', not 'blocked'. "
+                    "Use 'clawpm tasks state <id> open' to change state directly."
+                ),
+            })
+            continue
+
+        r = _do_state_change(
+            config,
+            project_id=project_id, task_id=full_task_id, new_state=new_state_str,
+            note=note,
+        )
+        if r.get("ok"):
+            # Log the explicit unblock action only when the transition landed.
+            add_entry(
+                config,
+                project=project_id,
+                action=WorkLogAction.UNBLOCK,
+                task=full_task_id,
+                summary=note or "Blocker resolved",
+                auto=True,
+            )
+        results.append(r)
+
+    _render_state_results(results, new_state_str, project_id, fmt, batch=len(task_ids) > 1)
 
 
 @main.command("next")
