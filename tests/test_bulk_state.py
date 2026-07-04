@@ -395,6 +395,20 @@ class TestSecondaryFailureIsolation:
         assert data["state"] == "done"
         assert data.get("dispatch_teardown_errors"), "expected a teardown marker"
 
+    def test_text_mode_surfaces_degraded_marker(self, temp_portfolio, monkeypatch):
+        import clawpm.cli as cli_mod
+
+        runner = CliRunner()
+        ids = [_add(runner, "test", f"D{i}") for i in range(2)]
+
+        def _boom(*_a, **_k):
+            raise OSError("worklog append failure")
+
+        monkeypatch.setattr(cli_mod, "add_entry", _boom)
+        r = runner.invoke(main, ["--format", "text", "done", "-p", "test", *ids])
+        assert r.exit_code == 0, r.output
+        assert "degraded" in r.output
+
 
 class TestUnblockBulk:
     def test_unblock_bulk_mixed(self, temp_portfolio):

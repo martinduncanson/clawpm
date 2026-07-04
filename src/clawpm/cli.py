@@ -1933,11 +1933,13 @@ def _do_state_change(
                         "target_dir": cand.as_posix(),
                         "task_id": task_id,
                     })
-                except (OSError, PermissionError) as exc:
-                    # Filesystem failure is the only realistic class here.
-                    # Surface to the response — silent leftover settings.json
-                    # is exactly the "stale dispatch" failure mode this
-                    # entire feature exists to prevent.
+                except Exception as exc:
+                    # Broad by design: this runs AFTER the primary change is
+                    # durable, so NOTHING here may raise out of the per-task unit
+                    # (that would misreport a committed done as failed / abort a
+                    # batch). Surface to the response — silent leftover
+                    # settings.json is exactly the "stale dispatch" failure mode
+                    # this feature exists to prevent (fail-open WITH a marker).
                     teardown_errors.append({
                         "target_dir": cand.as_posix(),
                         "error_class": type(exc).__name__,
@@ -2107,9 +2109,21 @@ def _render_state_results(
     if fmt == OutputFormat.JSON:
         output_json(payload)
     else:
+        # Secondary side-effect markers that a durable success may still carry
+        # (best-effort work-log / reflection / lease / teardown / cascade
+        # failures). Surface them in text mode too, so a succeeded-but-degraded
+        # task isn't silent outside JSON.
+        marker_keys = (
+            "log_errors", "reflection_errors", "lease_errors",
+            "files_changed_errors", "parent_ready_errors",
+            "cascade_errors", "dispatch_teardown_errors",
+        )
         for r in results:
             if r.get("ok"):
                 click.echo(f"ok   {r['task_id']} moved to {new_state}")
+                degraded = [k for k in marker_keys if (r.get("data") or {}).get(k)]
+                if degraded:
+                    click.echo(f"     (degraded: {', '.join(degraded)})")
             else:
                 click.echo(f"FAIL {r['task_id']}: {r['error']} - {r['message']}")
         click.echo(f"{len(succeeded)}/{len(results)} succeeded, {len(failed)} failed")
