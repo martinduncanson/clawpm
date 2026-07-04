@@ -350,7 +350,7 @@ def add_mission_mini_goal(
         raise ValueError(f"actor must be 'agent' or 'human', got {actor!r}")
 
     from .tasks import get_task, get_tasks_dir
-    from .concurrency import file_lock, retry_transient
+    from .concurrency import file_lock, guard_fs_tamper, retry_transient
     tasks_dir = get_tasks_dir(config, project_id)
     if not tasks_dir:
         raise ValueError(f"Project {project_id} has no tasks dir")
@@ -404,7 +404,10 @@ def add_mission_mini_goal(
                 f"Task {task_id} vanished — it may have been moved by a "
                 "concurrent session; retry the mini-goal link."
             )
-        text = task.file_path.read_text(encoding="utf-8")
+        # CLAWP-071 — the task was resolved under this lock; an external
+        # delete/move here surfaces as the friendly concurrent-modification error.
+        with guard_fs_tamper(f"Task {task_id}"):
+            text = task.file_path.read_text(encoding="utf-8")
         try:
             fm, body = split_frontmatter(text)
         except FrontmatterError as exc:
@@ -425,6 +428,23 @@ def add_mission_mini_goal(
             + "\n---"
             + body
         )
+
+        # CLAWP-071 — two-phase: append the mini-goal in memory and PRE-RENDER
+        # the mission write BEFORE mutating the task frontmatter. This is the
+        # "build both, then commit" step: if the mission is missing/malformed/
+        # externally-deleted, _render_mission raises here with the task file still
+        # untouched (no divergence), instead of the old order that committed the
+        # task first and only then discovered the mission was unwritable. The
+        # residual window — a hard failure DURING the mission write below, after
+        # the task frontmatter is committed — is closed by the compensation
+        # rollback that restores the task's original frontmatter (Grok review).
+        mission.mini_goals.append(MissionMiniGoal(id=task_id, actor=actor))
+        try:
+            _render_mission(mission)  # validate the mission is writable; recomputed on write
+        except Exception:
+            mission.mini_goals.pop()  # undo the in-memory append; nothing on disk changed
+            raise
+
         original_text = text  # for rollback if the mission rewrite fails
         tmp = task.file_path.with_suffix(".tmp")
         try:
@@ -432,17 +452,16 @@ def add_mission_mini_goal(
             retry_transient(tmp.replace, task.file_path)
         except Exception:
             tmp.unlink(missing_ok=True)
+            mission.mini_goals.pop()  # task never committed — keep memory consistent
             raise
 
-        # Append to the mission + rewrite INSIDE the lock so the persisted
-        # mini_goals list reflects every concurrent add (no lost update — Codex).
-        # The task-write and mission-write are NOT a single atomic unit (general
-        # 2-phase atomicity across mutators is CLAWP-067); so if the mission
-        # rewrite fails, roll the task frontmatter back to keep the two files
-        # consistent rather than leaving the task tagged but absent from the
-        # mission (Grok review).
+        # Commit the mission write INSIDE the lock so the persisted mini_goals
+        # list reflects every concurrent add (no lost update — Codex). The
+        # pre-render above already validated it; a failure here is a genuine
+        # write/replace fault, so roll the task frontmatter back to keep the two
+        # files consistent rather than leaving the task tagged but absent from
+        # the mission (Grok review).
         try:
-            mission.mini_goals.append(MissionMiniGoal(id=task_id, actor=actor))
             _rewrite_mission(mission)
         except Exception as exc:
             rb = task.file_path.with_suffix(".rollback.tmp")
@@ -461,11 +480,22 @@ def add_mission_mini_goal(
         return mission
 
 
-def _rewrite_mission(mission: Mission) -> None:
-    """Persist a mission's mini_goals + status back to its file."""
+def _render_mission(mission: Mission) -> str:
+    """Compute a mission file rewritten with its current status + mini_goals.
+
+    Pure (reads the mission file, builds the text, writes nothing) so a caller
+    can VALIDATE / pre-render the mission write BEFORE mutating a paired file —
+    the CLAWP-071 two-phase step that keeps ``add_mission_mini_goal`` from
+    committing the task-side frontmatter when the mission is unwritable. Raises
+    ``ValueError`` on a missing / malformed mission file (or the raw YAML error
+    for an unparseable one, preserving the pre-CLAWP-079 contract); a mid-lock
+    external delete is mapped to a friendly ``ConcurrentModificationError``.
+    """
     if mission.file_path is None:
         raise ValueError("Mission has no file path")
-    text = mission.file_path.read_text(encoding="utf-8")
+    from .concurrency import guard_fs_tamper
+    with guard_fs_tamper(f"Mission {mission.id}"):
+        text = mission.file_path.read_text(encoding="utf-8")
     try:
         fm, body = split_frontmatter(text)
     except FrontmatterError as exc:
@@ -482,12 +512,18 @@ def _rewrite_mission(mission: Mission) -> None:
         raise
     fm["status"] = mission.status
     fm["mini_goals"] = [g.to_dict() for g in mission.mini_goals]
-    new_text = (
+    return (
         "---\n"
         + yaml.dump(fm, default_flow_style=False, allow_unicode=True, sort_keys=False).rstrip()
         + "\n---"
         + body
     )
+
+
+def _rewrite_mission(mission: Mission) -> None:
+    """Persist a mission's mini_goals + status back to its file."""
+    new_text = _render_mission(mission)
+    assert mission.file_path is not None  # _render_mission raises otherwise
     from .concurrency import retry_transient
     tmp = mission.file_path.with_suffix(".tmp")
     try:

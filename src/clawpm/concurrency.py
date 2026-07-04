@@ -405,6 +405,104 @@ def retry_transient(
     raise AssertionError("retry_transient exhausted without returning or raising")
 
 
+class ConcurrentModificationError(ValueError):
+    """A file a mutator was editing vanished or changed under it mid-critical-section.
+
+    Raised when a filesystem read/write inside a held per-project lock hits a
+    ``FileNotFoundError`` / ``NotADirectoryError`` even though the target was
+    just resolved (and usually ``exists()``-checked). Because clawpm's own
+    writers all serialise on that lock, such a disappearance means an EXTERNAL,
+    non-clawpm process moved or deleted the file. Subclasses ``ValueError`` so
+    the CLI's ``_mutation_errors`` mapper already routes it to a structured
+    error, while the message names the likely cause and the remedy (retry)
+    instead of leaking a raw errno traceback (CLAWP-071).
+    """
+
+
+@contextmanager
+def guard_fs_tamper(desc: str) -> Iterator[None]:
+    """Map a mid-critical-section filesystem disappearance to a friendly error.
+
+    Wrap a ``read_text`` / ``replace`` body that runs INSIDE a per-project lock
+    on a file that was already resolved. A ``FileNotFoundError`` or
+    ``NotADirectoryError`` from that body can only mean an external process
+    removed/moved the file (clawpm's writers serialise on the lock), so re-raise
+    it as :class:`ConcurrentModificationError` with an actionable message.
+
+    Deliberately narrow: only the disappearance shapes are mapped. A
+    ``PermissionError`` (which on POSIX is a genuine ACL denial and on Windows is
+    ambiguous with a transient sharing fault already retried by
+    :func:`retry_transient`) is NOT mapped — it propagates so the caller sees the
+    real condition, matching the narrow philosophy of ``_is_transient_fs_error``.
+    """
+    try:
+        yield
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise ConcurrentModificationError(
+            f"{desc} vanished mid-update — a concurrent session or external "
+            "process moved or deleted it. Retry the operation."
+        ) from exc
+
+
+def commit_staged_pair(
+    first: tuple[Path, str],
+    second: tuple[Path, str],
+    encoding: str = "utf-8",
+) -> None:
+    """Two-phase commit of two ``(path, content)`` writes (CLAWP-071).
+
+    Stage BOTH new contents to sibling ``.tmp`` files first; only if BOTH staging
+    writes succeed are they renamed into place, ``first`` before ``second``. This
+    makes the common failure — an error while *building* or *staging* either
+    file — leave BOTH targets untouched (both tmps are discarded), instead of the
+    old "write A, then build/write B fails, A already committed" divergence.
+
+    **Ordering contract:** the caller MUST order the pair so the residual crash
+    window (a hard kill between the two renames) leaves the SELF-HEALING or
+    recoverable divergence direction. Put the file that is the authoritative
+    record — or whose absence from the other is reconciled by an idempotent
+    backstop — as ``first``. Example: ``add_subtask`` passes the child file
+    first (its ``parent:`` frontmatter is authoritative and an orphan child is
+    reconciled by ``parent_rollup_status``'s dir-scan) and the parent
+    children-list cache second.
+
+    Guarantees:
+      * If building/staging either tmp fails, neither target is modified.
+      * Each rename is individually atomic and retried on transient Windows
+        sharing/access faults (:func:`retry_transient`).
+    Residual (accepted): a hard crash between the two renames commits ``first``
+    only; the caller's ordering + backstop/compensation covers that. True
+    cross-file crash atomicity would need a persistent journal + replay, which is
+    disproportionate here given the existing idempotent reconciliation.
+    """
+    (p1, c1), (p2, c2) = first, second
+    t1 = p1.with_suffix(p1.suffix + ".tmp")
+    t2 = p2.with_suffix(p2.suffix + ".tmp")
+    # Phase 1 — stage both. A failure here leaves both targets untouched.
+    try:
+        t1.write_text(c1, encoding=encoding)
+        t2.write_text(c2, encoding=encoding)
+    except Exception:
+        t1.unlink(missing_ok=True)
+        t2.unlink(missing_ok=True)
+        raise
+    # Phase 2 — commit first, then second. A failure committing `first` still
+    # leaves both targets untouched (its rename either fully happens or raises).
+    try:
+        retry_transient(t1.replace, p1)
+    except Exception:
+        t1.unlink(missing_ok=True)
+        t2.unlink(missing_ok=True)
+        raise
+    # `first` is now committed. A failure here is the residual window the caller
+    # is responsible for (backstop reconciliation or compensation rollback).
+    try:
+        retry_transient(t2.replace, p2)
+    except Exception:
+        t2.unlink(missing_ok=True)
+        raise
+
+
 def append_jsonl_line(path: Path, line: str, encoding: str = "utf-8") -> None:
     """Atomic-append helper for the canonical JSONL writer pattern.
 
