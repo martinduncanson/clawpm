@@ -63,6 +63,7 @@ from .tasks import (
     edit_task,
     split_task,
     add_subtask,
+    touch_task_updated,
 )
 from .worklog import (
     add_entry,
@@ -674,7 +675,7 @@ def project_doctor(
     - Missing clawpm-requirement marker in repo agent docs (CLAUDE.md/AGENTS.md/README.md)
     """
     import json as _json_doc
-    from datetime import datetime, timezone, timedelta
+    from datetime import date, datetime, timezone, timedelta
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
@@ -764,7 +765,22 @@ def project_doctor(
                 continue
             # Also check work_log for the most recent entry for this task
             task_id_stem = progress_file.name.replace(".progress.md", "")
+            # CLAWP-086 — prefer the task's own `updated` stamp over file mtime,
+            # which lies after git operations / syncs / external edits. Fall back
+            # to mtime for legacy tasks that predate the stamp.
             last_touched = mtime
+            try:
+                _fm, _ = parse_frontmatter(
+                    progress_file.read_text(encoding="utf-8", errors="replace")
+                )
+                _updated = _fm.get("updated") if isinstance(_fm, dict) else None
+                if _updated:
+                    _u = datetime.fromisoformat(str(_updated).rstrip("Z"))
+                    if _u.tzinfo is None:
+                        _u = _u.replace(tzinfo=timezone.utc)
+                    last_touched = _u
+            except (ValueError, OSError):
+                pass
             # Read work_log entries for this task to find more recent touch
             work_log_path = config.portfolio_root / "work_log.jsonl"
             if work_log_path.exists():
@@ -918,12 +934,32 @@ def project_doctor(
                         break
                 if not deps_resolved:
                     continue
-                try:
-                    btime = datetime.fromtimestamp(
-                        blocked_file.stat().st_mtime, tz=timezone.utc
-                    )
-                except OSError:
-                    continue
+                # CLAWP-086 — prefer the task's `updated` stamp (blocked
+                # transitions stamp it) over the blocked-file mtime, which lies
+                # after a checkout/sync. `bt` is already parsed above. Fall back
+                # to mtime for legacy tasks or an unparseable stamp.
+                btime: datetime | None = None
+                if bt.updated:
+                    try:
+                        # CLAWP-086 (Codex review): `updated` is a date-only
+                        # stamp — too coarse for the 24h cutoff. Interpret it
+                        # CONSERVATIVELY as end-of-day UTC so a task blocked late
+                        # on day D isn't falsely reported the next morning;
+                        # genuinely stale multi-day blocks are still caught.
+                        _bd = date.fromisoformat(str(bt.updated).strip())
+                        btime = datetime(
+                            _bd.year, _bd.month, _bd.day, 23, 59, 59,
+                            tzinfo=timezone.utc,
+                        )
+                    except ValueError:
+                        btime = None
+                if btime is None:
+                    try:
+                        btime = datetime.fromtimestamp(
+                            blocked_file.stat().st_mtime, tz=timezone.utc
+                        )
+                    except OSError:
+                        continue
                 if btime > cutoff_blocked:
                     continue
                 stale_blocked.append({
@@ -3488,6 +3524,12 @@ def log_add(
         agent=agent,
         session_key=session_key,
     )
+
+    # CLAWP-086 — a task-targeted log entry is the "log-attach" mutator: it
+    # records activity against the task, so bump its `updated` stamp (best-
+    # effort; the work-log entry above is the primary artefact).
+    if task_id:
+        touch_task_updated(config, project_id, task_id)
 
     output_success("Entry added", data=entry.to_dict(), fmt=fmt)
 

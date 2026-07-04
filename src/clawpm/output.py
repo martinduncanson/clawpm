@@ -187,11 +187,13 @@ def output_tasks_list(tasks: list[Any], fmt: OutputFormat = OutputFormat.JSON, f
             title = t.title[:45] + "..." if len(t.title) > 45 else t.title
             cmplx = f" \\[{t.complexity.value}]" if t.complexity else ""
             parent_marker = " [dim]↳[/dim]" if t.parent else ""
-            
+            # CLAWP-086 — surface the `updated` stamp in the text list too.
+            upd = f" [dim]upd:{t.updated}[/dim]" if getattr(t, "updated", None) else ""
+
             console.print(
                 f"{indent}[cyan]{t.id}[/cyan]{parent_marker} "
                 f"[{state_color}]\\[{t.state.value}][/{state_color}] "
-                f"P{t.priority}{cmplx} {title}"
+                f"P{t.priority}{cmplx} {title}{upd}"
             )
 
         for t in top_level:
@@ -231,6 +233,11 @@ def output_task_detail(
 
         if task.depends:
             console.print(f"[dim]Depends on:[/dim] {', '.join(task.depends)}")
+        # CLAWP-086 — surface created/updated in the text detail view.
+        if getattr(task, "created", None):
+            console.print(f"[dim]Created:[/dim] {task.created}")
+        if getattr(task, "updated", None):
+            console.print(f"[dim]Updated:[/dim] {task.updated}")
         if task.file_path:
             console.print(f"[dim]File:[/dim] {task.file_path}")
 

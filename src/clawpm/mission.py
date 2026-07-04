@@ -41,7 +41,7 @@ from typing import Any
 import yaml
 
 from .discovery import get_project_dir
-from .frontmatter import FrontmatterError, split_frontmatter
+from .frontmatter import FrontmatterError, split_frontmatter, stamp_updated
 from .models import PortfolioConfig, Task, TaskState
 from .tasks import list_tasks
 
@@ -418,6 +418,7 @@ def add_mission_mini_goal(
             ) from cause
         fm["parent_mission"] = mission_id
         fm["actor"] = actor
+        stamp_updated(fm)  # CLAWP-086 — mission-linking mutates the task file.
         new_text = (
             "---\n"
             + yaml.dump(fm, default_flow_style=False, allow_unicode=True).rstrip()

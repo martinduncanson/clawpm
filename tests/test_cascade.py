@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import tempfile
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -306,11 +307,23 @@ class TestDoctorStaleBlocked:
         change_task_state(config, "test", child.id, TaskState.BLOCKED)
         change_task_state(config, "test", parent.id, TaskState.DONE)
 
-        # Backdate child.md mtime by 48h so it's past the 24h cutoff.
+        # Backdate the child so it's past the 24h cutoff. Since CLAWP-086 the
+        # stale-blocked check prefers the `updated` frontmatter stamp over the
+        # (lying) file mtime, so backdate BOTH: rewrite `updated` to 2 days ago
+        # (the authoritative signal — the block above stamped it to today) and
+        # the mtime as the legacy fallback.
+        import re as _re
         child_blocked_path = (
             temp_portfolio["tasks_dir"] / "blocked" / f"{child.id}.md"
         )
         assert child_blocked_path.exists()
+        _old_date = (date.today() - timedelta(days=2)).isoformat()
+        _txt = child_blocked_path.read_text(encoding="utf-8")
+        _txt, _n = _re.subn(
+            r"updated: '?\d{4}-\d{2}-\d{2}'?", f"updated: '{_old_date}'", _txt
+        )
+        assert _n == 1
+        child_blocked_path.write_text(_txt, encoding="utf-8")
         import time
         old_ts = time.time() - (48 * 3600)
         os.utime(child_blocked_path, (old_ts, old_ts))

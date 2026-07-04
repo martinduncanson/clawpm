@@ -27,11 +27,23 @@ change on-disk bytes.
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
 import yaml
 
 _FENCE = "---"
+
+
+def stamp_updated(frontmatter: dict[str, Any], when: str | None = None) -> None:
+    """Set the ``updated`` timestamp on a frontmatter mapping, in place (CLAWP-086).
+
+    Single source of the field name + ISO-date format so every task mutator
+    stamps identically. ``when`` defaults to today's ISO date; a caller that
+    also stamps ``created`` in the same write passes the shared value so
+    ``created == updated`` holds on creation.
+    """
+    frontmatter["updated"] = when or date.today().isoformat()
 
 
 class FrontmatterError(ValueError):

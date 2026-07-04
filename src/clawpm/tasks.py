@@ -10,7 +10,12 @@ from pathlib import Path
 import yaml
 
 from .concurrency import file_lock, retry_transient
-from .frontmatter import FrontmatterError, parse_frontmatter, split_frontmatter
+from .frontmatter import (
+    FrontmatterError,
+    parse_frontmatter,
+    split_frontmatter,
+    stamp_updated,
+)
 from .models import Task, TaskState, TaskComplexity, Predictions, PortfolioConfig
 from .discovery import get_project_dir, find_project_dir_fallback
 
@@ -357,6 +362,107 @@ def get_next_task(config: PortfolioConfig, project_id: str) -> Task | None:
     return None
 
 
+# Match the top-level `updated:` key however it's spaced (`updated: x`,
+# `updated:x`, bare `updated:`) so replacement is idempotent and never inserts a
+# duplicate line (Grok review). `^updated:` can't match sibling keys like
+# `updated_at:` (that's `updated_`, not `updated:`).
+_UPDATED_LINE_RE = re.compile(r"^updated:")
+
+
+def _set_updated_line(text: str, stamp: str) -> str | None:
+    """Insert or replace ONLY the top-level ``updated:`` line in ``text``'s
+    frontmatter block, preserving every other byte (CLAWP-086, Codex review).
+
+    Returns the rewritten text, or ``None`` if ``text`` has no well-formed
+    leading ``---`` … ``---`` frontmatter fence (leave the file untouched).
+    The stamp is written quoted (``updated: '2026-07-04'``) to match how PyYAML
+    serialises the date-shaped string elsewhere, so ``Task.from_file`` reads it
+    back as a ``str``.
+    """
+    if not text.startswith("---"):
+        return None
+    lines = text.split("\n")
+    if lines[0].strip() != "---":
+        return None
+    close_idx = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            close_idx = i
+            break
+    if close_idx is None:
+        return None  # unterminated fence
+    new_line = f"updated: '{stamp}'"
+    for i in range(1, close_idx):
+        if _UPDATED_LINE_RE.match(lines[i]):
+            lines[i] = new_line
+            return "\n".join(lines)
+    lines.insert(close_idx, new_line)
+    return "\n".join(lines)
+
+
+def _stamp_updated_file(file_path: Path, when: str | None = None) -> None:
+    """Bump the ``updated`` stamp in a task file's frontmatter, in place (CLAWP-086).
+
+    Used by the move-only mutators (``change_task_state``, ``split_task``) whose
+    frontmatter is otherwise untouched — the file is relocated, so without this
+    the ``updated`` stamp would not reflect the state change and doctor's stale
+    check would fall back to the (lying) file mtime.
+
+    Surgical, NOT a reserialize (Codex review): these paths were previously
+    move-only and preserved the file bytes verbatim. A full ``yaml.dump``
+    round-trip would silently drop operator comments and rewrite key order /
+    quoting on every routine ``start`` / ``block`` / ``done`` / ``split``.
+    Instead only the single top-level ``updated:`` line is inserted or replaced;
+    every other byte (comments, order, style, body) is preserved. A file with no
+    well-formed frontmatter fence is left untouched.
+
+    The read is wrapped in ``retry_transient`` (Codex review): this runs right
+    after a successful ``shutil.move`` under the lock, so an un-retried read
+    could hit the same transient Windows sharing/access fault the surrounding
+    move/reload path already retries — raising after the move had committed and
+    leaving state + work-log inconsistent.
+    """
+    text = retry_transient(lambda: file_path.read_text(encoding="utf-8"))
+    new_text = _set_updated_line(text, when or date.today().isoformat())
+    if new_text is None:
+        return  # no well-formed frontmatter fence — leave the file untouched
+    tmp = file_path.with_suffix(file_path.suffix + ".tmp")
+    try:
+        tmp.write_text(new_text, encoding="utf-8")
+        # Retry transient Windows sharing/access faults on the rename — this
+        # runs under the per-project lock alongside concurrent scanners (CLAWP-051).
+        retry_transient(tmp.replace, file_path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def touch_task_updated(
+    config: PortfolioConfig,
+    project_id: str,
+    task_id: str,
+    when: str | None = None,
+) -> bool:
+    """Bump a task's ``updated`` stamp without otherwise mutating it (CLAWP-086).
+
+    The log-attach path (``clawpm log add --task X``): recording activity against
+    a task is a mutation of its recency, so ``updated`` should reflect it and
+    ``tasks show``/``list`` surface the new date. Best-effort — returns ``True``
+    if the task file was found and stamped, ``False`` otherwise; never raises on
+    a missing task, since the work-log entry is the primary artefact and must not
+    be undone by a stamping failure.
+    """
+    tasks_dir = get_tasks_dir(config, project_id)
+    if not tasks_dir:
+        return False
+    with file_lock(tasks_dir / ".clawpm-tasks.lock"):
+        task = get_task(config, project_id, task_id)
+        if not task or not task.file_path or not task.file_path.exists():
+            return False
+        _stamp_updated_file(task.file_path, when)
+        return True
+
+
 def _write_rejection_frontmatter(
     file_path: Path,
     rationale: str,
@@ -377,6 +483,7 @@ def _write_rejection_frontmatter(
     fm["rationale"] = rationale
     if supersedes:
         fm["supersedes"] = supersedes
+    stamp_updated(fm)  # CLAWP-086 — rejection is a mutation.
 
     new_text = (
         "---\n"
@@ -523,10 +630,24 @@ def change_task_state(
                         f"Task metadata '{_task_md}' no longer exists — "
                         "it may have been moved by a concurrent session."
                     )
+                # (b.1) CLAWP-086 (Codex review) — a directory task's PROGRESS
+                #       transition keeps `_task.md` in place (no `.progress.md`
+                #       rename), so the move-path stamp below never runs. Stamp
+                #       here so `start` on a decomposed parent still bumps
+                #       `updated`. REJECTED already stamped in step (d).
+                if new_state != TaskState.REJECTED:
+                    _stamp_updated_file(_task_md)
                 return retry_transient(Task.from_file, _task_md)
 
             # (e) Move (retry transient Windows sharing/access faults — CLAWP-051)
             retry_transient(shutil.move, str(task_dir), str(new_dir))
+
+            # (e.1) CLAWP-086 — stamp `updated` on the relocated file. REJECTED
+            #       already stamped via _write_rejection_frontmatter before the
+            #       move (whose divergent serializer we must not disturb), so
+            #       skip it here.
+            if new_state != TaskState.REJECTED:
+                _stamp_updated_file(new_dir / "_task.md")
 
             # (f) Reload and return INSIDE the lock (Finding 5). Retry the read
             #     too: a scanner can hit the freshly-moved file transiently even
@@ -588,6 +709,11 @@ def change_task_state(
 
         # (e) Move (retry transient Windows sharing/access faults — CLAWP-051)
         retry_transient(shutil.move, str(current_path), str(new_path))
+
+        # (e.1) CLAWP-086 — stamp `updated` on the relocated file. REJECTED
+        #       already stamped via _write_rejection_frontmatter before the move.
+        if new_state != TaskState.REJECTED:
+            _stamp_updated_file(new_path)
 
         # (f) Reload and return INSIDE the lock (Finding 5). Retry the read too:
         #     a scanner can hit the freshly-moved file transiently even though
@@ -957,13 +1083,15 @@ def add_task(
             next_num = max(existing_nums, default=-1) + 1
             task_id = f"{prefix}-{next_num:03d}"
 
-        # Build frontmatter
+        # Build frontmatter. CLAWP-086 — `updated` equals `created` at add time.
+        _today = date.today().isoformat()
         frontmatter = {
             "id": task_id,
             "priority": priority,
-            "created": date.today().isoformat(),
+            "created": _today,
             "baseline_ref": _baseline_ref,
         }
+        stamp_updated(frontmatter, _today)
 
         if complexity:
             frontmatter["complexity"] = complexity.value
@@ -1171,6 +1299,9 @@ def edit_task(
                 after = lines[section_idx:] if section_idx is not None else []
                 content = "\n".join(before) + f"\n\n{body}\n\n" + "\n".join(after)
 
+        # CLAWP-086 — every edit bumps the `updated` stamp.
+        stamp_updated(frontmatter)
+
         # Rebuild file — utf-8 always so Unicode content survives on Windows
         new_text = f"---\n{yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True).strip()}\n---\n{content}"
         tmp_path = task.file_path.with_suffix(".tmp")
@@ -1223,6 +1354,9 @@ def split_task(
         new_path = task_dir / "_task.md"
         retry_transient(shutil.move, str(current_path), str(new_path))
 
+        # CLAWP-086 — splitting a leaf into a parent dir is a structural mutation.
+        _stamp_updated_file(new_path)
+
         return retry_transient(Task.from_file, new_path)
 
 
@@ -1252,6 +1386,7 @@ def _append_child_to_parent_frontmatter(
         return  # idempotent
     children.append(child_id)
     fm["children"] = children
+    stamp_updated(fm)  # CLAWP-086 — gaining a child mutates the parent.
     body = raw_body.lstrip("\n")
     new_text = (
         "---\n"
@@ -1350,13 +1485,15 @@ def add_subtask(
         next_num = (max(existing_nums) if existing_nums else 0) + 1
         subtask_id = f"{parent_id}-{next_num:03d}"
 
-        # Build frontmatter
+        # Build frontmatter. CLAWP-086 — `updated` equals `created` at add time.
+        _today = date.today().isoformat()
         frontmatter: dict = {
             "id": subtask_id,
             "priority": priority,
             "parent": parent_id,
-            "created": date.today().isoformat(),
+            "created": _today,
         }
+        stamp_updated(frontmatter, _today)
 
         if complexity:
             frontmatter["complexity"] = complexity.value

@@ -25,7 +25,12 @@ from typing import Any
 
 import yaml
 
-from .frontmatter import FrontmatterError, parse_frontmatter, split_frontmatter
+from .frontmatter import (
+    FrontmatterError,
+    parse_frontmatter,
+    split_frontmatter,
+    stamp_updated,
+)
 from .models import (
     Predictions,
     ResearchType,
@@ -606,12 +611,15 @@ def _render_task_content(
     is used for the new-root task (which has no leaf) so root predictions are
     not silently lost.
     """
+    # CLAWP-086 — mirror add_task/add_subtask: `updated` == `created` at emit time.
+    _today = date.today().isoformat()
     frontmatter: dict[str, Any] = {
         "id": task_id,
         "priority": 5,
-        "created": date.today().isoformat(),
+        "created": _today,
         "baseline_ref": baseline_ref,
     }
+    stamp_updated(frontmatter, _today)
 
     if parent_id:
         frontmatter["parent"] = parent_id
@@ -1272,6 +1280,7 @@ def _stamp_prd_ref(task_file: Path, prd_ref: str) -> None:
     if fm.get("prd_ref") == prd_ref:
         return  # idempotent
     fm["prd_ref"] = prd_ref
+    stamp_updated(fm)  # CLAWP-086 — writing prd_ref mutates the task file.
     body = raw_body.lstrip("\n")
     new_text = (
         "---\n"
