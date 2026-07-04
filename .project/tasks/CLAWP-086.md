@@ -30,7 +30,9 @@ SPEC: stamp updated on every mutator; sequence AFTER the parse_frontmatter helpe
 
 ## Acceptance Criteria
 
-- [ ] (Add criteria here)
+- [ ] Criterion 1: Every mutating path (edit, state, log-attach, decompose, split) stamps updated: ISO date in frontmatter; add sets it equal to created
+- [ ] Criterion 2: tasks show/list surface updated; doctor stale-task check prefers updated over file mtime
+- [ ] Criterion 3: Round-trip preserved by Task.from_file; tests cover each mutator stamping
 
 ## Notes
 
