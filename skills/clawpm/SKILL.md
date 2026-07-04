@@ -38,7 +38,7 @@ clawpm is meant to be *agentic*: the acting agent should reach for the right pri
 | About to spawn a parallel agent on shared files | `clawpm conflicts --scope ...` (or `--task <id>`) | Pre-flight file-claim check; empty `conflicts` array = safe to dispatch. |
 | Subagent doing >5min file work toward a verifiable goal | **see "Two dispatch modes" below** | The mode depends on *how* the subagent runs (separate process vs in-harness). |
 | Verify a subagent's deliverable against its rubric | `subagent-judge` skill | Independent criterion-by-criterion grade; catches "said done, missed criterion N". |
-| Render a task's rubric for a grader / outcome payload | `tasks emit-rubric <id>` | Markdown rubric, or `--format outcome-payload` for the Anthropic Outcomes shape. |
+| Render a task's rubric for a grader / outcome payload | `tasks emit-rubric <id>` | Markdown rubric, or `--rubric-format outcome-payload` for the Anthropic Outcomes shape. |
 | Long/crash-prone dispatch that must survive a dead holder | `lease grant/heartbeat` (+ `tasks dispatch --lease-ttl`) | TTL + heartbeat; expiry → fallback policy (requeue/route/escalate). No daemon. |
 | High-confidence "done" you don't fully trust | `eval-stop --confirm-close` (or `CLAWPM_CONFIRM_CLOSE`) | Spends an adversarial refutation pass only on the ok=true→close transition. |
 | Calibrate future estimates from history | `reflect summarize` / `reflect suggest` | Actual/predicted ratios bucketed by complexity/confidence; deflates a gut estimate. |

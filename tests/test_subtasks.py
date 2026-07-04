@@ -372,6 +372,58 @@ class TestAddSubtask:
         parent = get_task(config, "test", "TEST-000")
         assert len(parent.children) == 3
     
+    def test_subtask_persists_predictions_and_scope(self, temp_portfolio):
+        """CLAWP-072-006: `tasks add --parent` must persist predictions, scope,
+        and success_criteria identically to a parentless add — previously the
+        CLI subtask path silently dropped every prediction/scope flag."""
+        import json
+        from click.testing import CliRunner
+        from clawpm.cli import main
+
+        config = temp_portfolio["config"]
+        parent = add_task(config, "test", "Parent for prediction passthrough")
+
+        pred_flags = [
+            "--predict-duration", "2h",
+            "--confidence", "4",
+            "--predicted-by", "agent",
+            "--success-criteria",
+            '{"criterion": "P95 <200ms", "gradeable_signal": "loadtest"}',
+            "--scope", "src/**",
+        ]
+
+        runner = CliRunner()
+
+        # Parentless add — the reference persistence behaviour.
+        r_flat = runner.invoke(
+            main,
+            ["-p", "test", "tasks", "add", "-t", "Flat baseline", *pred_flags],
+        )
+        assert r_flat.exit_code == 0, r_flat.output
+        flat = get_task(config, "test", json.loads(r_flat.output)["data"]["id"])
+
+        # Subtask add — must persist the same fields.
+        r_sub = runner.invoke(
+            main,
+            ["-p", "test", "tasks", "add", "-t", "Child with predictions",
+             "--parent", parent.id, *pred_flags],
+        )
+        assert r_sub.exit_code == 0, r_sub.output
+        sub = get_task(config, "test", json.loads(r_sub.output)["data"]["id"])
+
+        assert sub.parent == parent.id
+        # Scope persisted identically.
+        assert sub.scope == flat.scope == ["src/**"]
+        # Predictions persisted identically (not silently dropped).
+        assert sub.predictions is not None and not sub.predictions.is_empty()
+        assert sub.predictions.to_dict() == flat.predictions.to_dict()
+        # Spot-check the specific fields the audit flagged.
+        assert sub.predictions.confidence == 4
+        assert sub.predictions.duration_min == 120
+        assert sub.predictions.filled_by == "agent"
+        assert len(sub.predictions.success_criteria) == 1
+        assert sub.predictions.success_criteria[0].criterion == "P95 <200ms"
+
     def test_add_subtask_to_existing_directory(self, temp_portfolio):
         """Test adding subtask to already-split parent."""
         tasks_dir = temp_portfolio["tasks_dir"]

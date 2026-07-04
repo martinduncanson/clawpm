@@ -64,7 +64,7 @@ clawpm tasks add --project <proj> \
 ### 2. Verify the rubric is renderable
 
 ```bash
-clawpm tasks emit-rubric <CLAWP-id> --format markdown
+clawpm tasks emit-rubric <CLAWP-id> --rubric-format markdown
 ```
 
 If criteria are too vague to grade, the rubric will read as unfollowable. Tighten before dispatching.
