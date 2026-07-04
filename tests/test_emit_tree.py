@@ -600,13 +600,21 @@ class TestEmitTreeNewRoot:
         doc = parse_emit_document(FLAT_TREE_DOC)
         result = emit_tree(config, "emittest", doc)
 
-        # find L1 task (first leaf — has criteria)
+        # Select L1 ("Leaf one" — the leaf carrying the "Tests pass" criterion)
+        # explicitly. result.emitted is built from a filesystem scan (iterdir,
+        # emit_tree._collect_emitted_tasks) with no ordering guarantee, so
+        # indexing [0] happened to hit L1 on NTFS but not on ext4.
         leaf_ids = [t["id"] for t in result.emitted if t.get("parent") == result.root_id]
         assert len(leaf_ids) >= 1
+        l1_id = next(
+            t["id"]
+            for t in result.emitted
+            if t.get("parent") == result.root_id and t.get("title") == "Leaf one"
+        )
 
         cli_result = runner.invoke(
             main,
-            ["tasks", "emit-rubric", "--project", "emittest", leaf_ids[0]],
+            ["tasks", "emit-rubric", "--project", "emittest", l1_id],
         )
         assert cli_result.exit_code == 0
         out = json.loads(cli_result.output)
