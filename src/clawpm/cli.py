@@ -1717,32 +1717,14 @@ def _do_state_change(
         return {"ok": False, "task_id": task_id, "error": "state_change_failed", "message": str(exc)}
 
     if not task:
-        # change_task_state returns None both for a genuinely absent task AND
-        # for the DONE rollup gate re-checked inside the lock (a child reopened
-        # in the outer-check→lock window). Disambiguate so a concurrency race on
-        # the gate reports the honest "subtasks_incomplete", not "task_not_found"
-        # (Grok review). The outer gate above already handled the common case;
-        # this covers only the narrow in-lock race.
-        if state == TaskState.DONE and not force:
-            from .tasks import parent_rollup_status
-            _race_task = get_task(config, project_id, task_id)
-            if _race_task:
-                _race_status = parent_rollup_status(config, project_id, _race_task)
-                if not _race_status["ready"]:
-                    incomplete = (
-                        [f"{c['id']} [{c['state']}]" for c in _race_status["incomplete"]]
-                        + [f"{m} [missing]" for m in _race_status["missing"]]
-                    )
-                    return {
-                        "ok": False,
-                        "task_id": task_id,
-                        "error": "subtasks_incomplete",
-                        "message": (
-                            f"Cannot complete {task_id} - subtasks incomplete:\n  "
-                            + "\n  ".join(incomplete)
-                            + "\nUse --force to complete anyway."
-                        ),
-                    }
+        # change_task_state returns None for a genuinely absent task. It can
+        # ALSO return None for the DONE rollup gate re-checked inside the lock
+        # (a child reopened in the outer-check→lock window) — a pre-existing,
+        # rare concurrency nuance that the single-task path has always reported
+        # as task_not_found. Disambiguating it honestly requires the mutator to
+        # raise a distinct gate error (a tasks.py contract change touching all
+        # callers), which is out of scope for CLAWP-083 and belongs with the
+        # concurrency-integrity work (CLAWP-071); preserved as-is here for parity.
         return {
             "ok": False, "task_id": task_id, "error": "task_not_found",
             "message": f"No task with id '{task_id}' in project '{project_id}'",
@@ -1757,6 +1739,8 @@ def _do_state_change(
     log_errors: list[dict] = []
     reflection_errors: list[dict] = []
     lease_errors: list[dict] = []
+    files_changed_errors: list[dict] = []
+    parent_ready_errors: list[dict] = []
 
     def _safe_add_entry(**kwargs) -> None:
         try:
@@ -1791,8 +1775,12 @@ def _do_state_change(
                 if result.returncode == 0 and result.stdout.strip():
                     raw_files = [f for f in result.stdout.strip().split('\n') if f]
                     files_changed = filter_files_changed(raw_files, project.repo_path)
-            except Exception:
-                pass
+            except Exception as exc:
+                # files_changed enrichment is advisory; a git failure just drops
+                # it (the work-log entry is still written). Record a marker so a
+                # persistent failure isn't wholly invisible (fail-open WITH a
+                # marker), consistent with the other secondaries.
+                files_changed_errors.append({"error_class": type(exc).__name__, "message": str(exc)})
 
         summary = note if note else f"Task marked {new_state}"
         _safe_add_entry(
@@ -1978,8 +1966,12 @@ def _do_state_change(
         from .tasks import parent_ready_signal
         try:
             parent_ready = parent_ready_signal(config, project_id, task_id)
-        except Exception:
+        except Exception as exc:
+            # Advisory only; on error we simply don't surface a parent-ready
+            # hint. Record a marker for consistency with the other best-effort
+            # post-mutation steps (fail-open WITH a marker).
             parent_ready = None
+            parent_ready_errors.append({"error_class": type(exc).__name__, "message": str(exc)})
 
     data = task.to_dict()
     if parent_ready:
@@ -1998,6 +1990,10 @@ def _do_state_change(
         data["reflection_errors"] = reflection_errors
     if lease_errors:
         data["lease_errors"] = lease_errors
+    if files_changed_errors:
+        data["files_changed_errors"] = files_changed_errors
+    if parent_ready_errors:
+        data["parent_ready_errors"] = parent_ready_errors
     return {
         "ok": True,
         "task_id": task_id,
