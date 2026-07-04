@@ -377,6 +377,24 @@ class TestSecondaryFailureIsolation:
         data = json.loads(r.output)["data"]
         assert data.get("reflection_errors"), "expected a reflection_errors marker"
 
+    def test_dispatch_teardown_failure_marker(self, temp_portfolio, monkeypatch):
+        # A failure building the dispatch-teardown candidate set must not turn
+        # an already-durable done into a failed result (Codex P2 + Grok HIGH).
+        import clawpm.dispatch as dispatch_mod
+
+        runner = CliRunner()
+        a = _add(runner, "test", "TD")
+
+        def boom(*_a, **_k):
+            raise OSError("dispatch registry read failed")
+
+        monkeypatch.setattr(dispatch_mod, "active_dispatch_dirs", boom)
+        r = runner.invoke(main, ["-p", "test", "done", a])
+        assert r.exit_code == 0, r.output
+        data = json.loads(r.output)["data"]
+        assert data["state"] == "done"
+        assert data.get("dispatch_teardown_errors"), "expected a teardown marker"
+
 
 class TestUnblockBulk:
     def test_unblock_bulk_mixed(self, temp_portfolio):

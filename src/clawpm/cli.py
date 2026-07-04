@@ -1865,22 +1865,30 @@ def _do_state_change(
             read_dispatch_marker,
             teardown_dispatch_settings,
         )
-        project = get_project(config, project_id)
-        candidate_dirs: list[Path] = list(
-            active_dispatch_dirs(
-                config.portfolio_root, task_id, project_id
+        # Building the candidate set (registry read + legacy probes) is itself a
+        # BEST-EFFORT secondary: a registry/FS error here must not raise out of
+        # this per-task unit and turn an already-durable done into a failed
+        # result (Codex/Grok review) — record a marker instead.
+        candidate_dirs: list[Path] = []
+        try:
+            project = get_project(config, project_id)
+            candidate_dirs = list(
+                active_dispatch_dirs(
+                    config.portfolio_root, task_id, project_id
+                )
             )
-        )
-        # Legacy fallback: dispatches written before the registry was
-        # introduced won't appear in active_dispatch_dirs. Probe the
-        # canonical locations so existing in-flight dispatches still
-        # get torn down on their next done.
-        if project and project.repo_path and project.repo_path.exists():
-            if project.repo_path not in candidate_dirs:
-                candidate_dirs.append(project.repo_path)
-            wt_dir = project.repo_path / ".clawpm-worktrees" / task_id
-            if wt_dir.exists() and wt_dir not in candidate_dirs:
-                candidate_dirs.append(wt_dir)
+            # Legacy fallback: dispatches written before the registry was
+            # introduced won't appear in active_dispatch_dirs. Probe the
+            # canonical locations so existing in-flight dispatches still
+            # get torn down on their next done.
+            if project and project.repo_path and project.repo_path.exists():
+                if project.repo_path not in candidate_dirs:
+                    candidate_dirs.append(project.repo_path)
+                wt_dir = project.repo_path / ".clawpm-worktrees" / task_id
+                if wt_dir.exists() and wt_dir not in candidate_dirs:
+                    candidate_dirs.append(wt_dir)
+        except Exception as exc:
+            teardown_errors.append({"error_class": type(exc).__name__, "message": str(exc)})
         seen_dirs: set[str] = set()
         for cand in candidate_dirs:
             # Dedup by resolved path so registry + legacy probes don't
@@ -1892,7 +1900,18 @@ def _do_state_change(
             if key in seen_dirs:
                 continue
             seen_dirs.add(key)
-            marker = read_dispatch_marker(cand)
+            # read_dispatch_marker reads a settings file: an unreadable /
+            # non-UTF-8 file raises past the JSONDecodeError it catches. Guard
+            # it so it can't abort the (already durable) done (Codex P2).
+            try:
+                marker = read_dispatch_marker(cand)
+            except Exception as exc:
+                teardown_errors.append({
+                    "target_dir": cand.as_posix(),
+                    "error_class": type(exc).__name__,
+                    "message": str(exc),
+                })
+                continue
             # Codex round-6 P1: must match BOTH task_id AND project_id.
             # Without the project_id check on the marker, completing a
             # task in project A could tear down a same-task-id dispatch
@@ -1926,6 +1945,15 @@ def _do_state_change(
                     })
 
     # Write reflection event when task completes or is blocked
+    if state in (TaskState.DONE, TaskState.BLOCKED) and not pre_transition_task:
+        # The transition succeeded but the pre-transition snapshot (taken before
+        # the mutator) was unavailable — e.g. get_task returned None on a
+        # transient read. Calibration data is lost; mark it so the drop is
+        # visible rather than silent (Grok review).
+        reflection_errors.append({
+            "error_class": "MissingPreTransitionSnapshot",
+            "message": "pre-transition task snapshot unavailable; reflection event skipped",
+        })
     if state in (TaskState.DONE, TaskState.BLOCKED) and pre_transition_task:
         try:
             from .reflect import write_reflection_event, _compute_actuals
@@ -2046,6 +2074,13 @@ def _render_state_results(
     summary; the process exits non-zero if ANY task failed, and the JSON reports
     exactly which (honest exit code + machine-readable breakdown).
     """
+    if not results:
+        # Defensive: nargs=-1 + required=True guarantees >=1 supplied id and the
+        # dedup preserves >=1 result, so this is unreachable via the CLI — but
+        # guard rather than IndexError if a future caller reaches render with an
+        # empty set (Grok review).
+        output_error("no_tasks", "No task ids to process.", fmt=fmt)
+        sys.exit(2)
     if not batch:
         r = results[0]
         if r.get("ok"):
