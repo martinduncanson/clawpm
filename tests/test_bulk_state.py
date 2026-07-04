@@ -32,7 +32,8 @@ def _make_project(projects_dir: Path, pid: str, name: str) -> None:
     meta = project_dir / ".project"
     meta.mkdir()
     (meta / "settings.toml").write_text(
-        f'id = "{pid}"\nname = "{name}"\nstatus = "active"\npriority = 3\n'
+        f'id = "{pid}"\nname = "{name}"\nstatus = "active"\npriority = 3\n',
+        encoding="utf-8",
     )
     tasks_dir = meta / "tasks"
     tasks_dir.mkdir()
@@ -49,7 +50,8 @@ def temp_portfolio():
         f'portfolio_root = "{portfolio_root.as_posix()}"\n'
         f'project_roots = ["{(portfolio_root / "projects").as_posix()}"]\n'
         "[defaults]\n"
-        'status = "active"\n'
+        'status = "active"\n',
+        encoding="utf-8",
     )
     projects_dir = portfolio_root / "projects"
     projects_dir.mkdir()
@@ -294,6 +296,32 @@ class TestBulkRejectRefusal:
 # ---------------------------------------------------------------------------
 # unblock bulk with per-task isolation
 # ---------------------------------------------------------------------------
+
+
+class TestSecondaryFailureIsolation:
+    """A durable primary state change must not be turned into a batch-aborting
+    traceback by a failing secondary work-log append (Grok review, CLAWP-083)."""
+
+    def test_worklog_append_failure_does_not_abort_batch(self, temp_portfolio, monkeypatch):
+        import clawpm.cli as cli_mod
+
+        runner = CliRunner()
+        ids = [_add(runner, "test", f"L{i}") for i in range(3)]
+
+        def _boom(*_a, **_k):
+            raise OSError("simulated work_log append failure")
+
+        monkeypatch.setattr(cli_mod, "add_entry", _boom)
+        r = runner.invoke(main, ["-p", "test", "done", *ids])
+        # All three still transition (state file moves are durable); the batch
+        # is not aborted, and each carries a log_errors marker.
+        assert r.exit_code == 0, r.output
+        payload = json.loads(r.output)
+        assert payload["summary"] == {"total": 3, "succeeded": 3, "failed": 0}
+        for res in payload["results"]:
+            assert res["ok"] is True
+            assert res["data"]["state"] == "done"
+            assert res["data"]["log_errors"], "expected a log_errors marker"
 
 
 class TestUnblockBulk:

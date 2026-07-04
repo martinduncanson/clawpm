@@ -1722,6 +1722,20 @@ def _do_state_change(
             "message": f"No task with id '{task_id}' in project '{project_id}'",
         }
 
+    # The primary state change is now durable. Every step below is a BEST-EFFORT
+    # secondary side effect: it must never raise out of this per-task unit,
+    # because that would abort the rest of a bulk batch AND misreport the
+    # already-committed change as failed. Work-log appends are the main such
+    # step, so route them through a marker-collecting wrapper (fail-open WITH a
+    # marker, matching the cascade/teardown error handling below).
+    log_errors: list[dict] = []
+
+    def _safe_add_entry(**kwargs) -> None:
+        try:
+            add_entry(config, **kwargs)
+        except Exception as exc:
+            log_errors.append({"error_class": type(exc).__name__, "message": str(exc)})
+
     # Auto-log state change
     # CLAWP-053: REJECTED is a terminal state; log as NOTE with the rationale.
     action_map = {
@@ -1753,8 +1767,7 @@ def _do_state_change(
                 pass
 
         summary = note if note else f"Task marked {new_state}"
-        add_entry(
-            config,
+        _safe_add_entry(
             project=project_id,
             action=action_map[state],
             task=task_id,
@@ -1767,8 +1780,7 @@ def _do_state_change(
     # children, record which were still outstanding so the override is
     # auditable in the work_log.
     if state == TaskState.DONE and force and rollup_incomplete:
-        add_entry(
-            config,
+        _safe_add_entry(
             project=project_id,
             action=WorkLogAction.NOTE,
             task=task_id,
@@ -1787,22 +1799,23 @@ def _do_state_change(
         from .tasks import cascade_unblock_dependents
         try:
             cascade_results = cascade_unblock_dependents(config, project_id, task_id)
-        except (OSError, KeyError) as exc:
+        except (OSError, KeyError, ValueError) as exc:
             # The primary state change already committed (it ran under the
             # _mutation_errors contract above). This dependency cascade is a
-            # BEST-EFFORT secondary step: a filesystem/graph error — INCLUDING a
-            # LockTimeout or FileNotFoundError from a cascaded change_task_state —
-            # must NOT fail the user's (already durable) done. This DELIBERATELY
-            # diverges from the CLAWP-067 exit-1 contract: the error is surfaced
-            # in the response data so it's visible (fail-open WITH a marker, not
-            # fail-silent) and the operator can retry the unblock — failing the
-            # command here would misreport the successful done as failed.
+            # BEST-EFFORT secondary step: any mutator-contract error from a
+            # cascaded change_task_state — LockTimeout / FileNotFoundError
+            # (both OSError subclasses) or a ValueError from corrupt-frontmatter
+            # refusal — must NOT fail the user's (already durable) done. This
+            # DELIBERATELY diverges from the CLAWP-067 exit-1 contract: the error
+            # is surfaced in the response data so it's visible (fail-open WITH a
+            # marker, not fail-silent) and the operator can retry the unblock —
+            # failing the command here would misreport the successful done as
+            # failed, and in a bulk batch it would abort the remaining tasks.
             # (CLAWP-067 review: intentional, not an oversight.)
             cascade_errors.append({"error_class": type(exc).__name__, "message": str(exc)})
 
         for cr in cascade_results:
-            add_entry(
-                config,
+            _safe_add_entry(
                 project=project_id,
                 action=WorkLogAction.CASCADE_UNBLOCK,
                 task=cr["task_id"],
@@ -1944,6 +1957,8 @@ def _do_state_change(
         data["dispatch_teardowns"] = teardowns
     if teardown_errors:
         data["dispatch_teardown_errors"] = teardown_errors
+    if log_errors:
+        data["log_errors"] = log_errors
     return {
         "ok": True,
         "task_id": task_id,
@@ -3200,14 +3215,21 @@ def quick_unblock(ctx: click.Context, project_id: str | None, task_ids: tuple[st
         )
         if r.get("ok"):
             # Log the explicit unblock action only when the transition landed.
-            add_entry(
-                config,
-                project=project_id,
-                action=WorkLogAction.UNBLOCK,
-                task=full_task_id,
-                summary=note or "Blocker resolved",
-                auto=True,
-            )
+            # Best-effort: the transition is already durable, so a work-log
+            # append failure must not abort the batch — surface it as a marker.
+            try:
+                add_entry(
+                    config,
+                    project=project_id,
+                    action=WorkLogAction.UNBLOCK,
+                    task=full_task_id,
+                    summary=note or "Blocker resolved",
+                    auto=True,
+                )
+            except Exception as exc:
+                r.setdefault("data", {}).setdefault("log_errors", []).append(
+                    {"error_class": type(exc).__name__, "message": str(exc)}
+                )
         results.append(r)
 
     _render_state_results(results, new_state_str, project_id, fmt, batch=len(task_ids) > 1)
