@@ -197,6 +197,18 @@ class TestMutatorsBumpUpdated:
         raw = f.read_bytes()
         assert b"\r\r" not in raw  # no doubled CR
         assert f"updated: '{date.today().isoformat()}'".encode() in raw
+        # Uniform line endings, no MIX: every LF is part of a CRLF (Windows
+        # write_text) OR none are (Linux LF). A mixed result (0 < crlf < lf)
+        # would mean the surgical edit left a lone LF among CRLF lines.
+        lf_total = raw.count(b"\n")
+        crlf = raw.count(b"\r\n")
+        assert crlf == lf_total or crlf == 0
+        # No lone LF (LF not preceded by CR) unless the whole file is LF-only.
+        if crlf:
+            assert not any(
+                raw[i:i + 1] == b"\n" and (i == 0 or raw[i - 1:i] != b"\r")
+                for i in range(len(raw))
+            )
 
     def test_decompose_stamps_child_and_bumps_parent(self, temp_portfolio):
         cfg = temp_portfolio["config"]
@@ -265,6 +277,9 @@ class TestMutatorsBumpUpdated:
         # Space-less form is still replaced, not duplicated.
         spaceless = _set_updated_line("---\nid: x\nupdated:'2020-01-01'\n---\n#T\n", "2026-07-04")
         assert spaceless.count("updated:") == 1
+        # Space-BEFORE-colon (valid YAML) is also replaced, not duplicated.
+        spaced = _set_updated_line("---\nid: x\nupdated : '2020-01-01'\n---\n#T\n", "2026-07-04")
+        assert spaced.count("updated") == 1
 
     def test_reject_bumps_updated(self, temp_portfolio):
         cfg = temp_portfolio["config"]

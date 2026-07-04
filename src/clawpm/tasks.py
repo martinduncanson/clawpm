@@ -363,10 +363,11 @@ def get_next_task(config: PortfolioConfig, project_id: str) -> Task | None:
 
 
 # Match the top-level `updated:` key however it's spaced (`updated: x`,
-# `updated:x`, bare `updated:`) so replacement is idempotent and never inserts a
-# duplicate line (Grok review). `^updated:` can't match sibling keys like
-# `updated_at:` (that's `updated_`, not `updated:`).
-_UPDATED_LINE_RE = re.compile(r"^updated:")
+# `updated:x`, bare `updated:`, or `updated :` with space before the colon —
+# valid YAML) so replacement is idempotent and never inserts a duplicate line
+# (Grok review). `\s*` between `updated` and `:` can't match sibling keys like
+# `updated_at:` (that's `updated_`, not whitespace + colon).
+_UPDATED_LINE_RE = re.compile(r"^updated\s*:")
 
 
 def _set_updated_line(text: str, stamp: str) -> str | None:
@@ -459,7 +460,14 @@ def touch_task_updated(
         task = get_task(config, project_id, task_id)
         if not task or not task.file_path or not task.file_path.exists():
             return False
-        _stamp_updated_file(task.file_path, when)
+        try:
+            _stamp_updated_file(task.file_path, when)
+        except Exception:
+            # Best-effort: the work-log entry (already written by the caller) is
+            # the primary artefact and must not be undone by a stamping failure
+            # (Grok review). doctor's progress-stale check also consults the
+            # work log, so recency stays covered even if the stamp is skipped.
+            return False
         return True
 
 
