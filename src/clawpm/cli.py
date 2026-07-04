@@ -1717,6 +1717,32 @@ def _do_state_change(
         return {"ok": False, "task_id": task_id, "error": "state_change_failed", "message": str(exc)}
 
     if not task:
+        # change_task_state returns None both for a genuinely absent task AND
+        # for the DONE rollup gate re-checked inside the lock (a child reopened
+        # in the outer-check→lock window). Disambiguate so a concurrency race on
+        # the gate reports the honest "subtasks_incomplete", not "task_not_found"
+        # (Grok review). The outer gate above already handled the common case;
+        # this covers only the narrow in-lock race.
+        if state == TaskState.DONE and not force:
+            from .tasks import parent_rollup_status
+            _race_task = get_task(config, project_id, task_id)
+            if _race_task:
+                _race_status = parent_rollup_status(config, project_id, _race_task)
+                if not _race_status["ready"]:
+                    incomplete = (
+                        [f"{c['id']} [{c['state']}]" for c in _race_status["incomplete"]]
+                        + [f"{m} [missing]" for m in _race_status["missing"]]
+                    )
+                    return {
+                        "ok": False,
+                        "task_id": task_id,
+                        "error": "subtasks_incomplete",
+                        "message": (
+                            f"Cannot complete {task_id} - subtasks incomplete:\n  "
+                            + "\n  ".join(incomplete)
+                            + "\nUse --force to complete anyway."
+                        ),
+                    }
         return {
             "ok": False, "task_id": task_id, "error": "task_not_found",
             "message": f"No task with id '{task_id}' in project '{project_id}'",
@@ -1729,6 +1755,8 @@ def _do_state_change(
     # step, so route them through a marker-collecting wrapper (fail-open WITH a
     # marker, matching the cascade/teardown error handling below).
     log_errors: list[dict] = []
+    reflection_errors: list[dict] = []
+    lease_errors: list[dict] = []
 
     def _safe_add_entry(**kwargs) -> None:
         try:
@@ -1830,8 +1858,12 @@ def _do_state_change(
         try:
             from .leases import release_lease
             release_lease(config.portfolio_root, task_id, project_id)
-        except Exception:
-            pass
+        except Exception as exc:
+            # Best-effort: a lease left un-released is recoverable (the sweep
+            # will eventually retire it) and must not fail an already-durable
+            # done — but record a marker so a persistent failure is visible
+            # rather than silently leaving stale leases (fail-open WITH a marker).
+            lease_errors.append({"error_class": type(exc).__name__, "message": str(exc)})
 
         # Auto-teardown dispatch settings that reference the just-done task.
         # Codex round-4 fix: use the portfolio dispatch registry so we
@@ -1931,9 +1963,12 @@ def _do_state_change(
                 surprise_taxonomy=list(surprise_tags) if surprise_tags else [],
                 agent_profile=pre_transition_task.agent_profile,
             )
-        except Exception:
-            # Never let reflection failure block the state change
-            pass
+        except Exception as exc:
+            # Never let reflection failure block the (already durable) state
+            # change — but record a marker so a lost calibration event is
+            # visible rather than silently dropped (fail-open WITH a marker,
+            # consistent with log_errors / cascade_errors).
+            reflection_errors.append({"error_class": type(exc).__name__, "message": str(exc)})
 
     # CLAWP-037 — if completing this task fully rolled up its parent, surface
     # a parent-ready advisory so the operator knows the parent is now
@@ -1959,12 +1994,43 @@ def _do_state_change(
         data["dispatch_teardown_errors"] = teardown_errors
     if log_errors:
         data["log_errors"] = log_errors
+    if reflection_errors:
+        data["reflection_errors"] = reflection_errors
+    if lease_errors:
+        data["lease_errors"] = lease_errors
     return {
         "ok": True,
         "task_id": task_id,
         "message": f"Task {task_id} moved to {new_state}",
         "data": data,
     }
+
+
+def _do_state_change_isolated(batch: bool, config, **kwargs) -> dict:
+    """Call :func:`_do_state_change`, isolating an UNEXPECTED exception in bulk
+    mode (CLAWP-083, Grok review).
+
+    ``_do_state_change`` already maps the known mutator contract to failure
+    results, but a truly unexpected exception (a genuine bug, a new OSError
+    subclass, a corrupt-file read in ``get_task``) would otherwise unwind the
+    whole batch loop and discard every result collected so far. In BATCH mode we
+    convert it to a visible failure result (``error="unexpected_error"`` +
+    class + message) so the batch still renders an honest summary and non-zero
+    exit — fail-open WITH a marker, not fail-silent. In SINGLE mode we re-raise
+    to preserve the traceback for a genuine bug (fail-open != fail-silent).
+    """
+    try:
+        return _do_state_change(config, **kwargs)
+    except Exception as exc:
+        if not batch:
+            raise
+        return {
+            "ok": False,
+            "task_id": kwargs.get("task_id"),
+            "error": "unexpected_error",
+            "error_class": type(exc).__name__,
+            "message": str(exc),
+        }
 
 
 def _render_state_results(
@@ -2086,6 +2152,7 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_ids: tuple[str,
 
     # De-dup while preserving order so a repeated id in one batch does not
     # double-fire the cascade / work-log / reflection side effects.
+    batch = len(task_ids) > 1
     seen: set[str] = set()
     results: list[dict] = []
     for raw in task_ids:
@@ -2094,8 +2161,8 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_ids: tuple[str,
             continue
         seen.add(expanded)
         results.append(
-            _do_state_change(
-                config,
+            _do_state_change_isolated(
+                batch, config,
                 project_id=project_id, task_id=expanded, new_state=new_state,
                 note=note, force=force,
                 reflect_note=reflect_note, meta_reflect=meta_reflect,
@@ -2104,7 +2171,7 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_ids: tuple[str,
             )
         )
 
-    _render_state_results(results, new_state, project_id, fmt, batch=len(task_ids) > 1)
+    _render_state_results(results, new_state, project_id, fmt, batch=batch)
 
 
 @tasks.command("decompose")
@@ -3139,8 +3206,16 @@ def quick_start(ctx: click.Context, project_id: str | None, task_ids: tuple[str,
                         "to log midway updates instead.",
                         err=True,
                     )
-            except Exception:
-                pass  # Never let the guard break the start command
+            except Exception as _guard_exc:
+                # Never let the advisory guard break the start command. Stay
+                # silent by default (a warning that can't render shouldn't abort
+                # the batch), but leave a CLAWPM_DEBUG breadcrumb so a persistent
+                # guard failure across a batch isn't wholly invisible.
+                if os.environ.get("CLAWPM_DEBUG"):
+                    click.echo(
+                        f"clawpm: start guard for {tid!r} failed: {_guard_exc!r}",
+                        err=True,
+                    )
 
     ctx.invoke(tasks_state, project_id=project_id, task_ids=task_ids, new_state="progress", note=None)
 
@@ -3208,8 +3283,8 @@ def quick_unblock(ctx: click.Context, project_id: str | None, task_ids: tuple[st
             })
             continue
 
-        r = _do_state_change(
-            config,
+        r = _do_state_change_isolated(
+            len(task_ids) > 1, config,
             project_id=project_id, task_id=full_task_id, new_state=new_state_str,
             note=note,
         )

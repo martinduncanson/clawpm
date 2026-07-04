@@ -323,6 +323,60 @@ class TestSecondaryFailureIsolation:
             assert res["data"]["state"] == "done"
             assert res["data"]["log_errors"], "expected a log_errors marker"
 
+    def test_unexpected_exception_isolated_in_batch(self, temp_portfolio, monkeypatch):
+        import clawpm.cli as cli_mod
+
+        runner = CliRunner()
+        a = _add(runner, "test", "A")
+        b = _add(runner, "test", "B")
+        real = cli_mod.change_task_state
+
+        def flaky(config, project_id, task_id, new_state, **kw):
+            if task_id == a:
+                raise RuntimeError("boom unexpected")
+            return real(config, project_id, task_id, new_state, **kw)
+
+        monkeypatch.setattr(cli_mod, "change_task_state", flaky)
+        r = runner.invoke(main, ["-p", "test", "done", a, b])
+        # Unexpected exception on `a` is isolated; `b` still transitions.
+        assert r.exit_code == 1
+        payload = json.loads(r.output)
+        by_id = {res["task_id"]: res for res in payload["results"]}
+        assert by_id[a]["ok"] is False
+        assert by_id[a]["error"] == "unexpected_error"
+        assert by_id[a]["error_class"] == "RuntimeError"
+        assert by_id[b]["ok"] is True
+
+    def test_unexpected_exception_propagates_in_single(self, temp_portfolio, monkeypatch):
+        import clawpm.cli as cli_mod
+
+        runner = CliRunner()
+        a = _add(runner, "test", "Solo")
+
+        def boom(*_a, **_k):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(cli_mod, "change_task_state", boom)
+        r = runner.invoke(main, ["-p", "test", "done", a])
+        # Single-task: preserve traceback semantics (exception propagates).
+        assert r.exit_code != 0
+        assert isinstance(r.exception, RuntimeError)
+
+    def test_reflection_failure_marker(self, temp_portfolio, monkeypatch):
+        import clawpm.reflect as reflect_mod
+
+        runner = CliRunner()
+        a = _add(runner, "test", "Refl")
+
+        def boom(*_a, **_k):
+            raise OSError("reflection write failed")
+
+        monkeypatch.setattr(reflect_mod, "write_reflection_event", boom)
+        r = runner.invoke(main, ["-p", "test", "done", a])
+        assert r.exit_code == 0, r.output
+        data = json.loads(r.output)["data"]
+        assert data.get("reflection_errors"), "expected a reflection_errors marker"
+
 
 class TestUnblockBulk:
     def test_unblock_bulk_mixed(self, temp_portfolio):
