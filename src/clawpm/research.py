@@ -157,7 +157,17 @@ def add_research(
     Conclusion at creation). Pass ``open_ended=True`` for the progressive
     template that keeps placeholder sections for an investigation filled in
     over time.
+
+    Raises ValueError if single-shot capture is requested without a summary —
+    the verdict is enforced at the library boundary, not just in the CLI, so a
+    direct caller can't create a verdict-less entry that never reads as stale.
     """
+    if not open_ended and not summary:
+        raise ValueError(
+            "single-shot research capture requires a summary (the verdict); "
+            "pass open_ended=True for a progressive entry instead."
+        )
+
     research_dir = get_research_dir(config, project_id)
     if not research_dir:
         return None

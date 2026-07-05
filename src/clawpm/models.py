@@ -852,8 +852,14 @@ def _parse_created(created: str | None) -> datetime | None:
     """Best-effort parse of a frontmatter ``created`` value to a datetime."""
     if not created:
         return None
+    s = str(created).strip()
+    # Pre-3.11 datetime.fromisoformat rejects a trailing 'Z'; normalise it so a
+    # legacy/tooling-emitted UTC timestamp doesn't parse as None and get
+    # spuriously reported stale.
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
     try:
-        dt = datetime.fromisoformat(str(created))
+        dt = datetime.fromisoformat(s)
     except ValueError:
         return None
     # Date-only / naive values are treated as UTC; an already-aware value is

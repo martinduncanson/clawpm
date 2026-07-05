@@ -152,6 +152,13 @@ def test_stale_placeholder_handles_tz_aware_created():
     assert not is_stale_placeholder(item2)
 
 
+def test_stale_placeholder_handles_trailing_z_timestamp():
+    # A UTC 'Z'-suffixed timestamp must parse (not fall through to None->stale).
+    recent = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    item = _research("## Summary\n\n(To be filled in)\n", created=recent)
+    assert not is_stale_placeholder(item)
+
+
 # ---------------------------------------------------------------------------
 # add_research template modes
 # ---------------------------------------------------------------------------
@@ -195,6 +202,12 @@ def test_add_research_single_shot_omits_empty_sections(temp_portfolio):
     assert "## Conclusion" not in text
     assert "..." not in text
     assert not has_placeholder_sections(text)
+
+
+def test_add_research_single_shot_requires_summary_at_library_boundary(temp_portfolio):
+    config = temp_portfolio["config"]
+    with pytest.raises(ValueError):
+        add_research(config, "test", "No verdict", ResearchType.INVESTIGATION)
 
 
 def test_add_research_open_keeps_progressive_template(temp_portfolio):
