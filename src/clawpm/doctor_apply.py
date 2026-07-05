@@ -34,7 +34,7 @@ from typing import Any
 
 import yaml
 
-from .frontmatter import FrontmatterError, split_frontmatter
+from .frontmatter import FrontmatterError, split_frontmatter, stamp_updated
 from .tasks import cascade_unblock_dependents
 
 
@@ -77,8 +77,15 @@ def _rewrite_frontmatter_state(file_path: Path, new_state: str) -> None:
         fm, body = split_frontmatter(text)
     except FrontmatterError as exc:
         if exc.reason == "absent":
-            # No frontmatter to rewrite — synthesize a minimal one.
-            new_text = f"---\nstate: {new_state}\n---\n\n{text}"
+            # No frontmatter to rewrite — synthesize a minimal one. CLAWP-086:
+            # a state rewrite is a mutation, so it carries an `updated` stamp.
+            _synth = {"state": new_state}
+            stamp_updated(_synth)
+            new_text = (
+                "---\n"
+                + yaml.safe_dump(_synth, default_flow_style=False, sort_keys=False)
+                + f"---\n\n{text}"
+            )
         elif exc.reason == "unterminated":
             # Malformed; refuse to silently break the file.
             raise ValueError(f"malformed frontmatter in {file_path}") from None
@@ -91,6 +98,7 @@ def _rewrite_frontmatter_state(file_path: Path, new_state: str) -> None:
             raise
     else:
         fm["state"] = new_state
+        stamp_updated(fm)  # CLAWP-086 — a state rewrite is a mutation.
         new_fm_text = yaml.safe_dump(fm, default_flow_style=False, sort_keys=False)
         new_text = f"---\n{new_fm_text}---{body}"
 

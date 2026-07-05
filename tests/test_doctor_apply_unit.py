@@ -50,7 +50,12 @@ class TestRewriteFrontmatterState:
         f.write_text("just a body, no frontmatter\n", encoding="utf-8")
         _rewrite_frontmatter_state(f, "done")
         text = f.read_text(encoding="utf-8")
-        assert text.startswith("---\nstate: done\n---")
+        # CLAWP-086 — a state rewrite is a mutation, so the synthesized minimal
+        # frontmatter also carries an `updated` stamp.
+        assert text.startswith("---\nstate: done\n")
+        fm = yaml.safe_load(text.split("---", 2)[1])
+        assert fm["state"] == "done"
+        assert "updated" in fm
         assert "just a body" in text
 
     def test_malformed_frontmatter_raises(self, tmp_path):

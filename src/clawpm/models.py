@@ -429,6 +429,10 @@ class Task:
     parent: str | None = None
     children: list[str] = field(default_factory=list)  # Populated by discovery
     created: str | None = None
+    # CLAWP-086 — ISO-date stamp bumped by every task mutator. Doctor's
+    # stale-task check prefers this over file mtime, which lies after git
+    # operations / syncs / external edits. None for legacy tasks (pre-086).
+    updated: str | None = None
     content: str = ""
     file_path: Path | None = None
     predictions: Predictions = field(default_factory=Predictions)
@@ -593,6 +597,18 @@ class Task:
             deleg_raw if deleg_raw in ("agent", "human", "either") else "either"
         )
 
+        # CLAWP-086 — coerce `created`/`updated` to str. An unquoted ISO scalar
+        # (``updated: 2026-07-04``, e.g. hand-edited) is parsed by YAML as a
+        # ``datetime.date``; both fields' contract is ``str | None`` and
+        # ``to_dict`` feeds JSON, so normalise to the ISO string here. clawpm's
+        # own writes are already quoted strings, so this is a no-op for them.
+        # (`created` was already latently exposed to this — coerced alongside
+        # `updated` for symmetry; Grok review.)
+        created_raw = frontmatter.get("created")
+        created: str | None = str(created_raw) if created_raw is not None else None
+        updated_raw = frontmatter.get("updated")
+        updated: str | None = str(updated_raw) if updated_raw is not None else None
+
         # CLAWP-055 — baseline_ref: opaque string stamped at task creation.
         # None for legacy tasks — backward-compat default.
         baseline_ref_raw = frontmatter.get("baseline_ref")
@@ -612,7 +628,8 @@ class Task:
             scope=frontmatter.get("scope", []),
             parent=frontmatter.get("parent"),
             children=children,
-            created=frontmatter.get("created"),
+            created=created,
+            updated=updated,
             content=content,
             file_path=path,
             predictions=predictions,
@@ -663,6 +680,7 @@ class Task:
             "children": self.children,
             "is_parent": self.is_parent,
             "created": self.created,
+            "updated": self.updated,
             "file_path": str(self.file_path) if self.file_path else None,
             "parallel_group": self.parallel_group,
             "actor": self.actor,
