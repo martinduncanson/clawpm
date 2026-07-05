@@ -151,13 +151,19 @@ def output_projects_list(
         console.print(table)
 
 
-def output_tasks_list(tasks: list[Any], fmt: OutputFormat = OutputFormat.JSON, flat: bool = False) -> None:
+def output_tasks_list(tasks: list[Any], fmt: OutputFormat = OutputFormat.JSON, flat: bool = False, show_project: bool = False) -> None:
     """Output a list of tasks.
-    
+
     Args:
         tasks: List of Task objects
         fmt: Output format (JSON or TEXT)
         flat: If True, show flat list without hierarchy (text mode only)
+        show_project: If True (CLAWP-084 --all-projects), prefix each text row
+            with its ``project_id`` and force a flat render — the merged list
+            spans projects, so per-project parent/child hierarchy is not
+            meaningful and identical ids from different projects must not be
+            conflated in the hierarchy map. Ignored in JSON mode (there the
+            project scope rides on each row's ``project_id`` field).
     """
     if fmt == OutputFormat.JSON:
         output_json([t.to_dict() for t in tasks])
@@ -166,9 +172,13 @@ def output_tasks_list(tasks: list[Any], fmt: OutputFormat = OutputFormat.JSON, f
             console.print("[dim]No tasks found[/dim]")
             return
 
+        # CLAWP-084 — cross-project view is always flat (see docstring).
+        if show_project:
+            flat = True
+
         # Build task map for hierarchy
         task_map = {t.id: t for t in tasks}
-        
+
         # Identify which tasks to show at top level
         # (tasks without parents, or whose parents aren't in the list)
         if flat:
@@ -190,6 +200,9 @@ def output_tasks_list(tasks: list[Any], fmt: OutputFormat = OutputFormat.JSON, f
             title = t.title[:45] + "..." if len(t.title) > 45 else t.title
             cmplx = f" \\[{t.complexity.value}]" if t.complexity else ""
             parent_marker = " [dim]↳[/dim]" if t.parent else ""
+            # CLAWP-084 — project scope prefix in the cross-project view.
+            proj = getattr(t, "project_id", None)
+            proj_str = f"[magenta]\\[{escape(str(proj))}][/magenta] " if (show_project and proj) else ""
             # CLAWP-086 — surface the `updated` stamp in the text list too.
             upd = f" [dim]upd:{t.updated}[/dim]" if getattr(t, "updated", None) else ""
             # CLAWP-069 — surface workstream tags inline (blue #tag markers).
@@ -203,7 +216,7 @@ def output_tasks_list(tasks: list[Any], fmt: OutputFormat = OutputFormat.JSON, f
             )
 
             console.print(
-                f"{indent}[cyan]{t.id}[/cyan]{parent_marker} "
+                f"{indent}{proj_str}[cyan]{t.id}[/cyan]{parent_marker} "
                 f"[{state_color}]\\[{t.state.value}][/{state_color}] "
                 f"P{t.priority}{cmplx} {title}{upd}{tag_str}"
             )

@@ -544,6 +544,13 @@ class Task:
     # Opaque string: git short-SHA when the project is a git repo, else a
     # "ts:<ISO8601-UTC>" timestamp. None for legacy tasks (backward-compat).
     baseline_ref: str | None = None
+    # CLAWP-084 — runtime-only project scope for cross-project views
+    # (``tasks list --all-projects``). NOT persisted: never read from
+    # frontmatter (from_file omits it) and never written (writes use explicit
+    # keys), so single-project loads leave it None. Set explicitly by the
+    # all-projects list path so each row carries its owning project id and two
+    # same-numeric-id tasks in different projects are never conflated.
+    project_id: str | None = None
 
     @property
     def is_parent(self) -> bool:
@@ -781,6 +788,11 @@ class Task:
             # CLAWP-055 — baseline ref (opaque; None for legacy tasks)
             "baseline_ref": self.baseline_ref,
         }
+        # CLAWP-084 — cross-project scope. Emitted ONLY when set (the
+        # all-projects view sets it); single-project output stays byte-identical
+        # so there is no schema change without --all-projects.
+        if self.project_id is not None:
+            result["project_id"] = self.project_id
         body = self.body
         if body:
             result["body"] = body
