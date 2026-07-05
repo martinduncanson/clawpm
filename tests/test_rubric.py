@@ -310,7 +310,7 @@ class TestEmitRubricCLI:
         r = runner.invoke(
             main,
             ["-p", "test", "tasks", "emit-rubric", tid,
-             "--format", "outcome-payload"],
+             "--rubric-format", "outcome-payload"],
         )
         assert r.exit_code == 0, r.output
         payload = json.loads(r.output)["payload"]

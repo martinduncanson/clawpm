@@ -99,7 +99,7 @@ clawpm tasks add --project <proj> \
     --success-criteria "Zero unverified findings in <out>.json (every entry has votesReal>=ceil(votesCast/2))"
 
 # 2. Render the rubric to confirm it's gradeable.
-clawpm tasks emit-rubric <CLAWP-id> --format markdown
+clawpm tasks emit-rubric <CLAWP-id> --rubric-format markdown
 
 # 3. Dispatch (worktree for parallel-safety).
 clawpm tasks dispatch <CLAWP-id> --worktree

@@ -454,7 +454,7 @@ Multi-level trees: set `parent_ref` on a leaf to point to another leaf's `ref`. 
 
 ```bash
 # Render a task's gradeable rubric
-clawpm tasks emit-rubric <id> [--format markdown]
+clawpm tasks emit-rubric <id> [--rubric-format markdown]
 
 # Write hook-wired settings for a subagent
 clawpm tasks dispatch <id> [--worktree] \

@@ -1281,6 +1281,12 @@ def add_subtask(
     description: str = "",
     agent_profile: str | None = None,
     predictions: Predictions | None = None,
+    depends: list[str] | None = None,
+    scope: list[str] | None = None,
+    parallel_group: int | None = None,
+    out_of_scope: list[str] | None = None,
+    stop_conditions: list[str] | None = None,
+    delegability: str | None = None,
 ) -> Task | None:
     """Add a subtask to a parent task.
     
@@ -1361,8 +1367,27 @@ def add_subtask(
         if complexity:
             frontmatter["complexity"] = complexity.value
 
+        if depends:
+            frontmatter["depends"] = depends
+
+        if scope:
+            frontmatter["scope"] = scope
+
+        if parallel_group is not None:
+            frontmatter["parallel_group"] = parallel_group
+
         if agent_profile:
             frontmatter["agent_profile"] = agent_profile
+
+        # CLAWP-054 — contract fields, symmetric with add_task so a subtask is a
+        # fully-specified verifiable goal (CLAWP-072-006: these were silently
+        # dropped on the `tasks add --parent` path).
+        if out_of_scope:
+            frontmatter["out_of_scope"] = out_of_scope
+        if stop_conditions:
+            frontmatter["stop_conditions"] = stop_conditions
+        if delegability and delegability != "either":
+            frontmatter["delegability"] = delegability
 
         # CLAWP-037 — children created via `tasks decompose` carry their own
         # success_criteria (and other predictions) so each subtask is a
