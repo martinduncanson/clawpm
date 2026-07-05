@@ -5043,7 +5043,6 @@ def research_add(
         summary=summary or "",
         findings=list(findings) if findings else None,
         conclusion=conclusion or "",
-        open_ended=open_ended,
     )
 
     if not item:

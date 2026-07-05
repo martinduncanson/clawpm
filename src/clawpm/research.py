@@ -96,7 +96,7 @@ def get_research(config: PortfolioConfig, project_id: str, research_id: str) -> 
 
 
 def _render_open_body(question: str) -> str:
-    """Progressive template for a genuinely open investigation (``--open``)."""
+    """Progressive template for a genuinely open investigation (no verdict yet)."""
     return f"""## Question
 
 {question or "(Describe the research question)"}
@@ -149,25 +149,19 @@ def add_research(
     summary: str = "",
     findings: list[str] | None = None,
     conclusion: str = "",
-    open_ended: bool = False,
 ) -> Research | None:
     """Add a new research item to a project.
 
-    Default is single-shot capture (verdict written into Summary/Findings/
-    Conclusion at creation). Pass ``open_ended=True`` for the progressive
-    template that keeps placeholder sections for an investigation filled in
-    over time.
+    The template is inferred from the content supplied: if a summary, findings,
+    or conclusion is given, the verdict is written straight into those sections
+    (single-shot capture); otherwise a progressive template with placeholder
+    sections is emitted for an investigation to be filled in over time. A
+    progressive entry still carries the stub markers, so it surfaces via the
+    staleness signal if it's never completed.
 
-    Raises ValueError if single-shot capture is requested without a summary —
-    the verdict is enforced at the library boundary, not just in the CLI, so a
-    direct caller can't create a verdict-less entry that never reads as stale.
+    The verdict-or-explicit-open contract is enforced at the CLI boundary
+    (``research add``), not here, so direct/library callers stay flexible.
     """
-    if not open_ended and not summary:
-        raise ValueError(
-            "single-shot research capture requires a summary (the verdict); "
-            "pass open_ended=True for a progressive entry instead."
-        )
-
     research_dir = get_research_dir(config, project_id)
     if not research_dir:
         return None
@@ -197,10 +191,11 @@ def add_research(
     if tags:
         frontmatter["tags"] = tags
 
-    if open_ended:
-        body = _render_open_body(question)
-    else:
+    # Single-shot when a verdict/content is supplied; progressive otherwise.
+    if summary or findings or conclusion:
         body = _render_single_shot_body(question, summary, findings, conclusion)
+    else:
+        body = _render_open_body(question)
 
     # Build content
     content = f"""---

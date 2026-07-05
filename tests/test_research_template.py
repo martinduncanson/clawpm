@@ -211,13 +211,10 @@ def test_add_research_single_shot_omits_empty_sections(temp_portfolio):
     assert not has_placeholder_sections(text)
 
 
-def test_add_research_single_shot_requires_summary_at_library_boundary(temp_portfolio):
-    config = temp_portfolio["config"]
-    with pytest.raises(ValueError):
-        add_research(config, "test", "No verdict", ResearchType.INVESTIGATION)
-
-
-def test_add_research_open_keeps_progressive_template(temp_portfolio):
+def test_add_research_no_content_yields_progressive_template(temp_portfolio):
+    # The library infers the template from content: no verdict supplied -> the
+    # progressive (stub) template, which stays stale-detectable. Strictness
+    # lives at the CLI boundary, not here.
     config = temp_portfolio["config"]
     item = add_research(
         config,
@@ -225,7 +222,6 @@ def test_add_research_open_keeps_progressive_template(temp_portfolio):
         "Open investigation",
         ResearchType.INVESTIGATION,
         question="Open question?",
-        open_ended=True,
     )
     text = item.file_path.read_text(encoding="utf-8")
     assert "## Summary" in text
@@ -238,7 +234,7 @@ def test_add_research_open_keeps_progressive_template(temp_portfolio):
 def test_to_dict_includes_has_placeholder(temp_portfolio):
     config = temp_portfolio["config"]
     filled = add_research(config, "test", "A", ResearchType.SPIKE, summary="done")
-    stub = add_research(config, "test", "B", ResearchType.SPIKE, open_ended=True)
+    stub = add_research(config, "test", "B", ResearchType.SPIKE)
     assert filled.to_dict()["has_placeholder"] is False
     assert stub.to_dict()["has_placeholder"] is True
 
@@ -333,7 +329,7 @@ def test_cli_add_open_succeeds_with_stub(temp_portfolio):
 def test_cli_list_reports_stale_placeholder(temp_portfolio):
     config = temp_portfolio["config"]
     # An open entry backdated past the threshold, still stubbed.
-    item = add_research(config, "test", "Old open", ResearchType.INVESTIGATION, open_ended=True)
+    item = add_research(config, "test", "Old open", ResearchType.INVESTIGATION)
     text = item.file_path.read_text(encoding="utf-8")
     old = (datetime.now(timezone.utc) - timedelta(days=PLACEHOLDER_STALE_DAYS + 10)).date().isoformat()
     item.file_path.write_text(text.replace(f"created: '{item.created}'", f"created: '{old}'"), encoding="utf-8")
