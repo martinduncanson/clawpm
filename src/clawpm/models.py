@@ -814,10 +814,9 @@ class WorkLogEntry:
 # Default age (days) after which a still-placeholder research entry is flagged.
 PLACEHOLDER_STALE_DAYS = 14
 
-# Literal stubs the progressive (``--open``) template emits at the *start* of a
-# section body. Matched only against a section body's leading text — not any
-# substring of the content — so a filled entry that merely quotes the phrase
-# isn't flagged forever.
+# Literal stubs the progressive (``--open``) template emits. Matched only where
+# a section-body line *starts* with one — not as a bare substring — so a filled
+# entry that merely quotes the phrase mid-line isn't flagged forever.
 _PLACEHOLDER_PREFIXES = (
     "(To be filled in",
     "(Describe the research question)",
@@ -829,22 +828,25 @@ _HEADING_SPLIT = re.compile(r"(?m)^#{1,6}[ \t].*$")
 
 
 def has_placeholder_sections(content: str) -> bool:
-    """Return True if any section body is still an unfilled template stub.
+    """Return True if any section body still carries an unfilled template stub.
 
-    A section counts as a placeholder when its body (the text between one
-    heading and the next) either starts with a template prefix or is nothing
-    but an ``...`` ellipsis stub. Anchoring to section bodies means a genuine
-    prose ellipsis or an incidental quote of the stub text doesn't trip it,
-    while a bare ``## Findings\n...`` stub (with or without a blank line) does.
+    Each section body (the text between one heading and the next) is scanned
+    line by line. A line that is exactly ``...`` is a stub marker, and a line
+    that starts with a template prefix is too — checked per line rather than on
+    the whole body so a stub still counts even when someone has typed notes
+    above or below it without deleting the ``...`` (and with or without the
+    template's blank line). A genuine prose ellipsis mid-sentence, or an
+    incidental quote of the stub text inside a line, does not trip it.
     """
     for body in _HEADING_SPLIT.split(content):
-        stripped = body.strip()
-        if not stripped:
-            continue
-        if stripped == "...":
-            return True
-        if any(stripped.startswith(prefix) for prefix in _PLACEHOLDER_PREFIXES):
-            return True
+        for raw_line in body.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line == "...":
+                return True
+            if any(line.startswith(prefix) for prefix in _PLACEHOLDER_PREFIXES):
+                return True
     return False
 
 

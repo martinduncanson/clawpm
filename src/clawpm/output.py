@@ -360,7 +360,7 @@ def output_research_list(items: list[Any], fmt: OutputFormat = OutputFormat.JSON
                 stale_count += 1
             title = r.title[:40] + "..." if len(r.title) > 40 else r.title
             if stale:
-                title = f"{title} [red]⚠ stale placeholder[/red]"
+                title = f"{title} [red][!] stale placeholder[/red]"
 
             table.add_row(
                 r.id,
@@ -373,9 +373,9 @@ def output_research_list(items: list[Any], fmt: OutputFormat = OutputFormat.JSON
         console.print(table)
         if stale_count:
             console.print(
-                f"[red]⚠ {stale_count} entr"
+                f"[red][!] {stale_count} entr"
                 f"{'y' if stale_count == 1 else 'ies'} still carry placeholder "
-                f"sections past {PLACEHOLDER_STALE_DAYS} days — fill in or mark complete.[/red]"
+                f"sections past {PLACEHOLDER_STALE_DAYS} days - fill in or mark complete.[/red]"
             )
 
 

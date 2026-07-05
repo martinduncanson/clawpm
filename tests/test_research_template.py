@@ -79,6 +79,13 @@ def test_has_placeholder_detects_ellipsis_without_blank_line():
     assert has_placeholder_sections("## Findings\n...\n")
 
 
+def test_has_placeholder_detects_ellipsis_with_content_below():
+    # A stub "..." line that someone typed notes under (without deleting it)
+    # must still count as a placeholder.
+    body = "## Findings\n\n...\n\nsome half-written notes here\n"
+    assert has_placeholder_sections(body)
+
+
 def test_has_placeholder_ignores_prose_ellipsis():
     # A genuine ellipsis mid-sentence must not be read as a stub.
     assert not has_placeholder_sections("## Summary\n\nWe tried A... then B, and shipped.\n")
