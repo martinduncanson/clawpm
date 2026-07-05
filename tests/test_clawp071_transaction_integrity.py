@@ -52,7 +52,8 @@ def temp_portfolio():
     (portfolio_root / "portfolio.toml").write_text(
         f'portfolio_root = "{portfolio_root.as_posix()}"\n'
         f'project_roots = ["{(portfolio_root / "projects").as_posix()}"]\n\n'
-        "[defaults]\nstatus = \"active\"\n"
+        "[defaults]\nstatus = \"active\"\n",
+        encoding="utf-8",
     )
     projects_dir = portfolio_root / "projects"
     projects_dir.mkdir()
@@ -61,12 +62,14 @@ def temp_portfolio():
     project_meta = project_dir / ".project"
     project_meta.mkdir()
     (project_meta / "settings.toml").write_text(
-        'id = "test"\nname = "Test Project"\nstatus = "active"\npriority = 3\n'
+        'id = "test"\nname = "Test Project"\nstatus = "active"\npriority = 3\n',
+        encoding="utf-8",
     )
     tasks_dir = project_meta / "tasks"
     tasks_dir.mkdir()
     (tasks_dir / "done").mkdir()
     (tasks_dir / "blocked").mkdir()
+    (tasks_dir / "rejected").mkdir()
 
     old_env = os.environ.get("CLAWPM_PORTFOLIO")
     os.environ["CLAWPM_PORTFOLIO"] = str(portfolio_root)
@@ -382,6 +385,113 @@ class TestAddSubtaskTwoPhase:
         tracked = {c["id"] for c in status["incomplete"]} | set(status["missing"])
         assert orphan_id in tracked
 
+    def test_numbering_union_counts_rejected_directory_child(self, temp_portfolio):
+        """Codex P2 r3 (CLAWP-071): a crash-orphaned split child later REJECTED
+        lives at ``tasks/rejected/<child>/_task.md``. The allocator must count it
+        or the next add reuses its ordinal, and get_task later resolves the
+        rejected ledger entry instead of the freshly-minted child."""
+        config = temp_portfolio["config"]
+        tasks_dir = temp_portfolio["tasks_dir"]
+        parent = add_task(config, "test", "Parent")
+        child1 = add_subtask(config, "test", parent.id, "Real child")  # -001
+        assert child1.id == f"{parent.id}-001"
+
+        # Plant a REJECTED directory-task child at -002, NOT in persisted children.
+        rejected_id = f"{parent.id}-002"
+        rejected_dir = tasks_dir / "rejected" / rejected_id
+        rejected_dir.mkdir(parents=True)
+        (rejected_dir / "_task.md").write_text(
+            f"---\nid: {rejected_id}\nparent: {parent.id}\npriority: 5\n---\n# Rejected split\n",
+            encoding="utf-8",
+        )
+
+        nxt = add_subtask(config, "test", parent.id, "Next child")
+        assert nxt.id == f"{parent.id}-003", "must skip the rejected -002 ordinal"
+
+    def test_numbering_union_counts_toplevel_reopened_directory_child(
+        self, temp_portfolio
+    ):
+        """Codex P2 r3 (CLAWP-071): a split child completed then REOPENED is moved
+        to the TOP-LEVEL ``tasks/<child>/_task.md`` (not back under the parent),
+        keeping ``parent: <parent>``. The allocator must scan the top-level tasks
+        dir for directory children or it reuses the reopened child's ordinal."""
+        config = temp_portfolio["config"]
+        tasks_dir = temp_portfolio["tasks_dir"]
+        parent = add_task(config, "test", "Parent")
+        child1 = add_subtask(config, "test", parent.id, "Real child")  # -001
+        assert child1.id == f"{parent.id}-001"
+
+        # Plant a top-level directory-task child at -002 (reopened split orphan),
+        # NOT persisted in the parent's children list.
+        reopened_id = f"{parent.id}-002"
+        reopened_dir = tasks_dir / reopened_id
+        reopened_dir.mkdir()
+        (reopened_dir / "_task.md").write_text(
+            f"---\nid: {reopened_id}\nparent: {parent.id}\npriority: 5\n---\n# Reopened split\n",
+            encoding="utf-8",
+        )
+
+        nxt = add_subtask(config, "test", parent.id, "Next child")
+        assert nxt.id == f"{parent.id}-003", "must skip the reopened -002 ordinal"
+
+    def test_rollup_backstop_finds_rejected_directory_child(self, temp_portfolio):
+        """Codex P2 r3 (CLAWP-071): parent_rollup_status must count a rejected
+        directory child. A rejected child is unresolved (not DONE), so it must gate
+        the parent — otherwise the parent can be completed over it."""
+        config = temp_portfolio["config"]
+        tasks_dir = temp_portfolio["tasks_dir"]
+        parent = add_task(config, "test", "Parent")
+        child1 = add_subtask(config, "test", parent.id, "Real child")
+        change_task_state(config, "test", child1.id, TaskState.DONE)
+        fresh = get_task(config, "test", parent.id)
+        assert parent_rollup_status(config, "test", fresh)["ready"] is True
+
+        # Plant a REJECTED directory-task child not in persisted children.
+        orphan_id = f"{parent.id}-778"
+        orphan_dir = tasks_dir / "rejected" / orphan_id
+        orphan_dir.mkdir(parents=True)
+        (orphan_dir / "_task.md").write_text(
+            f"---\nid: {orphan_id}\nparent: {parent.id}\npriority: 5\n---\n# Rejected split\n",
+            encoding="utf-8",
+        )
+
+        fresh = get_task(config, "test", parent.id)
+        status = parent_rollup_status(config, "test", fresh)
+        assert status["ready"] is False, "rejected child must gate the rollup"
+        tracked = {c["id"] for c in status["incomplete"]} | set(status["missing"])
+        assert orphan_id in tracked
+
+    def test_emit_tree_allocator_delegates_to_shared_union(self, temp_portfolio):
+        """Codex P2 r3 (CLAWP-071): emit_tree's ``_existing_child_nums`` must route
+        through the shared allocator so its collision pre-check / id-mint sees the
+        SAME occupied ordinals (rejected + top-level directory children) that
+        ``add_subtask`` does — no drift between the two allocators."""
+        from clawpm import emit_tree as emit_mod
+        from clawpm.tasks import _existing_child_ordinals
+
+        config = temp_portfolio["config"]
+        tasks_dir = temp_portfolio["tasks_dir"]
+        parent = add_task(config, "test", "Parent")
+        add_subtask(config, "test", parent.id, "Real child")  # -001
+
+        # Plant a rejected directory child at -002 that only the shared (state-dir)
+        # scan can see — the old emit_tree mirror scanned neither rejected nor
+        # top-level directory children.
+        rejected_id = f"{parent.id}-002"
+        rejected_dir = tasks_dir / "rejected" / rejected_id
+        rejected_dir.mkdir(parents=True)
+        (rejected_dir / "_task.md").write_text(
+            f"---\nid: {rejected_id}\nparent: {parent.id}\npriority: 5\n---\n# Rejected\n",
+            encoding="utf-8",
+        )
+
+        emit_nums = emit_mod._existing_child_nums(tasks_dir, parent.id)
+        shared_nums = _existing_child_ordinals(
+            tasks_dir, tasks_dir / parent.id, parent.id
+        )
+        assert emit_nums == shared_nums
+        assert 1 in emit_nums and 2 in emit_nums, "sees -001 and the rejected -002"
+
 
 # ---------------------------------------------------------------------------
 # Item 1b — add_mission_mini_goal 2-phase atomicity
@@ -420,6 +530,35 @@ class TestMissionMiniGoalTwoPhase:
         assert after.parent_mission == m.id
         reloaded = get_mission(config, "test", m.id)
         assert t.id in {g.id for g in reloaded.mini_goals}
+
+    def test_rewrite_failure_rolls_back_task_frontmatter(
+        self, temp_portfolio, monkeypatch
+    ):
+        """CLAWP-071: when the mission REWRITE fails (after pre-render validation
+        passed and the task frontmatter was committed), the compensation must roll
+        the task frontmatter back so the two files don't diverge (task tagged but
+        mission missing the goal). The in-memory ``mission.mini_goals`` pop that
+        rides along (Antigravity review) keeps the discarded internal object
+        consistent but isn't observable through the public API — the disk-side
+        rollback is."""
+        config = temp_portfolio["config"]
+        m = add_mission(config, "test", "M", "obj", deadline_days=7)
+        t = add_task(config, "test", "Task to link")
+
+        # Let the pre-render (validation) pass, then fail the actual rewrite.
+        def boom_rewrite(_mission):
+            raise OSError("mission write fault (simulated)")
+
+        monkeypatch.setattr(mission_mod, "_rewrite_mission", boom_rewrite)
+        with pytest.raises(OSError, match="write fault"):
+            add_mission_mini_goal(config, "test", m.id, t.id)
+
+        # Task frontmatter rolled back — not tagged.
+        after = get_task(config, "test", t.id)
+        assert not after.parent_mission, "task frontmatter must be rolled back"
+        # Mission file on disk never gained the goal.
+        reloaded = get_mission(config, "test", m.id)
+        assert t.id not in {g.id for g in reloaded.mini_goals}
 
 
 # ---------------------------------------------------------------------------

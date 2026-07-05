@@ -862,7 +862,16 @@ def parent_rollup_status(
     children: set[str] = set(task.children or [])
     tasks_dir = get_tasks_dir(config, project_id) if config is not None else None
     if tasks_dir is not None:
-        scan_dirs = [tasks_dir, tasks_dir / "done", tasks_dir / "blocked"]
+        # Every state dir a child can migrate to — incl. rejected/ (a
+        # crash-orphaned split child later rejected lands in tasks/rejected/
+        # <child>/_task.md and must still gate the parent's rollup — CLAWP-071
+        # Codex r3).
+        scan_dirs = [
+            tasks_dir,
+            tasks_dir / "done",
+            tasks_dir / "blocked",
+            tasks_dir / "rejected",
+        ]
         # Directory-task subtask dir (open subtasks live alongside _task.md).
         if task.file_path is not None and task.file_path.name == "_task.md":
             scan_dirs.append(task.file_path.parent)
@@ -1529,6 +1538,78 @@ def _append_child_to_parent_frontmatter(
         raise
 
 
+def _child_state_dirs(tasks_dir: Path, parent_dir: Path) -> list[Path]:
+    """Every directory a child of this parent can legitimately live in.
+
+    A subtask's file starts under ``parent_dir`` but ``change_task_state`` MOVES
+    it out on a terminal/blocked transition: DONE → ``tasks/done/``, BLOCKED →
+    ``tasks/blocked/``, REJECTED → ``tasks/rejected/``. A child that was split
+    into its own directory task and then REOPENED lands at the top-level
+    ``tasks/<child>/_task.md`` (not back under the parent). Any of these
+    locations can hold a crash-orphaned child that is absent from the parent's
+    persisted ``children`` list, so the ID allocator and rollup backstop must
+    scan all of them or they can reuse an occupied ordinal / miss an unresolved
+    child (CLAWP-071 Codex r1-3).
+    """
+    return [
+        parent_dir,
+        tasks_dir,
+        tasks_dir / "done",
+        tasks_dir / "blocked",
+        tasks_dir / "rejected",
+    ]
+
+
+def _existing_child_ordinals(
+    tasks_dir: Path, parent_dir: Path, parent_id: str,
+) -> set[int]:
+    """Union of every ordinal already used by a child of ``parent_id``.
+
+    Shared allocator for ``add_subtask`` and ``emit_tree``'s attach path so the
+    two can't drift (Codex CLAWP-071 r3). Scans, across ALL state dirs
+    (:func:`_child_state_dirs`):
+    - flat children ``<parent>-NNN.md`` (excluding a directory's own ``_task.md``),
+    - directory children ``<parent>-NNN/_task.md``,
+    and unions the parent's persisted ``children`` list (covers a child deleted
+    outright after creation, invisible to any dir scan). Reading the max of this
+    set and adding 1 guarantees a fresh ordinal even when earlier children have
+    migrated, reopened, been rejected, or crash-orphaned.
+    """
+    nums: set[int] = set()
+
+    def _record(id_or_stem: str) -> None:
+        try:
+            nums.add(int(id_or_stem.split("-")[-1].replace(".progress", "")))
+        except (IndexError, ValueError):
+            pass
+
+    for state_dir in _child_state_dirs(tasks_dir, parent_dir):
+        if not state_dir.exists():
+            continue
+        for f in state_dir.glob(f"{parent_id}-*.md"):
+            if f.name != "_task.md":
+                _record(f.stem)
+        for d in state_dir.glob(f"{parent_id}-*"):
+            if d.is_dir() and (d / "_task.md").exists():
+                _record(d.name)
+
+    # Parent's persisted children — covers a child deleted after creation, which
+    # no directory scan can see. Read leniently: a vanished/malformed parent must
+    # not crash allocation (the dir scans above already bound the union).
+    for parent_file in (parent_dir / "_task.md", tasks_dir / f"{parent_id}.md"):
+        if not parent_file.exists():
+            continue
+        try:
+            fm, _ = parse_frontmatter(parent_file.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        for cid in (fm.get("children") or []):
+            if isinstance(cid, str) and cid.startswith(parent_id + "-"):
+                _record(cid)
+
+    return nums
+
+
 def add_subtask(
     config: PortfolioConfig,
     project_id: str,
@@ -1584,49 +1665,13 @@ def add_subtask(
         if not parent_dir:
             return None
 
-        # Generate subtask ID. Codex round-2 P2 fix: union three sources so a
-        # migrated/deleted earlier child can't have its id silently reused:
-        #   (1) files still in the parent directory (open / progress)
-        #   (2) migrated children in tasks/done/ and tasks/blocked/
-        #   (3) the parent's persisted frontmatter children list (covers
-        #       files that were deleted outright after creation)
-        # Without (2)+(3), running `tasks decompose` again on a parent whose
-        # earlier children have all moved to done/ would re-issue `P-001`,
-        # colliding with the migrated record.
-        existing_nums: set[int] = set()
-
-        def _record_num_from_id(tid: str) -> None:
-            try:
-                num_str = tid.split("-")[-1].replace(".progress", "")
-                existing_nums.add(int(num_str))
-            except (IndexError, ValueError):
-                pass
-
-        for f in parent_dir.glob(f"{parent_id}-*.md"):
-            _record_num_from_id(f.stem)
-        for state_dir in (tasks_dir / "done", tasks_dir / "blocked"):
-            if state_dir.exists():
-                for f in state_dir.glob(f"{parent_id}-*.md"):
-                    _record_num_from_id(f.stem)
-        # CLAWP-071 (Codex r2): also count DIRECTORY-task children (a subtask that
-        # was split into its own parent dir → ``<parent>/<child>/_task.md``). The
-        # ``*.md`` globs above only see flat children, so a crash-orphaned child
-        # (absent from the persisted ``children`` list) that was later split would
-        # otherwise have its number reused here, creating ``<parent>/<child>.md``
-        # colliding with the existing directory task. Mirror the directory-child
-        # scan the rollup backstop uses so the numbering union stays complete.
-        for d in parent_dir.glob(f"{parent_id}-*"):
-            if d.is_dir():
-                _record_num_from_id(d.name)
-        for state_dir in (tasks_dir / "done", tasks_dir / "blocked"):
-            if state_dir.exists():
-                for d in state_dir.glob(f"{parent_id}-*"):
-                    if d.is_dir():
-                        _record_num_from_id(d.name)
-        for cid in (parent.children or []):
-            if cid.startswith(parent_id + "-"):
-                _record_num_from_id(cid)
-
+        # Generate subtask ID via the shared allocator, which unions every used
+        # ordinal across ALL state dirs (flat + directory children) plus the
+        # parent's persisted list — so a migrated/reopened/rejected/deleted or
+        # crash-orphaned child can't have its number silently reused (CLAWP-071
+        # Codex r1-3). emit_tree's attach path routes through the same helper so
+        # the two allocators can't drift.
+        existing_nums = _existing_child_ordinals(tasks_dir, parent_dir, parent_id)
         next_num = (max(existing_nums) if existing_nums else 0) + 1
         subtask_id = f"{parent_id}-{next_num:03d}"
 

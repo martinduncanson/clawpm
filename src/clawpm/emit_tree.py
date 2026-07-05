@@ -455,42 +455,16 @@ def _check_constitution(
 def _existing_child_nums(tasks_dir: Path, parent_id: str) -> set[int]:
     """Union-scan the existing child ordinals for ``parent_id``.
 
-    Mirrors add_subtask's id-generator union: parent dir glob + done/ + blocked/
-    + the parent's persisted ``children:`` frontmatter list. Read-only; shared by
-    the collision pre-check (phase 2) and the staging id-mint (phase 3) so the
-    two can never disagree.
+    Delegates to the single shared allocator (:func:`tasks._existing_child_ordinals`)
+    so ``emit_tree``'s attach path and ``add_subtask`` can never disagree on which
+    ordinals are taken (Codex CLAWP-071 r3). Read-only; used by both the collision
+    pre-check (phase 2) and the staging id-mint (phase 3). ``parent_dir`` is the
+    top-level ``tasks/<parent_id>/`` directory — the allocator scans done/blocked/
+    rejected and top-level directory children beyond that.
     """
-    existing_nums: set[int] = set()
+    from .tasks import _existing_child_ordinals
 
-    def _record(tid: str) -> None:
-        try:
-            num_str = tid.split("-")[-1].replace(".progress", "")
-            existing_nums.add(int(num_str))
-        except (IndexError, ValueError):
-            pass
-
-    parent_dir = tasks_dir / parent_id
-    if parent_dir.exists():
-        for f in parent_dir.glob(f"{parent_id}-*.md"):
-            _record(f.stem)
-    for state_dir in (tasks_dir / "done", tasks_dir / "blocked"):
-        if state_dir.exists():
-            for f in state_dir.glob(f"{parent_id}-*.md"):
-                _record(f.stem)
-
-    # Also union the parent task's persisted frontmatter children list.
-    for pf in (tasks_dir / f"{parent_id}.md", tasks_dir / parent_id / "_task.md"):
-        if pf.exists():
-            try:
-                text = pf.read_text(encoding="utf-8")
-                fm, _ = parse_frontmatter(text)
-                for cid in (fm.get("children") or []):
-                    if isinstance(cid, str) and cid.startswith(parent_id + "-"):
-                        _record(cid)
-            except Exception:
-                pass
-
-    return existing_nums
+    return _existing_child_ordinals(tasks_dir, tasks_dir / parent_id, parent_id)
 
 
 def _check_id_collisions(

@@ -464,6 +464,12 @@ def add_mission_mini_goal(
         try:
             _rewrite_mission(mission)
         except Exception as exc:
+            # The mission rewrite failed, so the mission file on disk never
+            # gained this mini-goal. Undo the in-memory append too, or the
+            # returned/raised ``mission`` object diverges from the persisted
+            # file — a caller that reuses it would re-render a mini-goal that
+            # was never committed (Antigravity CLAWP-071 review).
+            mission.mini_goals.pop()
             rb = task.file_path.with_suffix(".rollback.tmp")
             try:
                 rb.write_text(original_text, encoding="utf-8")
