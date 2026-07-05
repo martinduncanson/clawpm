@@ -915,3 +915,8 @@ clawpm log tail            # See recent activity
 ```
 
 **`add_failed` after `project init`?** Check `.project/settings.toml` — `repo_path` must use forward slashes on Windows (`F:/Git/...` not `F:\Git\...`). The CLI now warns when this is suspected, but old settings.toml files written by earlier versions may still be broken.
+
+**Windows CLI caveats (observed 2026-07-05):**
+- `--predict-scope` values containing glob metacharacters (`scripts/**`) get expanded into extra positional arguments and fail `tasks add` with "Got unexpected extra arguments". Use plain directory prefixes (`scripts/`) or exact file paths — the conflict heuristic strips glob chars anyway.
+- `--predict-duration` rejects combined units (`2h30m`) — use a single unit (`150m`, `2h`).
+- If multiple `clawpm.exe` shims are on PATH, a stale one can shadow the working install (`ModuleNotFoundError: No module named 'clawpm'`). Check with `where.exe clawpm` and invoke the shim next to the Python install that has clawpm importable.
