@@ -692,6 +692,7 @@ def project_doctor(
     codegraph_advice: list[dict] = []
     semble_advice: list[dict] = []
     encoding_risks: list[dict] = []
+    dangling_links: list[dict] = []  # CLAWP-082
 
     STALE_DAYS = 7
     CODEGRAPH_FILE_THRESHOLD = 50  # below this we don't bother advising
@@ -752,6 +753,17 @@ def project_doctor(
                 "project": proj.id,
                 "message": f"repo_path does not exist: {proj.repo_path}",
             })
+
+        # --- CLAWP-082: dangling wiki-link check ---
+        # A [[id]] whose target is not a known task/research/mission id in this
+        # project is a broken reference — surface it. Typed edges have their
+        # own integrity checks; this covers only the freeform wiki graph.
+        try:
+            from .links import find_dangling_links
+            dangling_links.extend(find_dangling_links(config, proj.id))
+        except Exception:
+            # Never let a link-scan hiccup abort the whole health check.
+            pass
 
         # --- Phase 1.6 Check a: Stale tasks ---
         # Scan .progress.md files; flag if mtime > STALE_DAYS ago
@@ -1203,7 +1215,7 @@ def project_doctor(
     has_warnings = bool(
         stale_tasks or stale_blocked or drift_tasks or prefix_collisions or unreadable_files
         or commit_drift or missing_markers or codex_availability or encoding_risks
-        or expired_lease_findings
+        or expired_lease_findings or dangling_links
         or any(i["level"] == "warning" for i in issues)
     )
 
@@ -1287,6 +1299,7 @@ def project_doctor(
             "semble_advice": semble_advice,
             "encoding_risks": encoding_risks,
             "expired_leases": expired_lease_findings,
+            "dangling_links": dangling_links,
         }
         if apply_mode:
             payload["applied"] = applied
@@ -1302,7 +1315,7 @@ def project_doctor(
         if not (
             issues or stale_tasks or stale_blocked or drift_tasks or prefix_collisions or unreadable_files
             or commit_drift or missing_markers or codex_availability or codegraph_advice
-            or semble_advice or encoding_risks or expired_lease_findings
+            or semble_advice or encoding_risks or expired_lease_findings or dangling_links
         ):
             click.echo("[OK] No issues found")
         else:
@@ -1377,6 +1390,11 @@ def project_doctor(
                     f"- no heartbeat for {el['age_seconds']}s (TTL {el['ttl_seconds']}s); "
                     f"fallback {el['fallback_policy']}. {el['suggested_action']}"
                 )
+            for dl in dangling_links:
+                click.echo(
+                    f"[WARNING] [dangling-link] {dl['source']} ({dl['project_id']}) "
+                    f"-> [[{dl['target']}]] references an unknown id."
+                )
 
         if apply_mode:
             prefix = "[DRY-RUN]" if dry_run else "[APPLIED]"
@@ -1415,8 +1433,15 @@ def tasks(ctx: click.Context) -> None:
 @click.option("--flat", is_flag=True, help="Show flat list without hierarchy")
 @click.option("--tag", "tags", multiple=True, help="Filter by workstream tag (CLAWP-069, repeatable). Repeated --tag is OR (matches any); add --all-tags for AND (matches all).")
 @click.option("--all-tags", "all_tags", is_flag=True, default=False, help="Require ALL --tag values (AND) instead of the default any-of (OR).")
+@click.option("--text", "text", default=None, help="Filter by text over title + body (CLAWP-082). Substring by default; add --regex for a case-insensitive regex.")
+@click.option("--regex", "use_regex", is_flag=True, default=False, help="Treat --text as a case-insensitive regular expression.")
+@click.option("--priority", "priority", default=None, help="Filter by priority (CLAWP-082): exact ('5') or comparator ('<=3', '>7').")
+@click.option("--complexity", "complexities", multiple=True, type=click.Choice(["s", "m", "l", "xl"]), help="Filter by complexity (CLAWP-082, repeatable, OR).")
+@click.option("--parent", "parent", default=None, help="Only the direct subtasks of this parent task id (CLAWP-082).")
+@click.option("--linked", "linked", default=None, help="Only tasks referencing this id via a [[wiki-link]] or a typed edge (CLAWP-082).")
+@click.option("--limit", "limit", type=int, default=None, help="Cap the number of results after filtering + sorting (CLAWP-082).")
 @click.pass_context
-def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, flat: bool, tags: tuple[str, ...], all_tags: bool) -> None:
+def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, flat: bool, tags: tuple[str, ...], all_tags: bool, text: str | None, use_regex: bool, priority: str | None, complexities: tuple[str, ...], parent: str | None, linked: str | None, limit: int | None) -> None:
     """List tasks for a project (default: open+progress+blocked, use -s all for everything)."""
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
@@ -1434,11 +1459,38 @@ def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, fl
     else:
         found_tasks = list_tasks(config, project_id, state_filter=TaskState(state))
 
-    # CLAWP-069 — composable filter pass. Built generically so CLAWP-082 can
-    # append --text/--priority/--complexity/--parent/--limit filters here.
+    # CLAWP-069/082 — composable filter pass. Every axis is a `by_*` predicate
+    # combined with AND via apply_filters (a task must satisfy all of them).
+    from .filters import (
+        apply_filters, by_complexity, by_linked, by_parent, by_priority,
+        by_tags, by_text,
+    )
+    filter_list = []
     if tags:
-        from .filters import apply_filters, by_tags
-        found_tasks = apply_filters(found_tasks, [by_tags(tags, match_all=all_tags)])
+        filter_list.append(by_tags(tags, match_all=all_tags))
+    if text:
+        filter_list.append(by_text(text, use_regex=use_regex))
+    if priority is not None:
+        filter_list.append(by_priority(priority))
+    if complexities:
+        filter_list.append(by_complexity(complexities))
+    if parent:
+        filter_list.append(by_parent(expand_task_id(parent, project_id)))
+    if linked:
+        from .links import build_link_index
+        index = build_link_index(config, project_id)
+        # Resolve both the expanded (task-style) id and the raw ref so --linked
+        # works for research/mission ids that expand_task_id would leave alone.
+        refs: set[str] = set()
+        for target in {expand_task_id(linked, project_id), linked}:
+            refs |= index.referencing_ids(target)
+        filter_list.append(by_linked(refs))
+
+    if filter_list:
+        found_tasks = apply_filters(found_tasks, filter_list)
+
+    if limit is not None and limit >= 0:
+        found_tasks = found_tasks[:limit]
 
     output_tasks_list(found_tasks, fmt=fmt, flat=flat)
 
@@ -1512,14 +1564,29 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
     from .hints import hints_for_shown_task, hints_enabled
     _hints = hints_for_shown_task(task) if hints_enabled(ctx) else None
 
+    # CLAWP-082 — derive backlinks at read time. `links` (outbound wiki-links)
+    # is already on the task; `linked_from` unifies inbound wiki + typed edges.
+    from .links import build_link_index
+    _index = build_link_index(config, project_id)
+    _linked_from = _index.linked_from(task_id)
+
     if fmt == OutputFormat.JSON:
         task_dict = task.to_dict()
         task_dict["reflections_voided"] = reflections_voided
+        task_dict["linked_from"] = _linked_from
         if _hints:
             task_dict["hints"] = _hints
         output_json(task_dict)
     else:
         output_task_detail(task, fmt=fmt, hints=_hints)
+        if task.links:
+            click.echo("[links: " + ", ".join(task.links) + "]")
+        if _linked_from:
+            click.echo(
+                "[linked_from: "
+                + ", ".join(f"{lf['id']} ({lf['via']})" for lf in _linked_from)
+                + "]"
+            )
         if reflections_voided:
             click.echo("[reflections_voided: true]")
 
@@ -3651,19 +3718,30 @@ def agent_context(ctx: click.Context, project_id: str | None, log_limit: int) ->
             else:
                 context["spec"] = spec_content
     
+    # CLAWP-082 — build the derived link index once and attach backlinks
+    # (`linked_from`) to every task dict surfaced below. `links` (outbound
+    # wiki-links) already rides along in each task's to_dict().
+    from .links import build_link_index
+    _link_index = build_link_index(config, resolved_id)
+
+    def _with_backlinks(t: Task) -> dict:
+        d = t.to_dict()
+        d["linked_from"] = _link_index.linked_from(t.id)
+        return d
+
     # Current task (in progress)
     in_progress = list_tasks(config, resolved_id, state_filter=TaskState.PROGRESS)
-    context["in_progress"] = [t.to_dict() for t in in_progress]
-    
+    context["in_progress"] = [_with_backlinks(t) for t in in_progress]
+
     # Next task if nothing in progress
     if not in_progress:
         next_task = get_next_task(config, resolved_id)
         if next_task:
-            context["next_task"] = next_task.to_dict()
-    
+            context["next_task"] = _with_backlinks(next_task)
+
     # Blocked tasks
     blocked = list_tasks(config, resolved_id, state_filter=TaskState.BLOCKED)
-    context["blockers"] = [t.to_dict() for t in blocked]
+    context["blockers"] = [_with_backlinks(t) for t in blocked]
     
     # Open task count
     open_tasks = list_tasks(config, resolved_id, state_filter=TaskState.OPEN)

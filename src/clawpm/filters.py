@@ -14,6 +14,8 @@ carry EVERY requested tag).
 
 from __future__ import annotations
 
+import operator
+import re
 from collections.abc import Callable, Iterable, Sequence
 
 from .models import Task, normalize_tags
@@ -47,6 +49,106 @@ def by_tags(tags: Sequence[str], match_all: bool = False) -> TaskFilter:
         return any(w in have for w in wanted)
 
     return _pred
+
+
+def _haystack(task: Task) -> str:
+    """The text a ``--text`` query searches: title + body."""
+    return f"{task.title}\n{task.content}"
+
+
+def by_text(query: str, use_regex: bool = False) -> TaskFilter:
+    """Filter tasks by a text query over title + body (CLAWP-082).
+
+    ``use_regex=False`` (default) is a case-insensitive substring match;
+    ``use_regex=True`` compiles ``query`` as a case-insensitive regular
+    expression. A blank query — or a regex that fails to compile — yields a
+    filter that matches nothing, so a typo can't silently return the whole
+    backlog (mirrors ``by_tags``' unsatisfiable-empty behaviour).
+    """
+    if not query or not query.strip():
+        return lambda _t: False
+    if use_regex:
+        try:
+            pattern = re.compile(query, re.IGNORECASE)
+        except re.error:
+            return lambda _t: False
+        return lambda t: pattern.search(_haystack(t)) is not None
+    needle = query.lower()
+    return lambda t: needle in _haystack(t).lower()
+
+
+_PRIORITY_COMPARATORS: list[tuple[str, Callable[[int, int], bool]]] = [
+    ("<=", operator.le),
+    (">=", operator.ge),
+    ("==", operator.eq),
+    ("<", operator.lt),
+    (">", operator.gt),
+    ("=", operator.eq),
+]
+
+
+def by_priority(spec: str | int) -> TaskFilter:
+    """Filter tasks by priority (CLAWP-082).
+
+    ``spec`` is an exact value (``5``) or a comparator expression
+    (``<=3``, ``>7``, ``>=2``) — priority is ordinal (lower = more urgent),
+    so ranges are the useful query. An unparseable spec matches nothing.
+    """
+    s = str(spec).strip()
+    op = operator.eq
+    num = s
+    for prefix, fn in _PRIORITY_COMPARATORS:
+        if s.startswith(prefix):
+            op = fn
+            num = s[len(prefix):].strip()
+            break
+    try:
+        value = int(num)
+    except (TypeError, ValueError):
+        return lambda _t: False
+    return lambda t: op(t.priority, value)
+
+
+def by_complexity(values: Sequence[str]) -> TaskFilter:
+    """Filter tasks by complexity (CLAWP-082), OR across the requested values.
+
+    Values are lowercased (``s``/``m``/``l``/``xl``). A task with no complexity
+    set never matches. An empty request matches nothing.
+    """
+    wanted = {v.strip().lower() for v in values if isinstance(v, str) and v.strip()}
+
+    def _pred(task: Task) -> bool:
+        if not wanted:
+            return False
+        current = task.complexity.value if task.complexity else None
+        return current in wanted
+
+    return _pred
+
+
+def by_parent(parent_id: str) -> TaskFilter:
+    """Filter to the direct subtasks of ``parent_id`` (CLAWP-082).
+
+    A blank parent id matches nothing (asking for children of nothing is an
+    unsatisfiable query, not "all root tasks").
+    """
+    pid = (parent_id or "").strip()
+    if not pid:
+        return lambda _t: False
+    return lambda t: (t.parent or "") == pid
+
+
+def by_linked(referencing_ids: Iterable[str]) -> TaskFilter:
+    """Filter to tasks whose id is in ``referencing_ids`` (CLAWP-082).
+
+    The caller precomputes the referencing-id set from the derived link index
+    (``links.build_link_index(...).referencing_ids(target)``) — every entity
+    that references the target via a ``[[id]]`` wiki-link OR a typed edge. This
+    keeps ``filters`` decoupled from the link-graph machinery (models-only
+    import surface). An empty set matches nothing.
+    """
+    wanted = {i for i in referencing_ids if isinstance(i, str)}
+    return lambda t: t.id in wanted
 
 
 def apply_filters(tasks: Iterable[Task], filters: Iterable[TaskFilter]) -> list[Task]:

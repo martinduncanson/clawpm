@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -95,6 +96,35 @@ def normalize_tags(raw: Any) -> list[str]:
             continue
         seen.add(tag)
         out.append(tag)
+    return out
+
+
+# A wiki-link is ``[[target]]`` or ``[[target|display]]`` (CLAWP-082). Brackets
+# can't nest, so the character class excludes them. Defined here (not in
+# links.py) so ``Task.from_file`` can parse a task's own outbound links without
+# a models->links import cycle — links.py imports this back.
+_WIKILINK_RE = re.compile(r"\[\[([^\[\]]+)\]\]")
+
+
+def extract_wiki_links(text: str | None) -> list[str]:
+    """Parse ``[[id]]`` wiki-link targets from body text (CLAWP-082).
+
+    Targets are de-duplicated preserving first-seen order. A ``[[id|alias]]``
+    form keeps only the ``id`` before the pipe. Blank targets are dropped.
+    Returns ``[]`` for empty/None input. Pure and dependency-free so both the
+    ``Task``/``Research``/``Mission`` load paths and the derived link index can
+    share one parser.
+    """
+    if not text:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _WIKILINK_RE.finditer(text):
+        target = m.group(1).split("|", 1)[0].strip()
+        if not target or target in seen:
+            continue
+        seen.add(target)
+        out.append(target)
     return out
 
 
@@ -461,6 +491,11 @@ class Task:
     # via ``normalize_tags`` at load and write time. Do NOT propagate parent->
     # child — each task carries its own tags independently.
     tags: list[str] = field(default_factory=list)
+    # CLAWP-082 — freeform ``[[id]]`` wiki-link targets parsed from the body.
+    # Outbound edges only; backlinks (``linked_from``) are DERIVED at read time
+    # by links.build_link_index, never stored. Distinct from the typed graph
+    # (depends/parent/reference_tasks/supersedes/parent_mission).
+    links: list[str] = field(default_factory=list)
     parent: str | None = None
     children: list[str] = field(default_factory=list)  # Populated by discovery
     created: str | None = None
@@ -648,6 +683,10 @@ class Task:
         # dropped). Absent / non-list frontmatter → [].
         tags = normalize_tags(frontmatter.get("tags"))
 
+        # CLAWP-082 — freeform [[id]] wiki-links parsed from the body. Derived
+        # from content, never persisted in frontmatter.
+        links = extract_wiki_links(content)
+
         # CLAWP-055 — baseline_ref: opaque string stamped at task creation.
         # None for legacy tasks — backward-compat default.
         baseline_ref_raw = frontmatter.get("baseline_ref")
@@ -666,6 +705,7 @@ class Task:
             depends=frontmatter.get("depends", []),
             scope=frontmatter.get("scope", []),
             tags=tags,
+            links=links,
             parent=frontmatter.get("parent"),
             children=children,
             created=created,
@@ -717,6 +757,8 @@ class Task:
             "depends": self.depends,
             "scope": self.scope,
             "tags": self.tags,
+            # CLAWP-082 — outbound freeform wiki-links (see `links` field).
+            "links": self.links,
             "parent": self.parent,
             "children": self.children,
             "is_parent": self.is_parent,
