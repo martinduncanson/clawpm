@@ -64,6 +64,7 @@ from .tasks import (
     split_task,
     add_subtask,
     touch_task_updated,
+    distinct_tags,
 )
 from .worklog import (
     add_entry,
@@ -1412,8 +1413,10 @@ def tasks(ctx: click.Context) -> None:
     help="Filter by state (default: open+progress+blocked; use 'rejected' for the won't-do ledger)",
 )
 @click.option("--flat", is_flag=True, help="Show flat list without hierarchy")
+@click.option("--tag", "tags", multiple=True, help="Filter by workstream tag (CLAWP-069, repeatable). Repeated --tag is OR (matches any); add --all-tags for AND (matches all).")
+@click.option("--all-tags", "all_tags", is_flag=True, default=False, help="Require ALL --tag values (AND) instead of the default any-of (OR).")
 @click.pass_context
-def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, flat: bool) -> None:
+def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, flat: bool, tags: tuple[str, ...], all_tags: bool) -> None:
     """List tasks for a project (default: open+progress+blocked, use -s all for everything)."""
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
@@ -1431,7 +1434,36 @@ def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, fl
     else:
         found_tasks = list_tasks(config, project_id, state_filter=TaskState(state))
 
+    # CLAWP-069 — composable filter pass. Built generically so CLAWP-082 can
+    # append --text/--priority/--complexity/--parent/--limit filters here.
+    if tags:
+        from .filters import apply_filters, by_tags
+        found_tasks = apply_filters(found_tasks, [by_tags(tags, match_all=all_tags)])
+
     output_tasks_list(found_tasks, fmt=fmt, flat=flat)
+
+
+@tasks.command("tags")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
+@click.option("--include-done/--no-include-done", "include_done", default=True, help="Include terminal (done + rejected) tasks in the tally (default: yes).")
+@click.pass_context
+def tasks_tags(ctx: click.Context, project_id: str | None, include_done: bool) -> None:
+    """List distinct workstream tags with task counts (CLAWP-069)."""
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+
+    project_id, _ = require_project(ctx, project_id)
+
+    pairs = distinct_tags(config, project_id, include_done=include_done)
+
+    if fmt == OutputFormat.JSON:
+        output_json([{"tag": tag, "count": count} for tag, count in pairs])
+    else:
+        if not pairs:
+            click.echo("No tags found")
+            return
+        for tag, count in pairs:
+            click.echo(f"{count:>4}  {tag}")
 
 
 @tasks.command("show")
@@ -1503,6 +1535,8 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
 @click.option("--scope-file", "scope_file", default=None, type=click.Path(), help="Read scope glob patterns from file (one per line). Windows-safe: bypasses CRT argv glob-expansion. Use instead of --scope when patterns contain wildcards.")
 @click.option("--parallel-group", "parallel_group", type=int, default=None, help="Batch ordinal for parallel dispatch (CLAWP-021). Use --clear-parallel-group to remove.")
 @click.option("--clear-parallel-group", "clear_parallel_group", is_flag=True, default=False, help="Remove parallel_group from the task — opts out of batch dispatch.")
+@click.option("--tag", "tags", multiple=True, help="Workstream tags (CLAWP-069, repeatable). REPLACES the task's tag set (mirrors --scope). Use --clear-tags to remove all.")
+@click.option("--clear-tags", "clear_tags", is_flag=True, default=False, help="Remove all tags from the task.")
 # --- Prediction flags (all optional) ---
 @click.option("--predict-duration", "predict_duration", default=None, help="Predicted duration: 90, 90m, 2h, 3d, 1w")
 @click.option("--predict-complexity", "predict_complexity", type=click.Choice(["s", "m", "l", "xl"]), default=None, help="Predicted complexity")
@@ -1543,6 +1577,8 @@ def tasks_edit(
     scope_file: str | None,
     parallel_group: int | None,
     clear_parallel_group: bool,
+    tags: tuple[str, ...],
+    clear_tags: bool,
     predict_duration: str | None,
     predict_complexity: str | None,
     predict_files_changed: int | None,
@@ -1602,12 +1638,16 @@ def tasks_edit(
     ])
 
     if not any([title, priority is not None, complexity, body, scope, scope_file, has_predictions, parallel_group is not None, clear_parallel_group,
-                 out_of_scope, out_of_scope_file, stop_conditions, delegability is not None]):
-        output_error("no_changes", "Specify at least one field to edit (--title, --priority, --complexity, --body, --scope, --scope-file, --parallel-group, --clear-parallel-group, --predict-*, --out-of-scope, --out-of-scope-file, --stop-condition, or --delegability)", fmt=fmt)
+                 out_of_scope, out_of_scope_file, stop_conditions, delegability is not None, tags, clear_tags]):
+        output_error("no_changes", "Specify at least one field to edit (--title, --priority, --complexity, --body, --scope, --scope-file, --parallel-group, --clear-parallel-group, --tag, --clear-tags, --predict-*, --out-of-scope, --out-of-scope-file, --stop-condition, or --delegability)", fmt=fmt)
         sys.exit(1)
 
     if parallel_group is not None and clear_parallel_group:
         output_error("conflicting_flags", "Cannot use both --parallel-group and --clear-parallel-group", fmt=fmt)
+        sys.exit(1)
+
+    if tags and clear_tags:
+        output_error("conflicting_flags", "Cannot use both --tag and --clear-tags", fmt=fmt)
         sys.exit(1)
 
     cmplx = TaskComplexity(complexity) if complexity else None
@@ -1649,6 +1689,8 @@ def tasks_edit(
             priority=priority,
             complexity=cmplx,
             scope=scope_list,
+            tags=list(tags) if tags else None,
+            clear_tags=clear_tags,
             body=body,
             predictions=predictions,
             parallel_group=parallel_group,
@@ -2384,6 +2426,7 @@ def tasks_decompose(
 @click.option("--scope-file", "scope_file", default=None, type=click.Path(), help="Read scope glob patterns from file (one per line). Windows-safe: bypasses CRT argv glob-expansion. Use instead of --scope when patterns contain wildcards.")
 @click.option("--parallel-group", "parallel_group", type=int, default=None, help="Batch ordinal for parallel dispatch (CLAWP-021). Tasks sharing a group dispatch together; group N+1 waits for group N.")
 @click.option("--agent-profile", "agent_profile", default=None, help="Capability/skill profile (CLAWP-038). Recorded on the task and propagated to reflection/iteration events so calibration can segment predicted-vs-actual by profile.")
+@click.option("--tag", "tags", multiple=True, help="Cross-cutting workstream tag (CLAWP-069, repeatable, e.g. --tag concurrency --tag mcp). Normalised to lowercase.")
 @click.option("--parent", "parent_id", help="Parent task ID (creates subtask)")
 @click.option("--description", help="Task description (deprecated, use --body)")
 @click.option("--body", "-b", help="Task body content")
@@ -2436,6 +2479,7 @@ def tasks_add(
     scope_file: str | None,
     parallel_group: int | None,
     agent_profile: str | None,
+    tags: tuple[str, ...],
     parent_id: str | None,
     description: str | None,
     body: str | None,
@@ -2550,6 +2594,7 @@ def tasks_add(
         parent_id = expand_task_id(parent_id, project_id)
     # Create subtask if parent specified
     with _mutation_errors(fmt, "add_failed"):
+        tags_list = list(tags) if tags else None
         if parent_id:
             deps = list(depends) if depends else None
             task = add_subtask(
@@ -2568,6 +2613,7 @@ def tasks_add(
                 out_of_scope=list(out_of_scope) if out_of_scope else None,
                 stop_conditions=list(stop_conditions) if stop_conditions else None,
                 delegability=delegability,
+                tags=tags_list,
             )
         else:
             deps = list(depends) if depends else None
@@ -2580,6 +2626,7 @@ def tasks_add(
                 complexity=cmplx,
                 depends=deps,
                 scope=scope_list,
+                tags=tags_list,
                 description=task_body,
                 predictions=predictions,
                 parallel_group=parallel_group,

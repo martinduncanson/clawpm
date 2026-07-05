@@ -16,7 +16,7 @@ from .frontmatter import (
     split_frontmatter,
     stamp_updated,
 )
-from .models import Task, TaskState, TaskComplexity, Predictions, PortfolioConfig
+from .models import Task, TaskState, TaskComplexity, Predictions, PortfolioConfig, normalize_tags
 from .discovery import get_project_dir, find_project_dir_fallback
 
 
@@ -125,6 +125,35 @@ def list_tasks(
     tasks.sort(key=lambda t: (t.priority, t.id))
 
     return tasks
+
+
+def distinct_tags(
+    config: PortfolioConfig,
+    project_id: str,
+    include_done: bool = True,
+) -> list[tuple[str, int]]:
+    """Return distinct workstream tags with task counts (CLAWP-069).
+
+    Scans every task state — open/progress/blocked plus the terminal done/ and
+    rejected/ silos — so the discovered tag universe is complete (Codex + Grok
+    review: rejected tasks, i.e. the won't-do ledger, were previously omitted).
+    Sorted by count descending, then tag name for a stable ordering.
+
+    ``include_done=False`` narrows to the active-work view (open/progress/
+    blocked) by dropping the terminal states (DONE and REJECTED) from the tally.
+    """
+    # list_tasks(state_filter=None) excludes the rejected/ silo by design, so
+    # union an explicit rejected scan to make the tag universe complete.
+    tasks = list_tasks(config, project_id, state_filter=None)
+    tasks = tasks + list_tasks(config, project_id, state_filter=TaskState.REJECTED)
+    _terminal = {TaskState.DONE, TaskState.REJECTED}
+    counts: dict[str, int] = {}
+    for task in tasks:
+        if not include_done and task.state in _terminal:
+            continue
+        for tag in task.tags:
+            counts[tag] = counts.get(tag, 0) + 1
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
 
 
 def _candidate_task_paths(tasks_dir: Path, task_id: str) -> list[Path]:
@@ -994,6 +1023,7 @@ def add_task(
     complexity: TaskComplexity | None = None,
     depends: list[str] | None = None,
     scope: list[str] | None = None,
+    tags: list[str] | None = None,
     description: str = "",
     predictions: Predictions | None = None,
     parallel_group: int | None = None,
@@ -1110,6 +1140,13 @@ def add_task(
         if scope:
             frontmatter["scope"] = scope
 
+        # CLAWP-069 — normalise tags at the write boundary so what lands on disk
+        # matches what the filter/count paths expect (lowercased, deduped).
+        if tags:
+            norm_tags = normalize_tags(tags)
+            if norm_tags:
+                frontmatter["tags"] = norm_tags
+
         if parallel_group is not None:
             frontmatter["parallel_group"] = parallel_group
 
@@ -1191,6 +1228,8 @@ def edit_task(
     priority: int | None = None,
     complexity: TaskComplexity | None = None,
     scope: list[str] | None = None,
+    tags: list[str] | None = None,
+    clear_tags: bool = False,
     body: str | None = None,
     predictions: Predictions | None = None,
     parallel_group: int | None = None,
@@ -1247,6 +1286,18 @@ def edit_task(
                 frontmatter["scope"] = scope
             else:
                 frontmatter.pop("scope", None)
+        # CLAWP-069 — tags REPLACE (mirrors scope): --tag X --tag Y sets the
+        # full set; --clear-tags removes the field entirely. Normalise so on-
+        # disk form matches the filter/count paths.
+        # Removal is EXCLUSIVELY via clear_tags — a tags value that normalises
+        # to empty (e.g. `--tag ""` / a blank shell-expansion) is treated as a
+        # no-op, never a silent wipe of existing tags (Codex + Grok review).
+        if clear_tags:
+            frontmatter.pop("tags", None)
+        elif tags is not None:
+            norm_tags = normalize_tags(tags)
+            if norm_tags:
+                frontmatter["tags"] = norm_tags
         if clear_parallel_group:
             frontmatter.pop("parallel_group", None)
         elif parallel_group is not None:
@@ -1430,6 +1481,7 @@ def add_subtask(
     out_of_scope: list[str] | None = None,
     stop_conditions: list[str] | None = None,
     delegability: str | None = None,
+    tags: list[str] | None = None,
 ) -> Task | None:
     """Add a subtask to a parent task.
     
@@ -1533,6 +1585,13 @@ def add_subtask(
             frontmatter["stop_conditions"] = stop_conditions
         if delegability and delegability != "either":
             frontmatter["delegability"] = delegability
+
+        # CLAWP-069 — subtasks may carry their own workstream tags (no
+        # propagation from the parent; each task is tagged independently).
+        if tags:
+            norm_tags = normalize_tags(tags)
+            if norm_tags:
+                frontmatter["tags"] = norm_tags
 
         # CLAWP-037 — children created via `tasks decompose` carry their own
         # success_criteria (and other predictions) so each subtask is a

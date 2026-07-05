@@ -10,6 +10,7 @@ from enum import Enum
 from typing import Any
 
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 from rich.panel import Panel
 from rich.text import Text
@@ -189,11 +190,20 @@ def output_tasks_list(tasks: list[Any], fmt: OutputFormat = OutputFormat.JSON, f
             parent_marker = " [dim]↳[/dim]" if t.parent else ""
             # CLAWP-086 — surface the `updated` stamp in the text list too.
             upd = f" [dim]upd:{t.updated}[/dim]" if getattr(t, "updated", None) else ""
+            # CLAWP-069 — surface workstream tags inline (blue #tag markers).
+            # Escape tag text: tags are arbitrary strings that may contain Rich
+            # markup metacharacters ([ ] /), which would otherwise be parsed as
+            # styling or break markup rendering (Codex review).
+            tags = getattr(t, "tags", None) or []
+            tag_str = (
+                " " + " ".join(f"[blue]#{escape(tag)}[/blue]" for tag in tags)
+                if tags else ""
+            )
 
             console.print(
                 f"{indent}[cyan]{t.id}[/cyan]{parent_marker} "
                 f"[{state_color}]\\[{t.state.value}][/{state_color}] "
-                f"P{t.priority}{cmplx} {title}{upd}"
+                f"P{t.priority}{cmplx} {title}{upd}{tag_str}"
             )
 
         for t in top_level:
@@ -238,6 +248,10 @@ def output_task_detail(
             console.print(f"[dim]Created:[/dim] {task.created}")
         if getattr(task, "updated", None):
             console.print(f"[dim]Updated:[/dim] {task.updated}")
+        # CLAWP-069 — workstream tags (escaped: arbitrary strings may contain
+        # Rich markup metacharacters; Codex review).
+        if getattr(task, "tags", None):
+            console.print(f"[dim]Tags:[/dim] {', '.join(escape(t) for t in task.tags)}")
         if task.file_path:
             console.print(f"[dim]File:[/dim] {task.file_path}")
 
