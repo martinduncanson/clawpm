@@ -15,6 +15,8 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.text import Text
 
+from .models import PLACEHOLDER_STALE_DAYS
+
 
 # cp1252-safe stdio (CLAWP-011): reconfigure to UTF-8 before the rich Console is
 # constructed, so any non-ASCII glyph written to stdout/stderr on a Windows
@@ -320,9 +322,19 @@ def output_worklog_entries(entries: list[Any], fmt: OutputFormat = OutputFormat.
 
 
 def output_research_list(items: list[Any], fmt: OutputFormat = OutputFormat.JSON) -> None:
-    """Output a list of research items."""
+    """Output a list of research items.
+
+    Each entry is annotated with ``stale_placeholder``: an open/in-progress
+    entry that still carries unfilled template sections past the staleness
+    threshold (see :func:`clawpm.models.is_stale_placeholder`).
+    """
     if fmt == OutputFormat.JSON:
-        output_json([r.to_dict() for r in items])
+        rows = []
+        for r in items:
+            data = r.to_dict()
+            data["stale_placeholder"] = r.is_stale_placeholder()
+            rows.append(data)
+        output_json(rows)
     else:
         if not items:
             console.print("[dim]No research items found[/dim]")
@@ -335,6 +347,7 @@ def output_research_list(items: list[Any], fmt: OutputFormat = OutputFormat.JSON
         table.add_column("Status")
         table.add_column("Tags")
 
+        stale_count = 0
         for r in items:
             status_color = {
                 "open": "yellow",
@@ -342,15 +355,28 @@ def output_research_list(items: list[Any], fmt: OutputFormat = OutputFormat.JSON
                 "stale": "dim",
             }.get(r.status.value, "white")
 
+            stale = r.is_stale_placeholder()
+            if stale:
+                stale_count += 1
+            title = r.title[:40] + "..." if len(r.title) > 40 else r.title
+            if stale:
+                title = f"{title} [red][!] stale placeholder[/red]"
+
             table.add_row(
                 r.id,
-                r.title[:40] + "..." if len(r.title) > 40 else r.title,
+                title,
                 r.type.value,
                 f"[{status_color}]{r.status.value}[/{status_color}]",
                 ", ".join(r.tags) if r.tags else "-",
             )
 
         console.print(table)
+        if stale_count:
+            console.print(
+                f"[red][!] {stale_count} entr"
+                f"{'y' if stale_count == 1 else 'ies'} still carry placeholder "
+                f"sections past {PLACEHOLDER_STALE_DAYS} days - fill in or mark complete.[/red]"
+            )
 
 
 def output_context(context: dict[str, Any], fmt: OutputFormat = OutputFormat.JSON) -> None:

@@ -5053,6 +5053,10 @@ def research_list(ctx: click.Context, project_id: str | None, status: str | None
 @click.option("--id", "research_id", help="Research ID (auto-generated if not provided)")
 @click.option("--tags", multiple=True, help="Tags")
 @click.option("--question", "-q", help="Research question")
+@click.option("--summary", "--verdict", "summary", help="Verdict/summary written straight into the Summary section (single-shot capture).")
+@click.option("--finding", "findings", multiple=True, help="A finding bullet for the Findings section (repeatable).")
+@click.option("--conclusion", help="Conclusion written straight into the Conclusion section.")
+@click.option("--open", "open_ended", is_flag=True, help="Progressive template with placeholder sections for a genuinely open investigation (no verdict yet).")
 @click.pass_context
 def research_add(
     ctx: click.Context,
@@ -5062,12 +5066,44 @@ def research_add(
     research_id: str | None,
     tags: tuple[str, ...],
     question: str | None,
+    summary: str | None,
+    findings: tuple[str, ...],
+    conclusion: str | None,
+    open_ended: bool,
 ) -> None:
-    """Add a new research item."""
+    """Add a new research item.
+
+    Default is single-shot capture: pass --summary (alias --verdict) and any
+    number of --finding bullets to write the verdict straight into the
+    sections at creation time. Use --open for the progressive template that
+    keeps placeholder sections to fill in as an investigation proceeds.
+    """
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
-    
+
     project_id, _ = require_project(ctx, project_id)
+
+    # --open is the progressive (fill-in-later) path; it can't also carry a
+    # single-shot verdict, or the supplied content would be silently dropped.
+    if open_ended and (summary or findings or conclusion):
+        output_error(
+            "open_conflict",
+            "--open is for a progressive entry with no verdict yet; it cannot be "
+            "combined with --summary/--verdict, --finding, or --conclusion.",
+            fmt=fmt,
+        )
+        sys.exit(1)
+
+    # Single-shot capture needs a verdict (the Summary); --finding/--conclusion
+    # are optional additions and don't substitute for it.
+    if not open_ended and not summary:
+        output_error(
+            "missing_verdict",
+            "research add needs --summary/--verdict (single-shot capture) or --open "
+            "for a progressive entry to fill in later.",
+            fmt=fmt,
+        )
+        sys.exit(1)
 
     # Support both -t tag1 -t tag2 and --tags tag1,tag2
     parsed_tags = []
@@ -5082,6 +5118,9 @@ def research_add(
         research_id=research_id,
         tags=parsed_tags if parsed_tags else None,
         question=question or "",
+        summary=summary or "",
+        findings=list(findings) if findings else None,
+        conclusion=conclusion or "",
     )
 
     if not item:

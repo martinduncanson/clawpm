@@ -6,7 +6,7 @@ import fnmatch
 import re
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -852,6 +852,93 @@ class WorkLogEntry:
         )
 
 
+# Default age (days) after which a still-placeholder research entry is flagged.
+PLACEHOLDER_STALE_DAYS = 14
+
+# Literal stubs the progressive (``--open``) template emits. Matched only where
+# a section-body line *starts* with one — not as a bare substring — so a filled
+# entry that merely quotes the phrase mid-line isn't flagged forever.
+_PLACEHOLDER_PREFIXES = (
+    "(To be filled in",
+    "(Describe the research question)",
+)
+
+# A fenced-code-block delimiter (```), so ``...`` lines inside a code sample
+# (e.g. a Python stub body) aren't mistaken for template stubs.
+_CODE_FENCE = re.compile(r"^\s*```")
+
+
+def has_placeholder_sections(content: str) -> bool:
+    """Return True if the body still carries an unfilled template stub.
+
+    Scanned line by line, skipping fenced code blocks. A line that is exactly
+    ``...`` is a stub marker, and a line that starts with a template prefix is
+    too — checked per line so a stub still counts even when notes are typed
+    above or below it without deleting the ``...`` (with or without the
+    template's blank line). A genuine prose ellipsis mid-sentence, an incidental
+    quote of the stub text inside a line, or an ``...`` inside a code sample
+    does not trip it.
+    """
+    in_code_fence = False
+    for raw_line in content.splitlines():
+        if _CODE_FENCE.match(raw_line):
+            in_code_fence = not in_code_fence
+            continue
+        if in_code_fence:
+            continue
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line == "...":
+            return True
+        if any(line.startswith(prefix) for prefix in _PLACEHOLDER_PREFIXES):
+            return True
+    return False
+
+
+def _parse_created(created: str | None) -> datetime | None:
+    """Best-effort parse of a frontmatter ``created`` value to a datetime."""
+    if not created:
+        return None
+    s = str(created).strip()
+    # Pre-3.11 datetime.fromisoformat rejects a trailing 'Z'; normalise it so a
+    # legacy/tooling-emitted UTC timestamp doesn't parse as None and get
+    # spuriously reported stale.
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    # Date-only / naive values are treated as UTC; an already-aware value is
+    # converted rather than having its zone silently overwritten.
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def is_stale_placeholder(
+    item: "Research",
+    days: int = PLACEHOLDER_STALE_DAYS,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Return True if an open/in-progress entry is still stubbed after ``days``.
+
+    Complete and stale entries are intentionally closed and never flagged.
+    """
+    if item.status in (ResearchStatus.COMPLETE, ResearchStatus.STALE):
+        return False
+    if not has_placeholder_sections(item.content):
+        return False
+    created = _parse_created(item.created)
+    if created is None:
+        # No usable creation date — surface it rather than silently ignore.
+        return True
+    now = now or datetime.now(timezone.utc)
+    return (now - created).days >= days
+
+
 @dataclass
 class Research:
     """A research item."""
@@ -865,6 +952,16 @@ class Research:
     content: str = ""
     openclaw: dict[str, Any] | None = None
     file_path: Path | None = None
+
+    def has_placeholder(self) -> bool:
+        """True if this entry still carries unfilled template placeholders."""
+        return has_placeholder_sections(self.content)
+
+    def is_stale_placeholder(
+        self, days: int = PLACEHOLDER_STALE_DAYS, *, now: datetime | None = None
+    ) -> bool:
+        """True if this open/in-progress entry is still stubbed after ``days``."""
+        return is_stale_placeholder(self, days, now=now)
 
     @classmethod
     def from_file(cls, path: Path) -> Research:
@@ -910,6 +1007,7 @@ class Research:
             "tags": self.tags,
             "created": self.created,
             "openclaw": self.openclaw,
+            "has_placeholder": self.has_placeholder(),
             "file_path": str(self.file_path) if self.file_path else None,
         }
 

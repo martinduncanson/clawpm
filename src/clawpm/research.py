@@ -8,8 +8,27 @@ from pathlib import Path
 import yaml
 
 from .frontmatter import FrontmatterError, split_frontmatter
-from .models import Research, ResearchType, ResearchStatus, PortfolioConfig
+from .models import (
+    Research,
+    ResearchType,
+    ResearchStatus,
+    PortfolioConfig,
+    PLACEHOLDER_STALE_DAYS,
+    has_placeholder_sections,
+    is_stale_placeholder,
+)
 from .discovery import get_project_dir
+
+__all__ = [
+    "PLACEHOLDER_STALE_DAYS",
+    "has_placeholder_sections",
+    "is_stale_placeholder",
+    "get_research_dir",
+    "list_research",
+    "get_research",
+    "add_research",
+    "link_research_session",
+]
 
 
 def get_research_dir(config: PortfolioConfig, project_id: str) -> Path | None:
@@ -76,6 +95,49 @@ def get_research(config: PortfolioConfig, project_id: str, research_id: str) -> 
     return None
 
 
+def _render_open_body(question: str) -> str:
+    """Progressive template for a genuinely open investigation (no verdict yet)."""
+    return f"""## Question
+
+{question or "(Describe the research question)"}
+
+## Summary
+
+(To be filled in as research progresses)
+
+## Findings
+
+...
+
+## Conclusion
+
+...
+"""
+
+
+def _render_single_shot_body(
+    question: str,
+    summary: str,
+    findings: list[str] | None,
+    conclusion: str,
+) -> str:
+    """Single-shot capture: verdict recorded at creation, no rotting stubs.
+
+    Only sections with real content are emitted — an empty Findings/Conclusion
+    is omitted rather than stubbed, so the placeholder detector stays clean.
+    """
+    sections: list[str] = []
+    if question:
+        sections.append(f"## Question\n\n{question}")
+    sections.append(f"## Summary\n\n{summary}")
+    if findings:
+        bullets = "\n".join(f"- {f}" for f in findings)
+        sections.append(f"## Findings\n\n{bullets}")
+    if conclusion:
+        sections.append(f"## Conclusion\n\n{conclusion}")
+    return "\n\n".join(sections) + "\n"
+
+
 def add_research(
     config: PortfolioConfig,
     project_id: str,
@@ -84,8 +146,22 @@ def add_research(
     research_id: str | None = None,
     tags: list[str] | None = None,
     question: str = "",
+    summary: str = "",
+    findings: list[str] | None = None,
+    conclusion: str = "",
 ) -> Research | None:
-    """Add a new research item to a project."""
+    """Add a new research item to a project.
+
+    The template is inferred from the content supplied: if a summary, findings,
+    or conclusion is given, the verdict is written straight into those sections
+    (single-shot capture); otherwise a progressive template with placeholder
+    sections is emitted for an investigation to be filled in over time. A
+    progressive entry still carries the stub markers, so it surfaces via the
+    staleness signal if it's never completed.
+
+    The verdict-or-explicit-open contract is enforced at the CLI boundary
+    (``research add``), not here, so direct/library callers stay flexible.
+    """
     research_dir = get_research_dir(config, project_id)
     if not research_dir:
         return None
@@ -115,28 +191,19 @@ def add_research(
     if tags:
         frontmatter["tags"] = tags
 
+    # Single-shot when a verdict/content is supplied; progressive otherwise.
+    if summary or findings or conclusion:
+        body = _render_single_shot_body(question, summary, findings, conclusion)
+    else:
+        body = _render_open_body(question)
+
     # Build content
     content = f"""---
 {yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True).strip()}
 ---
 # {title}
 
-## Question
-
-{question or "(Describe the research question)"}
-
-## Summary
-
-(To be filled in as research progresses)
-
-## Findings
-
-...
-
-## Conclusion
-
-...
-"""
+{body}"""
 
     # Generate filename
     filename = f"{today}_{research_id.replace(f'{project_id}-research-', '')}.md"

@@ -515,8 +515,17 @@ State changes (`start`/`done`/`block`) auto-log with files changed. Install `hoo
 ### Research and issues
 
 ```bash
-clawpm research add --type investigation --title "Question"
-clawpm research list
+# Single-shot capture (default): record the verdict at creation time
+clawpm research add --type decision --title "Adopt X?" \
+    --summary "Yes — adopt X for reason Y" \
+    --finding "X is fast" --finding "X is MIT-licensed" \
+    --conclusion "Ship next sprint"
+# --verdict is an alias for --summary
+
+# Progressive entry for a genuinely open investigation (fill in over time)
+clawpm research add --type investigation --title "Open question" --open
+
+clawpm research list   # flags open/in-progress entries still stubbed past 14 days
 clawpm issues add --type bug --severity high --actual "What happened"
 clawpm issues list [--open]
 ```
