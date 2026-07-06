@@ -64,6 +64,12 @@ def _mutation_errors(fmt, error_code: str):
         sys.exit(1)
 
 
+# CLI-accepted dispatch fallback-policy names (click.Choice for both the
+# `dispatch` and `lease grant` commands). Shared here so the two command
+# groups present an identical choice set.
+_FALLBACK_POLICIES = ["requeue", "route-secondary", "escalate-to-human", "fail"]
+
+
 # Global format option
 pass_format = click.make_pass_decorator(OutputFormat, ensure=True)
 
