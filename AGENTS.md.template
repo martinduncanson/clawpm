@@ -68,6 +68,59 @@ clawpm doctor --apply --yes --project <REPLACE-WITH-PROJECT-ID>
 clawpm doctor --apply --dry-run --project <REPLACE-WITH-PROJECT-ID>  # preview
 ```
 
+## Agentic layer — plan, dispatch, verify
+
+The planner skill plans on a capable model; the deterministic core persists and dispatches; cheap models execute under an enforced rubric. See the README for the full loop.
+
+```bash
+# Persist a fully-contracted task-tree atomically — zero LLM calls (planner emits this)
+clawpm tasks emit-tree --project <REPLACE-WITH-PROJECT-ID> [--dry-run] [--strict] < tree.json
+
+# Render a task's success-criteria as a gradeable rubric
+clawpm tasks emit-rubric <task-id> [--rubric-format markdown]
+
+# Dispatch a leaf — writes hook-wired .claude/settings.local.json (Stop-hook rubric gate)
+clawpm tasks dispatch <task-id> [--worktree] [--confirm-close] [--refute-votes N] \
+    [--lease-ttl <secs>] \
+    [--fallback-policy requeue|route-secondary|escalate-to-human|fail] [--confirm-stale]
+clawpm tasks teardown-dispatch <task-id>       # remove the dispatch settings
+
+# Stop-hook judge — the subagent cannot terminate until its rubric is satisfied
+clawpm hook eval-stop --task <task-id>
+
+# Crash-safe leases: TTL + heartbeat + lazy expiry (no daemon)
+clawpm lease grant --task <task-id> --ttl <secs> --fallback-policy <p>
+clawpm lease heartbeat --task <task-id>
+clawpm lease list [--project <REPLACE-WITH-PROJECT-ID>]
+clawpm lease sweep [--dry-run]
+
+# Comparative pairwise selection among candidate deliverables
+clawpm judge tournament --rubric-file rubric.md \
+    --candidate a.txt --candidate b.txt [--label v1] [--label v2]
+
+# Decompose an existing task into child subtasks, each with its own rubric
+clawpm tasks decompose <parent-id> --child "Title" \
+    --child '{"title":"...","success_criteria":["..."],"complexity":"m"}'
+```
+
+## Tags, filters, and bulk state
+
+```bash
+# Cross-cutting workstream tags (CLAWP-069, repeatable, lowercased)
+clawpm tasks add -t "..." --tag concurrency --tag mcp
+clawpm tasks list --tag concurrency [--all-tags]      # repeated --tag = OR; --all-tags = AND
+clawpm tasks tags                                     # distinct tags with counts
+
+# Query filters + [[wiki-link]] backlinks (CLAWP-082)
+clawpm tasks list --text "auth" [--regex] --priority "<=3" --complexity l --limit 10
+clawpm tasks list --parent <task-id>                  # direct subtasks of a parent
+clawpm tasks list --linked <task-id>                  # tasks referencing an id (wiki-link or typed edge)
+
+# Bulk state (CLAWP-083): many IDs at once, per-task isolation, aggregate result
+clawpm done 72 73 74 --note "batch complete"
+clawpm start 72 73 74
+```
+
 ## When to invoke
 
 | Lifecycle moment | clawpm action |

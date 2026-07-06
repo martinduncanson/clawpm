@@ -339,6 +339,7 @@ clawpm reflect summarize    # update the calibration corpus
 | `clawpm start 42` | `clawpm tasks state 42 progress` | Start working (auto-logs) |
 | `clawpm done 42` | `clawpm tasks state 42 done` | Mark done (auto-logs files changed) |
 | `clawpm block 42 --note "reason"` | `clawpm tasks state 42 blocked` | Mark blocked |
+| `clawpm unblock 42 [--start]` | `clawpm tasks state 42 open` | Clear a blocker (`--start` → progress) |
 | `clawpm next` | `clawpm projects next` | Next task across all projects |
 | `clawpm status` | — | Project overview |
 | `clawpm context` | — | Full agent context (spec, tasks, log, git, issues) |
@@ -346,7 +347,7 @@ clawpm reflect summarize    # update the calibration corpus
 | `clawpm conflicts --task <id>` | — | Pre-flight check for scope overlap |
 | `clawpm serve` | — | Start read-only web dashboard at http://127.0.0.1:8080 (needs the `web` extra: `pip install 'clawpm[web]'`) |
 
-Short task IDs work everywhere: `42` expands to `CLAWP-042` based on project prefix.
+Short task IDs work everywhere: `42` expands to `CLAWP-042` based on project prefix. `start` / `done` / `block` / `unblock` (and `tasks state`) accept many IDs at once — see **Bulk state** below.
 
 ### Projects
 
@@ -364,13 +365,45 @@ clawpm project doctor              # Health check
 clawpm tasks                        # List open + in-progress + blocked
 clawpm tasks list [-s all]          # Filter by state (open/progress/done/blocked/rejected/all)
 clawpm tasks list -s rejected       # View the won't-do / rejected ledger
-clawpm tasks show <id>              # Full task details (predictions, scope, contract, body)
-clawpm tasks add -t "Title" [-b "body"] [--parent <id>] [--scope "glob/**"]
-clawpm tasks edit <id> [--title/--priority/--complexity/--body/--scope]
+clawpm tasks show <id>              # Full task details (predictions, scope, contract, backlinks, body)
+clawpm tasks add -t "Title" [-b "body"] [--parent <id>] [--scope "glob/**"] [--tag <tag>]
+clawpm tasks edit <id> [--title/--priority/--complexity/--body/--scope/--tag/--clear-tags]
 clawpm tasks state <id> <state> [--note] [--reflect-note] [--meta-reflect]
-clawpm tasks state <id> rejected --rationale "reason"   # add to won't-do ledger
+clawpm tasks state 72 73 74 done    # bulk mode (CLAWP-083): per-task isolation, aggregate result
+clawpm tasks state <id> rejected --rationale "reason"   # add to won't-do ledger (reject one at a time)
 clawpm tasks split <id>             # Convert to parent directory for subtasks
 ```
+
+**Bulk state (CLAWP-083):** `state` and its aliases `done` / `start` / `block` / `unblock` accept many task IDs at once (`clawpm done 72 73 74`). Each transition runs with per-task error isolation and returns an aggregate JSON result; the exit code is non-zero if any single transition failed. `--note` and the reflection flags apply to every listed task. Bulk `rejected` is refused — each rejection needs its own `--rationale`.
+
+### Tags and workstreams (CLAWP-069)
+
+Cross-cutting tags group tasks that span projects or milestones (e.g. `concurrency`, `mcp`). Tags are normalised to lowercase.
+
+```bash
+clawpm tasks add -t "..." --tag concurrency --tag mcp     # repeatable
+clawpm tasks edit <id> --tag concurrency                  # REPLACES the tag set (mirrors --scope)
+clawpm tasks edit <id> --clear-tags                       # remove all tags
+clawpm tasks list --tag concurrency                       # filter; repeated --tag = OR (match any)
+clawpm tasks list --tag concurrency --tag mcp --all-tags  # AND: require all tags
+clawpm tasks tags [--no-include-done]                     # distinct tags with task counts
+```
+
+### Query filters and backlinks (CLAWP-082)
+
+`tasks list` composes text and metadata filters; freeform `[[id]]` wiki-links are indexed into backlinks visible in `show` / `context`.
+
+```bash
+clawpm tasks list --text "auth"                   # substring over title + body
+clawpm tasks list --text "auth.*token" --regex    # case-insensitive regex instead of substring
+clawpm tasks list --priority "<=3"                # exact ('5') or comparator ('<=3', '>7')
+clawpm tasks list --complexity l --complexity xl  # repeatable, OR
+clawpm tasks list --parent CLAWP-042              # only direct subtasks of a parent
+clawpm tasks list --linked CLAWP-042              # tasks referencing an id via [[wiki-link]] or typed edge
+clawpm tasks list --text "auth" --limit 10        # cap results after filter + sort
+```
+
+Write `[[CLAWP-042]]` in any task / research / mission body to link it. `clawpm tasks show` and `clawpm context` surface the derived `linked_from` backlinks — wiki-links and typed edges (`depends`, `parent`/`children`, `reference_tasks`, `supersedes`, mission goals) unified in one list.
 
 ### Constitution
 
@@ -639,6 +672,10 @@ Output is JSON by default for agent consumption. Add `-f text` for humans.
 
 Every individual task write uses `tmp.write_text(...)` → `tmp.replace(target)` (atomic rename, same filesystem). JSONL side-effects route through locked append (`concurrency.append_jsonl_line`). `emit-tree` extends this to whole-tree atomicity: stage into `.emit-<uuid>/` on the same filesystem → single `Path.replace` for new-root trees (the entire subtree in one rename), ordered individual file promotions for `attach_to` trees. A crash during stage leaves an invisible dot-dir swept by `clawpm doctor`.
 
+### The `updated` timestamp (CLAWP-086)
+
+Every mutator stamps an `updated: <date>` field into task frontmatter on each state change or edit. Staleness and drift checks (including `clawpm doctor`) prefer this stamp over the file's mtime, which lies after git operations, syncs, or external edits. Legacy tasks that predate the stamp fall back to mtime.
+
 ### Task states and file locations
 
 | State | File pattern | Meaning |
@@ -716,6 +753,8 @@ uv tool install -e ~/clawpm/projects/clawpm
 ```
 
 Requires Python 3.11+. `uv` recommended; `pip install -e <path>` also works.
+
+Invoke as the `clawpm` console script or, equivalently, via the module entry point `python -m clawpm ...` (CLAWP-072-005) — useful when the console script isn't on `PATH` or you need a specific interpreter.
 
 ---
 
