@@ -138,10 +138,12 @@ from clawpm.cli import issues as _issues  # noqa: F401 (registers commands)
 from clawpm.cli import conflicts as _conflicts  # noqa: F401 (registers commands)
 from clawpm.cli import inbox as _inbox  # noqa: F401 (registers commands)
 from clawpm.cli import constitution as _constitution  # noqa: F401 (registers commands)
+from clawpm.cli import serve as _serve  # noqa: F401 (registers commands)
 
 # Re-exports: symbols that moved into group modules but are still referenced
 # via the historical `clawpm.cli.<name>` path (by the domain layer and tests).
 from clawpm.cli.conflicts import _globs_overlap  # noqa: F401
+from clawpm.cli.serve import _load_web_server  # noqa: F401
 
 # ============================================================================
 # Use command (project context)
@@ -4592,47 +4594,4 @@ def reflect_void(
         "errors": errors,
         "count": len(voided),
     })
-
-
-# ============================================================================
-# Serve command
-# ============================================================================
-
-def _load_web_server():
-    """Import the optional web-server deps (the ``web`` extra).
-
-    Returns ``(create_app, uvicorn)``. Raises ``ImportError`` if fastapi /
-    uvicorn aren't installed. Factored out so the graceful-degradation path
-    is testable without uninstalling the deps.
-    """
-    import uvicorn
-    from clawpm.serve import create_app
-
-    return create_app, uvicorn
-
-
-@main.command("serve")
-@click.option("--host", default="127.0.0.1", help="Host to bind to")
-@click.option("--port", default=8080, help="Port to bind to")
-def serve(host: str, port: int) -> None:
-    """Start the web UI server (read-only dashboard)."""
-    try:
-        create_app, uvicorn = _load_web_server()
-    except ImportError:
-        click.echo(
-            "The ClawPM web UI requires the optional 'web' extra.\n"
-            "Install it with:  pip install 'clawpm[web]'",
-            err=True,
-        )
-        sys.exit(1)
-
-    uvicorn.run(create_app(), host=host, port=port)
-
-
-if __name__ == "__main__":
-    main()
-
-
-
-
 
