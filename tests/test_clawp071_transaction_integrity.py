@@ -492,6 +492,29 @@ class TestAddSubtaskTwoPhase:
         assert emit_nums == shared_nums
         assert 1 in emit_nums and 2 in emit_nums, "sees -001 and the rejected -002"
 
+    def test_allocator_lenient_on_nonmapping_parent_frontmatter(self, temp_portfolio):
+        """CLAWP-071 (Antigravity-adjacent): parse_frontmatter is lenient but does
+        NOT coerce a non-mapping YAML document to dict. A parent whose frontmatter
+        parses to a list/scalar must not crash allocation with AttributeError —
+        the ``isinstance(fm, dict)`` guard keeps the read lenient (matching the
+        pre-unification emit_tree broad-except behaviour)."""
+        from clawpm.tasks import _existing_child_ordinals
+
+        config = temp_portfolio["config"]
+        tasks_dir = temp_portfolio["tasks_dir"]
+        parent = add_task(config, "test", "Parent")
+        add_subtask(config, "test", parent.id, "Real child")  # -001
+        parent_dir = tasks_dir / parent.id
+
+        # Overwrite the parent _task.md with LIST-shaped frontmatter (non-mapping).
+        (parent_dir / "_task.md").write_text(
+            "---\n- item one\n- item two\n---\n# Parent\n", encoding="utf-8"
+        )
+
+        # Must not raise; the directory scan still finds the -001 flat child.
+        nums = _existing_child_ordinals(tasks_dir, parent_dir, parent.id)
+        assert 1 in nums
+
 
 # ---------------------------------------------------------------------------
 # Item 1b — add_mission_mini_goal 2-phase atomicity

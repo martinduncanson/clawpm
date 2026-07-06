@@ -1603,7 +1603,13 @@ def _existing_child_ordinals(
             fm, _ = parse_frontmatter(parent_file.read_text(encoding="utf-8"))
         except OSError:
             continue
-        for cid in (fm.get("children") or []):
+        # parse_frontmatter is lenient — it swallows YAML parse errors and returns
+        # ({}, body), so malformed frontmatter never reaches here as an exception.
+        # But it does NOT coerce a non-mapping document to dict (a list/scalar
+        # frontmatter yields a non-dict), so guard the .get() to stay lenient
+        # rather than raising AttributeError on that edge.
+        children = fm.get("children") if isinstance(fm, dict) else None
+        for cid in (children or []):
             if isinstance(cid, str) and cid.startswith(parent_id + "-"):
                 _record(cid)
 
