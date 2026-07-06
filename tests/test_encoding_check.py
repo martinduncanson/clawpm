@@ -406,6 +406,57 @@ class TestRuleUnconfiguredStdout:
         rules = [r["rule"] for r in findings]
         assert "unconfigured-stdout" in rules
 
+    def test_package_submodule_covered_by_init_reconfigure_not_flagged(self, tmp_path):
+        # CLAWP-077: a submodule is covered by its package __init__'s reconfigure.
+        # Importing any submodule runs the package __init__ first, so a single
+        # reconfigure there genuinely protects every submodule at runtime. This
+        # is what lets cli.py split into cli/ without duplicating the reconfigure
+        # block into every group module.
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text(
+            "import sys\n"
+            'sys.stdout.reconfigure(encoding="utf-8", errors="replace")\n',
+            encoding="utf-8",
+        )
+        sub = pkg / "sub.py"
+        sub.write_text(
+            "def main():\n"
+            "    print('hello')\n",
+            encoding="utf-8",
+        )
+        rules = [r["rule"] for r in check_file(sub)]
+        assert "unconfigured-stdout" not in rules
+
+    def test_package_submodule_not_covered_when_init_lacks_reconfigure_flagged(self, tmp_path):
+        # The exemption is narrow: if the package __init__ does NOT reconfigure,
+        # the submodule is still at risk and must remain flagged.
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("x = 1\n", encoding="utf-8")
+        sub = pkg / "sub.py"
+        sub.write_text(
+            "def main():\n"
+            "    print('hello')\n",
+            encoding="utf-8",
+        )
+        rules = [r["rule"] for r in check_file(sub)]
+        assert "unconfigured-stdout" in rules
+
+    def test_package_init_itself_not_covered_by_itself_flagged(self, tmp_path):
+        # A package __init__.py is NOT exempted by itself — it must reconfigure
+        # on its own, since it is the module that runs first for the whole pkg.
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        init = pkg / "__init__.py"
+        init.write_text(
+            "def main():\n"
+            "    print('hello')\n",
+            encoding="utf-8",
+        )
+        rules = [r["rule"] for r in check_file(init)]
+        assert "unconfigured-stdout" in rules
+
     def test_logger_only_module_not_flagged(self, tmp_path):
         # logger.info / logger.echo is NOT stdout — module with only logging
         # should not be flagged for missing reconfigure.
