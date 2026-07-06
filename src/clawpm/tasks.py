@@ -9,7 +9,13 @@ from pathlib import Path
 
 import yaml
 
-from .concurrency import file_lock, retry_transient
+from .concurrency import (
+    ConcurrentModificationError,
+    commit_staged_pair,
+    file_lock,
+    guard_fs_tamper,
+    retry_transient,
+)
 from .frontmatter import (
     FrontmatterError,
     parse_frontmatter,
@@ -511,7 +517,11 @@ def _write_rejection_frontmatter(
     Preserves all existing frontmatter keys; only adds/overwrites
     ``rationale`` and (if given) ``supersedes``.
     """
-    text = file_path.read_text(encoding="utf-8")
+    # CLAWP-071 — this runs inside change_task_state's lock on a file the caller
+    # already resolved; an external delete/move here means a non-clawpm process
+    # removed it, so surface the friendly concurrent-modification error.
+    with guard_fs_tamper(f"Task file '{file_path}'"):
+        text = file_path.read_text(encoding="utf-8")
     # Lenient parse: unparseable YAML drops to fm={} while keeping the raw body,
     # so the rewrite replaces the bad frontmatter rather than doubling it. An
     # absent/unterminated fence keeps body=text and synthesises a fence below.
@@ -554,18 +564,10 @@ def change_task_state(
     if not tasks_dir:
         return None
 
-    # Find the current task file
-    task = get_task(config, project_id, task_id)
-    if not task or not task.file_path:
-        return None
-
-    current_path = task.file_path
-    is_directory_task = current_path.name == "_task.md"
-
     # CLAWP-053 — rationale is required for REJECTED; validate BEFORE acquiring
     # any lock and BEFORE any filesystem mutation so we fail fast without side
-    # effects.  This pure-validation check has no FS mutation, so it is safe
-    # (and cheaper) to run outside the critical section.
+    # effects.  This pure-validation check needs neither the task nor the lock,
+    # so it is safe (and cheaper) to run outside the critical section.
     if new_state == TaskState.REJECTED:
         if not rationale or not rationale.strip():
             raise ValueError(
@@ -573,49 +575,58 @@ def change_task_state(
                 "Pass rationale='<reason>' to change_task_state()."
             )
 
-    # CLAWP-051 — hold the per-project lock around the ENTIRE
-    # read→validate→mutate→reload transaction, not just the final move.
-    # Findings 1+4+5 (Codex review): pulling all five steps inside a single
-    # critical section prevents three distinct races:
+    # CLAWP-051 / CLAWP-071 — hold the per-project lock around the ENTIRE
+    # resolve→classify→validate→mutate→reload transaction, not just the final
+    # move. Findings 1+4+5 (Codex, CLAWP-051) plus the CLAWP-071 structural
+    # TOCTOU fix mean the task RESOLUTION (get_task) and the directory-vs-file
+    # CLASSIFICATION now happen INSIDE the lock too, so the whole operation acts
+    # on one consistent snapshot — a concurrent split_task converting the file to
+    # a directory (or vice-versa) between resolution and mutation can no longer
+    # split the snapshot. Prevented races:
+    #   (0) task resolution + is_directory_task classification before lock (CLAWP-071)
     #   (1) REJECTED frontmatter rewrite before lock (Finding 1)
     #   (4) parent rollup check evaluated before lock (Finding 4)
     #   (5) Task.from_file reload after lock release (Finding 5)
     #
-    # REENTRANCY (CLAWP-066): file_lock is now reentrant per-thread, so a callee
-    # that re-acquires the same lock path (e.g. split_task) nests safely instead
-    # of self-deadlocking. The historical "keep this block flat" rule is no
-    # longer a correctness requirement — it remains good hygiene for readability,
-    # but nesting the same-path lock is safe.
+    # REENTRANCY (CLAWP-066): file_lock is reentrant per-thread, so a callee that
+    # re-acquires the same lock path nests safely instead of self-deadlocking.
     _lock_path = tasks_dir / ".clawpm-tasks.lock"
 
-    if is_directory_task:
-        # For directory-based tasks, move the entire directory
-        task_dir = current_path.parent
-
-        # Resolve the target directory before the lock (pure computation, no FS
-        # mutation; mkdir with exist_ok is idempotent so it is safe here too).
-        if new_state == TaskState.OPEN:
-            new_dir = tasks_dir / task_id
-        elif new_state == TaskState.PROGRESS:
-            # Progress doesn't move directory, just tracks in some other way
-            # For now, keep in same location (progress is tracked differently for dirs)
-            new_dir = task_dir
-        elif new_state == TaskState.DONE:
-            done_dir = tasks_dir / "done"
-            done_dir.mkdir(exist_ok=True)
-            new_dir = done_dir / task_id
-        elif new_state == TaskState.BLOCKED:
-            blocked_dir = tasks_dir / "blocked"
-            blocked_dir.mkdir(exist_ok=True)
-            new_dir = blocked_dir / task_id
-        elif new_state == TaskState.REJECTED:
-            rejected_dir = tasks_dir / "rejected"
-            rejected_dir.mkdir(exist_ok=True)
-            new_dir = rejected_dir / task_id
-        else:
+    with file_lock(_lock_path):
+        # (0) Resolve + classify INSIDE the lock so the snapshot is consistent.
+        task = get_task(config, project_id, task_id)
+        if not task or not task.file_path:
             return None
+        current_path = task.file_path
+        is_directory_task = current_path.name == "_task.md"
 
-        with file_lock(_lock_path):
+        if is_directory_task:
+            # For directory-based tasks, move the entire directory.
+            task_dir = current_path.parent
+
+            # Resolve the target directory (pure computation; mkdir with
+            # exist_ok is idempotent so it is safe under the lock).
+            if new_state == TaskState.OPEN:
+                new_dir = tasks_dir / task_id
+            elif new_state == TaskState.PROGRESS:
+                # Progress doesn't move directory, just tracks in some other way
+                # For now, keep in same location (progress is tracked differently for dirs)
+                new_dir = task_dir
+            elif new_state == TaskState.DONE:
+                done_dir = tasks_dir / "done"
+                done_dir.mkdir(exist_ok=True)
+                new_dir = done_dir / task_id
+            elif new_state == TaskState.BLOCKED:
+                blocked_dir = tasks_dir / "blocked"
+                blocked_dir.mkdir(exist_ok=True)
+                new_dir = blocked_dir / task_id
+            elif new_state == TaskState.REJECTED:
+                rejected_dir = tasks_dir / "rejected"
+                rejected_dir.mkdir(exist_ok=True)
+                new_dir = rejected_dir / task_id
+            else:
+                return None
+
             # (a) Re-validate source exists — another session may have moved it.
             if not task_dir.exists():
                 raise FileNotFoundError(
@@ -691,27 +702,26 @@ def change_task_state(
             #     though the move under the lock already committed (CLAWP-051).
             return retry_transient(Task.from_file, new_dir / "_task.md")
 
-    # Regular file-based task.  Same five-step critical section as above.
-    if new_state == TaskState.OPEN:
-        new_path = tasks_dir / f"{task_id}.md"
-    elif new_state == TaskState.PROGRESS:
-        new_path = tasks_dir / f"{task_id}.progress.md"
-    elif new_state == TaskState.DONE:
-        done_dir = tasks_dir / "done"
-        done_dir.mkdir(exist_ok=True)
-        new_path = done_dir / f"{task_id}.md"
-    elif new_state == TaskState.BLOCKED:
-        blocked_dir = tasks_dir / "blocked"
-        blocked_dir.mkdir(exist_ok=True)
-        new_path = blocked_dir / f"{task_id}.md"
-    elif new_state == TaskState.REJECTED:
-        rejected_dir = tasks_dir / "rejected"
-        rejected_dir.mkdir(exist_ok=True)
-        new_path = rejected_dir / f"{task_id}.md"
-    else:
-        return None
+        # Regular file-based task.  Same critical section as above.
+        if new_state == TaskState.OPEN:
+            new_path = tasks_dir / f"{task_id}.md"
+        elif new_state == TaskState.PROGRESS:
+            new_path = tasks_dir / f"{task_id}.progress.md"
+        elif new_state == TaskState.DONE:
+            done_dir = tasks_dir / "done"
+            done_dir.mkdir(exist_ok=True)
+            new_path = done_dir / f"{task_id}.md"
+        elif new_state == TaskState.BLOCKED:
+            blocked_dir = tasks_dir / "blocked"
+            blocked_dir.mkdir(exist_ok=True)
+            new_path = blocked_dir / f"{task_id}.md"
+        elif new_state == TaskState.REJECTED:
+            rejected_dir = tasks_dir / "rejected"
+            rejected_dir.mkdir(exist_ok=True)
+            new_path = rejected_dir / f"{task_id}.md"
+        else:
+            return None
 
-    with file_lock(_lock_path):
         # (a) Re-validate source exists.
         if not current_path.exists():
             raise FileNotFoundError(
@@ -852,7 +862,16 @@ def parent_rollup_status(
     children: set[str] = set(task.children or [])
     tasks_dir = get_tasks_dir(config, project_id) if config is not None else None
     if tasks_dir is not None:
-        scan_dirs = [tasks_dir, tasks_dir / "done", tasks_dir / "blocked"]
+        # Every state dir a child can migrate to — incl. rejected/ (a
+        # crash-orphaned split child later rejected lands in tasks/rejected/
+        # <child>/_task.md and must still gate the parent's rollup — CLAWP-071
+        # Codex r3).
+        scan_dirs = [
+            tasks_dir,
+            tasks_dir / "done",
+            tasks_dir / "blocked",
+            tasks_dir / "rejected",
+        ]
         # Directory-task subtask dir (open subtasks live alongside _task.md).
         if task.file_path is not None and task.file_path.name == "_task.md":
             scan_dirs.append(task.file_path.parent)
@@ -862,6 +881,21 @@ def parent_rollup_status(
             for f in sd.glob("*.md"):
                 if f.name == "_task.md":
                     continue
+                try:
+                    t = Task.from_file(f)
+                except Exception:
+                    continue
+                if t.parent == task.id:
+                    children.add(t.id)
+            # CLAWP-071 (Codex P2): also discover DIRECTORY-task children
+            # (``<dir>/<child>/_task.md``). The ``*.md`` glob above only sees
+            # immediate files, so a child that was split into a parent directory
+            # would drop out of this backstop. That matters for the add_subtask
+            # child-first residual window: a crash-orphaned flat child (present in
+            # neither the persisted children list) that is later ``split_task``ed
+            # would otherwise vanish from the rollup, letting the parent be marked
+            # DONE while the child directory is still open.
+            for f in sd.glob("*/_task.md"):
                 try:
                     t = Task.from_file(f)
                 except Exception:
@@ -1252,7 +1286,11 @@ def edit_task(
         if not task or not task.file_path:
             return None
 
-        text = task.file_path.read_text(encoding="utf-8")
+        # CLAWP-071 — the task was resolved under this lock; a FileNotFound here
+        # means an external process deleted/moved it. Map to the friendly
+        # concurrent-modification error instead of a raw traceback.
+        with guard_fs_tamper(f"Task {task_id}"):
+            text = task.file_path.read_text(encoding="utf-8")
 
         # Parse frontmatter and content. An absent fence falls through with
         # frontmatter={}, content=text (a fence is synthesised on rebuild). An
@@ -1419,6 +1457,51 @@ def split_task(
         return retry_transient(Task.from_file, new_path)
 
 
+def _child_append_text(parent_path: Path, child_id: str) -> str | None:
+    """Compute the parent's frontmatter rewritten to include ``child_id`` in its
+    ``children`` list, or ``None`` if the append is a genuine no-op.
+
+    Pure (reads the parent, builds the new text, writes nothing) so callers can
+    STAGE this alongside the child-file write and commit both together (CLAWP-071
+    two-phase). Returns ``None`` ONLY for a true no-op — the parent is not a
+    directory-task ``_task.md`` (nothing to persist into) or already lists the
+    child (idempotent).
+
+    RAISES on an inability to BUILD the update, so the two-phase caller writes
+    NEITHER file rather than orphaning the child (Codex CLAWP-071 review — do not
+    conflate "nothing to do" with "couldn't build"):
+    - :class:`ConcurrentModificationError` if the parent ``_task.md`` vanished
+      (an external delete/move under the lock).
+    - :class:`FrontmatterError` (a ``ValueError``) if its frontmatter is
+      absent / unterminated / unparseable.
+    """
+    if parent_path.name != "_task.md":
+        return None  # not a directory-task parent — genuine no-op
+    if not parent_path.exists():
+        raise ConcurrentModificationError(
+            f"Parent task '{parent_path}' vanished mid-update — a concurrent "
+            "session or external process moved or deleted it. Retry the operation."
+        )
+    with guard_fs_tamper(f"Parent task '{parent_path}'"):
+        text = parent_path.read_text(encoding="utf-8")
+    fm, raw_body = split_frontmatter(text)  # raises FrontmatterError on malformation
+    children = fm.get("children")
+    if not isinstance(children, list):
+        children = []
+    if child_id in children:
+        return None  # idempotent — already persisted
+    children.append(child_id)
+    fm["children"] = children
+    stamp_updated(fm)  # CLAWP-086 — gaining a child mutates the parent.
+    body = raw_body.lstrip("\n")
+    return (
+        "---\n"
+        + yaml.dump(fm, default_flow_style=False, allow_unicode=True).strip()
+        + "\n---\n"
+        + body
+    )
+
+
 def _append_child_to_parent_frontmatter(
     parent_path: Path, child_id: str,
 ) -> None:
@@ -1430,29 +1513,19 @@ def _append_child_to_parent_frontmatter(
     children silently shrink and the rollup gate's missing/dangling-child
     handling never fires. Idempotent — repeated calls for the same child_id
     leave the list unchanged.
+
+    Standalone writer kept for callers that update the parent independently of a
+    child-file write (``emit_tree``); it stays LENIENT — a vanished or
+    malformed-frontmatter parent is skipped, matching the pre-CLAWP-071 contract.
+    ``add_subtask`` instead uses ``_child_append_text`` + :func:`commit_staged_pair`
+    for two-phase atomicity, where a build failure is fatal (no orphan child).
     """
-    if parent_path.name != "_task.md" or not parent_path.exists():
-        return
-    text = parent_path.read_text(encoding="utf-8")
     try:
-        fm, raw_body = split_frontmatter(text)
-    except FrontmatterError:
-        return  # no/malformed frontmatter — nothing to persist into
-    children = fm.get("children")
-    if not isinstance(children, list):
-        children = []
-    if child_id in children:
-        return  # idempotent
-    children.append(child_id)
-    fm["children"] = children
-    stamp_updated(fm)  # CLAWP-086 — gaining a child mutates the parent.
-    body = raw_body.lstrip("\n")
-    new_text = (
-        "---\n"
-        + yaml.dump(fm, default_flow_style=False, allow_unicode=True).strip()
-        + "\n---\n"
-        + body
-    )
+        new_text = _child_append_text(parent_path, child_id)
+    except (FrontmatterError, ConcurrentModificationError):
+        return  # lenient: skip a vanished / malformed-frontmatter parent
+    if new_text is None:
+        return
     tmp = parent_path.with_suffix(parent_path.suffix + ".tmp")
     try:
         tmp.write_text(new_text, encoding="utf-8")
@@ -1463,6 +1536,84 @@ def _append_child_to_parent_frontmatter(
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
+
+
+def _child_state_dirs(tasks_dir: Path, parent_dir: Path) -> list[Path]:
+    """Every directory a child of this parent can legitimately live in.
+
+    A subtask's file starts under ``parent_dir`` but ``change_task_state`` MOVES
+    it out on a terminal/blocked transition: DONE → ``tasks/done/``, BLOCKED →
+    ``tasks/blocked/``, REJECTED → ``tasks/rejected/``. A child that was split
+    into its own directory task and then REOPENED lands at the top-level
+    ``tasks/<child>/_task.md`` (not back under the parent). Any of these
+    locations can hold a crash-orphaned child that is absent from the parent's
+    persisted ``children`` list, so the ID allocator and rollup backstop must
+    scan all of them or they can reuse an occupied ordinal / miss an unresolved
+    child (CLAWP-071 Codex r1-3).
+    """
+    return [
+        parent_dir,
+        tasks_dir,
+        tasks_dir / "done",
+        tasks_dir / "blocked",
+        tasks_dir / "rejected",
+    ]
+
+
+def _existing_child_ordinals(
+    tasks_dir: Path, parent_dir: Path, parent_id: str,
+) -> set[int]:
+    """Union of every ordinal already used by a child of ``parent_id``.
+
+    Shared allocator for ``add_subtask`` and ``emit_tree``'s attach path so the
+    two can't drift (Codex CLAWP-071 r3). Scans, across ALL state dirs
+    (:func:`_child_state_dirs`):
+    - flat children ``<parent>-NNN.md`` (excluding a directory's own ``_task.md``),
+    - directory children ``<parent>-NNN/_task.md``,
+    and unions the parent's persisted ``children`` list (covers a child deleted
+    outright after creation, invisible to any dir scan). Reading the max of this
+    set and adding 1 guarantees a fresh ordinal even when earlier children have
+    migrated, reopened, been rejected, or crash-orphaned.
+    """
+    nums: set[int] = set()
+
+    def _record(id_or_stem: str) -> None:
+        try:
+            nums.add(int(id_or_stem.split("-")[-1].replace(".progress", "")))
+        except (IndexError, ValueError):
+            pass
+
+    for state_dir in _child_state_dirs(tasks_dir, parent_dir):
+        if not state_dir.exists():
+            continue
+        for f in state_dir.glob(f"{parent_id}-*.md"):
+            if f.name != "_task.md":
+                _record(f.stem)
+        for d in state_dir.glob(f"{parent_id}-*"):
+            if d.is_dir() and (d / "_task.md").exists():
+                _record(d.name)
+
+    # Parent's persisted children — covers a child deleted after creation, which
+    # no directory scan can see. Read leniently: a vanished/malformed parent must
+    # not crash allocation (the dir scans above already bound the union).
+    for parent_file in (parent_dir / "_task.md", tasks_dir / f"{parent_id}.md"):
+        if not parent_file.exists():
+            continue
+        try:
+            fm, _ = parse_frontmatter(parent_file.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        # parse_frontmatter is lenient — it swallows YAML parse errors and returns
+        # ({}, body), so malformed frontmatter never reaches here as an exception.
+        # But it does NOT coerce a non-mapping document to dict (a list/scalar
+        # frontmatter yields a non-dict), so guard the .get() to stay lenient
+        # rather than raising AttributeError on that edge.
+        children = fm.get("children") if isinstance(fm, dict) else None
+        for cid in (children or []):
+            if isinstance(cid, str) and cid.startswith(parent_id + "-"):
+                _record(cid)
+
+    return nums
 
 
 def add_subtask(
@@ -1520,34 +1671,13 @@ def add_subtask(
         if not parent_dir:
             return None
 
-        # Generate subtask ID. Codex round-2 P2 fix: union three sources so a
-        # migrated/deleted earlier child can't have its id silently reused:
-        #   (1) files still in the parent directory (open / progress)
-        #   (2) migrated children in tasks/done/ and tasks/blocked/
-        #   (3) the parent's persisted frontmatter children list (covers
-        #       files that were deleted outright after creation)
-        # Without (2)+(3), running `tasks decompose` again on a parent whose
-        # earlier children have all moved to done/ would re-issue `P-001`,
-        # colliding with the migrated record.
-        existing_nums: set[int] = set()
-
-        def _record_num_from_id(tid: str) -> None:
-            try:
-                num_str = tid.split("-")[-1].replace(".progress", "")
-                existing_nums.add(int(num_str))
-            except (IndexError, ValueError):
-                pass
-
-        for f in parent_dir.glob(f"{parent_id}-*.md"):
-            _record_num_from_id(f.stem)
-        for state_dir in (tasks_dir / "done", tasks_dir / "blocked"):
-            if state_dir.exists():
-                for f in state_dir.glob(f"{parent_id}-*.md"):
-                    _record_num_from_id(f.stem)
-        for cid in (parent.children or []):
-            if cid.startswith(parent_id + "-"):
-                _record_num_from_id(cid)
-
+        # Generate subtask ID via the shared allocator, which unions every used
+        # ordinal across ALL state dirs (flat + directory children) plus the
+        # parent's persisted list — so a migrated/reopened/rejected/deleted or
+        # crash-orphaned child can't have its number silently reused (CLAWP-071
+        # Codex r1-3). emit_tree's attach path routes through the same helper so
+        # the two allocators can't drift.
+        existing_nums = _existing_child_ordinals(tasks_dir, parent_dir, parent_id)
         next_num = (max(existing_nums) if existing_nums else 0) + 1
         subtask_id = f"{parent_id}-{next_num:03d}"
 
@@ -1617,19 +1747,37 @@ def add_subtask(
 
         # Write file — utf-8 so Unicode in title/description survives on Windows
         file_path = parent_dir / f"{subtask_id}.md"
-        tmp_path = file_path.with_suffix(".tmp")
-        try:
-            tmp_path.write_text(content, encoding="utf-8")
-            # Retry transient Windows sharing/access faults on the rename (CLAWP-051)
-            retry_transient(tmp_path.replace, file_path)
-        except Exception:
-            tmp_path.unlink(missing_ok=True)
-            raise
 
-        # CLAWP-037 round-1 fix: persist the child on the parent so the rollup
-        # gate keeps it in view after the child migrates to done/ or blocked/.
-        if parent.file_path is not None:
-            _append_child_to_parent_frontmatter(parent.file_path, subtask_id)
+        # CLAWP-071 — two-phase atomicity of the child-create + parent children-
+        # list append. Compute the parent's rewritten frontmatter BEFORE writing
+        # anything (CLAWP-037: persist the child so the rollup gate keeps it in
+        # view after the child migrates to done/ or blocked/), then stage + commit
+        # both files together. The child is committed FIRST: its ``parent:``
+        # frontmatter is the authoritative link and an orphan child (child on
+        # disk, parent cache not yet updated) is reconciled by
+        # ``parent_rollup_status`` (which scans flat AND directory-task children).
+        #
+        # ``_child_append_text`` returns None ONLY for a genuine no-op (child
+        # already listed — impossible for a fresh subtask id) and RAISES on a
+        # build failure (parent vanished / unparseable). So the single-write path
+        # below is taken only for the true no-op; a build failure propagates and
+        # writes NEITHER file, instead of orphaning the child (Codex review).
+        parent_new_text = _child_append_text(parent.file_path, subtask_id)
+        if parent_new_text is None:
+            # True no-op on the parent — single atomic child write.
+            tmp_path = file_path.with_suffix(".tmp")
+            try:
+                tmp_path.write_text(content, encoding="utf-8")
+                # Retry transient Windows sharing/access faults (CLAWP-051).
+                retry_transient(tmp_path.replace, file_path)
+            except Exception:
+                tmp_path.unlink(missing_ok=True)
+                raise
+        else:
+            commit_staged_pair(
+                (file_path, content),
+                (parent.file_path, parent_new_text),
+            )
 
         # Reload under the lock; retry_transient covers a scanner touching the
         # freshly-written child file even though the write committed (CLAWP-051).
