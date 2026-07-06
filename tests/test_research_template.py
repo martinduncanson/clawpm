@@ -33,7 +33,8 @@ def temp_portfolio():
         f'portfolio_root = "{portfolio_root.as_posix()}"\n'
         f'project_roots = ["{(portfolio_root / "projects").as_posix()}"]\n'
         "[defaults]\n"
-        'status = "active"\n'
+        'status = "active"\n',
+        encoding="utf-8",
     )
     projects_dir = portfolio_root / "projects"
     projects_dir.mkdir()
@@ -42,7 +43,8 @@ def temp_portfolio():
     project_meta = project_dir / ".project"
     project_meta.mkdir()
     (project_meta / "settings.toml").write_text(
-        'id = "test"\nname = "Test"\nstatus = "active"\npriority = 3\n'
+        'id = "test"\nname = "Test"\nstatus = "active"\npriority = 3\n',
+        encoding="utf-8",
     )
     (project_meta / "tasks").mkdir()
 
@@ -84,6 +86,20 @@ def test_has_placeholder_detects_ellipsis_with_content_below():
     # must still count as a placeholder.
     body = "## Findings\n\n...\n\nsome half-written notes here\n"
     assert has_placeholder_sections(body)
+
+
+def test_has_placeholder_ignores_ellipsis_inside_code_fence():
+    # A bare "..." line inside a fenced code sample (Python stub) is not a stub.
+    body = (
+        "## Findings\n\n"
+        "The handler stubs out as:\n\n"
+        "```python\n"
+        "def handle():\n"
+        "    ...\n"
+        "```\n\n"
+        "which we then implemented fully.\n"
+    )
+    assert not has_placeholder_sections(body)
 
 
 def test_has_placeholder_ignores_prose_ellipsis():

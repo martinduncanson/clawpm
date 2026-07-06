@@ -822,31 +822,36 @@ _PLACEHOLDER_PREFIXES = (
     "(Describe the research question)",
 )
 
-# Splits the body into section bodies on any ATX heading line, so each section's
-# content can be examined independently of the surrounding prose.
-_HEADING_SPLIT = re.compile(r"(?m)^#{1,6}[ \t].*$")
+# A fenced-code-block delimiter (```), so ``...`` lines inside a code sample
+# (e.g. a Python stub body) aren't mistaken for template stubs.
+_CODE_FENCE = re.compile(r"^\s*```")
 
 
 def has_placeholder_sections(content: str) -> bool:
-    """Return True if any section body still carries an unfilled template stub.
+    """Return True if the body still carries an unfilled template stub.
 
-    Each section body (the text between one heading and the next) is scanned
-    line by line. A line that is exactly ``...`` is a stub marker, and a line
-    that starts with a template prefix is too — checked per line rather than on
-    the whole body so a stub still counts even when someone has typed notes
-    above or below it without deleting the ``...`` (and with or without the
-    template's blank line). A genuine prose ellipsis mid-sentence, or an
-    incidental quote of the stub text inside a line, does not trip it.
+    Scanned line by line, skipping fenced code blocks. A line that is exactly
+    ``...`` is a stub marker, and a line that starts with a template prefix is
+    too — checked per line so a stub still counts even when notes are typed
+    above or below it without deleting the ``...`` (with or without the
+    template's blank line). A genuine prose ellipsis mid-sentence, an incidental
+    quote of the stub text inside a line, or an ``...`` inside a code sample
+    does not trip it.
     """
-    for body in _HEADING_SPLIT.split(content):
-        for raw_line in body.splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            if line == "...":
-                return True
-            if any(line.startswith(prefix) for prefix in _PLACEHOLDER_PREFIXES):
-                return True
+    in_code_fence = False
+    for raw_line in content.splitlines():
+        if _CODE_FENCE.match(raw_line):
+            in_code_fence = not in_code_fence
+            continue
+        if in_code_fence:
+            continue
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line == "...":
+            return True
+        if any(line.startswith(prefix) for prefix in _PLACEHOLDER_PREFIXES):
+            return True
     return False
 
 
