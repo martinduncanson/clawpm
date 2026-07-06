@@ -24,6 +24,7 @@ predictions:
   - full test suite green including all new fault-injection/concurrency tests; Codex
     + Grok review clean
 priority: 5
+updated: '2026-07-06'
 ---
 
 # Concurrency v4: transaction integrity (2-phase atomicity + structural TOCTOU + external-tampering)
