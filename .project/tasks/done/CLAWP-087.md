@@ -19,6 +19,7 @@ priority: 6
 scope:
 - src/clawpm/research.py
 - src/clawpm/cli.py
+updated: '2026-07-06'
 ---
 # Fix research entry template/workflow mismatch (verdict-in-Question antipattern)
 
