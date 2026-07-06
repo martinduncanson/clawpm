@@ -17,8 +17,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import click
-
 from .models import Actuals, Predictions, TaskComplexity, WorkLogAction, WorkLogEntry
 
 
@@ -43,6 +41,12 @@ def parse_duration(value: "str | int | None") -> "int | None":
     s = str(value).strip().lower()
     match = re.fullmatch(r"(\d+)([mhdw]?)", s)
     if not match:
+        # Lazy import so this module (imported by the click-free service layer's
+        # transition() via write_reflection_event / _compute_actuals) does not
+        # pull click into the MCP import chain — click.BadParameter is only
+        # meaningful at the CLI boundary, and parse_duration is only ever called
+        # from CLI command handlers (CLAWP-077 Codex review).
+        import click
         raise click.BadParameter(
             f"Bad duration: {value!r}. Use 90, 90m, 2h, 1d, or 1w."
         )

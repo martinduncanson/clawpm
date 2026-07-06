@@ -20,7 +20,7 @@ import subprocess
 from pathlib import Path
 
 from clawpm.concurrency import LockTimeout
-from clawpm.models import TaskState, WorkLogAction
+from clawpm.models import SURPRISE_TAXONOMY, TaskState, WorkLogAction
 from clawpm.discovery import get_project
 from clawpm.tasks import change_task_state, get_task
 from clawpm.worklog import add_entry, filter_files_changed, read_entries
@@ -58,6 +58,21 @@ def transition(
     """
     task_id = expand_task_id(task_id, project_id)
     state = TaskState(new_state)
+
+    # Validate surprise-taxonomy tags at the service boundary (CLAWP-077 Codex
+    # review). This seam is the MCP entry point (CLAWP-068), and
+    # write_reflection_event's contract requires callers to pre-validate — an
+    # out-of-vocabulary tag would permanently write a bad value into the fixed
+    # calibration taxonomy in the reflection JSONL. The CLI (tasks_state) also
+    # validates for a friendlier flag-level error and never reaches here with a
+    # bad tag; this is the backstop for every non-CLI caller. ValueError is part
+    # of the mutator contract the callers already map.
+    invalid_tags = [t for t in surprise_tags if t not in SURPRISE_TAXONOMY]
+    if invalid_tags:
+        raise ValueError(
+            f"Unknown surprise tag(s): {invalid_tags}. "
+            f"Valid values: {sorted(SURPRISE_TAXONOMY)}"
+        )
 
     # CLAWP-037 — parent rollup gate. Compute readiness up front so we can
     # either block (no --force) or proceed-and-log (--force). A missing

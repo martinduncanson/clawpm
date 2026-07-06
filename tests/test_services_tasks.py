@@ -11,6 +11,11 @@ from __future__ import annotations
 
 import ast
 import inspect
+import os
+import subprocess
+import sys
+
+import pytest
 
 from clawpm.services.tasks import transition, transition_isolated
 from clawpm.tasks import add_subtask, add_task, get_task
@@ -95,3 +100,37 @@ def test_service_layer_has_no_click_or_cli_imports():
 
     assert not any(m == "click" or m.startswith("click.") for m in imported), imported
     assert not any(m == "clawpm.cli" or m.startswith("clawpm.cli") for m in imported), imported
+
+
+def test_service_import_chain_does_not_load_click():
+    # Stronger than the AST check: importing the service in a FRESH interpreter
+    # must not pull click into sys.modules through ANY transitive dependency
+    # (CLAWP-077 Codex review — clawpm.reflect used to import click at module
+    # top, so transition's reflection path dragged click into the MCP import
+    # chain; parse_duration's click import is now lazy). Proves the seam is
+    # genuinely click-free at import, not just in its own source.
+    code = (
+        "import sys\n"
+        "import clawpm.services.tasks\n"
+        "leaked = sorted(m for m in sys.modules if m == 'click' or m.startswith('click.'))\n"
+        "assert not leaked, leaked\n"
+    )
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True, text=True, env=env,
+    )
+    assert proc.returncode == 0, f"click leaked into the service import chain:\n{proc.stderr}"
+
+
+def test_transition_rejects_out_of_taxonomy_surprise_tag(isolated_portfolio):
+    # The service boundary validates surprise tags so a non-CLI caller (MCP)
+    # cannot write an out-of-vocabulary tag into the fixed calibration taxonomy.
+    config = isolated_portfolio.config
+    task = add_task(config, "test", title="Bad tag")
+
+    with pytest.raises(ValueError, match="Unknown surprise tag"):
+        transition(
+            config, project_id="test", task_id=task.id,
+            new_state="done", surprise_tags=("not_a_real_tag",),
+        )
