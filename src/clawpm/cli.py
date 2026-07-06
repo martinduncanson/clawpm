@@ -1539,15 +1539,26 @@ def _collect_project_tasks(
         filter_list.append(by_priority(priority))
     if complexities:
         filter_list.append(by_complexity(complexities))
+    # CLAWP-084 — resolve this project's ACTUAL task-ID prefix (explicit
+    # task_prefix -> inferred-from-tasks) so a short ref like `1` expands to the
+    # real minted id even when the prefix diverges from the naive project_id[:5]
+    # (Codex P2: --all-projects over a project with task_prefix="SAME" stored
+    # children under SAME-001 but expanded --parent 1 to ALPHA-001 -> no match).
+    # Also corrects the single-project path for divergent-prefix projects.
+    resolved_prefix = None
+    if parent or linked:
+        from .tasks import resolve_existing_prefix
+        _settings = get_project(config, project_id)
+        resolved_prefix = resolve_existing_prefix(_settings) if _settings else None
     if parent:
-        filter_list.append(by_parent(expand_task_id(parent, project_id)))
+        filter_list.append(by_parent(expand_task_id(parent, project_id, resolved_prefix)))
     if linked:
         from .links import build_link_index
         index = build_link_index(config, project_id)
         # Resolve both the expanded (task-style) id and the raw ref so --linked
         # works for research/mission ids that expand_task_id would leave alone.
         refs: set[str] = set()
-        for target in {expand_task_id(linked, project_id), linked}:
+        for target in {expand_task_id(linked, project_id, resolved_prefix), linked}:
             refs |= index.referencing_ids(target)
         filter_list.append(by_linked(refs))
 

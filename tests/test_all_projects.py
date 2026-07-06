@@ -22,8 +22,9 @@ import pytest
 from click.testing import CliRunner
 
 from clawpm.cli import main
+from clawpm.context import expand_task_id
 from clawpm.discovery import load_portfolio_config
-from clawpm.tasks import add_task
+from clawpm.tasks import add_subtask, add_task
 
 
 def _make_portfolio(tmp_path: Path, monkeypatch, projects: list[dict]) -> SimpleNamespace:
@@ -248,6 +249,59 @@ class TestDefaultUnchanged:
         assert titles == {"Alpha one"}
         # No schema change without the flag: project_id key is absent.
         assert all("project_id" not in row for row in rows)
+
+
+class TestShortRefPrefixResolution:
+    """Codex P2 — short-ref --parent/--linked must expand with each project's
+    RESOLVED task prefix, not the naive project_id[:5]."""
+
+    def test_expand_task_id_prefix_override(self):
+        # Divergent explicit prefix: naive derivation would give "ALPHA".
+        assert expand_task_id("1", "alpha") == "ALPHA-001"
+        assert expand_task_id("1", "alpha", "SAME") == "SAME-001"
+        assert expand_task_id("4-2", "alpha", "SAME") == "SAME-004-002"
+        # An already-full ref is returned verbatim regardless of override.
+        assert expand_task_id("SAME-007", "alpha", "OTHER") == "SAME-007"
+
+    def test_all_projects_parent_short_ref_uses_resolved_prefix(self, tmp_path, monkeypatch):
+        # alpha mints under "SAME" (diverges from ALPHA); a short numeric
+        # --parent ref must expand to SAME-NNN, not ALPHA-NNN, or the subtask
+        # is silently missed.
+        port = _make_portfolio(tmp_path, monkeypatch, [
+            {"id": "alpha", "priority": 1, "prefix": "SAME"},
+            {"id": "beta", "priority": 5, "prefix": "OTHR"},
+        ])
+        parent = add_task(port.config, "alpha", "Parent")
+        child = add_subtask(port.config, "alpha", parent.id, "Child")
+        # Short numeric ref (no prefix) derived from the real minted id.
+        num = parent.id.rsplit("-", 1)[1].lstrip("0") or "0"
+
+        r = CliRunner().invoke(
+            main,
+            ["tasks", "list", "--all-projects", "-s", "all", "--parent", num],
+            env=_env(port),
+        )
+        assert r.exit_code == 0, r.output
+        ids = {row["id"] for row in json.loads(r.output)}
+        assert ids == {child.id}
+
+    def test_single_project_parent_short_ref_divergent_prefix(self, tmp_path, monkeypatch):
+        # Root-cause fix also corrects the single-project path.
+        port = _make_portfolio(tmp_path, monkeypatch, [
+            {"id": "alpha", "prefix": "SAME"},
+        ])
+        parent = add_task(port.config, "alpha", "Parent")
+        child = add_subtask(port.config, "alpha", parent.id, "Child")
+        num = parent.id.rsplit("-", 1)[1].lstrip("0") or "0"
+
+        r = CliRunner().invoke(
+            main,
+            ["tasks", "list", "--project", "alpha", "-s", "all", "--parent", num],
+            env=_env(port),
+        )
+        assert r.exit_code == 0, r.output
+        ids = {row["id"] for row in json.loads(r.output)}
+        assert ids == {child.id}
 
 
 class TestMutualExclusion:

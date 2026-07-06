@@ -140,7 +140,7 @@ def get_project_prefix(project_id: str) -> str:
     return clean[:5]
 
 
-def expand_task_id(task_ref: str, project_id: str) -> str:
+def expand_task_id(task_ref: str, project_id: str, prefix: str | None = None) -> str:
     """Expand a short task reference to full ID.
 
     Examples:
@@ -149,7 +149,17 @@ def expand_task_id(task_ref: str, project_id: str) -> str:
         - "022" -> "CLAWP-022"
         - "4-001" -> "CLAWP-004-001" (subtask)
         - "CLAWP-004-001" -> "CLAWP-004-001" (already full subtask)
+
+    ``prefix`` overrides the project's task-ID prefix (CLAWP-084). Pass the
+    project's RESOLVED prefix (explicit ``task_prefix`` -> inferred-from-tasks,
+    via ``tasks.resolve_existing_prefix``) when a project mints task ids under a
+    prefix that differs from the naive ``project_id[:5]`` — otherwise a short
+    ref like ``1`` expands to the wrong id (e.g. ``ALPHA-001`` instead of the
+    real ``SAME-001``) and short-ref ``--parent`` / ``--linked`` filters silently
+    match nothing. ``None`` falls back to the naive id-derived prefix.
     """
+    resolved_prefix = prefix if prefix else get_project_prefix(project_id)
+
     # Already has a prefix (contains hyphen and letters before it)
     # Match both PREFIX-NNN and PREFIX-NNN-NNN (subtask)
     if '-' in task_ref and re.match(r'^[A-Z]+-\d+(-\d+)?$', task_ref.upper()):
@@ -158,16 +168,14 @@ def expand_task_id(task_ref: str, project_id: str) -> str:
     # Subtask short ID: "4-001" or "004-001" -> "PREFIX-004-001"
     subtask_match = re.match(r'^(\d+)-(\d+)$', task_ref)
     if subtask_match:
-        prefix = get_project_prefix(project_id)
         parent_num = int(subtask_match.group(1))
         sub_num = int(subtask_match.group(2))
-        return f"{prefix}-{parent_num:03d}-{sub_num:03d}"
+        return f"{resolved_prefix}-{parent_num:03d}-{sub_num:03d}"
 
     # Pure numeric - expand with project prefix
     if task_ref.isdigit():
-        prefix = get_project_prefix(project_id)
         num = int(task_ref)
-        return f"{prefix}-{num:03d}"
+        return f"{resolved_prefix}-{num:03d}"
 
     # Return as-is if unrecognized format
     return task_ref
