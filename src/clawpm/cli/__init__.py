@@ -147,62 +147,9 @@ from clawpm.cli import shortcuts as _shortcuts  # noqa: F401 (registers commands
 from clawpm.cli import project as _project  # noqa: F401 (registers commands)
 from clawpm.cli import admin as _admin  # noqa: F401 (registers commands)
 from clawpm.cli import resume as _resume  # noqa: F401 (registers commands)
+from clawpm.cli import use as _use  # noqa: F401 (registers commands)
 
 # Re-exports: symbols that moved into group modules but are still referenced
 # via the historical `clawpm.cli.<name>` path (by the domain layer and tests).
 from clawpm.cli.conflicts import _globs_overlap  # noqa: F401
 from clawpm.cli.serve import _load_web_server  # noqa: F401
-
-# ============================================================================
-# Use command (project context)
-# ============================================================================
-
-
-@main.command("use")
-@click.argument("project_id", required=False)
-@click.option("--clear", is_flag=True, help="Clear the current context")
-@click.pass_context
-def use_project(ctx: click.Context, project_id: str | None, clear: bool) -> None:
-    """Set or show the current project context.
-    
-    When no project is specified, shows the current context.
-    Use --clear to remove the context.
-    """
-    fmt = get_format(ctx)
-    config = require_portfolio(ctx)
-    
-    if clear:
-        set_context_project(None)
-        output_success("Context cleared", fmt=fmt)
-        return
-    
-    if project_id:
-        # Verify project exists
-        proj = get_project(config, project_id)
-        if not proj:
-            output_error("project_not_found", f"Project '{project_id}' not found", fmt=fmt)
-            sys.exit(1)
-        
-        set_context_project(project_id)
-        output_success(f"Now using project: {proj.name} ({proj.id})", fmt=fmt)
-    else:
-        # Show current context
-        current = get_context_project()
-        cwd_project = detect_project_from_cwd()
-        
-        result = {
-            "context_project": current,
-            "cwd_project": cwd_project.id if cwd_project else None,
-            "effective": cwd_project.id if cwd_project else current,
-        }
-        
-        if fmt == OutputFormat.JSON:
-            output_json(result)
-        else:
-            if cwd_project:
-                click.echo(f"Current directory: {cwd_project.name} ({cwd_project.id})")
-            elif current:
-                click.echo(f"Context: {current}")
-            else:
-                click.echo("No project context set. Use 'clawpm use <project>' or cd into a project.")
-
