@@ -13,7 +13,8 @@ from clawpm.discovery import discover_projects, get_project
 from clawpm.tasks import get_next_task, get_task, list_tasks
 from clawpm.worklog import add_entry, tail_entries
 from clawpm.context import expand_task_id
-from clawpm.cli.tasks import _do_state_change_isolated, _render_state_results, tasks_add, tasks_state
+from clawpm.cli.tasks import _render_state_results, tasks_add, tasks_state
+from clawpm.services.tasks import transition_isolated
 from clawpm.cli.projects import projects_next
 from clawpm.cli.base import main, get_format, require_portfolio, require_project
 
@@ -156,7 +157,7 @@ def quick_unblock(ctx: click.Context, project_id: str | None, task_ids: tuple[st
             })
             continue
 
-        r = _do_state_change_isolated(
+        r = transition_isolated(
             len(task_ids) > 1, config,
             project_id=project_id, task_id=full_task_id, new_state=new_state_str,
             note=note,
