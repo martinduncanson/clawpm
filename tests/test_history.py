@@ -330,7 +330,7 @@ class TestVTCleanDiscipline:
         # The lazy-import discipline: cli.py must not have `from clawpm.history`
         # or `import clawpm.history` at module top level. Only inside the command
         # function body.
-        cli_text = Path(__file__).parent.parent.joinpath("src/clawpm/cli.py").read_text(encoding="utf-8")
+        cli_text = Path(__file__).parent.parent.joinpath("src/clawpm/cli/__init__.py").read_text(encoding="utf-8")
         # Find the first import block (up to first @click decorator or function def)
         head = cli_text.split("@main")[0] if "@main" in cli_text else cli_text[:5000]
         assert "from clawpm.history" not in head

@@ -10,11 +10,10 @@ from pathlib import Path
 
 import click
 
-from . import __version__
-from .concurrency import LockTimeout
-from .frontmatter import parse_frontmatter
-from .models import (
-    PortfolioConfig,
+from clawpm import __version__
+from clawpm.concurrency import LockTimeout
+from clawpm.frontmatter import parse_frontmatter
+from clawpm.models import (
     ProjectStatus,
     SuccessCriterion,
     Task,
@@ -26,7 +25,7 @@ from .models import (
     Predictions,
     SURPRISE_TAXONOMY,
 )
-from .output import (
+from clawpm.output import (
     OutputFormat,
     output_json,
     output_error,
@@ -38,7 +37,7 @@ from .output import (
     output_research_list,
     output_context,
 )
-from .discovery import (
+from clawpm.discovery import (
     get_portfolio_path,
     load_portfolio_config,
     discover_projects,
@@ -49,13 +48,13 @@ from .discovery import (
     is_git_repo,
     path_for_config,
 )
-from .announce import (
+from clawpm.announce import (
     AnnounceEncodingError,
     find_existing_marker_file,
     select_target_file,
     write_or_replace_stanza,
 )
-from .tasks import (
+from clawpm.tasks import (
     list_tasks,
     get_task,
     get_next_task,
@@ -66,9 +65,8 @@ from .tasks import (
     add_subtask,
     touch_task_updated,
     distinct_tags,
-    archive_done_tasks,
 )
-from .worklog import (
+from clawpm.worklog import (
     add_entry,
     filter_files_changed,
     tail_entries,
@@ -76,13 +74,13 @@ from .worklog import (
     get_logged_commit_hashes,
     read_entries,
 )
-from .research import (
+from clawpm.research import (
     list_research,
     get_research,
     add_research,
     link_research_session,
 )
-from .context import (
+from clawpm.context import (
     resolve_project,
     expand_task_id,
     get_context_project,
@@ -761,7 +759,7 @@ def project_doctor(
         # project is a broken reference — surface it. Typed edges have their
         # own integrity checks; this covers only the freeform wiki graph.
         try:
-            from .links import find_dangling_links
+            from clawpm.links import find_dangling_links
             dangling_links.extend(find_dangling_links(config, proj.id))
         except Exception:
             # Never let a link-scan hiccup abort the whole health check.
@@ -1087,7 +1085,7 @@ def project_doctor(
     # subsequent agent operations. Operator-judgment class — never
     # auto-applied (codegraph creates `.claude/CLAUDE.md` which the
     # operator may not want).
-    from .codegraph import count_code_files, is_project_indexed
+    from clawpm.codegraph import count_code_files, is_project_indexed
     for proj in projects_to_check:
         if not proj.repo_path or not proj.repo_path.exists():
             continue
@@ -1114,7 +1112,7 @@ def project_doctor(
     # docs/all modes. A mixed repo (lots of code AND lots of docs) should
     # get BOTH advisories — neither suppresses the other. Soft signal,
     # never auto-applied. Idempotent via the .clawpm-semble index marker.
-    from .semble import count_doc_files, is_doc_indexed
+    from clawpm.semble import count_doc_files, is_doc_indexed
     for proj in projects_to_check:
         if not proj.repo_path or not proj.repo_path.exists():
             continue
@@ -1172,7 +1170,7 @@ def project_doctor(
     # existing tasks -> [:5] for the as-yet-unminted), so the check reflects the
     # IDs actually being minted: a task_prefix override clears a false collision,
     # and an inferred/derived prefix surfaces a real one the naive [:5] missed.
-    from .tasks import resolve_existing_prefix as _resolve_prefix
+    from clawpm.tasks import resolve_existing_prefix as _resolve_prefix
 
     prefix_map: dict[str, list[str]] = {}
     all_projects = discover_projects(config)
@@ -1191,7 +1189,7 @@ def project_doctor(
     # under --apply.
     expired_lease_findings: list[dict] = []
     try:
-        from .leases import expired_leases as _expired_leases
+        from clawpm.leases import expired_leases as _expired_leases
         _now_doc = datetime.now(timezone.utc)
         for _l in _expired_leases(config.portfolio_root, _now_doc, project_id=project_id):
             _age = int((_now_doc - _l.last_heartbeat_at).total_seconds())
@@ -1238,7 +1236,7 @@ def project_doctor(
                 apply_aborted = True
 
         if proceed:
-            from .doctor_apply import run_apply_phase
+            from clawpm.doctor_apply import run_apply_phase
 
             applied, apply_skipped = run_apply_phase(
                 config=config,
@@ -1262,7 +1260,7 @@ def project_doctor(
             # the sweep to project_id so a project-scoped run never reaps another
             # project's leases (cross-project isolation — Codex critical).
             if expired_lease_findings and not dry_run:
-                from .leases import sweep as _lease_sweep
+                from clawpm.leases import sweep as _lease_sweep
                 for _act in _lease_sweep(config, config.portfolio_root, project_id=project_id):
                     target = f"{_act['task_id']} ({_act['project_id']})"
                     if _act.get("retired_without_fallback"):
@@ -1442,86 +1440,16 @@ def tasks(ctx: click.Context) -> None:
 @click.option("--parent", "parent", default=None, help="Only the direct subtasks of this parent task id (CLAWP-082).")
 @click.option("--linked", "linked", default=None, help="Only tasks referencing this id via a [[wiki-link]] or a typed edge (CLAWP-082).")
 @click.option("--limit", "limit", type=int, default=None, help="Cap the number of results after filtering + sorting (CLAWP-082).")
-@click.option("--all-projects", "all_projects", is_flag=True, default=False, help="List tasks across every ACTIVE project (CLAWP-084). Each row carries its project_id; filters compose per-project. Mutually exclusive with --project.")
-@click.option(
-    "--include-archived", "include_archived", is_flag=True, default=False,
-    help="Fold archived done tasks (done/archive/) back into the listing (CLAWP-085). "
-         "Only affects 'done' and 'all' scans.",
-)
 @click.pass_context
-def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, flat: bool, tags: tuple[str, ...], all_tags: bool, text: str | None, use_regex: bool, priority: str | None, complexities: tuple[str, ...], parent: str | None, linked: str | None, limit: int | None, all_projects: bool, include_archived: bool) -> None:
-    """List tasks for a project (default: open+progress+blocked, use -s all for everything).
-
-    ``--all-projects`` (CLAWP-084) spans every ACTIVE project instead of one.
-    """
+def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, flat: bool, tags: tuple[str, ...], all_tags: bool, text: str | None, use_regex: bool, priority: str | None, complexities: tuple[str, ...], parent: str | None, linked: str | None, limit: int | None) -> None:
+    """List tasks for a project (default: open+progress+blocked, use -s all for everything)."""
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
 
-    if all_projects:
-        # CLAWP-084 — portfolio-wide view. --project scopes to a single project,
-        # so combining it with --all-projects is contradictory; refuse rather
-        # than silently pick one.
-        if project_id is not None:
-            raise click.UsageError("--all-projects cannot be combined with --project.")
-        active = discover_projects(config, status_filter=ProjectStatus.ACTIVE)
-        found_tasks = []
-        proj_priority: dict[str, int] = {}
-        for proj in active:
-            proj_priority[proj.id] = proj.priority
-            proj_tasks = _collect_project_tasks(
-                config, proj.id, state, tags, all_tags, text, use_regex,
-                priority, complexities, parent, linked, include_archived,
-            )
-            # Stamp the owning project on each row so cross-project ids stay
-            # unambiguous (two same-numeric-id tasks in different projects must
-            # never be conflated — cross-project id-isolation class).
-            for t in proj_tasks:
-                t.project_id = proj.id
-            found_tasks.extend(proj_tasks)
-        # Portfolio ordering mirrors `projects next`: project priority first,
-        # then task priority, then id for a stable total order across projects.
-        found_tasks.sort(key=lambda t: (proj_priority.get(t.project_id, 10**9), t.priority, t.id))
-    else:
-        project_id, _ = require_project(ctx, project_id)
-        found_tasks = _collect_project_tasks(
-            config, project_id, state, tags, all_tags, text, use_regex,
-            priority, complexities, parent, linked, include_archived,
-        )
+    project_id, _ = require_project(ctx, project_id)
 
-    if limit is not None and limit >= 0:
-        found_tasks = found_tasks[:limit]
-
-    # CLAWP-084 — in the cross-project view force a flat, project-scoped render:
-    # parent/child hierarchy is per-project and the merged task_map could
-    # otherwise conflate identical ids from different projects.
-    output_tasks_list(found_tasks, fmt=fmt, flat=flat, show_project=all_projects)
-
-
-def _collect_project_tasks(
-    config: PortfolioConfig,
-    project_id: str,
-    state: str | None,
-    tags: tuple[str, ...],
-    all_tags: bool,
-    text: str | None,
-    use_regex: bool,
-    priority: str | None,
-    complexities: tuple[str, ...],
-    parent: str | None,
-    linked: str | None,
-    include_archived: bool = False,
-) -> list["Task"]:
-    """Gather + filter one project's tasks (CLAWP-084 extraction).
-
-    Shared by the single-project and ``--all-projects`` list paths so the
-    state-gather + composable-filter pass (CLAWP-069/082) behaves identically in
-    both. Link resolution stays per-project — a ``[[wiki-link]]`` resolves
-    within its own project — which is exactly why the filter pass runs inside
-    the per-project loop rather than globally. No limit is applied here; the
-    caller applies it (globally, after the cross-project merge + sort).
-    """
     if state == "all":
-        found_tasks = list_tasks(config, project_id, state_filter=None, include_archived=include_archived)
+        found_tasks = list_tasks(config, project_id, state_filter=None)
     elif state is None:
         # Default: show everything except done
         found_tasks = []
@@ -1529,13 +1457,11 @@ def _collect_project_tasks(
             found_tasks.extend(list_tasks(config, project_id, state_filter=s))
         found_tasks.sort(key=lambda t: (t.priority, t.id))
     else:
-        found_tasks = list_tasks(
-            config, project_id, state_filter=TaskState(state), include_archived=include_archived
-        )
+        found_tasks = list_tasks(config, project_id, state_filter=TaskState(state))
 
     # CLAWP-069/082 — composable filter pass. Every axis is a `by_*` predicate
     # combined with AND via apply_filters (a task must satisfy all of them).
-    from .filters import (
+    from clawpm.filters import (
         apply_filters, by_complexity, by_linked, by_parent, by_priority,
         by_tags, by_text,
     )
@@ -1548,33 +1474,25 @@ def _collect_project_tasks(
         filter_list.append(by_priority(priority))
     if complexities:
         filter_list.append(by_complexity(complexities))
-    # CLAWP-084 — resolve this project's ACTUAL task-ID prefix (explicit
-    # task_prefix -> inferred-from-tasks) so a short ref like `1` expands to the
-    # real minted id even when the prefix diverges from the naive project_id[:5]
-    # (Codex P2: --all-projects over a project with task_prefix="SAME" stored
-    # children under SAME-001 but expanded --parent 1 to ALPHA-001 -> no match).
-    # Also corrects the single-project path for divergent-prefix projects.
-    resolved_prefix = None
-    if parent or linked:
-        from .tasks import resolve_existing_prefix
-        _settings = get_project(config, project_id)
-        resolved_prefix = resolve_existing_prefix(_settings) if _settings else None
     if parent:
-        filter_list.append(by_parent(expand_task_id(parent, project_id, resolved_prefix)))
+        filter_list.append(by_parent(expand_task_id(parent, project_id)))
     if linked:
-        from .links import build_link_index
+        from clawpm.links import build_link_index
         index = build_link_index(config, project_id)
         # Resolve both the expanded (task-style) id and the raw ref so --linked
         # works for research/mission ids that expand_task_id would leave alone.
         refs: set[str] = set()
-        for target in {expand_task_id(linked, project_id, resolved_prefix), linked}:
+        for target in {expand_task_id(linked, project_id), linked}:
             refs |= index.referencing_ids(target)
         filter_list.append(by_linked(refs))
 
     if filter_list:
         found_tasks = apply_filters(found_tasks, filter_list)
 
-    return found_tasks
+    if limit is not None and limit >= 0:
+        found_tasks = found_tasks[:limit]
+
+    output_tasks_list(found_tasks, fmt=fmt, flat=flat)
 
 
 @tasks.command("tags")
@@ -1643,26 +1561,19 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
             except _json_show.JSONDecodeError:
                 pass
 
-    from .hints import hints_for_shown_task, hints_enabled
+    from clawpm.hints import hints_for_shown_task, hints_enabled
     _hints = hints_for_shown_task(task) if hints_enabled(ctx) else None
 
     # CLAWP-082 — derive backlinks at read time. `links` (outbound wiki-links)
     # is already on the task; `linked_from` unifies inbound wiki + typed edges.
-    from .links import build_link_index
+    from clawpm.links import build_link_index
     _index = build_link_index(config, project_id)
     _linked_from = _index.linked_from(task_id)
-
-    # CLAWP-085: flag archived done tasks so a resolved-from-archive task is
-    # visibly distinguished from a live done task. is_archived_path matches the
-    # specific done/archive/ silo, not any "archive" path segment.
-    from .tasks import is_archived_path
-    is_archived = is_archived_path(task.file_path)
 
     if fmt == OutputFormat.JSON:
         task_dict = task.to_dict()
         task_dict["reflections_voided"] = reflections_voided
         task_dict["linked_from"] = _linked_from
-        task_dict["archived"] = is_archived
         if _hints:
             task_dict["hints"] = _hints
         output_json(task_dict)
@@ -1676,82 +1587,8 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
                 + ", ".join(f"{lf['id']} ({lf['via']})" for lf in _linked_from)
                 + "]"
             )
-        if is_archived:
-            click.echo("[archived: true]")
         if reflections_voided:
             click.echo("[reflections_voided: true]")
-
-
-@tasks.command("archive")
-@click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
-@click.option(
-    "--older-than", "older_than", default="90d",
-    help="Archive done tasks whose file has not been touched in this window "
-         "(e.g. 90d, 12w, 2160h). Default: 90d.",
-)
-@click.option(
-    "--dry-run", "dry_run", is_flag=True, default=False,
-    help="List what would be archived without moving anything.",
-)
-@click.pass_context
-def tasks_archive(ctx: click.Context, project_id: str | None, older_than: str, dry_run: bool) -> None:
-    """Move stale done tasks into done/archive/ to keep the hot path cheap (CLAWP-085).
-
-    Move-not-delete: nothing is ever removed. Archived tasks stay resolvable via
-    'tasks show' and can be re-listed with 'tasks list -s done --include-archived'.
-    """
-    fmt = get_format(ctx)
-    config = require_portfolio(ctx)
-    project_id, _ = require_project(ctx, project_id)
-
-    from .reflect import parse_duration
-    try:
-        minutes = parse_duration(older_than)
-    except click.BadParameter:
-        minutes = None
-    if minutes is None:
-        output_error(
-            "bad_older_than",
-            f"Invalid --older-than {older_than!r}. Use forms like 90d, 12w, 2160h.",
-            fmt=fmt,
-        )
-        sys.exit(1)
-    older_than_days = minutes / (60 * 24)
-
-    with _mutation_errors(fmt, "archive_failed"):
-        results = archive_done_tasks(
-            config, project_id, older_than_days=older_than_days, dry_run=dry_run,
-        )
-
-    # Partition the per-candidate records: clean moves/plans vs. skipped vs.
-    # errored (stat failures surfaced, not swallowed).
-    errored = [r for r in results if r.get("error")]
-    skipped = [r for r in results if r.get("skipped")]
-    archived = [r for r in results if not r.get("error") and not r.get("skipped")]
-
-    if fmt == OutputFormat.JSON:
-        output_json({
-            "success": True,
-            "project": project_id,
-            "dry_run": dry_run,
-            "older_than": older_than,
-            "count": len(archived),
-            "archived": archived,
-            "skipped": skipped,
-            "errors": errored,
-        })
-    else:
-        verb = "Would archive" if dry_run else "Archived"
-        if not archived:
-            click.echo(f"No done tasks older than {older_than} to archive.")
-        else:
-            click.echo(f"{verb} {len(archived)} task(s) older than {older_than}:")
-            for rec in archived:
-                click.echo(f"  {rec['id']} -> {rec['to']}")
-        for rec in skipped:
-            click.echo(f"  [skipped: {rec['skipped']}] {rec['id']}")
-        for rec in errored:
-            click.echo(f"  [error: {rec['error']}] {rec['id']}")
 
 
 @tasks.command("edit")
@@ -1885,7 +1722,7 @@ def tasks_edit(
 
     predictions: Predictions | None = None
     if has_predictions:
-        from .reflect import parse_duration as _parse_duration
+        from clawpm.reflect import parse_duration as _parse_duration
         try:
             parsed_duration = _parse_duration(predict_duration)
         except Exception as exc:
@@ -1981,7 +1818,7 @@ def _do_state_change(
     if state == TaskState.DONE:
         _rollup_task = get_task(config, project_id, task_id)
         if _rollup_task:
-            from .tasks import parent_rollup_status
+            from clawpm.tasks import parent_rollup_status
             _status = parent_rollup_status(config, project_id, _rollup_task)
             rollup_incomplete = (
                 [f"{c['id']} [{c['state']}]" for c in _status["incomplete"]]
@@ -2120,7 +1957,7 @@ def _do_state_change(
     teardowns: list[dict] = []
     teardown_errors: list[dict] = []
     if state == TaskState.DONE:
-        from .tasks import cascade_unblock_dependents
+        from clawpm.tasks import cascade_unblock_dependents
         try:
             cascade_results = cascade_unblock_dependents(config, project_id, task_id)
         except (OSError, KeyError, ValueError) as exc:
@@ -2152,7 +1989,7 @@ def _do_state_change(
         # against moving non-PROGRESS tasks, but releasing here retires the
         # lease immediately rather than waiting for the next sweep.)
         try:
-            from .leases import release_lease
+            from clawpm.leases import release_lease
             release_lease(config.portfolio_root, task_id, project_id)
         except Exception as exc:
             # Best-effort: a lease left un-released is recoverable (the sweep
@@ -2168,7 +2005,7 @@ def _do_state_change(
         # not just the hardcoded repo_path + worktree pair. Falls back
         # to the legacy locations as a belt-and-braces second pass for
         # dispatches that pre-date the registry.
-        from .dispatch import (
+        from clawpm.dispatch import (
             active_dispatch_dirs,
             read_dispatch_marker,
             teardown_dispatch_settings,
@@ -2266,7 +2103,7 @@ def _do_state_change(
         })
     if state in (TaskState.DONE, TaskState.BLOCKED) and pre_transition_task:
         try:
-            from .reflect import write_reflection_event, _compute_actuals
+            from clawpm.reflect import write_reflection_event, _compute_actuals
             all_log_entries = read_entries(config, project=project_id)
             actuals = _compute_actuals(
                 task_id,
@@ -2301,7 +2138,7 @@ def _do_state_change(
     # closeable. Pure advisory; the parent is not auto-completed.
     parent_ready = None
     if state == TaskState.DONE:
-        from .tasks import parent_ready_signal
+        from clawpm.tasks import parent_ready_signal
         try:
             parent_ready = parent_ready_signal(config, project_id, task_id)
         except Exception as exc:
@@ -2770,7 +2607,7 @@ def tasks_add(
     scope_list = list(scope) if scope else None
 
     # Parse human-friendly duration (e.g. "2h", "3d") → minutes
-    from .reflect import parse_duration as _parse_duration
+    from clawpm.reflect import parse_duration as _parse_duration
     try:
         parsed_predict_duration = _parse_duration(predict_duration)
     except Exception as exc:
@@ -2897,7 +2734,7 @@ def tasks_add(
     task_dict = task.to_dict()
     if not reference_tasks and task.predictions and not task.predictions.is_empty():
         try:
-            from .reflect import find_reference_tasks
+            from clawpm.reflect import find_reference_tasks
             # CLAWP-030: pass repo_path so reference scoring can augment
             # with CodeGraph semantic-symbol overlap when the project is
             # indexed. find_reference_tasks degrades gracefully when not.
@@ -2929,7 +2766,7 @@ def tasks_add(
         try:
             project = get_project(config, project_id)
             if project and project.repo_path and project.repo_path.exists():
-                from .codegraph import suggest_scope_from_text
+                from clawpm.codegraph import suggest_scope_from_text
                 query_text = (
                     (task.title or "")
                     + "\n"
@@ -2946,7 +2783,7 @@ def tasks_add(
             pass
 
     # CLAWP-050: terse, code-derived next-action hints to steer the agent.
-    from .hints import hints_for_added_task, attach_hints
+    from clawpm.hints import hints_for_added_task, attach_hints
     attach_hints(ctx, task_dict, hints_for_added_task(task))
 
     output_success(f"Task {task.id} created", data=task_dict, fmt=fmt)
@@ -2979,7 +2816,7 @@ def tasks_emit_rubric(
     event — clawpm is the persistence layer, the rubric is the contract.
     """
     import json as _json_rub
-    from .rubric import render_rubric_markdown, render_rubric_json_payload
+    from clawpm.rubric import render_rubric_markdown, render_rubric_json_payload
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
@@ -3103,12 +2940,12 @@ def tasks_dispatch(
     so multiple subagents can be dispatched in parallel without colliding
     on a single .claude/settings.local.json.
     """
-    from .dispatch import (
+    from clawpm.dispatch import (
         create_worktree,
         settings_path,
         write_dispatch_settings,
     )
-    from .rubric import render_rubric_markdown
+    from clawpm.rubric import render_rubric_markdown
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
@@ -3139,7 +2976,7 @@ def tasks_dispatch(
     # 'drift-not-checked' warning so the operator knows the check didn't run.
     # EXPECTED-class skips (no scope, no baseline, ts: marker, non-git) stay silent.
     if not confirm_stale:
-        from .baseline import detect_scope_drift
+        from clawpm.baseline import detect_scope_drift
         _proj_for_drift = get_project(config, project_id)
         _repo_for_drift = getattr(_proj_for_drift, "repo_path", None) if _proj_for_drift else None
         _drift_result = detect_scope_drift(
@@ -3235,7 +3072,7 @@ def tasks_dispatch(
     # Run on EVERY dispatch, not only leased ones (Codex P2): a dead holder
     # from an earlier lease must be reaped on the next dispatch even if this one
     # isn't requesting a lease. Cheap — a no-op when leases.jsonl is absent.
-    from .leases import sweep as _lease_sweep
+    from clawpm.leases import sweep as _lease_sweep
     swept = []
     sweep_error = None
     try:
@@ -3269,7 +3106,7 @@ def tasks_dispatch(
     # Grant the lease AFTER settings are written (so a settings failure doesn't
     # leave a lease with no heartbeat source).
     if lease_ttl is not None:
-        from .leases import FallbackPolicy, grant_lease, holder_token
+        from clawpm.leases import FallbackPolicy, grant_lease, holder_token
         # Store an ABSOLUTE target dir (Codex P2): a relative --target-dir would
         # make a later sweep (run from another CWD) tear down the wrong path.
         # The holder is a shell-safe TOKEN of that path (Codex P2) — the same
@@ -3333,7 +3170,7 @@ def tasks_teardown_dispatch(
     By default, only removes files clawpm wrote (marker present) for the
     given task_id. Without task_id, removes any clawpm-managed dispatch.
     """
-    from .dispatch import read_dispatch_marker, teardown_dispatch_settings
+    from clawpm.dispatch import read_dispatch_marker, teardown_dispatch_settings
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
@@ -3405,7 +3242,7 @@ def tasks_emit_tree(
         "constitution_violations": [...], "dry_run": false } }
     """
     import json as _json
-    from .emit_tree import parse_emit_document, emit_tree, EmitValidationError
+    from clawpm.emit_tree import parse_emit_document, emit_tree, EmitValidationError
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
@@ -3693,7 +3530,7 @@ def quick_next(ctx: click.Context, project_id: str | None, batch_mode: bool) -> 
         # across projects (a batch is a unit of parallel dispatch, not a
         # cross-portfolio queue).
         project_id, _ = require_project(ctx, project_id)
-        from .tasks import select_next_batch
+        from clawpm.tasks import select_next_batch
         group, candidates, conflicts = select_next_batch(config, project_id)
 
         if group is None:
@@ -3734,7 +3571,7 @@ def quick_next(ctx: click.Context, project_id: str | None, batch_mode: bool) -> 
         # Get next task for specific project
         task = get_next_task(config, project_id)
         if task:
-            from .hints import hints_for_next_task, hints_enabled
+            from clawpm.hints import hints_for_next_task, hints_enabled
             _h = hints_for_next_task(task) if hints_enabled(ctx) else None
             output_task_detail(task, fmt=fmt, hints=_h)
         else:
@@ -3884,7 +3721,7 @@ def agent_context(ctx: click.Context, project_id: str | None, log_limit: int) ->
     # CLAWP-082 — build the derived link index once and attach backlinks
     # (`linked_from`) to every task dict surfaced below. `links` (outbound
     # wiki-links) already rides along in each task's to_dict().
-    from .links import build_link_index
+    from clawpm.links import build_link_index
     _link_index = build_link_index(config, resolved_id)
 
     def _with_backlinks(t: Task) -> dict:
@@ -4010,7 +3847,7 @@ def resume_cmd(ctx: click.Context, project_id: str | None, no_cache: bool) -> No
     used by the Stop-hook for a tight where-you-are / what's-next summary.
     Falls back to a structured signals summary when the judge isn't on PATH.
     """
-    from .resume import render_briefing
+    from clawpm.resume import render_briefing
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
@@ -4150,8 +3987,8 @@ def log_tail(ctx: click.Context, project_id: str | None, limit: int, follow: boo
     """Show recent work log entries (auto-filters to current project)."""
     import time
     import json as json_module
-    from .models import WorkLogEntry
-    from .worklog import get_worklog_path
+    from clawpm.models import WorkLogEntry
+    from clawpm.worklog import get_worklog_path
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
@@ -4431,8 +4268,8 @@ def judge_tournament(
     clears the rubric. Each pair is judged in both position orders to cancel
     position bias; ambiguous pairs keep the higher seed.
     """
-    from .judges.tournament import Candidate, evaluate_tournament
-    from .judges.stop_condition import make_judge_invoker
+    from clawpm.judges.tournament import Candidate, evaluate_tournament
+    from clawpm.judges.stop_condition import make_judge_invoker
 
     fmt = get_format(ctx)
     if not candidate_files:
@@ -4530,7 +4367,7 @@ def hook_session_start(
     quoting, no embedded JSON in command strings).
     """
     import json as _json_ss
-    from .dispatch import session_start_payload_path
+    from clawpm.dispatch import session_start_payload_path
 
     fmt = get_format(ctx)
     project_id, _ = require_project(ctx, project_id)
@@ -4601,14 +4438,14 @@ def hook_eval_stop(
     """
     import json as _json_hook
     import os as _os_hook
-    from .judges.stop_condition import (
+    from clawpm.judges.stop_condition import (
         JudgeVerdict,
         evaluate_stop_condition,
         evaluate_stop_condition_confirmed,
         load_transcript_from_hook_input,
         map_verdict_to_hook_output,
     )
-    from .rubric import render_rubric_markdown
+    from clawpm.rubric import render_rubric_markdown
 
     # CLAWP-041: resolve confirm-close gating. Flag wins; else env; else off.
     if confirm_close is None:
@@ -4711,7 +4548,7 @@ def hook_eval_stop(
         # worse, but we MUST leave a doctor signal so repeated judge
         # errors don't silently degrade clawpm to no-enforcement.
         try:
-            from .reflect import write_iteration_event
+            from clawpm.reflect import write_iteration_event
             write_iteration_event(
                 portfolio_root=config.portfolio_root,
                 task_id=task_id,
@@ -4740,7 +4577,7 @@ def hook_eval_stop(
     # spine — narrow exception so a real filesystem failure surfaces in
     # the systemMessage instead of silently nuking the iteration count.
     try:
-        from .reflect import write_iteration_event
+        from clawpm.reflect import write_iteration_event
         write_iteration_event(
             portfolio_root=config.portfolio_root,
             task_id=task_id,
@@ -4768,7 +4605,7 @@ def hook_eval_stop(
     # so the count includes the iteration we just recorded.
     if not verdict.ok and not verdict.impossible:
         try:
-            from .reflect import detect_thrashing, _DEFAULT_THRASH_THRESHOLD
+            from clawpm.reflect import detect_thrashing, _DEFAULT_THRASH_THRESHOLD
             import os as _os_thr
             # Resolve effective threshold: per-task > env > module default.
             _thr_task = get_task(config, project_id, task_id)
@@ -4914,7 +4751,7 @@ def agent_dispatch(
     ``--judge-cmd-override`` that points to a stub command, or by setting
     ``CLAWPM_JUDGE_CMD`` (legacy env var from CLAWP-017).
     """
-    from .agent import AgentDispatchError, dispatch_agent
+    from clawpm.agent import AgentDispatchError, dispatch_agent
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
@@ -5007,7 +4844,7 @@ def mission_add(
     force: bool,
 ) -> None:
     """Create a new mission. Mini-goals are linked separately via add-goal."""
-    from .mission import add_mission
+    from clawpm.mission import add_mission
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
@@ -5041,7 +4878,7 @@ def mission_list(
     ctx: click.Context, project_id: str | None, status_filter: str | None
 ) -> None:
     """List missions for a project."""
-    from .mission import list_missions
+    from clawpm.mission import list_missions
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
@@ -5063,7 +4900,7 @@ def mission_status_cmd(
     ctx: click.Context, project_id: str | None, mission_id: str
 ) -> None:
     """Compute progress + outcome state for a mission."""
-    from .mission import mission_status
+    from clawpm.mission import mission_status
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
@@ -5099,7 +4936,7 @@ def mission_tasks_cmd(
     ctx: click.Context, project_id: str | None, mission_id: str, actor: str | None
 ) -> None:
     """List mini-goal tasks for a mission, optionally filtered by actor."""
-    from .mission import mission_tasks
+    from clawpm.mission import mission_tasks
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
@@ -5131,7 +4968,7 @@ def mission_add_goal(
     actor: str,
 ) -> None:
     """Link an existing task to a mission as a mini-goal."""
-    from .mission import add_mission_mini_goal
+    from clawpm.mission import add_mission_mini_goal
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
@@ -5163,7 +5000,7 @@ def mission_state(
     new_status: str,
 ) -> None:
     """Transition a mission to complete / failed / cancelled / active."""
-    from .mission import set_mission_status
+    from clawpm.mission import set_mission_status
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
@@ -5216,10 +5053,6 @@ def research_list(ctx: click.Context, project_id: str | None, status: str | None
 @click.option("--id", "research_id", help="Research ID (auto-generated if not provided)")
 @click.option("--tags", multiple=True, help="Tags")
 @click.option("--question", "-q", help="Research question")
-@click.option("--summary", "--verdict", "summary", help="Verdict/summary written straight into the Summary section (single-shot capture).")
-@click.option("--finding", "findings", multiple=True, help="A finding bullet for the Findings section (repeatable).")
-@click.option("--conclusion", help="Conclusion written straight into the Conclusion section.")
-@click.option("--open", "open_ended", is_flag=True, help="Progressive template with placeholder sections for a genuinely open investigation (no verdict yet).")
 @click.pass_context
 def research_add(
     ctx: click.Context,
@@ -5229,44 +5062,12 @@ def research_add(
     research_id: str | None,
     tags: tuple[str, ...],
     question: str | None,
-    summary: str | None,
-    findings: tuple[str, ...],
-    conclusion: str | None,
-    open_ended: bool,
 ) -> None:
-    """Add a new research item.
-
-    Default is single-shot capture: pass --summary (alias --verdict) and any
-    number of --finding bullets to write the verdict straight into the
-    sections at creation time. Use --open for the progressive template that
-    keeps placeholder sections to fill in as an investigation proceeds.
-    """
+    """Add a new research item."""
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
-
+    
     project_id, _ = require_project(ctx, project_id)
-
-    # --open is the progressive (fill-in-later) path; it can't also carry a
-    # single-shot verdict, or the supplied content would be silently dropped.
-    if open_ended and (summary or findings or conclusion):
-        output_error(
-            "open_conflict",
-            "--open is for a progressive entry with no verdict yet; it cannot be "
-            "combined with --summary/--verdict, --finding, or --conclusion.",
-            fmt=fmt,
-        )
-        sys.exit(1)
-
-    # Single-shot capture needs a verdict (the Summary); --finding/--conclusion
-    # are optional additions and don't substitute for it.
-    if not open_ended and not summary:
-        output_error(
-            "missing_verdict",
-            "research add needs --summary/--verdict (single-shot capture) or --open "
-            "for a progressive entry to fill in later.",
-            fmt=fmt,
-        )
-        sys.exit(1)
 
     # Support both -t tag1 -t tag2 and --tags tag1,tag2
     parsed_tags = []
@@ -5281,9 +5082,6 @@ def research_add(
         research_id=research_id,
         tags=parsed_tags if parsed_tags else None,
         question=question or "",
-        summary=summary or "",
-        findings=list(findings) if findings else None,
-        conclusion=conclusion or "",
     )
 
     if not item:
@@ -5535,7 +5333,7 @@ def lease_group() -> None:
 @click.pass_context
 def lease_grant(ctx, project_id, task_id, ttl, fallback_policy, holder_id, target_dir):
     """Grant a lease on a dispatched task."""
-    from .leases import FallbackPolicy, grant_lease
+    from clawpm.leases import FallbackPolicy, grant_lease
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
@@ -5568,7 +5366,7 @@ def lease_grant(ctx, project_id, task_id, ttl, fallback_policy, holder_id, targe
 @click.pass_context
 def lease_heartbeat(ctx, project_id, task_id, holder_id):
     """Record a heartbeat — the holder is alive. (Called by the dispatch hook.)"""
-    from .leases import heartbeat
+    from clawpm.leases import heartbeat
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
@@ -5584,7 +5382,7 @@ def lease_heartbeat(ctx, project_id, task_id, holder_id):
 @click.pass_context
 def lease_release(ctx, project_id, task_id):
     """Release a lease — clean completion, no fallback on later sweeps."""
-    from .leases import release_lease
+    from clawpm.leases import release_lease
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
@@ -5600,7 +5398,7 @@ def lease_release(ctx, project_id, task_id):
 def lease_list(ctx, project_id):
     """List active leases with their expiry + fallback policy."""
     from datetime import datetime, timezone
-    from .leases import active_leases
+    from clawpm.leases import active_leases
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
@@ -5628,7 +5426,7 @@ def lease_list(ctx, project_id):
 def lease_sweep(ctx, dry_run):
     """Detect expired leases and apply their fallback (the no-daemon expiry check)."""
     from datetime import datetime, timezone
-    from .leases import expired_leases, sweep
+    from clawpm.leases import expired_leases, sweep
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
@@ -6009,7 +5807,7 @@ def reflect_summarize(ctx: click.Context, project_id: str | None) -> None:
     ratio. Omit --project to span all projects. This is the measurement half
     of the calibration loop; `reflect suggest` applies it.
     """
-    from .reflect import summarize_calibration
+    from clawpm.reflect import summarize_calibration
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
     # CLAWP-040 codex round-3 P2 fix: honor the global --project flag from
@@ -6060,7 +5858,7 @@ def reflect_suggest(
     Deterministic — no model call. Falls back to the global ratio when the
     complexity bucket has fewer than --min-bucket samples.
     """
-    from .reflect import parse_duration, suggest_duration
+    from clawpm.reflect import parse_duration, suggest_duration
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
 
@@ -6327,7 +6125,7 @@ def reflect_void(
 # Inbox commands
 # ============================================================================
 
-from .inbox import (  # noqa: E402 — local import to keep group self-contained
+from clawpm.inbox import (  # noqa: E402 — local import to keep group self-contained
     send_message as _inbox_send,
     read_inbox as _inbox_read,
     ack_messages as _inbox_ack,
@@ -6452,7 +6250,7 @@ def _load_web_server():
     is testable without uninstalling the deps.
     """
     import uvicorn
-    from .serve import create_app
+    from clawpm.serve import create_app
 
     return create_app, uvicorn
 
@@ -6522,7 +6320,7 @@ def constitution_add(
     params_raw: tuple[str, ...],
 ) -> None:
     """Add (or replace) a named invariant in the project constitution."""
-    from .constitution import add_invariant
+    from clawpm.constitution import add_invariant
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
@@ -6558,7 +6356,7 @@ def constitution_add(
 @click.pass_context
 def constitution_list(ctx: click.Context, project_id: str | None) -> None:
     """List invariants declared in the project constitution."""
-    from .constitution import load_constitution
+    from clawpm.constitution import load_constitution
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
@@ -6591,7 +6389,7 @@ def constitution_list(ctx: click.Context, project_id: str | None) -> None:
 @click.pass_context
 def constitution_remove(ctx: click.Context, project_id: str | None, name: str) -> None:
     """Remove a named invariant from the project constitution (idempotent)."""
-    from .constitution import remove_invariant
+    from clawpm.constitution import remove_invariant
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
