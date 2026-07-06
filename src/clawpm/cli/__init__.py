@@ -126,6 +126,12 @@ from clawpm.cli.base import (
     pass_format,
 )
 
+# --- group module registrations (import each for its command-registration side effect) ---
+from clawpm.cli import agent as _agent  # noqa: F401 (registers commands)
+from clawpm.cli import hook as _hook  # noqa: F401 (registers commands)
+from clawpm.cli import judge as _judge  # noqa: F401 (registers commands)
+from clawpm.cli import research as _research  # noqa: F401 (registers commands)
+
 # ============================================================================
 # Use command (project context)
 # ============================================================================
@@ -4069,9 +4075,6 @@ def log_commit(ctx: click.Context, project_id: str | None, limit: int, task_id: 
             click.echo(f"  {e.commit_hash[:8] if e.commit_hash else '?'} {e.summary}")
 
 
-from clawpm.cli import judge as _judge  # noqa: F401 (registers commands)
-from clawpm.cli import hook as _hook  # noqa: F401 (registers commands)
-from clawpm.cli import agent as _agent  # noqa: F401 (registers commands)
 # ============================================================================
 # Mission Control commands (CLAWP-022)
 # ============================================================================
@@ -4275,7 +4278,6 @@ def mission_state(
     )
 
 
-from clawpm.cli import research as _research  # noqa: F401 (registers commands)
 # ============================================================================
 # Setup commands
 # ============================================================================
