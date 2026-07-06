@@ -2,5 +2,5 @@ id = "clawpm"
 name = "clawpm"
 status = "active"
 priority = 5
-repo_path = "F:/Git/clawpm"
+repo_path = "F:/Git/clawpm/.clawpm-worktrees/CLAWP-077"
 labels = []
