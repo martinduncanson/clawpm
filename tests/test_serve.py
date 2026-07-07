@@ -249,11 +249,12 @@ def test_read_route_internal_error_is_500_envelope(portfolio, monkeypatch):
 
 def test_serve_without_web_extra_exits_gracefully(monkeypatch):
     from clawpm import cli
+    from clawpm.cli import serve as serve_mod
 
     def _boom():
         raise ImportError("No module named 'fastapi'")
 
-    monkeypatch.setattr(cli, "_load_web_server", _boom)
+    monkeypatch.setattr(serve_mod, "_load_web_server", _boom)
     result = CliRunner().invoke(cli.main, ["serve"])
     assert result.exit_code == 1
     assert "web" in result.output

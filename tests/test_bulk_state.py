@@ -303,7 +303,7 @@ class TestSecondaryFailureIsolation:
     traceback by a failing secondary work-log append (Grok review, CLAWP-083)."""
 
     def test_worklog_append_failure_does_not_abort_batch(self, temp_portfolio, monkeypatch):
-        import clawpm.cli as cli_mod
+        import clawpm.services.tasks as cli_mod
 
         runner = CliRunner()
         ids = [_add(runner, "test", f"L{i}") for i in range(3)]
@@ -324,7 +324,7 @@ class TestSecondaryFailureIsolation:
             assert res["data"]["log_errors"], "expected a log_errors marker"
 
     def test_unexpected_exception_isolated_in_batch(self, temp_portfolio, monkeypatch):
-        import clawpm.cli as cli_mod
+        import clawpm.services.tasks as cli_mod
 
         runner = CliRunner()
         a = _add(runner, "test", "A")
@@ -348,7 +348,7 @@ class TestSecondaryFailureIsolation:
         assert by_id[b]["ok"] is True
 
     def test_unexpected_exception_propagates_in_single(self, temp_portfolio, monkeypatch):
-        import clawpm.cli as cli_mod
+        import clawpm.services.tasks as cli_mod
 
         runner = CliRunner()
         a = _add(runner, "test", "Solo")
@@ -396,7 +396,7 @@ class TestSecondaryFailureIsolation:
         assert data.get("dispatch_teardown_errors"), "expected a teardown marker"
 
     def test_text_mode_surfaces_degraded_marker(self, temp_portfolio, monkeypatch):
-        import clawpm.cli as cli_mod
+        import clawpm.services.tasks as cli_mod
 
         runner = CliRunner()
         ids = [_add(runner, "test", f"D{i}") for i in range(2)]

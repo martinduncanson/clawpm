@@ -174,7 +174,7 @@ class TestEncodingScanClean:
     def test_entry_modules_reconfigure_stdout(self):
         # Pin the behaviour independent of the scanner's rule wording: the three
         # stdout-emitting modules must literally reconfigure stdout to UTF-8.
-        for rel in ("cli.py", "output.py", "judges/stop_condition.py"):
+        for rel in ("cli/__init__.py", "output.py", "judges/stop_condition.py"):
             src = (SRC_ROOT / rel).read_text(encoding="utf-8")
             assert "sys.stdout.reconfigure" in src, (
                 f"{rel} no longer reconfigures stdout — cp1252 crash risk returns"

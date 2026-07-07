@@ -253,6 +253,30 @@ def _has_stdout_reconfigure(tree: ast.Module) -> bool:
     return False
 
 
+def _package_init_reconfigures_stdout(file_path: Path) -> bool:
+    """Return True if *file_path* is a package submodule whose sibling
+    ``__init__.py`` reconfigures stdout to UTF-8.
+
+    Importing any submodule runs its package ``__init__.py`` first (Python
+    guarantees parent-package import), so a single reconfigure in the package
+    init genuinely covers every submodule at runtime. Without this, splitting a
+    reconfigure-at-top module into a package (CLAWP-077 split cli.py -> cli/)
+    would false-flag every stdout-emitting submodule. A package ``__init__.py``
+    is NOT covered by itself — it must still reconfigure on its own.
+    """
+    if file_path.name == "__init__.py":
+        return False
+    sibling_init = file_path.parent / "__init__.py"
+    if not sibling_init.is_file():
+        return False
+    try:
+        init_source = sibling_init.read_text(encoding="utf-8", errors="replace")
+        init_tree = ast.parse(init_source, filename=str(sibling_init))
+    except (OSError, SyntaxError):
+        return False
+    return _has_stdout_reconfigure(init_tree)
+
+
 def _has_print_like_call_anywhere(tree: ast.Module) -> bool:
     """Return True if the module contains any print/click.echo Call."""
     for node in ast.walk(tree):
@@ -337,7 +361,11 @@ def check_file(file_path: Path) -> list[dict]:
     # Check 3: module has print/echo but no stdout reconfigure
     # Only flags modules that actually do print/echo — pure-library modules
     # without any stdout writes don't need the reconfigure.
-    if _has_print_like_call_anywhere(tree) and not _has_stdout_reconfigure(tree):
+    if (
+        _has_print_like_call_anywhere(tree)
+        and not _has_stdout_reconfigure(tree)
+        and not _package_init_reconfigures_stdout(file_path)
+    ):
         findings.append({
             "file": posix,
             "line": 1,  # module-level finding
