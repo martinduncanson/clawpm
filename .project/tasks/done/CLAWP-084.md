@@ -16,6 +16,7 @@ priority: 6
 scope:
 - src/clawpm/cli.py
 - src/clawpm/tasks.py
+updated: '2026-07-07'
 ---
 # Cross-project tasks list (--all-projects)
 

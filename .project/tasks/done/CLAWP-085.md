@@ -21,6 +21,7 @@ priority: 6
 scope:
 - src/clawpm/tasks.py
 - src/clawpm/cli.py
+updated: '2026-07-07'
 ---
 # Done-task archive/prune (tasks archive command)
 
