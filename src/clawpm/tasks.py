@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -61,7 +62,7 @@ def _scan_task_files(location: Path, tasks: list[Task], state_filter: TaskState 
                     tasks.append(task)
             except Exception:
                 continue
-        elif item.is_dir() and not item.name.startswith(".") and item.name not in ("done", "blocked", "rejected"):
+        elif item.is_dir() and not item.name.startswith(".") and item.name.lower() not in ("done", "blocked", "rejected", "archive"):
             # Directory task: add the _task.md, then recurse for subtasks
             # AND any nested directory subtasks. The recursion subsumes the
             # old non-recursive single-level glob; nested directories with
@@ -108,15 +109,31 @@ def list_tasks(
     config: PortfolioConfig,
     project_id: str,
     state_filter: TaskState | None = None,
+    include_archived: bool = False,
 ) -> list[Task]:
-    """List all tasks for a project."""
+    """List all tasks for a project.
+
+    CLAWP-085: archived done tasks (under ``done/archive/``) are excluded from
+    every scan by default — that is the whole point of archiving, keeping the
+    hot path cheap. Pass ``include_archived=True`` to fold them back in; they
+    are DONE tasks, so they only appear where DONE tasks would (no filter, or
+    ``state_filter=DONE``).
+    """
     tasks_dir = get_tasks_dir(config, project_id)
     if not tasks_dir:
         return []
 
     tasks: list[Task] = []
 
-    for location in _scan_locations(tasks_dir, state_filter):
+    locations = _scan_locations(tasks_dir, state_filter)
+    # CLAWP-085: archived tasks are DONE, so only include them when the scan
+    # would surface DONE tasks at all (no filter or an explicit DONE filter).
+    # _scan_task_files skips the archive dir during the plain done/ scan, so
+    # it must be scanned explicitly here.
+    if include_archived and state_filter in (None, TaskState.DONE):
+        locations = [*locations, tasks_dir / "done" / "archive"]
+
+    for location in locations:
         _scan_task_files(location, tasks, state_filter)
 
     # Build parent-child relationships
@@ -162,6 +179,38 @@ def distinct_tags(
     return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
 
 
+def _parent_id_of(task_id: str) -> str | None:
+    """Parent id of a subtask id (``PARENT-NNN`` -> ``PARENT``), else None."""
+    if "-" in task_id:
+        parts = task_id.rsplit("-", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            return parts[0]
+    return None
+
+
+def _archive_candidate_paths(tasks_dir: Path, task_id: str) -> list[Path]:
+    """Every ``done/archive/`` location a task with ``task_id`` could occupy.
+
+    Shared by ``_candidate_task_paths`` (full resolution) and the lightweight
+    archived-DONE existence checks in ``get_next_task`` / cascade — so the
+    archive path shapes live in ONE place and can't drift (CLAWP-085 review r2:
+    a nested decomposed archived subtask lives at
+    ``done/archive/<parent>/<child>/_task.md`` and was previously unprobed).
+    """
+    archive = tasks_dir / "done" / "archive"
+    paths = [
+        archive / f"{task_id}.md",            # archived file task
+        archive / task_id / "_task.md",       # archived directory task
+    ]
+    parent_id = _parent_id_of(task_id)
+    if parent_id:
+        paths.extend([
+            archive / parent_id / f"{task_id}.md",        # archived subtask file
+            archive / parent_id / task_id / "_task.md",   # nested decomposed archived subtask
+        ])
+    return paths
+
+
 def _candidate_task_paths(tasks_dir: Path, task_id: str) -> list[Path]:
     """All on-disk locations a task with ``task_id`` could occupy.
 
@@ -172,13 +221,7 @@ def _candidate_task_paths(tasks_dir: Path, task_id: str) -> list[Path]:
     task, or a duplicate could be created in a location the guard didn't probe
     (CLAWP-051 Finding 2 / Codex review).
     """
-    # Extract parent ID from subtask ID (e.g., CLAWP-TEST-001 -> CLAWP-TEST)
-    # Subtask IDs have format: PARENT-NNN where NNN is numeric
-    parent_id = None
-    if "-" in task_id:
-        parts = task_id.rsplit("-", 1)
-        if len(parts) == 2 and parts[1].isdigit():
-            parent_id = parts[0]
+    parent_id = _parent_id_of(task_id)
 
     # Check all possible locations and filenames
     possible_paths = [
@@ -213,6 +256,12 @@ def _candidate_task_paths(tasks_dir: Path, task_id: str) -> list[Path]:
             # already covers the terminal states.
             tasks_dir / parent_id / task_id / "_task.md",
         ])
+
+    # CLAWP-085 — archived done tasks live under done/archive/ (every path shape,
+    # incl. nested decomposed subtasks). Resolvable by get_task so `tasks show`
+    # works, and probed by the add_task clobber guard so an archived id can't be
+    # reused — even though default scans skip the archive directory.
+    possible_paths.extend(_archive_candidate_paths(tasks_dir, task_id))
 
     return possible_paths
 
@@ -341,13 +390,28 @@ def _done_task_ids(tasks_dir: Path) -> set[str]:
     without YAML-parsing an unboundedly-growing ``done/`` silo (CLAWP-080).
     Done files never carry the ``.progress`` suffix (progress lives in the main
     dir), so the stem is the bare ID.
+
+    CLAWP-085: the ``done/archive/`` silo is PRUNED from this walk — it may grow
+    unboundedly, and re-scanning it on every ``get_next_task`` would undo the
+    hot-path win archiving exists to deliver. Archived DONE tasks are therefore
+    absent from this set; ``get_next_task`` resolves any such dependency
+    individually via the archive-aware ``get_task``.
     """
     done_dir = tasks_dir / "done"
     if not done_dir.exists():
         return set()
     ids: set[str] = set()
-    for path in done_dir.rglob("*.md"):
-        ids.add(path.parent.name if path.name == "_task.md" else path.stem)
+    for root, dirs, files in os.walk(done_dir):
+        # Prune the archive silo (a direct child of done/) from the descent so
+        # its contents are never enumerated on the hot path. Case-insensitive so
+        # an "Archive"/"ARCHIVE" dir on a case-preserving Windows FS is still
+        # pruned (team review).
+        if Path(root) == done_dir:
+            for d in [d for d in dirs if d.lower() == "archive"]:
+                dirs.remove(d)
+        for fn in files:
+            if fn.endswith(".md"):
+                ids.add(Path(root).name if fn == "_task.md" else fn[:-3])
     return ids
 
 
@@ -387,9 +451,18 @@ def get_next_task(config: PortfolioConfig, project_id: str) -> Task | None:
         if task.state not in (TaskState.OPEN, TaskState.PROGRESS):
             continue
 
-        # Check if all dependencies are satisfied
+        # Check if all dependencies are satisfied. A dependency missing from the
+        # cheap filename set may still be an archived DONE task (CLAWP-085:
+        # done/archive is pruned from _done_task_ids). Probe only those
+        # stragglers — usually zero — with lightweight path existence checks
+        # against the archive silo (no YAML parse; anything under done/archive is
+        # DONE by location), and treat a hit as satisfied.
         if task.depends:
-            if not all(dep in done_ids for dep in task.depends):
+            unresolved = [d for d in task.depends if d not in done_ids]
+            if unresolved and not all(
+                any(p.exists() for p in _archive_candidate_paths(tasks_dir, d))
+                for d in unresolved
+            ):
                 continue
 
         return task
@@ -768,6 +841,171 @@ def change_task_state(
         return retry_transient(Task.from_file, new_path)
 
 
+def _newest_mtime(entry: Path) -> float:
+    """Most-recent content mtime for a task ``entry`` (CLAWP-085).
+
+    A plain file returns its own mtime. A directory task returns the newest
+    mtime across the FILES in its tree, so a subtask edited within the window
+    keeps its parent out of the archive even when ``_task.md`` itself is stale
+    (review r2). The directory inode's own mtime is deliberately ignored — it
+    bumps on any child add/remove, which is not task activity and would make a
+    directory task effectively un-archivable. Per-file stat failures are
+    skipped; an unreadable file entry surfaces its OSError to the caller.
+    """
+    if entry.is_file():
+        return entry.stat().st_mtime
+    newest: float | None = None
+    for p in entry.rglob("*"):
+        if not p.is_file():
+            continue
+        try:
+            m = p.stat().st_mtime
+        except OSError:
+            continue
+        if newest is None or m > newest:
+            newest = m
+    # Empty directory (no files) — fall back to the dir's own mtime.
+    return newest if newest is not None else entry.stat().st_mtime
+
+
+def archive_done_tasks(
+    config: PortfolioConfig,
+    project_id: str,
+    *,
+    older_than_days: float,
+    dry_run: bool = False,
+) -> list[dict]:
+    """Move stale DONE tasks out of the hot path into ``done/archive/``.
+
+    CLAWP-085. ``done/`` grows unboundedly and every ``list``/``next``/
+    ``reflect`` scan pays for it. This relocates DONE tasks whose file has not
+    been touched in ``older_than_days`` days into ``tasks/done/archive/`` —
+    still on disk, still resolvable by ``get_task`` (the archive dir is in
+    ``_candidate_task_paths``), but skipped by default scans.
+
+    Move-not-delete: nothing is ever removed (destructive-ops doctrine). The
+    archive lives *under* ``done/`` so ``Task.from_file`` still derives DONE
+    state from the ``done`` path component — no state metadata is rewritten.
+
+    Age signal is the newest mtime across the task entry (the whole tree for a
+    directory task) — a proxy for last activity, so a recently-touched subtask
+    keeps its parent out of the archive. There is no dedicated completion
+    timestamp yet (CLAWP-086's ``updated`` frontmatter can sharpen this later).
+
+    The calibration corpus (``~/clawpm/reflections/*.jsonl``) is keyed by task
+    id and lives outside the repo — it is untouched, and ``find_reference_tasks``
+    reads it directly, so archiving does not affect reference-class anchoring.
+
+    Returns one record per qualifying candidate, each carrying ``{"id", "from",
+    "to"}`` plus an outcome marker:
+
+      - clean move (or, under ``dry_run``, a planned move): no extra marker;
+      - ``"skipped"``: ``"destination_exists"`` (an id already archived — never
+        clobbered) or ``"source_vanished"`` (a concurrent session moved it
+        between the scan and the move);
+      - ``"error"``: a ``stat`` failure on the candidate — surfaced, never
+        swallowed, so a single bad file doesn't silently shrink the report
+        (Grok review). Records are appended AFTER the move commits, so the list
+        never claims a move that didn't happen.
+    """
+    tasks_dir = get_tasks_dir(config, project_id)
+    if not tasks_dir:
+        return []
+    done_dir = tasks_dir / "done"
+    if not done_dir.exists():
+        return []
+
+    archive_dir = done_dir / "archive"
+    cutoff = datetime.now(timezone.utc).timestamp() - older_than_days * 86400
+    results: list[dict] = []
+
+    with file_lock(tasks_dir / ".clawpm-tasks.lock"):
+        for entry in sorted(done_dir.iterdir()):
+            # Never recurse into (or re-archive) the archive silo itself, and
+            # skip hidden/lock files. Case-insensitive match on the silo name so
+            # an "Archive" dir on a case-preserving Windows FS isn't treated as a
+            # task and moved into itself (team review).
+            if entry.name.lower() == "archive" or entry.name.startswith("."):
+                continue
+
+            if entry.is_file() and entry.suffix == ".md":
+                task_id = entry.stem
+            elif entry.is_dir():
+                if not (entry / "_task.md").exists():
+                    continue
+                task_id = entry.name
+            else:
+                continue
+
+            dest = archive_dir / entry.name
+            rec = {"id": task_id, "from": entry.as_posix(), "to": dest.as_posix()}
+
+            try:
+                # Age = newest mtime across the entry. For a directory task this
+                # spans the whole tree so a recently-touched subtask keeps its
+                # parent out of the archive (CLAWP-085 review r2 — Antigravity).
+                mtime = _newest_mtime(entry)
+            except OSError as exc:
+                # A stat failure on an otherwise-qualifying entry is real signal,
+                # not a silent skip — surface it in the report (Grok review).
+                rec["error"] = f"stat_failed: {exc}"
+                results.append(rec)
+                continue
+            if mtime > cutoff:
+                continue  # too recent to archive
+
+            # Destination-collision check runs for BOTH dry-run and the real move
+            # so the preview never claims it would archive a task the real run
+            # would skip (Codex review r2 P3). Unique task ids make a clash
+            # anomalous (id already archived) — skip rather than clobber history.
+            if dest.exists():
+                rec["skipped"] = "destination_exists"
+                results.append(rec)
+                continue
+
+            if dry_run:
+                results.append(rec)
+                continue
+
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            # TOCTOU: a concurrent session may have moved the source between the
+            # scan above and here. Record and continue rather than raising.
+            if not entry.exists():
+                rec["skipped"] = "source_vanished"
+                results.append(rec)
+                continue
+            retry_transient(shutil.move, str(entry), str(dest))
+            # Record only AFTER the move commits — the list never reports a move
+            # that didn't happen (Grok review).
+            results.append(rec)
+
+    return results
+
+
+def is_archived_path(path: Path | None) -> bool:
+    """True iff ``path`` sits inside a ``tasks/done/archive/`` silo (CLAWP-085).
+
+    Matches the specific ``.../tasks/done/archive/...`` sequence — requiring
+    all three consecutive segments, not just ``done``/``archive`` — so neither
+    a directory literally named ``archive`` (Codex review P3) nor a repo
+    checked out under an unrelated ancestor path that happens to contain
+    ``done/archive`` (e.g. ``.../done/archive/myrepo/.project/tasks/...``,
+    Antigravity review) can false-positive the freeze guard. Every real task
+    path has a ``tasks`` segment immediately above ``done``, so anchoring on
+    the triple is a real structural invariant, not a heuristic.
+    """
+    if path is None:
+        return False
+    # Case-insensitive on the dir names: a case-preserving/insensitive Windows
+    # filesystem (or an externally-created dir) can surface "Archive"/"DONE",
+    # and the freeze guard must still fire (team review).
+    parts = [p.lower() for p in path.parts]
+    return any(
+        parts[i] == "tasks" and parts[i + 1] == "done" and parts[i + 2] == "archive"
+        for i in range(len(parts) - 2)
+    )
+
+
 def cascade_unblock_dependents(
     config: PortfolioConfig,
     project_id: str,
@@ -795,6 +1033,7 @@ def cascade_unblock_dependents(
     """
     all_tasks = list_tasks(config, project_id)
     by_id = {t.id: t for t in all_tasks}
+    tasks_dir = get_tasks_dir(config, project_id)
 
     transitions: list[dict] = []
 
@@ -810,12 +1049,21 @@ def cascade_unblock_dependents(
         # as "done" violates the dependency contract. The cascade will
         # not promote tasks with dangling deps; `clawpm doctor` already
         # surfaces these via its dangling-ref check.
+        # CLAWP-085: a dep absent from by_id (which excludes done/archive) may
+        # be an archived DONE task — probe the archive silo (lightweight, no
+        # parse; archive holds only DONE) before treating it as unsatisfied, so
+        # a blocked task still auto-unblocks when a dep has been archived.
         all_deps_done = True
         for dep_id in task.depends:
             dep = by_id.get(dep_id)
-            if dep is None or dep.state != TaskState.DONE:
-                all_deps_done = False
-                break
+            if dep is not None and dep.state == TaskState.DONE:
+                continue
+            if dep is None and tasks_dir is not None and any(
+                p.exists() for p in _archive_candidate_paths(tasks_dir, dep_id)
+            ):
+                continue
+            all_deps_done = False
+            break
 
         if not all_deps_done:
             continue
@@ -971,7 +1219,9 @@ def _infer_prefix_from_tasks(tasks_dir: Path) -> str | None:
     from collections import Counter
 
     counts: Counter[str] = Counter()
-    for scan_dir in (tasks_dir, tasks_dir / "done", tasks_dir / "blocked"):
+    # CLAWP-085: include done/archive so prefix inference stays stable even when
+    # every non-archived task of a project has been archived out of the hot path.
+    for scan_dir in (tasks_dir, tasks_dir / "done", tasks_dir / "blocked", tasks_dir / "done" / "archive"):
         if not scan_dir.exists():
             continue
         for entry in scan_dir.iterdir():
@@ -1135,7 +1385,11 @@ def add_task(
 
             existing_nums = []
 
-            for scan_dir in [tasks_dir, tasks_dir / "done", tasks_dir / "blocked"]:
+            # CLAWP-085: include done/archive so an archived task's number is
+            # never re-minted. add_task is not a hot path, so paying the extra
+            # archive scan here (unlike list/next/reflect) is the correct
+            # trade — a silently reused ID would clobber archived history.
+            for scan_dir in [tasks_dir, tasks_dir / "done", tasks_dir / "blocked", tasks_dir / "done" / "archive"]:
                 if not scan_dir.exists():
                     continue
                 # .md files at this level. Subtask files ({prefix}-000-001.md) live
@@ -1435,6 +1689,15 @@ def split_task(
         if not task or not task.file_path:
             return None
 
+        # CLAWP-085: refuse to restructure an archived task — it is frozen DONE
+        # history under done/archive/ (Codex review P2).
+        if is_archived_path(task.file_path):
+            raise ValueError(
+                f"Task '{task_id}' is archived (done/archive/) — archived tasks "
+                "are frozen history and cannot be split. Move it out of the "
+                "archive first."
+            )
+
         # Already a directory-based task
         if task.file_path.name == "_task.md":
             return task
@@ -1550,13 +1813,21 @@ def _child_state_dirs(tasks_dir: Path, parent_dir: Path) -> list[Path]:
     persisted ``children`` list, so the ID allocator and rollup backstop must
     scan all of them or they can reuse an occupied ordinal / miss an unresolved
     child (CLAWP-071 Codex r1-3).
+
+    CLAWP-085: the ``done/archive/`` silo (standalone archived children) and an
+    archived directory-task parent's own dir (its children travelled with it)
+    are included too, so a re-decompose can never re-mint an ordinal that has
+    been archived out of ``done/``.
     """
+    parent_id = parent_dir.name
     return [
         parent_dir,
         tasks_dir,
         tasks_dir / "done",
         tasks_dir / "blocked",
         tasks_dir / "rejected",
+        tasks_dir / "done" / "archive",
+        tasks_dir / "done" / "archive" / parent_id,
     ]
 
 
@@ -1663,6 +1934,16 @@ def add_subtask(
         parent = get_task(config, project_id, parent_id)
         if not parent:
             return None
+        # CLAWP-085: an archived parent is frozen DONE history. Decomposing into
+        # it would write the new child under done/archive/, making it path-DONE
+        # and invisible to default scans. Refuse — the operator must unarchive
+        # (or pick a live parent) first (Codex review P2).
+        if is_archived_path(parent.file_path):
+            raise ValueError(
+                f"Task '{parent_id}' is archived (done/archive/) — archived tasks "
+                "are frozen history and cannot take new subtasks. Move it out of "
+                "the archive before decomposing."
+            )
         if parent.file_path and parent.file_path.name != "_task.md":
             parent = split_task(config, project_id, parent_id)
             if not parent:
@@ -1672,11 +1953,12 @@ def add_subtask(
             return None
 
         # Generate subtask ID via the shared allocator, which unions every used
-        # ordinal across ALL state dirs (flat + directory children) plus the
-        # parent's persisted list — so a migrated/reopened/rejected/deleted or
-        # crash-orphaned child can't have its number silently reused (CLAWP-071
-        # Codex r1-3). emit_tree's attach path routes through the same helper so
-        # the two allocators can't drift.
+        # ordinal across ALL state dirs (flat + directory children, incl.
+        # done/archive per CLAWP-085) plus the parent's persisted list — so a
+        # migrated/reopened/rejected/deleted/archived or crash-orphaned child
+        # can't have its number silently reused (CLAWP-071 Codex r1-3).
+        # emit_tree's attach path routes through the same helper so the two
+        # allocators can't drift.
         existing_nums = _existing_child_ordinals(tasks_dir, parent_dir, parent_id)
         next_num = (max(existing_nums) if existing_nums else 0) + 1
         subtask_id = f"{parent_id}-{next_num:03d}"

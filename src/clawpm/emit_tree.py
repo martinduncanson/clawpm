@@ -464,6 +464,9 @@ def _existing_child_nums(tasks_dir: Path, parent_id: str) -> set[int]:
     """
     from .tasks import _existing_child_ordinals
 
+    # CLAWP-085 child-ordinal archive-awareness now lives in the shared
+    # allocator (_existing_child_ordinals) so emit-tree and add_subtask can't
+    # disagree — see that function.
     return _existing_child_ordinals(tasks_dir, tasks_dir / parent_id, parent_id)
 
 
@@ -491,8 +494,10 @@ def _check_id_collisions(
     next_num = (max(existing_nums) if existing_nums else 0) + 1
     for lf in leaves:
         pred_id = f"{parent_id}-{next_num:03d}"
-        # Check if this predicted ID already exists anywhere
-        for state_dir in (tasks_dir, tasks_dir / "done", tasks_dir / "blocked", tasks_dir / "rejected"):
+        # Check if this predicted ID already exists anywhere (CLAWP-085:
+        # done/archive included so a predicted id can't collide with archived
+        # history).
+        for state_dir in (tasks_dir, tasks_dir / "done", tasks_dir / "blocked", tasks_dir / "rejected", tasks_dir / "done" / "archive"):
             conflict_file = state_dir / f"{pred_id}.md"
             conflict_dir = state_dir / pred_id / "_task.md"
             if conflict_file.exists() or conflict_dir.exists():
@@ -514,8 +519,12 @@ def _resolve_idempotency(
 ) -> list[str]:
     """Return leaf_keys of leaves that already exist (idempotent re-emit).
 
-    Scans all children of parent_id for matching leaf_key frontmatter.
-    Returns the list of already-emitted leaf_keys.
+    Scans every location a previously-emitted child of ``parent_id`` can live —
+    the live parent dir, plus ``done/``, ``blocked/``, and (CLAWP-085) the
+    ``done/archive/`` silo (standalone and inside a wholesale-archived parent) —
+    for matching ``leaf_key`` frontmatter. Without the terminal-state dirs, a
+    child that was completed (and possibly archived) since the last emit would
+    not be recognised and the same leaf would be minted twice (Codex review r2).
     """
     from .tasks import get_tasks_dir
 
@@ -526,9 +535,17 @@ def _resolve_idempotency(
     leaf_keys = {lf.leaf_key for lf in leaves}
     already_emitted: list[str] = []
 
-    parent_dir = tasks_dir / parent_id
-    if parent_dir.exists():
-        for f in parent_dir.glob(f"{parent_id}-*.md"):
+    scan_dirs = (
+        tasks_dir / parent_id,                          # live children
+        tasks_dir / "done",                             # completed standalone children
+        tasks_dir / "blocked",                          # blocked standalone children
+        tasks_dir / "done" / "archive",                 # archived standalone children
+        tasks_dir / "done" / "archive" / parent_id,     # children of a wholesale-archived parent
+    )
+    for scan_dir in scan_dirs:
+        if not scan_dir.exists():
+            continue
+        for f in scan_dir.glob(f"{parent_id}-*.md"):
             try:
                 text = f.read_text(encoding="utf-8")
                 fm, _ = parse_frontmatter(text)
@@ -693,7 +710,10 @@ def _predict_parent_id(
     _file_pat = re.compile(rf"^{re.escape(prefix)}-(\d+)(?:\.progress)?$")
     existing_nums = []
 
-    for scan_dir in [tasks_dir, tasks_dir / "done", tasks_dir / "blocked"]:
+    # CLAWP-085: include done/archive so this prediction stays in lockstep with
+    # add_task's (archive-aware) allocator — otherwise emit-tree could re-mint an
+    # archived root id and clobber archived history.
+    for scan_dir in [tasks_dir, tasks_dir / "done", tasks_dir / "blocked", tasks_dir / "done" / "archive"]:
         if not scan_dir.exists():
             continue
         for f in scan_dir.glob(f"{prefix}-*.md"):
@@ -1050,6 +1070,18 @@ def emit_tree(
             if not parent_task:
                 raise EmitValidationError(
                     f"attach_to target {parent_id!r} not found in project {project_id!r}"
+                )
+
+            # CLAWP-085: get_task now resolves archived tasks, so attach_to could
+            # land on a parent under done/archive/. Promoting children into it
+            # would write new files there — immediately path-DONE and hidden from
+            # scans. Refuse, matching add_subtask/split_task (Codex review r2 P2).
+            from .tasks import is_archived_path
+            if is_archived_path(parent_task.file_path):
+                raise EmitValidationError(
+                    f"attach_to target {parent_id!r} is archived (done/archive/) — "
+                    "archived tasks are frozen history and cannot take new children. "
+                    "Move it out of the archive first."
                 )
 
             # Split parent to directory if not already
