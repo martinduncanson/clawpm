@@ -220,7 +220,9 @@ clawpm project init                     # Initialize project in current dir
 ### Tasks
 ```bash
 clawpm tasks                            # List tasks (default: open+progress+blocked)
-clawpm tasks list [-s open|done|blocked|progress|all] [--flat]
+clawpm tasks list [-s open|done|blocked|progress|all] [--flat] [--all-projects]
+                                        # --all-projects: portfolio-wide view across every ACTIVE project;
+                                        # each row carries project_id, filters compose per-project (CLAWP-084)
 clawpm tasks show <id>                  # Task details (includes scope)
 clawpm tasks add -t "Title" [--priority 3] [--complexity m] [--parent <id>] [-b "body"] [--scope "glob/**"]
 clawpm tasks edit <id> [--title "..."] [--priority N] [--complexity s|m|l|xl] [--body "..."] [--scope "glob/**"]

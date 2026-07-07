@@ -14,6 +14,7 @@ from . import __version__
 from .concurrency import LockTimeout
 from .frontmatter import parse_frontmatter
 from .models import (
+    PortfolioConfig,
     ProjectStatus,
     SuccessCriterion,
     Task,
@@ -1440,14 +1441,78 @@ def tasks(ctx: click.Context) -> None:
 @click.option("--parent", "parent", default=None, help="Only the direct subtasks of this parent task id (CLAWP-082).")
 @click.option("--linked", "linked", default=None, help="Only tasks referencing this id via a [[wiki-link]] or a typed edge (CLAWP-082).")
 @click.option("--limit", "limit", type=int, default=None, help="Cap the number of results after filtering + sorting (CLAWP-082).")
+@click.option("--all-projects", "all_projects", is_flag=True, default=False, help="List tasks across every ACTIVE project (CLAWP-084). Each row carries its project_id; filters compose per-project. Mutually exclusive with --project.")
 @click.pass_context
-def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, flat: bool, tags: tuple[str, ...], all_tags: bool, text: str | None, use_regex: bool, priority: str | None, complexities: tuple[str, ...], parent: str | None, linked: str | None, limit: int | None) -> None:
-    """List tasks for a project (default: open+progress+blocked, use -s all for everything)."""
+def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, flat: bool, tags: tuple[str, ...], all_tags: bool, text: str | None, use_regex: bool, priority: str | None, complexities: tuple[str, ...], parent: str | None, linked: str | None, limit: int | None, all_projects: bool) -> None:
+    """List tasks for a project (default: open+progress+blocked, use -s all for everything).
+
+    ``--all-projects`` (CLAWP-084) spans every ACTIVE project instead of one.
+    """
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
 
-    project_id, _ = require_project(ctx, project_id)
+    if all_projects:
+        # CLAWP-084 — portfolio-wide view. --project scopes to a single project,
+        # so combining it with --all-projects is contradictory; refuse rather
+        # than silently pick one.
+        if project_id is not None:
+            raise click.UsageError("--all-projects cannot be combined with --project.")
+        active = discover_projects(config, status_filter=ProjectStatus.ACTIVE)
+        found_tasks = []
+        proj_priority: dict[str, int] = {}
+        for proj in active:
+            proj_priority[proj.id] = proj.priority
+            proj_tasks = _collect_project_tasks(
+                config, proj.id, state, tags, all_tags, text, use_regex,
+                priority, complexities, parent, linked,
+            )
+            # Stamp the owning project on each row so cross-project ids stay
+            # unambiguous (two same-numeric-id tasks in different projects must
+            # never be conflated — cross-project id-isolation class).
+            for t in proj_tasks:
+                t.project_id = proj.id
+            found_tasks.extend(proj_tasks)
+        # Portfolio ordering mirrors `projects next`: project priority first,
+        # then task priority, then id for a stable total order across projects.
+        found_tasks.sort(key=lambda t: (proj_priority.get(t.project_id, 10**9), t.priority, t.id))
+    else:
+        project_id, _ = require_project(ctx, project_id)
+        found_tasks = _collect_project_tasks(
+            config, project_id, state, tags, all_tags, text, use_regex,
+            priority, complexities, parent, linked,
+        )
 
+    if limit is not None and limit >= 0:
+        found_tasks = found_tasks[:limit]
+
+    # CLAWP-084 — in the cross-project view force a flat, project-scoped render:
+    # parent/child hierarchy is per-project and the merged task_map could
+    # otherwise conflate identical ids from different projects.
+    output_tasks_list(found_tasks, fmt=fmt, flat=flat, show_project=all_projects)
+
+
+def _collect_project_tasks(
+    config: PortfolioConfig,
+    project_id: str,
+    state: str | None,
+    tags: tuple[str, ...],
+    all_tags: bool,
+    text: str | None,
+    use_regex: bool,
+    priority: str | None,
+    complexities: tuple[str, ...],
+    parent: str | None,
+    linked: str | None,
+) -> list["Task"]:
+    """Gather + filter one project's tasks (CLAWP-084 extraction).
+
+    Shared by the single-project and ``--all-projects`` list paths so the
+    state-gather + composable-filter pass (CLAWP-069/082) behaves identically in
+    both. Link resolution stays per-project — a ``[[wiki-link]]`` resolves
+    within its own project — which is exactly why the filter pass runs inside
+    the per-project loop rather than globally. No limit is applied here; the
+    caller applies it (globally, after the cross-project merge + sort).
+    """
     if state == "all":
         found_tasks = list_tasks(config, project_id, state_filter=None)
     elif state is None:
@@ -1474,25 +1539,33 @@ def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, fl
         filter_list.append(by_priority(priority))
     if complexities:
         filter_list.append(by_complexity(complexities))
+    # CLAWP-084 — resolve this project's ACTUAL task-ID prefix (explicit
+    # task_prefix -> inferred-from-tasks) so a short ref like `1` expands to the
+    # real minted id even when the prefix diverges from the naive project_id[:5]
+    # (Codex P2: --all-projects over a project with task_prefix="SAME" stored
+    # children under SAME-001 but expanded --parent 1 to ALPHA-001 -> no match).
+    # Also corrects the single-project path for divergent-prefix projects.
+    resolved_prefix = None
+    if parent or linked:
+        from .tasks import resolve_existing_prefix
+        _settings = get_project(config, project_id)
+        resolved_prefix = resolve_existing_prefix(_settings) if _settings else None
     if parent:
-        filter_list.append(by_parent(expand_task_id(parent, project_id)))
+        filter_list.append(by_parent(expand_task_id(parent, project_id, resolved_prefix)))
     if linked:
         from .links import build_link_index
         index = build_link_index(config, project_id)
         # Resolve both the expanded (task-style) id and the raw ref so --linked
         # works for research/mission ids that expand_task_id would leave alone.
         refs: set[str] = set()
-        for target in {expand_task_id(linked, project_id), linked}:
+        for target in {expand_task_id(linked, project_id, resolved_prefix), linked}:
             refs |= index.referencing_ids(target)
         filter_list.append(by_linked(refs))
 
     if filter_list:
         found_tasks = apply_filters(found_tasks, filter_list)
 
-    if limit is not None and limit >= 0:
-        found_tasks = found_tasks[:limit]
-
-    output_tasks_list(found_tasks, fmt=fmt, flat=flat)
+    return found_tasks
 
 
 @tasks.command("tags")
