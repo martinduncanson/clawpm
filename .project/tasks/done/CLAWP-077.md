@@ -24,6 +24,7 @@ scope:
 - src/clawpm/cli.py
 - src/clawpm/cli/**
 - src/clawpm/services/**
+updated: '2026-07-07'
 ---
 # cli.py decomposition + transition service layer (MCP enabler)
 
