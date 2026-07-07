@@ -8,10 +8,10 @@ from pathlib import Path
 import click
 
 from clawpm.concurrency import LockTimeout
-from clawpm.models import Predictions, SURPRISE_TAXONOMY, SuccessCriterion, Task, TaskComplexity, TaskState, WorkLogAction
+from clawpm.models import PortfolioConfig, Predictions, ProjectStatus, SURPRISE_TAXONOMY, SuccessCriterion, Task, TaskComplexity, TaskState, WorkLogAction
 from clawpm.output import OutputFormat, output_error, output_json, output_success, output_task_detail, output_tasks_list
-from clawpm.discovery import get_project
-from clawpm.tasks import add_subtask, add_task, change_task_state, distinct_tags, edit_task, get_task, list_tasks, split_task
+from clawpm.discovery import discover_projects, get_project
+from clawpm.tasks import add_subtask, add_task, archive_done_tasks, change_task_state, distinct_tags, edit_task, get_task, list_tasks, split_task
 from clawpm.worklog import add_entry, filter_files_changed, read_entries
 from clawpm.context import expand_task_id
 from clawpm.cli.base import main, _mutation_errors, get_format, require_portfolio, require_project, _read_patterns_file, _FALLBACK_POLICIES
@@ -48,16 +48,86 @@ def tasks(ctx: click.Context) -> None:
 @click.option("--parent", "parent", default=None, help="Only the direct subtasks of this parent task id (CLAWP-082).")
 @click.option("--linked", "linked", default=None, help="Only tasks referencing this id via a [[wiki-link]] or a typed edge (CLAWP-082).")
 @click.option("--limit", "limit", type=int, default=None, help="Cap the number of results after filtering + sorting (CLAWP-082).")
+@click.option("--all-projects", "all_projects", is_flag=True, default=False, help="List tasks across every ACTIVE project (CLAWP-084). Each row carries its project_id; filters compose per-project. Mutually exclusive with --project.")
+@click.option(
+    "--include-archived", "include_archived", is_flag=True, default=False,
+    help="Fold archived done tasks (done/archive/) back into the listing (CLAWP-085). "
+         "Only affects 'done' and 'all' scans.",
+)
 @click.pass_context
-def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, flat: bool, tags: tuple[str, ...], all_tags: bool, text: str | None, use_regex: bool, priority: str | None, complexities: tuple[str, ...], parent: str | None, linked: str | None, limit: int | None) -> None:
-    """List tasks for a project (default: open+progress+blocked, use -s all for everything)."""
+def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, flat: bool, tags: tuple[str, ...], all_tags: bool, text: str | None, use_regex: bool, priority: str | None, complexities: tuple[str, ...], parent: str | None, linked: str | None, limit: int | None, all_projects: bool, include_archived: bool) -> None:
+    """List tasks for a project (default: open+progress+blocked, use -s all for everything).
+
+    ``--all-projects`` (CLAWP-084) spans every ACTIVE project instead of one.
+    """
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
 
-    project_id, _ = require_project(ctx, project_id)
+    if all_projects:
+        # CLAWP-084 — portfolio-wide view. --project scopes to a single project,
+        # so combining it with --all-projects is contradictory; refuse rather
+        # than silently pick one.
+        if project_id is not None:
+            raise click.UsageError("--all-projects cannot be combined with --project.")
+        active = discover_projects(config, status_filter=ProjectStatus.ACTIVE)
+        found_tasks = []
+        proj_priority: dict[str, int] = {}
+        for proj in active:
+            proj_priority[proj.id] = proj.priority
+            proj_tasks = _collect_project_tasks(
+                config, proj.id, state, tags, all_tags, text, use_regex,
+                priority, complexities, parent, linked, include_archived,
+            )
+            # Stamp the owning project on each row so cross-project ids stay
+            # unambiguous (two same-numeric-id tasks in different projects must
+            # never be conflated — cross-project id-isolation class).
+            for t in proj_tasks:
+                t.project_id = proj.id
+            found_tasks.extend(proj_tasks)
+        # Portfolio ordering mirrors `projects next`: project priority first,
+        # then task priority, then id for a stable total order across projects.
+        found_tasks.sort(key=lambda t: (proj_priority.get(t.project_id, 10**9), t.priority, t.id))
+    else:
+        project_id, _ = require_project(ctx, project_id)
+        found_tasks = _collect_project_tasks(
+            config, project_id, state, tags, all_tags, text, use_regex,
+            priority, complexities, parent, linked, include_archived,
+        )
 
+    if limit is not None and limit >= 0:
+        found_tasks = found_tasks[:limit]
+
+    # CLAWP-084 — in the cross-project view force a flat, project-scoped render:
+    # parent/child hierarchy is per-project and the merged task_map could
+    # otherwise conflate identical ids from different projects.
+    output_tasks_list(found_tasks, fmt=fmt, flat=flat, show_project=all_projects)
+
+
+def _collect_project_tasks(
+    config: PortfolioConfig,
+    project_id: str,
+    state: str | None,
+    tags: tuple[str, ...],
+    all_tags: bool,
+    text: str | None,
+    use_regex: bool,
+    priority: str | None,
+    complexities: tuple[str, ...],
+    parent: str | None,
+    linked: str | None,
+    include_archived: bool = False,
+) -> list["Task"]:
+    """Gather + filter one project's tasks (CLAWP-084 extraction).
+
+    Shared by the single-project and ``--all-projects`` list paths so the
+    state-gather + composable-filter pass (CLAWP-069/082) behaves identically in
+    both. Link resolution stays per-project — a ``[[wiki-link]]`` resolves
+    within its own project — which is exactly why the filter pass runs inside
+    the per-project loop rather than globally. No limit is applied here; the
+    caller applies it (globally, after the cross-project merge + sort).
+    """
     if state == "all":
-        found_tasks = list_tasks(config, project_id, state_filter=None)
+        found_tasks = list_tasks(config, project_id, state_filter=None, include_archived=include_archived)
     elif state is None:
         # Default: show everything except done
         found_tasks = []
@@ -65,7 +135,9 @@ def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, fl
             found_tasks.extend(list_tasks(config, project_id, state_filter=s))
         found_tasks.sort(key=lambda t: (t.priority, t.id))
     else:
-        found_tasks = list_tasks(config, project_id, state_filter=TaskState(state))
+        found_tasks = list_tasks(
+            config, project_id, state_filter=TaskState(state), include_archived=include_archived
+        )
 
     # CLAWP-069/082 — composable filter pass. Every axis is a `by_*` predicate
     # combined with AND via apply_filters (a task must satisfy all of them).
@@ -82,25 +154,33 @@ def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, fl
         filter_list.append(by_priority(priority))
     if complexities:
         filter_list.append(by_complexity(complexities))
+    # CLAWP-084 — resolve this project's ACTUAL task-ID prefix (explicit
+    # task_prefix -> inferred-from-tasks) so a short ref like `1` expands to the
+    # real minted id even when the prefix diverges from the naive project_id[:5]
+    # (Codex P2: --all-projects over a project with task_prefix="SAME" stored
+    # children under SAME-001 but expanded --parent 1 to ALPHA-001 -> no match).
+    # Also corrects the single-project path for divergent-prefix projects.
+    resolved_prefix = None
+    if parent or linked:
+        from clawpm.tasks import resolve_existing_prefix
+        _settings = get_project(config, project_id)
+        resolved_prefix = resolve_existing_prefix(_settings) if _settings else None
     if parent:
-        filter_list.append(by_parent(expand_task_id(parent, project_id)))
+        filter_list.append(by_parent(expand_task_id(parent, project_id, resolved_prefix)))
     if linked:
         from clawpm.links import build_link_index
         index = build_link_index(config, project_id)
         # Resolve both the expanded (task-style) id and the raw ref so --linked
         # works for research/mission ids that expand_task_id would leave alone.
         refs: set[str] = set()
-        for target in {expand_task_id(linked, project_id), linked}:
+        for target in {expand_task_id(linked, project_id, resolved_prefix), linked}:
             refs |= index.referencing_ids(target)
         filter_list.append(by_linked(refs))
 
     if filter_list:
         found_tasks = apply_filters(found_tasks, filter_list)
 
-    if limit is not None and limit >= 0:
-        found_tasks = found_tasks[:limit]
-
-    output_tasks_list(found_tasks, fmt=fmt, flat=flat)
+    return found_tasks
 
 
 @tasks.command("tags")
@@ -178,10 +258,17 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
     _index = build_link_index(config, project_id)
     _linked_from = _index.linked_from(task_id)
 
+    # CLAWP-085: flag archived done tasks so a resolved-from-archive task is
+    # visibly distinguished from a live done task. is_archived_path matches the
+    # specific done/archive/ silo, not any "archive" path segment.
+    from clawpm.tasks import is_archived_path
+    is_archived = is_archived_path(task.file_path)
+
     if fmt == OutputFormat.JSON:
         task_dict = task.to_dict()
         task_dict["reflections_voided"] = reflections_voided
         task_dict["linked_from"] = _linked_from
+        task_dict["archived"] = is_archived
         if _hints:
             task_dict["hints"] = _hints
         output_json(task_dict)
@@ -195,8 +282,82 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
                 + ", ".join(f"{lf['id']} ({lf['via']})" for lf in _linked_from)
                 + "]"
             )
+        if is_archived:
+            click.echo("[archived: true]")
         if reflections_voided:
             click.echo("[reflections_voided: true]")
+
+
+@tasks.command("archive")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
+@click.option(
+    "--older-than", "older_than", default="90d",
+    help="Archive done tasks whose file has not been touched in this window "
+         "(e.g. 90d, 12w, 2160h). Default: 90d.",
+)
+@click.option(
+    "--dry-run", "dry_run", is_flag=True, default=False,
+    help="List what would be archived without moving anything.",
+)
+@click.pass_context
+def tasks_archive(ctx: click.Context, project_id: str | None, older_than: str, dry_run: bool) -> None:
+    """Move stale done tasks into done/archive/ to keep the hot path cheap (CLAWP-085).
+
+    Move-not-delete: nothing is ever removed. Archived tasks stay resolvable via
+    'tasks show' and can be re-listed with 'tasks list -s done --include-archived'.
+    """
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+    project_id, _ = require_project(ctx, project_id)
+
+    from clawpm.reflect import parse_duration
+    try:
+        minutes = parse_duration(older_than)
+    except click.BadParameter:
+        minutes = None
+    if minutes is None:
+        output_error(
+            "bad_older_than",
+            f"Invalid --older-than {older_than!r}. Use forms like 90d, 12w, 2160h.",
+            fmt=fmt,
+        )
+        sys.exit(1)
+    older_than_days = minutes / (60 * 24)
+
+    with _mutation_errors(fmt, "archive_failed"):
+        results = archive_done_tasks(
+            config, project_id, older_than_days=older_than_days, dry_run=dry_run,
+        )
+
+    # Partition the per-candidate records: clean moves/plans vs. skipped vs.
+    # errored (stat failures surfaced, not swallowed).
+    errored = [r for r in results if r.get("error")]
+    skipped = [r for r in results if r.get("skipped")]
+    archived = [r for r in results if not r.get("error") and not r.get("skipped")]
+
+    if fmt == OutputFormat.JSON:
+        output_json({
+            "success": True,
+            "project": project_id,
+            "dry_run": dry_run,
+            "older_than": older_than,
+            "count": len(archived),
+            "archived": archived,
+            "skipped": skipped,
+            "errors": errored,
+        })
+    else:
+        verb = "Would archive" if dry_run else "Archived"
+        if not archived:
+            click.echo(f"No done tasks older than {older_than} to archive.")
+        else:
+            click.echo(f"{verb} {len(archived)} task(s) older than {older_than}:")
+            for rec in archived:
+                click.echo(f"  {rec['id']} -> {rec['to']}")
+        for rec in skipped:
+            click.echo(f"  [skipped: {rec['skipped']}] {rec['id']}")
+        for rec in errored:
+            click.echo(f"  [error: {rec['error']}] {rec['id']}")
 
 
 @tasks.command("edit")
