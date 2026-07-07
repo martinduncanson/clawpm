@@ -329,6 +329,13 @@ class TestArchiveRobustness:
         assert not is_archived_path(Path("/home/archive/proj/.project/tasks/CLAWP-1.md"))
         assert not is_archived_path(Path("/p/.project/tasks/done/CLAWP-1.md"))
         assert not is_archived_path(None)
+        # A repo checked out under an ancestor path that coincidentally contains
+        # a done/archive pair unrelated to the task structure → NOT archived
+        # (Antigravity review: the old any-pair scan matched anywhere in the
+        # absolute path; anchoring on the tasks/done/archive triple fixes it).
+        assert not is_archived_path(
+            Path("/home/bob/done/archive/myrepo/.project/tasks/CLAWP-1.md")
+        )
 
 
 class TestArchiveRound3:

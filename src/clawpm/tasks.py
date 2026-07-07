@@ -983,12 +983,16 @@ def archive_done_tasks(
 
 
 def is_archived_path(path: Path | None) -> bool:
-    """True iff ``path`` sits inside a ``done/archive/`` silo (CLAWP-085).
+    """True iff ``path`` sits inside a ``tasks/done/archive/`` silo (CLAWP-085).
 
-    Matches the specific ``.../done/archive/...`` sequence, not any path
-    component literally named ``archive`` — so a portfolio or repo checked out
-    under a directory named ``archive`` never marks a live ``tasks/`` file as
-    archived (Codex review P3).
+    Matches the specific ``.../tasks/done/archive/...`` sequence — requiring
+    all three consecutive segments, not just ``done``/``archive`` — so neither
+    a directory literally named ``archive`` (Codex review P3) nor a repo
+    checked out under an unrelated ancestor path that happens to contain
+    ``done/archive`` (e.g. ``.../done/archive/myrepo/.project/tasks/...``,
+    Antigravity review) can false-positive the freeze guard. Every real task
+    path has a ``tasks`` segment immediately above ``done``, so anchoring on
+    the triple is a real structural invariant, not a heuristic.
     """
     if path is None:
         return False
@@ -997,8 +1001,8 @@ def is_archived_path(path: Path | None) -> bool:
     # and the freeze guard must still fire (team review).
     parts = [p.lower() for p in path.parts]
     return any(
-        parts[i] == "done" and parts[i + 1] == "archive"
-        for i in range(len(parts) - 1)
+        parts[i] == "tasks" and parts[i + 1] == "done" and parts[i + 2] == "archive"
+        for i in range(len(parts) - 2)
     )
 
 
