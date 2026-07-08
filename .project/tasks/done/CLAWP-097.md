@@ -15,7 +15,7 @@ predictions:
   - Every CLI command/flag shipped in this campaign (069/082/083/085/086/072-005)
     appears in README's All commands section
 priority: 4
-updated: '2026-07-06'
+updated: '2026-07-08'
 ---
 
 # README command reference is stale (missing tags/archive/bulk-state/python -m/updated-field)
