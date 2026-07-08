@@ -69,6 +69,7 @@ from clawpm.cli import project as _project  # noqa: E402,F401
 from clawpm.cli import admin as _admin  # noqa: E402,F401
 from clawpm.cli import resume as _resume  # noqa: E402,F401
 from clawpm.cli import use as _use  # noqa: E402,F401
+from clawpm.cli import introspect as _introspect  # noqa: E402,F401
 
 # Re-exports: symbols that moved into group modules but are still referenced
 # via the historical `clawpm.cli.<name>` path (by the domain layer and tests).
