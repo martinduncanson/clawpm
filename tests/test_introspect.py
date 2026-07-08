@@ -51,14 +51,20 @@ def test_root_command_shape(doc):
 
 def test_every_command_has_required_keys(doc):
     required = {"name", "help", "short_help", "hidden", "deprecated", "params", "is_group"}
+    param_required = {
+        "name", "kind", "opts", "type", "required", "multiple", "nargs",
+        "has_default", "default",
+    }
+    group_required = {"invoke_without_command", "no_args_is_help", "chain", "commands"}
 
     def walk(node):
         assert required <= set(node.keys()), node["name"]
         for p in node["params"]:
-            assert {"name", "kind", "opts", "type", "required", "multiple", "nargs"} <= set(p)
+            assert param_required <= set(p), (node["name"], p["name"])
             assert p["kind"] in ("option", "argument")
+            assert isinstance(p["has_default"], bool)
         if node["is_group"]:
-            assert "commands" in node
+            assert group_required <= set(node.keys()), node["name"]
             for child in node["commands"].values():
                 walk(child)
 
@@ -145,20 +151,61 @@ def test_repeatable_option_marked_multiple(doc):
     assert "--tag" in opts["tags"]["opts"]
 
 
-def test_serialized_options_match_registry():
-    """Every serialized command's option set equals the command's live params —
-    proves the listing is generated from the registry, not hand-maintained."""
+def test_serialized_params_match_registry_structurally():
+    """Every serialized param — options AND positional arguments — matches its
+    live click param in order, kind, required, multiple, nargs, and choices.
 
-    def registered_opt_names(cmd):
-        return {p.name for p in cmd.params}
+    Name-set equality alone wouldn't catch a positional argument whose kind or
+    nargs was serialized wrongly; this proves the whole shape is generated from
+    the registry, not hand-maintained."""
 
     def walk(cmd, node):
-        assert registered_opt_names(cmd) == {p["name"] for p in node["params"]}, node["name"]
+        # Order-preserving, not just set-equal.
+        assert [p.name for p in cmd.params] == [p["name"] for p in node["params"]], node["name"]
+        for live, ser in zip(cmd.params, node["params"]):
+            assert ser["kind"] == live.param_type_name, (node["name"], live.name)
+            assert ser["required"] == bool(live.required), (node["name"], live.name)
+            assert ser["multiple"] == bool(getattr(live, "multiple", False))
+            assert ser["nargs"] == live.nargs
+            assert ser["opts"] == list(live.opts)
+            if isinstance(live.type, click.Choice):
+                assert ser["choices"] == list(live.type.choices)
         if isinstance(cmd, click.Group):
             for sub_name, sub_cmd in cmd.commands.items():
                 walk(sub_cmd, node["commands"][sub_name])
 
     walk(main, build_command_tree(main, "clawpm"))
+
+
+def test_positional_argument_serialized(doc):
+    # `clawpm use [PROJECT_ID]` — a positional argument, so an agent must be able
+    # to see it's an argument (not an option) with its arity.
+    node = _find(doc, ["use"])
+    args = [p for p in node["params"] if p["kind"] == "argument"]
+    assert any(p["name"] == "project_id" for p in args)
+    pid = next(p for p in args if p["name"] == "project_id")
+    # A positional carries its metavar name in opts, never a "--flag" form.
+    assert not any(o.startswith("-") for o in pid["opts"])
+    assert pid["nargs"] == 1
+
+
+def test_has_default_distinguishes_unset_from_none():
+    # An UNSET (no default configured) argument reports has_default=False, while
+    # a flag with an explicit default reports has_default=True — collapsing both
+    # to a bare null would be lossy.
+    doc = build_introspection(main)
+    use_args = {p["name"]: p for p in _find(doc, ["use"])["params"]}
+    assert use_args["project_id"]["has_default"] is False
+    no_hints = {p["name"]: p for p in doc["command"]["params"]}["no_hints"]
+    assert no_hints["has_default"] is True
+    assert no_hints["default"] is False
+
+
+def test_group_exposes_bare_invocation_semantics(doc):
+    # `tasks` is invoke_without_command=True (bare `clawpm tasks` lists tasks).
+    tasks = doc["command"]["commands"]["tasks"]
+    assert tasks["is_group"] is True
+    assert tasks["invoke_without_command"] is True
 
 
 # ---------------------------------------------------------------------------

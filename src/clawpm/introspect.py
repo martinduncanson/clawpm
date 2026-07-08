@@ -21,6 +21,11 @@ from typing import Any
 
 import click
 
+try:  # click >= 8.2 marks "no default configured" with this sentinel.
+    from click.core import UNSET as _UNSET
+except ImportError:  # pragma: no cover — click < 8.2 used None for "unset".
+    _UNSET = object()  # a private sentinel that no real default can equal.
+
 # Bump when the emitted schema shape changes in a way consumers must notice.
 INTROSPECT_SCHEMA_VERSION = 1
 
@@ -34,28 +39,37 @@ def _type_name(param_type: click.ParamType) -> str:
     return getattr(param_type, "name", None) or type(param_type).__name__
 
 
-def _serialize_default(default: Any) -> Any:
-    """Make a param default JSON-friendly.
+def _serialize_default(default: Any) -> tuple[bool, Any]:
+    """Represent a param default as ``(has_default, value)``.
 
-    Callable defaults (click resolves these at parse time) can't be serialized
-    meaningfully and would leak a repr; represent them as a marker. Click's
-    internal "unset" sentinel and any other non-JSON-native value collapse to
-    ``None`` (no meaningful default) so the whole document is clean JSON without
-    leaning on ``default=str`` to stringify an opaque object.
+    ``has_default`` distinguishes "no default configured" (click's ``UNSET``
+    sentinel) from a default that genuinely *is* ``None`` — collapsing both to a
+    bare ``null`` would be lossy, since an agent reconstructing an invocation
+    can't tell an omittable-defaults-to-None option from a required one. When a
+    default exists but isn't JSON-native, we preserve a marker/repr rather than
+    fabricate ``None``:
+
+      - ``UNSET`` sentinel        → ``(False, None)`` — nothing configured
+      - callable (resolved lazily) → ``(True, "<dynamic>")``
+      - other non-serializable     → ``(True, repr(default))`` — faithful, opaque
+      - JSON-native value          → ``(True, value)``
     """
+    if default is _UNSET:
+        return False, None
     if callable(default):
-        return "<dynamic>"
+        return True, "<dynamic>"
     try:
         json.dumps(default)
     except (TypeError, ValueError):
-        return None
-    return default
+        return True, repr(default)
+    return True, default
 
 
 def _serialize_param(param: click.Parameter) -> dict[str, Any]:
     """Serialize a single option/argument to the fields an agent needs to
     construct a valid invocation."""
     ptype = param.type
+    has_default, default_value = _serialize_default(param.default)
     entry: dict[str, Any] = {
         "name": param.name,
         "kind": param.param_type_name,  # "option" | "argument"
@@ -65,7 +79,8 @@ def _serialize_param(param: click.Parameter) -> dict[str, Any]:
         "required": bool(param.required),
         "multiple": bool(getattr(param, "multiple", False)),
         "nargs": param.nargs,
-        "default": _serialize_default(param.default),
+        "has_default": has_default,
+        "default": default_value,
     }
 
     if isinstance(ptype, click.Choice):
@@ -97,9 +112,13 @@ def build_command_tree(command: click.Command, name: str | None = None) -> dict[
     positional semantics of arguments (sorting them would misrepresent the
     invocation).
     """
+    # ``help`` is a str or None in practice, but guard cleandoc against a
+    # non-str slipping through (a lazy/None-like help object) so one odd command
+    # can't crash the whole walk.
+    help_text = command.help if isinstance(command.help, str) else None
     node: dict[str, Any] = {
         "name": name if name is not None else command.name,
-        "help": inspect.cleandoc(command.help) if command.help else None,
+        "help": inspect.cleandoc(help_text) if help_text else None,
         "short_help": command.get_short_help_str() or None,
         "hidden": bool(command.hidden),
         "deprecated": bool(command.deprecated),
@@ -108,6 +127,13 @@ def build_command_tree(command: click.Command, name: str | None = None) -> dict[
 
     if isinstance(command, click.Group):
         node["is_group"] = True
+        # A group can be a valid *leaf* invocation on its own — e.g. bare
+        # ``clawpm tasks`` lists tasks because the group sets
+        # ``invoke_without_command=True``. Surface that so an agent doesn't
+        # assume every group node must be descended into to be invoked.
+        node["invoke_without_command"] = bool(command.invoke_without_command)
+        node["no_args_is_help"] = bool(command.no_args_is_help)
+        node["chain"] = bool(command.chain)
         node["commands"] = {
             sub: build_command_tree(command.commands[sub], sub)
             for sub in sorted(command.commands)
