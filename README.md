@@ -405,6 +405,25 @@ clawpm tasks list --text "auth" --limit 10        # cap results after filter + s
 
 Write `[[CLAWP-042]]` in any task / research / mission body to link it. `clawpm tasks show` and `clawpm context` surface the derived `linked_from` backlinks — wiki-links and typed edges (`depends`, `parent`/`children`, `reference_tasks`, `supersedes`, mission goals) unified in one list.
 
+### Cross-project view (CLAWP-084)
+
+```bash
+clawpm tasks list --all-projects                  # every ACTIVE project in one list, each row carries project_id
+clawpm tasks list --all-projects --tag concurrency # composes with every filter above, per-project
+```
+
+`--all-projects` is mutually exclusive with `--project`. Cross-project id collisions (two projects independently minting the same numeric id) are never conflated — each row is explicitly project-scoped.
+
+### Archive (CLAWP-085)
+
+```bash
+clawpm tasks archive --older-than 90d             # move stale done tasks into done/archive/ (default 90d)
+clawpm tasks archive --dry-run                    # preview what would move, nothing written
+clawpm tasks list -s done --include-archived      # fold archived tasks back into a done/all scan
+```
+
+Move-not-delete: archived tasks are never removed, just relocated out of the hot scan path so `list`/`next`/`reflect` stop paying for unbounded `done/` growth. `tasks show` still resolves an archived task by id.
+
 ### Constitution
 
 Project constitutions are named invariants that constrain what `emit-tree` may accept. Four kinds:
