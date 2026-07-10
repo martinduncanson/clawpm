@@ -16,7 +16,7 @@ predictions:
 priority: 6
 scope:
 - src/clawpm/cli.py
-updated: '2026-07-05'
+updated: '2026-07-10'
 ---
 
 
