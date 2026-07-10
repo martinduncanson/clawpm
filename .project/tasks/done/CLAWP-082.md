@@ -25,6 +25,7 @@ scope:
 - src/clawpm/tasks.py
 - src/clawpm/models.py
 - src/clawpm/cli.py
+updated: '2026-07-10'
 ---
 # Task query/filtering + wiki-link backlinks (graph interlinking)
 

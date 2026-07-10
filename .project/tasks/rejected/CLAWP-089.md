@@ -8,6 +8,11 @@ predictions:
   duration_min: 120
   filled_by: operator
 priority: 5
+rationale: 'Duplicate filing of the same finding CLAWP-087 already covers (identical
+  title/body: research entry template verdict-in-Question antipattern). CLAWP-087
+  did the actual work and is done (PR #43, merged 2026-07-06). This is a stale duplicate
+  from the cross-worktree next-id race (see CLAWP-092), not a separate work item.'
+updated: '2026-07-10'
 ---
 # Fix research entry template/workflow mismatch (verdict-in-Question antipattern)
 

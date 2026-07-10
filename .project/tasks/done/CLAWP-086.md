@@ -21,6 +21,7 @@ priority: 6
 scope:
 - src/clawpm/models.py
 - src/clawpm/tasks.py
+updated: '2026-07-10'
 ---
 # Add updated timestamp to task frontmatter
 

@@ -21,6 +21,7 @@ predictions:
   success_criteria:
   - All five subtasks done; full pytest suite passes; single PR merged on fork
 priority: 3
+updated: '2026-07-10'
 ---
 # Quick-fix batch: dead code, config, CLI ergonomics (audit 2026-07-03)
 

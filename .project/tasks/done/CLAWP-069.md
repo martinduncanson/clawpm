@@ -8,6 +8,7 @@ predictions:
   duration_min: 180
   filled_by: agent
 priority: 5
+updated: '2026-07-10'
 ---
 # Tags / workstreams: cross-cutting task grouping
 

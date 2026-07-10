@@ -16,6 +16,7 @@ predictions:
     non-zero if any fails; reflection/worklog fires per task; tests cover mixed success/failure
     batches and cross-project id safety
 priority: 5
+updated: '2026-07-10'
 ---
 # Bulk state operations (varargs task ids)
 
