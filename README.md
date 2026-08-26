@@ -346,6 +346,7 @@ clawpm reflect summarize    # update the calibration corpus
 | `clawpm use <id>` | — | Set project context |
 | `clawpm conflicts --task <id>` | — | Pre-flight check for scope overlap |
 | `clawpm serve` | — | Start read-only web dashboard at http://127.0.0.1:8080 (needs the `web` extra: `pip install 'clawpm[web]'`) |
+| `clawpm mcp` | — | Start the stdio MCP server so any MCP host (Cursor, Windsurf, VS Code, Claude Code, Amazon Q) can drive clawpm (needs the `mcp` extra: `pip install 'clawpm[mcp]'`) |
 
 Short task IDs work everywhere: `42` expands to `CLAWP-042` based on project prefix. `start` / `done` / `block` / `unblock` (and `tasks state`) accept many IDs at once — see **Bulk state** below.
 
@@ -633,6 +634,56 @@ pip install 'clawpm[web]'           # one-time: install fastapi + uvicorn
 clawpm serve                       # Start on http://127.0.0.1:8080
 clawpm serve --port 8888
 ```
+
+### MCP server (stdio)
+
+Expose clawpm's core to any MCP host — Cursor, Windsurf, VS Code, Claude Code,
+Amazon Q — so an agent can drive task/research/mission management directly,
+not only through the Claude Code skill. Requires the optional `mcp` extra:
+
+```bash
+pip install 'clawpm[mcp]'           # one-time: install the MCP SDK
+clawpm mcp                          # start the stdio server (host launches this)
+clawpm mcp --tools standard         # widen the exposed tool set
+```
+
+The server wraps the core functions **directly** (no subprocess shell-out), so
+it returns structured JSON natively and sidesteps the cp1252 / spaced-path
+encoding pitfalls. It respects `CLAWPM_PORTFOLIO` / project discovery exactly as
+the CLI does, and auto-detects the project from its working directory (pass a
+`project` argument to any tool to target another).
+
+**Core tool set** (10 tools, the default — kept ≤ 12 to keep a host's tool list
+lean): reads `tasks_list`, `tasks_get`, `context`, `next`, `research_list`,
+`mission_list`; writes `tasks_add`, `tasks_state`, `tasks_edit`, `research_add`.
+Writes go through the same validated, calibration-aware path as the CLI
+(`services.tasks.transition` for state changes — parent-rollup gate, work-log,
+dependency cascade, reflection event; surprise-taxonomy validation).
+
+**Tool-count discipline.** The exposed surface is gated by `CLAWPM_MCP_TOOLS`
+(`core` | `standard` | `all`, default `core`) or the `--tools` flag, so future
+tiers never bloat the default. `tasks_add` accepts `success_criteria` and
+predictions (`predict_duration`, `confidence`, `pre_mortem`, …) so tasks created
+over MCP stay verifiable goals that feed calibration.
+
+**Per-project registration (anti-pollution).** Register the server per-project
+via a `.mcp.json` in the project root, so the tool surface loads only when the
+host is opened inside a clawpm project — not globally:
+
+```json
+{
+  "mcpServers": {
+    "clawpm": {
+      "command": "clawpm",
+      "args": ["mcp"],
+      "env": { "CLAWPM_MCP_TOOLS": "core" }
+    }
+  }
+}
+```
+
+stdio is the only transport in v1 (it matches how editors launch MCP servers); an
+HTTP transport may follow.
 
 ### Admin
 

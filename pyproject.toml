@@ -21,6 +21,11 @@ web = [
     "fastapi>=0.100.0",
     "uvicorn[standard]>=0.23.0",
 ]
+# MCP stdio server (CLAWP-068). The `clawpm mcp` command degrades gracefully
+# with a "pip install 'clawpm[mcp]'" hint when this extra isn't present.
+mcp = [
+    "mcp>=1.2.0",
+]
 # Mirrors [dependency-groups].dev below so `pip install -e ".[dev]"` (CI, plain
 # pip) works alongside `uv sync` (which reads the PEP 735 group). Keep in sync.
 dev = [
@@ -29,6 +34,7 @@ dev = [
     "fastapi>=0.100.0",
     "uvicorn[standard]>=0.23.0",
     "httpx>=0.24.0",
+    "mcp>=1.2.0",
 ]
 
 [project.urls]
@@ -53,6 +59,7 @@ dev = [
     "fastapi>=0.100.0",
     "uvicorn[standard]>=0.23.0",
     "httpx>=0.24.0",
+    "mcp>=1.2.0",
 ]
 
 [tool.pytest.ini_options]
