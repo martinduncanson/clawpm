@@ -32,6 +32,7 @@ Design:
 
 from __future__ import annotations
 
+import functools
 import os
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -150,9 +151,18 @@ def _build_predictions(
     if confidence is not None and not (1 <= confidence <= 5):
         raise ValueError(f"confidence must be 1-5, got {confidence}")
 
+    from click import BadParameter
+
     from clawpm.reflect import parse_duration as _parse_duration
 
-    parsed_duration = _parse_duration(predict_duration)  # raises on bad format
+    try:
+        # parse_duration is a Click-option callback and raises click.BadParameter
+        # (not ValueError) on a malformed string outside a CLI context — both
+        # tasks_add and tasks_edit only catch ValueError, so re-raise as one
+        # (CLAWP-068 review F2).
+        parsed_duration = _parse_duration(predict_duration)
+    except BadParameter as exc:
+        raise ValueError(str(exc)) from exc
     return Predictions(
         duration_min=parsed_duration,
         complexity=TaskComplexity(predict_complexity) if predict_complexity else None,
@@ -179,12 +189,16 @@ def tasks_list(
     project: str | None = None,
     state: str | None = None,
     tag: str | None = None,
+    limit: int | None = None,
 ) -> dict:
     """List tasks for a project.
 
     `state` filters by one of open|progress|blocked|done|rejected (omit for the
-    active view: open/progress/blocked). `tag` narrows to tasks carrying that
-    workstream tag. `project` auto-detects from the server's cwd if omitted.
+    active view: open/progress/blocked — matches the CLI's default, done and
+    rejected tasks are excluded unless `state` asks for them explicitly).
+    `tag` narrows to tasks carrying that workstream tag. `limit` caps the
+    result count after filtering + sorting (default: unlimited). `project`
+    auto-detects from the server's cwd if omitted.
     """
     from clawpm.models import TaskState
     from clawpm.tasks import list_tasks
@@ -192,23 +206,36 @@ def tasks_list(
     config = _load_config()
     project_id, source = _resolve_project(project)
 
-    state_filter = None
     if state:
         try:
             state_filter = TaskState(state)
         except ValueError:
             return {"ok": False, "error": "bad_state", "message": f"invalid state '{state}'"}
+        tasks = list_tasks(config, project_id, state_filter=state_filter)
+    else:
+        # Mirror the CLI's default (cli/tasks.py _collect_project_tasks): the
+        # "active view" is open+progress+blocked, NOT an unfiltered scan — an
+        # unfiltered list_tasks(state_filter=None) also walks the done/
+        # directory (CLAWP-068 review F3).
+        tasks = []
+        for s in (TaskState.OPEN, TaskState.PROGRESS, TaskState.BLOCKED):
+            tasks.extend(list_tasks(config, project_id, state_filter=s))
+        tasks.sort(key=lambda t: (t.priority, t.id))
 
-    tasks = list_tasks(config, project_id, state_filter=state_filter)
     if tag:
         tag_l = tag.strip().lower()
         tasks = [t for t in tasks if tag_l in [x.lower() for x in t.tags]]
+
+    total = len(tasks)
+    if limit is not None:
+        tasks = tasks[:limit]
 
     return {
         "ok": True,
         "project": project_id,
         "source": source,
         "count": len(tasks),
+        "total": total,
         "tasks": [t.to_dict() for t in tasks],
     }
 
@@ -463,6 +490,11 @@ def tasks_edit(
     predict_duration: str | None = None,
     predict_complexity: str | None = None,
     predict_files_changed: int | None = None,
+    predict_scope: list[str] | None = None,
+    predict_frameworks: list[str] | None = None,
+    predict_pitfalls: str | None = None,
+    unknowns: str | None = None,
+    predict_iterations: int | None = None,
     confidence: int | None = None,
     pre_mortem: str | None = None,
     predict_approach: str | None = None,
@@ -471,8 +503,11 @@ def tasks_edit(
 ) -> dict:
     """Edit an existing task's metadata (title, priority, complexity, body,
     scope, tags, dispatch-contract fields, predictions). Only the fields you
-    pass are changed. Supplying any `success_criteria`/`predict_*`/`confidence`/
-    `pre_mortem` replaces the predictions block. Returns the updated task."""
+    pass are changed. `edit_task` REPLACES the whole predictions block whenever
+    ANY predict_*/success_criteria/confidence/pre_mortem argument is supplied —
+    so to change one prediction field without erasing the others (pitfalls,
+    unknowns, scope, frameworks, iterations), pass the existing values for the
+    rest too (fetch them via `tasks_get` first). Returns the updated task."""
     from clawpm.context import expand_task_id
     from clawpm.models import TaskComplexity
     from clawpm.tasks import edit_task
@@ -495,17 +530,17 @@ def tasks_edit(
             predict_duration=predict_duration,
             predict_complexity=predict_complexity,
             predict_files_changed=predict_files_changed,
-            predict_scope=None,
-            predict_frameworks=None,
-            predict_pitfalls=None,
+            predict_scope=predict_scope,
+            predict_frameworks=predict_frameworks,
+            predict_pitfalls=predict_pitfalls,
             hypothesis=hypothesis,
             success_criteria=success_criteria,
             predict_approach=predict_approach,
-            unknowns=None,
+            unknowns=unknowns,
             confidence=confidence,
             reference_tasks=reference_tasks,
             pre_mortem=pre_mortem,
-            predict_iterations=None,
+            predict_iterations=predict_iterations,
         )
     except ValueError as exc:
         return {"ok": False, "error": "bad_predictions", "message": str(exc)}
@@ -600,6 +635,37 @@ TOOL_SPECS: list[ToolSpec] = [
 ]
 
 
+def _catch_unhandled(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap a tool so an exception it didn't already catch still returns the
+    documented ``{"ok": false, ...}`` JSON shape instead of an MCP ``isError``
+    text blob.
+
+    Every tool already catches its OWN known validation errors (bad_state,
+    bad_complexity, ...) and returns a dict. But several paths can still raise
+    past that — ``_resolve_project`` when no project is detected, ``edit_task``
+    on a corrupted task file, etc. Left unwrapped, those exceptions escape to
+    the MCP SDK's generic handler, which returns a plain-text ``isError``
+    result — a structurally different, unparseable shape next to every other
+    error this server returns (CLAWP-068 review F11). ``functools.wraps``
+    preserves ``__wrapped__``, which ``inspect.signature`` follows by default —
+    FastMCP's schema generation still sees the original signature/docstring.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return fn(*args, **kwargs)
+        except ValueError as exc:
+            # ValueError is this module's convention for "bad input/state"
+            # (see tasks_state's own except ValueError below) — give it the
+            # same error code a caller would get from a caught one.
+            return {"ok": False, "error": "invalid_argument", "message": str(exc)}
+        except Exception as exc:  # noqa: BLE001 - deliberate tool-boundary catch-all
+            return {"ok": False, "error": "internal_error", "message": str(exc)}
+
+    return wrapper
+
+
 def specs_for_tier(tools_tier: str | None) -> list[ToolSpec]:
     """The subset of tool specs exposed at the requested tier ceiling."""
     ceiling = resolve_tier(tools_tier)
@@ -620,7 +686,7 @@ def build_server(tools_tier: str | None = None, *, name: str = "clawpm"):
 
     server = FastMCP(name, instructions=SERVER_INSTRUCTIONS)
     for spec in specs_for_tier(tools_tier):
-        server.add_tool(spec.fn, name=spec.name)
+        server.add_tool(_catch_unhandled(spec.fn), name=spec.name)
     return server
 
 

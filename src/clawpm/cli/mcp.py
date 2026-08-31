@@ -31,15 +31,19 @@ def mcp(tools_tier: str | None) -> None:
     """
     try:
         from clawpm.mcp_server import run_stdio
+
+        run_stdio(tools_tier)
     except ImportError:
+        # run_stdio() (not this import) is what actually triggers the `mcp`
+        # SDK import, via build_server() — so the guard must wrap the call,
+        # not just the module import, or a missing extra raises a raw
+        # ModuleNotFoundError instead of this message (CLAWP-068 review F1).
         click.echo(
             "The clawpm MCP server requires the optional 'mcp' extra.\n"
             "Install it with:  pip install 'clawpm[mcp]'",
             err=True,
         )
         sys.exit(1)
-
-    run_stdio(tools_tier)
 
 
 if __name__ == "__main__":

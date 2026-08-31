@@ -288,8 +288,13 @@ def build_agent_context(config, project_id: str, source: str = "explicit", log_l
             )
             if result.returncode == 0:
                 git_status["recent_commits"] = [line for line in result.stdout.strip().split("\n") if line]
-        except Exception:
-            pass
+        except Exception as exc:
+            # Best-effort enrichment (git may be absent, repo_path may be stale,
+            # etc.) — swallow rather than fail the whole context call, but flag
+            # it so a caller (an MCP host in particular, which never sees this
+            # process's stderr) can tell "degraded" apart from "no git repo"
+            # (CLAWP-068 review F9).
+            git_status["error"] = str(exc)
 
         if git_status:
             context["git"] = git_status
@@ -313,7 +318,10 @@ def build_agent_context(config, project_id: str, source: str = "explicit", log_l
                                 })
                 if open_issues:
                     context["open_issues"] = open_issues[:5]
-            except Exception:
-                pass
+            except Exception as exc:
+                # Same rationale as the git-status catch above: flag a parse
+                # failure instead of silently reading as "no open issues"
+                # (CLAWP-068 review F9).
+                context["open_issues_error"] = str(exc)
 
     return context
