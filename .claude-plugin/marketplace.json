@@ -1,0 +1,22 @@
+{
+  "name": "clawpm",
+  "owner": {
+    "name": "Martin Duncanson",
+    "email": "martin.duncanson@gmail.com"
+  },
+  "metadata": {
+    "description": "clawpm — multi-project task and research management for Claude Code",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "clawpm",
+      "description": "Multi-project task and research management (JSON-first CLI)",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skills/clawpm"
+      ]
+    }
+  ]
+}
