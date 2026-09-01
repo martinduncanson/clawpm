@@ -152,6 +152,22 @@ def _build_predictions(
     """
     from clawpm.models import Predictions, SuccessCriterion, TaskComplexity
 
+    # NOTE (grok-4.5 round 3): the four list fields below use bare truthiness,
+    # matching the CLI's own `_has_predictions` check (cli/tasks.py) exactly —
+    # not a bug for the CLI, since Click's `multiple=True` can't distinguish
+    # "flag omitted" from "flag passed zero times" (both yield `()`). MCP's
+    # JSON args CAN make that distinction, so `predict_scope: []` alone (no
+    # other field) currently no-ops rather than registering as a predictions
+    # edit. Deliberately NOT switched to `is not None` here: doing so makes
+    # such a call NOT a no-op, but `Predictions.is_empty()` (models.py) then
+    # sees an otherwise-empty object and `edit_task` POPS the entire
+    # predictions block — replacing "silently ignored" with "silently wipes
+    # every existing prediction field" for a caller who likely only meant to
+    # touch scope. Neither behavior is clearly correct for this atomic-
+    # replace-only-supplied-fields design (already true for scalar fields
+    # too — see this function's own "resupply everything" contract note on
+    # tasks_edit); flagged in the PR thread as a design call rather than
+    # auto-fixed either way.
     has_predictions = any([
         predict_duration is not None,
         predict_complexity is not None,
@@ -173,6 +189,16 @@ def _build_predictions(
 
     if confidence is not None and not (1 <= confidence <= 5):
         raise ValueError(f"confidence must be 1-5, got {confidence}")
+
+    # Mirrors the CLI's `--predicted-by` click.Choice — an unvalidated string
+    # here would let an MCP caller write any value into filled_by, polluting
+    # calibration bucketing (e.g. reflect summarize groups by this field)
+    # with values the rest of the codebase never expects (Codex round 3).
+    _valid_filled_by = {"agent", "operator", "operator-edited", "retroactive"}
+    if predicted_by is not None and predicted_by not in _valid_filled_by:
+        raise ValueError(
+            f"predicted_by must be one of {sorted(_valid_filled_by)}, got {predicted_by!r}"
+        )
 
     from click import BadParameter
 
@@ -704,6 +730,8 @@ def _catch_unhandled(fn: Callable[..., Any]) -> Callable[..., Any]:
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
+        from clawpm.concurrency import LockTimeout
+
         try:
             return fn(*args, **kwargs)
         except ValueError as exc:
@@ -711,7 +739,25 @@ def _catch_unhandled(fn: Callable[..., Any]) -> Callable[..., Any]:
             # (see tasks_state's own except ValueError below) — give it the
             # same error code a caller would get from a caught one.
             return {"ok": False, "error": "invalid_argument", "message": str(exc)}
+        except LockTimeout as exc:
+            # add_task/edit_task/add_research don't have transition()'s own
+            # exception-to-dict mapping, so their mutator-contract exceptions
+            # would otherwise fall into the generic internal_error branch
+            # below, losing the distinction a caller needs to decide whether
+            # a retry is sensible (grok-4.5 review) — mirror transition()'s
+            # own codes (services/tasks.py) for the classes that matter.
+            return {"ok": False, "error": "lock_timeout", "message": str(exc)}
+        except FileNotFoundError as exc:
+            return {"ok": False, "error": "not_found", "message": str(exc)}
+        except FileExistsError as exc:
+            return {"ok": False, "error": "already_exists", "message": str(exc)}
         except Exception as exc:  # noqa: BLE001 - deliberate tool-boundary catch-all
+            # Genuinely unanticipated. Whether the mutation partially landed
+            # before this raised is NOT distinguishable here — that needs
+            # every core mutator to expose its own atomicity guarantee, which
+            # is the deferred CLAWP-071 work, not something to improvise in
+            # this wrapper. internal_error means "re-check state before
+            # retrying", not "nothing happened".
             # A truly unexpected exception (not this module's ValueError
             # convention) may indicate more than a normal domain failure —
             # e.g. a write tool raising mid-mutation. The JSON contract still

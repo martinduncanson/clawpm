@@ -357,6 +357,34 @@ def test_wire_level_bad_predict_duration_returns_bad_predictions(isolated_portfo
     _run(scenario)
 
 
+def test_wire_level_bad_predicted_by_returns_bad_predictions(isolated_portfolio):
+    """predicted_by must match the CLI's --predicted-by vocabulary
+    (agent|operator|operator-edited|retroactive) — an unvalidated string
+    would pollute filled_by-bucketed calibration data (Codex review round 3)."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    pid = isolated_portfolio.project_id
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+
+            added = await _call(client, "tasks_add", {
+                "project": pid, "title": "x", "confidence": 3, "predicted_by": "robot-overlord",
+            })
+            assert added["ok"] is False
+            assert added["error"] == "bad_predictions"
+
+            valid = await _call(client, "tasks_add", {
+                "project": pid, "title": "y", "confidence": 3, "predicted_by": "operator-edited",
+            })
+            assert valid["ok"] is True
+            assert valid["task"]["predictions"]["filled_by"] == "operator-edited"
+
+    _run(scenario)
+
+
 # ---------------------------------------------------------------------------
 # wire-level validation-error paths (CLAWP-068 review F12)
 # ---------------------------------------------------------------------------
@@ -434,13 +462,13 @@ def test_cli_mcp_help_runs():
 
 def test_cli_mcp_import_error_shows_friendly_message(monkeypatch):
     """Regression test for CLAWP-068 review F1. The real failure mode is
-    run_stdio() itself raising (via build_server()'s deferred `import mcp`),
-    not `from clawpm.mcp_server import run_stdio` — that import always
+    build_server() raising (its deferred `import mcp`), not
+    `from clawpm.mcp_server import build_server` — that import always
     succeeds since mcp_server.py has no top-level `mcp` dependency. Simulate
-    a missing extra by making run_stdio() raise ModuleNotFoundError(name="mcp"),
-    matching what Python actually raises for `import mcp...` when the package
-    is absent, and assert the CLI's guard now catches it (previously it only
-    wrapped the import)."""
+    a missing extra by making build_server() raise
+    ModuleNotFoundError(name="mcp"), matching what Python actually raises for
+    `import mcp...` when the package is absent, and assert the CLI's guard
+    now catches it (previously it only wrapped the import)."""
     from click.testing import CliRunner
     from clawpm.cli import main
     import clawpm.mcp_server as mcp_server_module
@@ -448,7 +476,7 @@ def test_cli_mcp_import_error_shows_friendly_message(monkeypatch):
     def _boom(tools_tier):
         raise ModuleNotFoundError("No module named 'mcp'", name="mcp")
 
-    monkeypatch.setattr(mcp_server_module, "run_stdio", _boom)
+    monkeypatch.setattr(mcp_server_module, "build_server", _boom)
 
     result = CliRunner().invoke(main, ["mcp"])
     assert result.exit_code == 1
@@ -456,10 +484,10 @@ def test_cli_mcp_import_error_shows_friendly_message(monkeypatch):
     assert "clawpm[mcp]" in result.output
 
 
-def test_cli_mcp_unrelated_module_not_found_propagates(monkeypatch):
+def test_cli_mcp_unrelated_module_not_found_at_construction_propagates(monkeypatch):
     """Regression test for the antigravity-review tightening of F1: a
-    ModuleNotFoundError for something OTHER than `mcp` (e.g. a bug deep in a
-    live server run) must NOT be swallowed and misreported as a missing
+    ModuleNotFoundError for something OTHER than `mcp`, raised while
+    building the server, must NOT be swallowed and misreported as a missing
     extra — it should propagate."""
     from click.testing import CliRunner
     from clawpm.cli import main
@@ -468,7 +496,30 @@ def test_cli_mcp_unrelated_module_not_found_propagates(monkeypatch):
     def _boom(tools_tier):
         raise ModuleNotFoundError("No module named 'some_unrelated_thing'", name="some_unrelated_thing")
 
-    monkeypatch.setattr(mcp_server_module, "run_stdio", _boom)
+    monkeypatch.setattr(mcp_server_module, "build_server", _boom)
+
+    result = CliRunner().invoke(main, ["mcp"])
+    assert result.exit_code != 0
+    assert "pip install 'clawpm[mcp]'" not in result.output
+    assert isinstance(result.exception, ModuleNotFoundError)
+
+
+def test_cli_mcp_module_not_found_during_run_propagates(monkeypatch):
+    """Regression test for grok-4.5's round-3 finding: the guard must wrap
+    ONLY construction (build_server()), not the blocking `.run()` call — a
+    ModuleNotFoundError('mcp') raised during actual server operation (long
+    after startup) must propagate as a real crash, not get misreported as
+    "install the extra" the way it would if the try/except still spanned the
+    whole blocking lifetime."""
+    from click.testing import CliRunner
+    from clawpm.cli import main
+    import clawpm.mcp_server as mcp_server_module
+
+    class _FakeServer:
+        def run(self):
+            raise ModuleNotFoundError("No module named 'mcp'", name="mcp")
+
+    monkeypatch.setattr(mcp_server_module, "build_server", lambda tools_tier: _FakeServer())
 
     result = CliRunner().invoke(main, ["mcp"])
     assert result.exit_code != 0
@@ -645,3 +696,73 @@ def test_wire_level_mission_list_bad_status(isolated_portfolio):
             assert result["error"] == "bad_status"
 
     _run(scenario)
+
+
+# ---------------------------------------------------------------------------
+# has_predictions truthiness — deliberately unchanged (CLAWP-068 review,
+# grok-4.5 round 3 — see _build_predictions's NOTE for why)
+# ---------------------------------------------------------------------------
+
+def test_wire_level_predict_scope_alone_is_a_noop(isolated_portfolio):
+    """`predict_scope: []` as the SOLE tasks_edit argument is a documented
+    no-op, matching the CLI's own `_has_predictions` truthiness check. Grok
+    flagged this as a possible clear-vs-omit gap (like the top-level scope
+    fix), but switching to `is not None` trades a silent no-op for a silent
+    full-wipe of every OTHER existing prediction field (Predictions.is_empty()
+    doesn't know about filled_by, so an otherwise-empty object gets popped
+    entirely by edit_task) — a design call, not a clear defect, left as-is
+    and flagged in the PR thread rather than auto-decided. This test locks in
+    the current (safer) behavior so it doesn't silently change later."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    pid = isolated_portfolio.project_id
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+
+            added = await _call(client, "tasks_add", {
+                "project": pid, "title": "x", "confidence": 3,
+            })
+            task_id = added["task"]["id"]
+            assert added["task"]["predictions"]["confidence"] == 3
+
+            edited = await _call(client, "tasks_edit", {
+                "project": pid, "task_id": task_id, "predict_scope": [],
+            })
+            assert edited["ok"] is True
+            # No-op: existing predictions (confidence) survive untouched,
+            # rather than being wiped by an unintended "empty" replacement.
+            assert edited["task"]["predictions"]["confidence"] == 3
+
+    _run(scenario)
+
+
+# ---------------------------------------------------------------------------
+# _catch_unhandled exception-code mapping (CLAWP-068 review, grok-4.5 round 3)
+# ---------------------------------------------------------------------------
+
+def test_catch_unhandled_maps_known_mutator_exceptions():
+    """LockTimeout/FileNotFoundError/FileExistsError get their own error
+    codes (matching services.tasks.transition's own convention) instead of
+    falling into the generic internal_error bucket — a caller deciding
+    whether to retry needs the distinction."""
+    from clawpm.concurrency import LockTimeout
+
+    def _raises(exc):
+        def fn():
+            raise exc
+        return fn
+
+    lock_result = M._catch_unhandled(_raises(LockTimeout("busy")))()
+    assert lock_result == {"ok": False, "error": "lock_timeout", "message": "busy"}
+
+    nf_result = M._catch_unhandled(_raises(FileNotFoundError("gone")))()
+    assert nf_result == {"ok": False, "error": "not_found", "message": "gone"}
+
+    exists_result = M._catch_unhandled(_raises(FileExistsError("dup")))()
+    assert exists_result == {"ok": False, "error": "already_exists", "message": "dup"}
+
+    other_result = M._catch_unhandled(_raises(RuntimeError("weird")))()
+    assert other_result == {"ok": False, "error": "internal_error", "message": "weird"}
