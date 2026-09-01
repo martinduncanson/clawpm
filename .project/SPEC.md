@@ -22,7 +22,7 @@ clawpm is a multi-project task and research management CLI — the persistent st
 - Not a daemon, service, or network bus. Cross-machine coordination stays out of core (agenticq is design-donor only — CLAWP-052; h5i git-refs transport parked — CLAWP-061).
 - Not an orchestrator runtime — external orchestrators (workflows) compose by shelling the CLI, never merge in (CLAWP-065).
 - Not a humans-first team issue tracker; the operator + agents are the users.
-- Not a code-review tool (codex-review et al. sit alongside, wired via work_log hookpoints).
+- Not a code-review tool (code-quorum et al. sit alongside, wired via work_log hookpoints).
 
 ## Technical Notes
 

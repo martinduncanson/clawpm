@@ -108,7 +108,7 @@ The article is heavy on personal-brand framing but three patterns are genuinely 
 
 ### Cross-modal evaluation for high-stakes outputs
 **Trigger:** Phase 2 calibration analytics (`clawpm reflect summarize`, etc.) lands and we need quality grading. Or any single high-stakes output worth checking.
-**Sketch:** routing layer — call N models on the same input (Opus / Sonnet / Haiku, or via different providers), aggregate scores, surface disagreement. The existing codex-review pattern is one model; cross-modal would generalize. The 1.6 subagent's self-skepticism ("which of these would you drop?") is a poor-man's version already in use.
+**Sketch:** routing layer — call N models on the same input (Opus / Sonnet / Haiku, or via different providers), aggregate scores, surface disagreement. The existing code-quorum pattern is one model; cross-modal would generalize. The 1.6 subagent's self-skepticism ("which of these would you drop?") is a poor-man's version already in use.
 **Inspiration:** Garry Tan's cross-modal eval; Tetlock-style ensemble forecasting.
 
 ### Entity propagation on task done

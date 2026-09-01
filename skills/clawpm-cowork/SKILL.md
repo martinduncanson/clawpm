@@ -13,7 +13,7 @@ This skill:
 
 1. Clones the operator's portfolio repo to `~/clawpm/` (so portfolio.toml + projects/ + work_log.jsonl exist)
 2. Installs the `clawpm` CLI from the latest source
-3. Clones the `codex-review` skill into `~/.claude/skills/codex-review/` so PRE-REVIEW + Codex review discipline works on Cowork (it's not bundled with clawpm)
+3. Clones the `code-quorum` skill into `~/.claude/skills/code-quorum/` so PRE-REVIEW + Codex review discipline works on Cowork (it's not bundled with clawpm)
 4. Runs `clawpm context` to resume where the operator left off
 5. (Optional) Sets up a session-end push-back so changes during the session land back in the portfolio repo
 
@@ -48,12 +48,12 @@ git clone "$CLAWPM_PORTFOLIO_REPO" "$HOME/clawpm"
 uv tool install git+https://github.com/martinduncanson/clawpm
 # (Active fork — has all recent improvements. Upstream is malphas-gh/clawpm.)
 
-# 3. Install codex-review skill (idempotent: clone if missing, pull if present)
+# 3. Install code-quorum skill (idempotent: clone if missing, pull if present)
 mkdir -p "$HOME/.claude/skills"
-if [ -d "$HOME/.claude/skills/codex-review/.git" ]; then
-  git -C "$HOME/.claude/skills/codex-review" pull --ff-only
+if [ -d "$HOME/.claude/skills/code-quorum/.git" ]; then
+  git -C "$HOME/.claude/skills/code-quorum" pull --ff-only
 else
-  git clone https://github.com/martinduncanson/codex-review.git "$HOME/.claude/skills/codex-review"
+  git clone https://github.com/martinduncanson/code-quorum.git "$HOME/.claude/skills/code-quorum"
 fi
 # Public repo, no auth needed. Carries PRE-REVIEW step + 3-5 Concerns mandate + wait-for-codex.py.
 

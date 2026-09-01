@@ -24,7 +24,7 @@ scope:
 
 Audit 2026-07-03: version frozen at 0.1.0 since inception, ZERO git tags despite 35 merged PRs / ~70 done tasks; no feature CHANGELOG (archive/CHANGELOG.md only records file moves); ROADMAP.md phase summary is the de-facto changelog and is stale (Phases 1.6/1.7 marked in flight though long shipped; Phase 2 gated on a 2026-06-05 checkpoint four weeks past). Anyone installing from git cannot tell what they have.
 
-SPEC: (1) write CHANGELOG.md (Keep-a-Changelog shape) seeded from ROADMAP phases + PR history; (2) decide version: tag v0.1.0 as-is or bump to 0.2.0 given the agentic layer shipped - recommend 0.2.0; (3) update pyproject + tag on fork; (4) refresh ROADMAP; (5) adopt the discipline: bump + CHANGELOG entry per merged feature PR (add to the codex-review briefing checklist for this repo).
+SPEC: (1) write CHANGELOG.md (Keep-a-Changelog shape) seeded from ROADMAP phases + PR history; (2) decide version: tag v0.1.0 as-is or bump to 0.2.0 given the agentic layer shipped - recommend 0.2.0; (3) update pyproject + tag on fork; (4) refresh ROADMAP; (5) adopt the discipline: bump + CHANGELOG entry per merged feature PR (add to the code-quorum briefing checklist for this repo).
 
 ## Acceptance Criteria
 

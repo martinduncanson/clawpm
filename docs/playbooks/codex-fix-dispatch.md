@@ -2,14 +2,14 @@
 
 **Status:** canonical reference for converting Codex review-iteration loops to rubric-dispatched subagents.
 **Primitives:** CLAWP-016 (rubric), CLAWP-017 (Stop-hook condition evaluator), CLAWP-018 (subagent dispatch).
-**Skill cross-ref:** `~/.claude/skills/codex-review/SKILL.md` — workflow steps 6 (BRIEF) through 9 (ITERATE).
+**Skill cross-ref:** `~/.claude/skills/code-quorum/SKILL.md` — workflow steps 6 (BRIEF) through 9 (ITERATE).
 
 ## When to use this pattern
 
 Convert any work unit that:
 
 1. Has a known **machine-verifiable terminal state** (Codex returns clean, tests pass, encoding scan empty).
-2. Involves **repeating cycles** of "fix → push → wait → re-review → fix" — the manual iteration loop the codex-review skill describes.
+2. Involves **repeating cycles** of "fix → push → wait → re-review → fix" — the manual iteration loop the code-quorum skill describes.
 3. Doesn't require operator judgment on each cycle (it's iteration, not design).
 
 If the cycle needs operator design decisions per round, leave it in the direct-work flow — dispatch is not the answer.
@@ -53,7 +53,7 @@ clawpm tasks add --project <proj> \
     -t "Codex-fix iteration loop: PR#<N> <short-title>" \
     --priority 3 \
     --predict-duration 1h --predict-complexity m --confidence 3 \
-    --predict-approach "Run codex-review skill workflow: triage Codex findings on the latest review, fix, commit, push, re-ping @codex, wait. Loop until rubric satisfied." \
+    --predict-approach "Run code-quorum skill workflow: triage Codex findings on the latest review, fix, commit, push, re-ping @codex, wait. Loop until rubric satisfied." \
     --predicted-by agent \
     --reference-task <prior-similar-CLAWP-id> \
     --success-criteria "Codex returns clean on PR#<N> head: wait-for-codex.py exit==3 OR review body matches /no major issues|breezy|chef.s kiss|looks good/i" \
@@ -85,13 +85,13 @@ This:
 
 ### 4. Spawn the subagent against the worktree
 
-From the parent agent's perspective (or via Claude Code's Task tool), launch the subagent with the worktree as its working directory and the codex-review skill workflow as its mandate:
+From the parent agent's perspective (or via Claude Code's Task tool), launch the subagent with the worktree as its working directory and the code-quorum skill workflow as its mandate:
 
 ```
 Task tool invocation:
   description: "Codex-fix loop PR#<N>"
   prompt: "You are in <repo>/.clawpm-worktrees/<CLAWP-id>/.
-           Follow the codex-review skill workflow (steps 6-9) to iterate
+           Follow the code-quorum skill workflow (steps 6-9) to iterate
            until the Stop-hook rubric passes. Do not attempt to terminate
            until all three criteria are satisfied. The judge will tell
            you which criteria are failing on each Stop event."
@@ -122,8 +122,8 @@ clawpm tasks teardown-dispatch <CLAWP-id>
 
 ## Cross-references
 
-- `~/.claude/skills/codex-review/SKILL.md` — the manual workflow this pattern automates.
-- `~/.claude/skills/codex-review/scripts/wait-for-codex.py` — 3-surface poll, the gradeable signal source.
+- `~/.claude/skills/code-quorum/SKILL.md` — the manual workflow this pattern automates.
+- `~/.claude/skills/code-quorum/scripts/wait-for-codex.py` — 3-surface poll, the gradeable signal source.
 - `src/clawpm/judges/stop_condition.py` — `evaluate_stop_condition` implementation.
 - `src/clawpm/dispatch.py` — settings.local.json + worktree management.
 - CLAUDE.md "Task definition discipline" section — the upstream policy this pattern operationalises.
