@@ -33,11 +33,16 @@ def mcp(tools_tier: str | None) -> None:
         from clawpm.mcp_server import run_stdio
 
         run_stdio(tools_tier)
-    except ImportError:
-        # run_stdio() (not this import) is what actually triggers the `mcp`
-        # SDK import, via build_server() — so the guard must wrap the call,
-        # not just the module import, or a missing extra raises a raw
+    except ModuleNotFoundError as exc:
+        # run_stdio() (not the import above) is what actually triggers the
+        # `mcp` SDK import, via build_server() — so the guard must wrap the
+        # call, not just the module import, or a missing extra raises a raw
         # ModuleNotFoundError instead of this message (CLAWP-068 review F1).
+        # Narrowed to the `mcp` package specifically (antigravity review) so
+        # an unrelated ModuleNotFoundError raised during a live server run
+        # isn't misreported as "install the mcp extra".
+        if exc.name != "mcp" and not (exc.name or "").startswith("mcp."):
+            raise
         click.echo(
             "The clawpm MCP server requires the optional 'mcp' extra.\n"
             "Install it with:  pip install 'clawpm[mcp]'",

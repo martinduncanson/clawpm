@@ -685,6 +685,16 @@ host is opened inside a clawpm project — not globally:
 stdio is the only transport in v1 (it matches how editors launch MCP servers); an
 HTTP transport may follow.
 
+**Known limitation — git worktrees.** Project resolution follows cwd, but the
+task/research files a tool reads or writes are located via the portfolio
+registry's recorded `repo_path`, not cwd. Launch the server from a git
+worktree (rather than the project's main checkout) and it will silently
+read/write the *main checkout's* files, not the worktree's own — the same
+underlying gap as CLAWP-098 (`clawpm tasks state` et al. from inside a
+dispatched worktree), now also reachable through this server. Don't register
+`.mcp.json` inside a worktree until that's fixed; launch from the main
+checkout.
+
 ### Admin
 
 ```bash

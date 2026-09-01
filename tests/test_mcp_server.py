@@ -437,14 +437,16 @@ def test_cli_mcp_import_error_shows_friendly_message(monkeypatch):
     run_stdio() itself raising (via build_server()'s deferred `import mcp`),
     not `from clawpm.mcp_server import run_stdio` — that import always
     succeeds since mcp_server.py has no top-level `mcp` dependency. Simulate
-    a missing extra by making run_stdio() raise ImportError, and assert the
-    CLI's guard now catches it (previously it only wrapped the import)."""
+    a missing extra by making run_stdio() raise ModuleNotFoundError(name="mcp"),
+    matching what Python actually raises for `import mcp...` when the package
+    is absent, and assert the CLI's guard now catches it (previously it only
+    wrapped the import)."""
     from click.testing import CliRunner
     from clawpm.cli import main
     import clawpm.mcp_server as mcp_server_module
 
     def _boom(tools_tier):
-        raise ImportError("No module named 'mcp'")
+        raise ModuleNotFoundError("No module named 'mcp'", name="mcp")
 
     monkeypatch.setattr(mcp_server_module, "run_stdio", _boom)
 
@@ -452,6 +454,26 @@ def test_cli_mcp_import_error_shows_friendly_message(monkeypatch):
     assert result.exit_code == 1
     assert "pip install" in result.output.lower()
     assert "clawpm[mcp]" in result.output
+
+
+def test_cli_mcp_unrelated_module_not_found_propagates(monkeypatch):
+    """Regression test for the antigravity-review tightening of F1: a
+    ModuleNotFoundError for something OTHER than `mcp` (e.g. a bug deep in a
+    live server run) must NOT be swallowed and misreported as a missing
+    extra — it should propagate."""
+    from click.testing import CliRunner
+    from clawpm.cli import main
+    import clawpm.mcp_server as mcp_server_module
+
+    def _boom(tools_tier):
+        raise ModuleNotFoundError("No module named 'some_unrelated_thing'", name="some_unrelated_thing")
+
+    monkeypatch.setattr(mcp_server_module, "run_stdio", _boom)
+
+    result = CliRunner().invoke(main, ["mcp"])
+    assert result.exit_code != 0
+    assert "pip install 'clawpm[mcp]'" not in result.output
+    assert isinstance(result.exception, ModuleNotFoundError)
 
 
 # ---------------------------------------------------------------------------
@@ -508,5 +530,118 @@ def test_wire_level_tasks_list_limit(isolated_portfolio):
             assert limited["count"] == 2
             assert limited["total"] == 3
             assert len(limited["tasks"]) == 2
+
+    _run(scenario)
+
+
+def test_wire_level_tasks_list_negative_limit_ignored(isolated_portfolio):
+    """A negative limit must not silently apply Python end-slicing
+    (tasks[:-1] drops the last task) — mirrors the CLI's own
+    `limit is not None and limit >= 0` guard (CLAWP-068 review, grok-4.5)."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    pid = isolated_portfolio.project_id
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+
+            await _call(client, "tasks_add", {"project": pid, "title": "t1"})
+            await _call(client, "tasks_add", {"project": pid, "title": "t2"})
+
+            result = await _call(client, "tasks_list", {"project": pid, "limit": -1})
+            assert result["count"] == 2
+
+    _run(scenario)
+
+
+# ---------------------------------------------------------------------------
+# predictions attribution + edit clear-vs-omit semantics (CLAWP-068 review,
+# grok-4.5/4.6 convergent findings)
+# ---------------------------------------------------------------------------
+
+def test_wire_level_predictions_default_filled_by_agent(isolated_portfolio):
+    """MCP-created predictions are attributed filled_by="agent" by default
+    (the CLI's own default is "operator", since a human types CLI flags);
+    predicted_by overrides it."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    pid = isolated_portfolio.project_id
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+
+            added = await _call(client, "tasks_add", {
+                "project": pid, "title": "x", "confidence": 3,
+            })
+            assert added["task"]["predictions"]["filled_by"] == "agent"
+
+            added2 = await _call(client, "tasks_add", {
+                "project": pid, "title": "y", "confidence": 3,
+                "predicted_by": "operator",
+            })
+            assert added2["task"]["predictions"]["filled_by"] == "operator"
+
+    _run(scenario)
+
+
+def test_wire_level_tasks_edit_empty_list_clears_scope(isolated_portfolio):
+    """An explicit empty list for scope/out_of_scope/stop_conditions clears
+    the field (matches edit_task's own contract); omitting the argument
+    leaves it unchanged. `x if x else None` previously coerced [] to None,
+    silently no-opping a clear request (CLAWP-068 review, grok-4.6)."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    pid = isolated_portfolio.project_id
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+
+            added = await _call(client, "tasks_add", {
+                "project": pid, "title": "x",
+                "scope": ["a.py"], "out_of_scope": ["b.py"], "stop_conditions": ["blocked"],
+            })
+            task_id = added["task"]["id"]
+            assert added["task"]["scope"] == ["a.py"]
+
+            cleared = await _call(client, "tasks_edit", {
+                "project": pid, "task_id": task_id,
+                "scope": [], "out_of_scope": [], "stop_conditions": [],
+            })
+            assert cleared["ok"] is True
+            assert cleared["task"]["scope"] == []
+            assert cleared["task"]["out_of_scope"] == []
+            assert cleared["task"]["stop_conditions"] == []
+
+            unchanged = await _call(client, "tasks_edit", {
+                "project": pid, "task_id": task_id, "title": "still x",
+            })
+            assert unchanged["task"]["scope"] == []
+
+    _run(scenario)
+
+
+# ---------------------------------------------------------------------------
+# mission_list status validation (CLAWP-068 review, grok-4.6)
+# ---------------------------------------------------------------------------
+
+def test_wire_level_mission_list_bad_status(isolated_portfolio):
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    pid = isolated_portfolio.project_id
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+
+            result = await _call(client, "mission_list", {"project": pid, "status": "not-a-status"})
+            assert result["ok"] is False
+            assert result["error"] == "bad_status"
 
     _run(scenario)
