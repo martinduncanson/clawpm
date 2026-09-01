@@ -224,7 +224,11 @@ def build_agent_context(config, project_id: str, source: str = "explicit", log_l
     if proj.project_dir:
         spec_file = proj.project_dir / ".project" / "SPEC.md"
         if spec_file.exists():
-            spec_content = spec_file.read_text(encoding="utf-8")
+            # errors="replace": SPEC.md is user-authored foreign input, same
+            # rationale as the git-status/issues.jsonl reads below — an
+            # invalid-UTF-8 byte shouldn't crash context building (antigravity
+            # review, pre-existing gap carried over from cli/shortcuts.py).
+            spec_content = spec_file.read_text(encoding="utf-8", errors="replace")
             if len(spec_content) > 2000:
                 context["spec"] = spec_content[:2000] + "\n\n[...truncated...]"
             else:
