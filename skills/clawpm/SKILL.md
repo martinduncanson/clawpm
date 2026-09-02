@@ -465,10 +465,11 @@ workday — calibration compares elapsed time, not scheduled hours):
 | `2h` | 120 minutes |
 | `3d` | 4 320 minutes (3 × 24 h) |
 | `1w` | 10 080 minutes (7 × 24 h) |
+| `2h30m` | 150 minutes (combined units, CLAWP-096) |
 
 **Phase 1 prediction flags** (on `tasks add` and `tasks edit`):
 ```
---predict-duration      Predicted duration: 90, 90m, 2h, 3d, 1w
+--predict-duration      Predicted duration: 90, 90m, 2h, 2h30m, 3d, 1w
 --predict-complexity    s|m|l|xl
 --predict-files-changed Number of files expected to change
 --predict-scope         File glob scope (repeatable)
