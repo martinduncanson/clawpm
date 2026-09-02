@@ -497,8 +497,144 @@ class TestCLITeardown:
 
 
 # ---------------------------------------------------------------------------
-# Auto-teardown on done
+# CLAWP-098: worktree-dispatched ID-mutator commands must resolve against
+# the worktree's OWN task tree, never the portfolio registry's canonical
+# (main-checkout) location — regardless of cwd, that registry lookup used
+# to be the only resolution path.
 # ---------------------------------------------------------------------------
+
+
+class TestWorktreeSessionScopedMutation:
+    def test_state_mutator_from_worktree_cwd_does_not_corrupt_main_checkout(
+        self, temp_portfolio_with_repo, monkeypatch
+    ):
+        """Regression for CLAWP-098.
+
+        Before the fix: ``get_project_dir`` resolved a project id purely via
+        the portfolio registry scan (100% cwd-independent), so running
+        ``tasks state <id> done`` with cwd inside a dispatched --worktree
+        checkout moved the MAIN checkout's task file to its ``done/`` dir
+        and left the worktree's own (git-tracked) copy of that same file
+        completely untouched — silent cross-checkout corruption.
+
+        After the fix: an active session registered at dispatch time (see
+        ``sessions.register_session`` / ``discovery.get_project_dir``) is
+        checked before the registry scan, so the SAME command mutates the
+        worktree's own task file and leaves the main checkout's copy alone.
+
+        The worktree needs its own copy of ``.project/tasks/<id>.md`` to
+        mutate in the first place -- exactly like clawpm's own dogfooded
+        repo (``.project/`` is git-tracked here, see this repo's
+        CLAUDE.md), which is the actual scenario CLAWP-098 was filed
+        against. So this test commits the freshly-added task file into the
+        fixture repo before dispatching, giving the worktree its own
+        checked-out copy via ``git worktree add``.
+        """
+        config = temp_portfolio_with_repo["config"]
+        repo_dir = temp_portfolio_with_repo["repo_dir"]
+        main_tasks_dir = temp_portfolio_with_repo["tasks_dir"]
+
+        task = add_task(
+            config, "test", title="WT-mutate",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+        main_open_path = main_tasks_dir / f"{task.id}.md"
+        assert main_open_path.exists()
+
+        # Commit .project/ (including the new task file) so the worktree
+        # this test dispatches next actually carries its own copy.
+        subprocess.run(["git", "-C", str(repo_dir), "add", ".project"], check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=a@b", "-c", "user.name=a",
+             "-C", str(repo_dir), "commit", "-q", "-m", "seed .project"],
+            check=True,
+        )
+
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code == 0, r.output
+        payload = json.loads(r.output)["data"]
+        assert payload["session_id"], "dispatch --worktree must register a session_id"
+        wt_path = Path(payload["target_dir"])
+        wt_open_path = wt_path / ".project" / "tasks" / f"{task.id}.md"
+        assert wt_open_path.exists(), (
+            "worktree checkout should carry its own copy of the task file "
+            "(committed into the fixture repo above)"
+        )
+
+        # Run the mutator FROM INSIDE the worktree — the exact scenario a
+        # dispatched subagent (or an operator cd'd into a worktree) hits.
+        monkeypatch.chdir(wt_path)
+        r2 = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "state", task.id, "done"]
+        )
+        assert r2.exit_code == 0, r2.output
+
+        # The worktree's OWN task file moved to ITS OWN done/.
+        assert not wt_open_path.exists()
+        assert (wt_path / ".project" / "tasks" / "done" / f"{task.id}.md").exists()
+
+        # The MAIN checkout's task file must be untouched — still open,
+        # never moved. This is the corruption CLAWP-098 fixes.
+        assert main_open_path.exists(), (
+            "main checkout's task file was corrupted by a mutator run from "
+            "inside the dispatched worktree"
+        )
+        assert not (main_tasks_dir / "done" / f"{task.id}.md").exists()
+
+    def test_state_mutator_outside_any_worktree_still_uses_registry(
+        self, temp_portfolio_with_repo
+    ):
+        """Sanity check: normal single-checkout usage (cwd matches no active
+        session) is completely unaffected by the session-scoped lookup —
+        the registry-lookup fallback still resolves and mutates the main
+        checkout's own task file exactly as before CLAWP-098."""
+        config = temp_portfolio_with_repo["config"]
+        main_tasks_dir = temp_portfolio_with_repo["tasks_dir"]
+        task = add_task(
+            config, "test", title="No worktree",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "state", task.id, "done"]
+        )
+        assert r.exit_code == 0, r.output
+        assert (main_tasks_dir / "done" / f"{task.id}.md").exists()
+
+    def test_teardown_releases_the_session(self, temp_portfolio_with_repo, monkeypatch):
+        """Tearing down a dispatch retires its session so a stale worktree
+        pointer doesn't linger as 'active' after the dispatch is done."""
+        from clawpm.sessions import active_sessions
+
+        config = temp_portfolio_with_repo["config"]
+        repo_dir = temp_portfolio_with_repo["repo_dir"]
+        portfolio_root = temp_portfolio_with_repo["root"]
+        task = add_task(
+            config, "test", title="WT-teardown",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+        subprocess.run(["git", "-C", str(repo_dir), "add", ".project"], check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=a@b", "-c", "user.name=a",
+             "-C", str(repo_dir), "commit", "-q", "-m", "seed .project"],
+            check=True,
+        )
+
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code == 0, r.output
+        wt_path = Path(json.loads(r.output)["data"]["target_dir"])
+        assert len(active_sessions(portfolio_root)) == 1
+
+        monkeypatch.chdir(wt_path)
+        r2 = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "state", task.id, "done"]
+        )
+        assert r2.exit_code == 0, r2.output
+
+        assert active_sessions(portfolio_root) == []
 
 
 class TestSessionStartSidecar:

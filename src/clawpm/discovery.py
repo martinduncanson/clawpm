@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .models import PortfolioConfig, ProjectSettings, ProjectStatus
+from .sessions import find_session_for_cwd
 
 logger = logging.getLogger(__name__)
 
@@ -238,15 +239,49 @@ def get_project_dir(config: PortfolioConfig, project_id: str) -> Path | None:
     """Get the .project directory for a project.
 
     Returns the ``.project/`` directory path (not the repo root) when found,
-    or ``None`` if the project cannot be located via the portfolio registry.
+    or ``None`` if the project cannot be located.
+
+    CLAWP-098: before consulting the portfolio registry, checks whether cwd
+    is inside a worktree that ``tasks dispatch --worktree`` registered a
+    session for (see ``sessions.find_session_for_cwd``). Without this, an
+    ID-based mutator run from inside a dispatched worktree would resolve
+    straight through to the MAIN checkout's ``.project/`` (the registry
+    lookup is 100% cwd-independent) and corrupt its task file instead of the
+    worktree's own. When cwd matches no active session — true for every
+    normal single-checkout invocation — this is a no-op and falls straight
+    through to the registry lookup exactly as before.
 
     Use :func:`find_project_dir_fallback` if you need a best-effort lookup
     that also checks the CWD walk when the registry lookup fails.
     """
+    session_dir = _session_scoped_project_dir(config, project_id)
+    if session_dir is not None:
+        return session_dir
+
     project = get_project(config, project_id)
     if project and project.project_dir:
         return project.project_dir / ".project"
     return None
+
+
+def _session_scoped_project_dir(config: PortfolioConfig, project_id: str) -> Path | None:
+    """Return the ``.project/`` dir of the worktree registered for cwd, if any.
+
+    Returns ``None`` (never raises) when there is no portfolio root, no cwd,
+    or no active session whose registered worktree contains cwd — the caller
+    treats ``None`` as "fall through to the registry lookup".
+    """
+    portfolio_root = getattr(config, "portfolio_root", None)
+    if not portfolio_root:
+        return None
+    try:
+        cwd = Path.cwd()
+    except OSError:
+        return None
+    session = find_session_for_cwd(portfolio_root, cwd, project_id=project_id)
+    if session is None:
+        return None
+    return session.worktree_path.resolve() / ".project"
 
 
 def _read_project_id_from_settings(settings_file: Path) -> str | None:

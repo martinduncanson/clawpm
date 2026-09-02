@@ -670,6 +670,8 @@ This is the dark-side counterpart to the rubric/Stop-hook power: a goal-scoped r
 
 **Never `--worktree`-dispatch a task that mutates a single shared store.** Worktree isolation is built for parallel *code* work with disjoint file scopes (see Scope-Aware Dispatch below). A task that appends to one shared ledger — a decisions store, `work_log.jsonl`, leases, any append-only state, **including clawpm's own JSONL stores** — must dispatch **in-place against the main repo dir**, or the ledger forks per worktree branch and records diverge or are lost. Worktree dispatch is for code; in-place dispatch is for state.
 
+**ID-based mutator commands are safe to run from inside a dispatched `--worktree` checkout (CLAWP-098, fixed).** Prior to the fix, `tasks state/done/block <id>` run with cwd inside a dispatched worktree resolved the project via the global portfolio registry — which ignores cwd entirely — and silently mutated the MAIN checkout's task file instead of the worktree's own copy. `tasks dispatch --worktree` now mints a session pointer (`~/clawpm/sessions.jsonl`) mapping the worktree's filesystem path to the dispatch; any ID-based mutator run with cwd inside that path resolves against the worktree's own `.project/tasks/`, not the registry. This requires the worktree to actually carry its own `.project/` (true for any project that tracks it in git, per CLAWP-075) — a project that doesn't commit `.project/` still has nothing for a worktree-scoped mutator to act on, same as before. Normal single-checkout usage (cwd outside any dispatched worktree) is unaffected either way.
+
 ## Scope-Aware Dispatch
 
 ClawPM can act as a file-claim registry for parallel agent runs. When multiple

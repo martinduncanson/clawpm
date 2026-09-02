@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 import click
@@ -1351,6 +1352,7 @@ def tasks_dispatch(
 
     project = get_project(config, project_id)
     # Resolve target directory
+    session_id: str | None = None
     if worktree:
         if not project or not project.repo_path or not project.repo_path.exists():
             output_error(
@@ -1369,6 +1371,15 @@ def tasks_dispatch(
                 fmt=fmt,
             )
             sys.exit(1)
+        # CLAWP-098: register a session-scoped pointer from a fresh session_id
+        # to the worktree's actual filesystem path. Without this, an ID-based
+        # mutator command (tasks state/done/block) run with cwd inside this
+        # worktree resolves its project via the portfolio registry — which is
+        # cwd-independent — straight back to the MAIN checkout, and mutates
+        # its task file instead of the worktree's own. See sessions.py.
+        from clawpm.sessions import register_session
+        session_id = str(uuid.uuid4())
+        register_session(config.portfolio_root, session_id, task_id, project_id, resolved_dir)
     elif target_dir:
         resolved_dir = Path(target_dir)
         resolved_dir.mkdir(parents=True, exist_ok=True)
@@ -1466,6 +1477,7 @@ def tasks_dispatch(
             "target_dir": resolved_dir.as_posix(),
             "settings_path": path.as_posix(),
             "worktree": worktree,
+            "session_id": session_id,
             "invocation": invocation,
             "rubric_injected": rubric is not None,
             "confirm_close": confirm_close,

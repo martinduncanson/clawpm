@@ -51,12 +51,14 @@ Design tradeoffs:
 from __future__ import annotations
 
 import subprocess
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
 from .discovery import get_project
 from .dispatch import create_worktree, write_dispatch_settings
+from .sessions import register_session
 from .judges.stop_condition import (
     JudgeVerdict,
     evaluate_stop_condition,
@@ -261,6 +263,15 @@ def dispatch_agent(
         raise AgentDispatchError(
             f"git worktree add failed: {error_detail}"
         ) from exc
+
+    # CLAWP-098: register a session-scoped pointer from a fresh session_id
+    # to this worktree's filesystem path, same as `tasks dispatch --worktree`
+    # (this command mirrors that flag — see module docstring). Without it,
+    # an ID-based mutator command the subagent runs with cwd inside
+    # target_dir would resolve its project via the portfolio registry —
+    # cwd-independent — straight back to the MAIN checkout and corrupt its
+    # task file instead of the worktree's own.
+    register_session(config.portfolio_root, str(uuid.uuid4()), subtask_id, project_id, target_dir)
 
     # CLAWP-029: initialise CodeGraph in the worktree so the subagent
     # has the index from turn one. Best-effort — failure (codegraph not

@@ -615,6 +615,13 @@ def teardown_dispatch_settings(
                 target_dir,
                 project_id=resolved_project,
             )
+            # CLAWP-098: retire any session_id -> worktree pointer registered
+            # for this (task_id, project_id) at dispatch time, so a torn-down
+            # dispatch's session doesn't outlive it. No-op (returns 0) for
+            # non-worktree dispatches, which never registered a session.
+            if resolved_project:
+                from .sessions import release_sessions_for_task
+                release_sessions_for_task(portfolio_root, resolved_task, resolved_project)
     return True
 
 
