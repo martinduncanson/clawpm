@@ -873,6 +873,85 @@ class TestWorktreeSessionScopedMutation:
         wt_path = Path(payload["target_dir"])
         assert (wt_path / ".project" / "tasks" / f"{task.id}.md").exists()
 
+    def test_worktree_dispatch_materialization_check_handles_monorepo_subdirectory(
+        self, tmp_path, monkeypatch
+    ):
+        """antigravity review, PR #55: `git cat-file -e HEAD:<path>` resolves
+        <path> relative to the REPO ROOT, not `-C`'s directory. A project
+        whose repo_path is a SUBDIRECTORY of a larger repo (mono-repo
+        layout) needs the probed paths prefixed with `git rev-parse
+        --show-prefix`, or the materialization check silently looks at the
+        wrong location, always concludes ".project isn't tracked", and
+        never blocks an uncommitted task -- resurfacing the original
+        CLAWP-098 corruption specifically for mono-repo-subdirectory
+        projects."""
+        repo_root = tmp_path / "monorepo"
+        repo_root.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo_root)], check=True)
+        (repo_root / "README.md").write_text("root", encoding="utf-8")
+        subprocess.run(
+            ["git", "-c", "user.email=a@b", "-c", "user.name=a",
+             "-C", str(repo_root), "add", "README.md"], check=True,
+        )
+        subprocess.run(
+            ["git", "-c", "user.email=a@b", "-c", "user.name=a",
+             "-C", str(repo_root), "commit", "-q", "-m", "init"], check=True,
+        )
+
+        # The project lives in a SUBDIRECTORY of repo_root -- repo_path is
+        # NOT the git root.
+        project_dir = repo_root / "myproject"
+        project_meta = project_dir / ".project"
+        project_meta.mkdir(parents=True)
+        (project_meta / "settings.toml").write_text(
+            'id = "mono"\nname = "Mono"\nstatus = "active"\npriority = 3\n'
+            f'repo_path = "{project_dir.as_posix()}"\n',
+            encoding="utf-8",
+        )
+        tasks_dir = project_meta / "tasks"
+        tasks_dir.mkdir()
+        (tasks_dir / "done").mkdir()
+        (tasks_dir / "blocked").mkdir()
+
+        portfolio_root = tmp_path / "portfolio"
+        portfolio_root.mkdir()
+        (portfolio_root / "portfolio.toml").write_text(
+            f'portfolio_root = "{portfolio_root.as_posix()}"\n'
+            f'project_roots = ["{repo_root.as_posix()}"]\n'
+            '[defaults]\nstatus = "active"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CLAWPM_PORTFOLIO", str(portfolio_root))
+        config = load_portfolio_config(portfolio_root)
+
+        # Commit the .project/ SCAFFOLDING FIRST (before any task exists on
+        # disk to accidentally sweep in) so the subdirectory-relative "is
+        # .project tracked at all" probe has something real to find -- at
+        # the WRONG (unprefixed) path this would report false, silently
+        # skipping the whole check.
+        (tasks_dir / ".gitkeep").write_text("", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo_root), "add", "myproject/.project"],
+                        check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=a@b", "-c", "user.name=a",
+             "-C", str(repo_root), "commit", "-q", "-m", "seed .project scaffolding"],
+            check=True,
+        )
+
+        task = add_task(
+            config, "mono", title="Monorepo task",
+            predictions=Predictions(success_criteria=["C1"]),
+        )  # deliberately NOT committed
+
+        r = CliRunner().invoke(
+            main, ["-p", "mono", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code != 0, (
+            "an uncommitted task in a mono-repo subdirectory project must "
+            "still be blocked, not silently let through"
+        )
+        assert "task_not_materialized" in r.output
+
 
 class TestSessionStartSidecar:
     def test_dispatch_writes_sidecar(self, temp_portfolio_with_repo, tmp_path):

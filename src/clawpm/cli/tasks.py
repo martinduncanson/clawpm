@@ -1381,8 +1381,22 @@ def tasks_dispatch(
         # all (CLAWP-075's convention) — a project that doesn't never had
         # anything here to check, and dispatch proceeds unaffected exactly
         # as before this fix.
+        #
+        # `git cat-file -e HEAD:<path>` resolves <path> relative to the
+        # REPO ROOT, not `-C`'s directory (antigravity review, PR #55) —
+        # for a project whose repo_path is a SUBDIRECTORY of a larger repo
+        # (a mono-repo layout), an unprefixed ".project" would probe the
+        # wrong location entirely. `git rev-parse --show-prefix` gives the
+        # path from the repo root down to repo_path (empty when repo_path
+        # IS the root), which every probed path below is prefixed with.
+        _prefix_result = subprocess.run(
+            ["git", "-C", str(project.repo_path), "rev-parse", "--show-prefix"],
+            capture_output=True, text=True,
+        )
+        _repo_prefix = _prefix_result.stdout.strip() if _prefix_result.returncode == 0 else ""
         _head_has_project = subprocess.run(
-            ["git", "-C", str(project.repo_path), "cat-file", "-e", "HEAD:.project"],
+            ["git", "-C", str(project.repo_path), "cat-file", "-e",
+             f"HEAD:{_repo_prefix}.project"],
             capture_output=True,
         ).returncode == 0
         if _head_has_project:
@@ -1391,7 +1405,7 @@ def tasks_dispatch(
             _materialized = any(
                 subprocess.run(
                     ["git", "-C", str(project.repo_path), "cat-file", "-e",
-                     f"HEAD:{p.as_posix()}"],
+                     f"HEAD:{_repo_prefix}{p.as_posix()}"],
                     capture_output=True,
                 ).returncode == 0
                 for p in _rel_candidates
