@@ -13,6 +13,7 @@ predictions:
   - Mutation sites raise a friendly error (not raw TypeError) when frontmatter parses
     to a non-dict
 priority: 6
+updated: '2026-09-02'
 ---
 # Non-dict frontmatter can TypeError at mutation sites
 
