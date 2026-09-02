@@ -245,7 +245,26 @@ def _replay(portfolio_root: Path) -> dict[str, SessionRecord]:
     nothing in the logs to explain why. Log it.
     """
     path = _registry_path(portfolio_root)
-    if not path.exists():
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        # Codex P1, PR #55 (round 6): Path.exists() catches OSError
+        # internally and returns False (same dead-code shape already fixed
+        # for is_dir() in stat_is_dir()'s docstring above) — a permission or
+        # unavailable-volume fault on this pre-read check would silently
+        # fall through as "no registry", never reaching the except OSError
+        # below that DOES log. Stat directly so a genuine fault is
+        # distinguished from "file doesn't exist yet" and logged the same
+        # way as every other fail-open path in this function.
+        logger.error(
+            "Failed to stat session registry %s: %s. Session-scoped project "
+            "resolution is DISABLED until this clears — ID-based mutator "
+            "commands run from inside a dispatched worktree will fall "
+            "through to the portfolio registry (main-checkout) lookup.",
+            path, exc,
+        )
         return {}
     sessions: dict[str, SessionRecord] = {}
     try:
