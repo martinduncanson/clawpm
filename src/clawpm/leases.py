@@ -377,7 +377,28 @@ def apply_fallback(config, portfolio_root: Path, lease: Lease, now: datetime) ->
     transitioned}``. ``transitioned`` is False if the task could not be moved
     (e.g. already gone) — the lease is still retired so a missing task doesn't
     loop forever in the sweep.
+
+    CLAWP-098 (Codex round-3 P1, PR #55): the ENTIRE body runs inside
+    ``sessions.suppress_session_resolution()``. This function processes
+    whichever task's lease expired — a task the OPERATOR did NOT explicitly
+    name in the command that triggered this sweep (``tasks dispatch``/
+    ``doctor`` run opportunistically). Without the suppression, running the
+    sweep with cwd inside an unrelated dispatched worktree A would silently
+    read AND transition a completely different task B inside A's checkout
+    instead of B's own canonical location, forking B's state into a
+    worktree that has nothing to do with it.
     """
+    from .sessions import suppress_session_resolution
+
+    with suppress_session_resolution():
+        return _apply_fallback_body(config, portfolio_root, lease, now)
+
+
+def _apply_fallback_body(config, portfolio_root: Path, lease: "Lease", now: datetime) -> dict:
+    """The actual fallback logic — split out of :func:`apply_fallback` purely
+    so its body can run inside the ``suppress_session_resolution()`` context
+    manager without re-indenting ~90 lines. Not meant to be called directly;
+    ``apply_fallback`` is the public entry point."""
     from .models import TaskState
     from .tasks import change_task_state, get_task
 

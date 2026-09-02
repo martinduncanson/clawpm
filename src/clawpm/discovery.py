@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .models import PortfolioConfig, ProjectSettings, ProjectStatus
-from .sessions import find_session_for_cwd
+from .sessions import _suppress_session_resolution, find_session_for_cwd
 
 logger = logging.getLogger(__name__)
 
@@ -286,8 +286,18 @@ def _session_scoped_project_dir(config: PortfolioConfig, project_id: str) -> Pat
     at; this is the write-corruption case ``get_project_dir``'s caller must
     still guard against some other way, unchanged from pre-CLAWP-098).
 
+    Also returns ``None`` — unconditionally, before even checking cwd —
+    inside a ``sessions.suppress_session_resolution()`` block (Codex round-3
+    P1, PR #55): portfolio-wide background housekeeping that resolves a task
+    the operator did NOT explicitly name in the current command (the
+    lease-fallback sweep opportunistically run by ``tasks dispatch``/
+    ``doctor``) must never inherit the caller's own worktree just because it
+    happens to share cwd and project_id — see that function's docstring.
+
     The caller treats ``None`` as "fall through to the registry lookup".
     """
+    if _suppress_session_resolution.get():
+        return None
     portfolio_root = getattr(config, "portfolio_root", None)
     if not portfolio_root:
         return None
@@ -309,7 +319,19 @@ def _session_scoped_project_dir(config: PortfolioConfig, project_id: str) -> Pat
         candidate = session.worktree_path.resolve() / ".project"
         if not candidate.is_dir():
             return None
-    except OSError:
+    except OSError as exc:
+        # grok review, PR #55: log at the same ERROR severity as
+        # sessions._replay's fail-open path — this is the same class of
+        # "silently regress to main-checkout resolution" degrade, just
+        # triggered by a filesystem fault on the WORKTREE side instead of
+        # the registry file. A logged-but-fall-open here beats both a hard
+        # crash (breaks read-only callers) and a silent one (CLAWP-039/041
+        # fail-open-needs-a-marker doctrine).
+        logger.error(
+            "Failed to resolve session worktree %s: %s. Falling through to "
+            "the portfolio registry (main-checkout) lookup for this call.",
+            session.worktree_path, exc,
+        )
         return None
     return candidate
 

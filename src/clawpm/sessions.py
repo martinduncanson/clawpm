@@ -65,6 +65,8 @@ tradeoff ``dispatches.jsonl`` already accepts with no reaping of its own.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -73,11 +75,52 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from .concurrency import append_jsonl_line
+from .concurrency import append_jsonl_line, retry_transient
 
 logger = logging.getLogger(__name__)
 
 SESSION_REGISTRY_FILENAME = "sessions.jsonl"
+
+# CLAWP-098 (Codex round-3 P1, PR #55): the cwd-based redirect is deliberately
+# coarse — it matches on (cwd, project_id) only, not task_id, because a
+# bulk `tasks state A B done` run from inside A's worktree must resolve
+# BOTH A's and B's explicitly-named lookups against that worktree (see
+# discovery.get_project_dir's docstring; test_bulk_state_from_worktree_only_
+# touches_worktree_copies covers this). But that coarseness leaks into
+# INCIDENTAL background processing that happens to run during the same
+# invocation without the operator ever naming the task: the portfolio-wide
+# lease-fallback sweep (leases.apply_fallback) reads and transitions
+# whichever task's lease expired, regardless of what the operator actually
+# asked for. Run from inside worktree A, an unrelated task B's expired
+# lease would get read AND transitioned inside A's checkout instead of B's
+# canonical location — silently forking B's state into a worktree that has
+# nothing to do with it, and marking B's lease reassigned even though its
+# authoritative copy was never touched.
+#
+# `suppress_session_resolution()` is the escape hatch: portfolio-wide
+# housekeeping that resolves a task NOT explicitly named by the operator
+# wraps its own get_task/change_task_state calls in it, forcing pure
+# registry-based (today's, cwd-independent) resolution for that one
+# operation regardless of the ambient cwd. contextvars (stdlib, thread- and
+# asyncio-task-local) rather than a plain module global so a suppressed
+# scope in one call stack can never leak into a concurrent one.
+_suppress_session_resolution: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "clawpm_suppress_session_resolution", default=False
+)
+
+
+@contextlib.contextmanager
+def suppress_session_resolution():
+    """Disable session-scoped ``get_project_dir`` redirection for this call
+    stack. See the module-level comment above ``_suppress_session_resolution``
+    for why this exists and who should use it — NOT a general escape hatch
+    for "I don't want the redirect here"; only for code resolving a task the
+    operator did not explicitly name in the current command."""
+    token = _suppress_session_resolution.set(True)
+    try:
+        yield
+    finally:
+        _suppress_session_resolution.reset(token)
 
 _REGISTERED = "registered"
 _RELEASED = "released"
@@ -195,7 +238,18 @@ def _replay(portfolio_root: Path) -> dict[str, SessionRecord]:
         # file. A replaced byte lands inside whichever line it corrupted;
         # that one line then fails json.loads() below and is skipped same
         # as any other malformed line, while every other line still parses.
-        raw = path.read_text(encoding="utf-8", errors="replace")
+        #
+        # retry_transient (grok review, PR #55): register_session/
+        # release_session write through concurrency.append_jsonl_line,
+        # which takes an exclusive lock for the duration of its write. A
+        # plain unlocked read racing that write is exactly the Windows
+        # sharing-violation shape (winerror 5/32/33) this repo already has
+        # a bounded retry for (CLAWP-032/051) — without it, a concurrent
+        # `tasks dispatch --worktree` (the INTENDED way to use this
+        # feature, likely to run in parallel with other dispatches) could
+        # transiently disable session resolution for every OTHER already-
+        # registered worktree, not just the one racing this read.
+        raw = retry_transient(lambda: path.read_text(encoding="utf-8", errors="replace"))
     except OSError as exc:
         # error, not warning (Codex P1, PR #55): this is the fail-open path
         # that most directly recreates CLAWP-098's original corruption —

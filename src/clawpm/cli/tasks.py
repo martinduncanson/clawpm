@@ -1371,6 +1371,43 @@ def tasks_dispatch(
                 fmt=fmt,
             )
             sys.exit(1)
+        # CLAWP-098 (grok review, PR #55): if this worktree's checkout DOES
+        # carry .project/ (the project git-tracks it, CLAWP-075) but the
+        # DISPATCHED task's own file isn't in it (added but never committed
+        # -- create_worktree checks out committed HEAD), fail loudly here,
+        # BEFORE writing anything, rather than silently dispatching with
+        # CLAWP-098's isolation off. A quiet degrade would mean: the Stop
+        # hook this dispatch installs (eval-stop --task <this task_id>)
+        # hangs forever looking for a task that isn't there IF a session
+        # got registered anyway (Codex P1) -- and skipping registration to
+        # avoid that instead silently un-isolates every OTHER task that IS
+        # committed in this same worktree checkout too, since isolation is
+        # per-worktree, not per-task (grok HIGH). Neither silent option is
+        # acceptable when the project has opted into this protection by
+        # tracking .project/ at all; a project that does NOT track
+        # .project/ never had anything to check here and is unaffected
+        # (see the tasks_dir.exists() check just below).
+        _wt_project_dir = resolved_dir / ".project"
+        if _wt_project_dir.is_dir():
+            from clawpm.tasks import _candidate_task_paths
+            _materialized = any(
+                p.exists()
+                for p in _candidate_task_paths(_wt_project_dir / "tasks", task_id)
+            )
+            if not _materialized:
+                output_error(
+                    "task_not_materialized",
+                    f"Task {task_id!r} exists in the current checkout but isn't "
+                    f"committed, and this project git-tracks .project/ — the new "
+                    f"worktree's checkout at {resolved_dir} has .project/ but not "
+                    f"this task's file. Dispatching anyway would either hang the "
+                    f"Stop hook (looking for a task that isn't there) or silently "
+                    f"disable CLAWP-098's worktree isolation for every task in "
+                    f"this checkout. Commit the task file first, then re-run "
+                    f"dispatch — or omit --worktree to dispatch in-place.",
+                    fmt=fmt,
+                )
+                sys.exit(1)
     elif target_dir:
         resolved_dir = Path(target_dir)
         resolved_dir.mkdir(parents=True, exist_ok=True)
@@ -1451,24 +1488,19 @@ def tasks_dispatch(
     if worktree:
         from clawpm.sessions import register_session
         from clawpm.tasks import _candidate_task_paths
-        # CLAWP-098 (Codex P1, PR #55): verify the task is actually
-        # materialized in the worktree BEFORE registering a session for it.
-        # If the task was `tasks add`-ed but never committed, create_worktree
-        # checked out a HEAD that has .project/ (git-tracked) but NOT this
-        # task's file — registering the session anyway would redirect the
-        # worktree's own eval-stop Stop-hook to look for it there, find
-        # nothing, and block termination forever ("task not found"), same
-        # failure shape as the reverted `clawpm agent dispatch` path.
-        #
-        # Checked with an EXPLICIT tasks_dir against resolved_dir, not via
-        # get_task(config, ...) — at this point in the command, cwd is
-        # wherever the OPERATOR invoked `tasks dispatch` from, essentially
-        # never inside the worktree it just created, so a cwd-based lookup
-        # would silently fall through to the OLD registry resolution (main
-        # checkout) and report a false "materialized" even when the
-        # worktree's own copy is missing. _candidate_task_paths is the same
-        # single-source-of-truth every task-file shape (plain file, subtask,
-        # directory-task _task.md, ...) resolves through elsewhere.
+        # Re-verify materialization here (cheap; already gated once, hard,
+        # right after create_worktree above when .project/ exists but this
+        # task doesn't — see that block's comment for the full reasoning).
+        # This second check only ever matters for the OTHER case: a project
+        # that doesn't git-track .project/ at all, where the early gate
+        # never ran and there is genuinely nothing here to register against
+        # — documented, pre-existing, unaffected-by-CLAWP-098 behavior, not
+        # an error. Checked with an EXPLICIT tasks_dir against resolved_dir,
+        # not via get_task(config, ...) — cwd here is wherever the OPERATOR
+        # invoked `tasks dispatch` from, essentially never inside the
+        # worktree it just created, so a cwd-based lookup would silently
+        # fall through to the OLD registry resolution and report a false
+        # "materialized" even when the worktree's own copy is missing.
         materialized = any(
             p.exists()
             for p in _candidate_task_paths(resolved_dir / ".project" / "tasks", task_id)

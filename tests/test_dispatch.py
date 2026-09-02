@@ -767,30 +767,35 @@ class TestWorktreeSessionScopedMutation:
         # Still exactly the ORIGINAL session -- no orphan from the failed retry.
         assert len(active_sessions(portfolio_root)) == 1
 
-    def test_worktree_dispatch_with_uncommitted_task_does_not_register_a_hanging_session(
+    def test_worktree_dispatch_with_uncommitted_task_is_blocked_not_silently_degraded(
         self, temp_portfolio_with_repo
     ):
-        """Regression for a Codex P1 finding on PR #55's second round: if a
+        """Regression for Codex P1 (round 2) + grok HIGH (round 3): if a
         task is `tasks add`-ed but never committed, create_worktree checks
         out a HEAD whose .project/ exists (git-tracked) but does NOT contain
-        the new task's file. Registering a session anyway would redirect
-        the worktree's own eval-stop Stop-hook to look for the task there,
-        find nothing, and hang forever -- the same failure class Codex
-        caught (and this PR reverted) for `clawpm agent dispatch`.
-        `tasks dispatch --worktree` must instead skip registration for THIS
-        dispatch, falling back to the pre-CLAWP-098 registry resolution --
-        known-unfixed for the uncommitted case, but never a hang."""
-        from clawpm.sessions import active_sessions
+        the new task's file.
 
+        An earlier version of this fix silently skipped session
+        registration in this case (falling back to pre-CLAWP-098
+        resolution) -- but grok correctly flagged that as its own footgun:
+        isolation is per-WORKTREE, not per-task, so skipping registration
+        entirely also silently un-isolates any OTHER, already-committed
+        sibling task that DOES live in that same checkout, with no warning
+        that isolation is off. Since the project has opted into this
+        protection by git-tracking .project/ at all, `tasks dispatch
+        --worktree` now REFUSES the dispatch outright with a clear,
+        actionable error -- before writing anything (no worktree settings,
+        no dispatch registry entry, no session) -- rather than silently
+        degrading. Committing the task first, or omitting --worktree,
+        unblocks it."""
         config = temp_portfolio_with_repo["config"]
         repo_dir = temp_portfolio_with_repo["repo_dir"]
-        portfolio_root = temp_portfolio_with_repo["root"]
 
         # Commit the .project/ SCAFFOLDING (settings.toml + an empty tasks
         # dir) WITHOUT any task yet -- a project that git-tracks .project/
-        # but hasn't committed THIS in-flight task, the realistic case
-        # Codex's finding describes (tasks add then dispatch without an
-        # intervening commit).
+        # but hasn't committed THIS in-flight task, the realistic case both
+        # findings describe (tasks add then dispatch without an intervening
+        # commit).
         (repo_dir / ".project" / "tasks" / ".gitkeep").write_text("", encoding="utf-8")
         subprocess.run(["git", "-C", str(repo_dir), "add", ".project"], check=True)
         subprocess.run(
@@ -807,13 +812,11 @@ class TestWorktreeSessionScopedMutation:
         r = CliRunner().invoke(
             main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
         )
-        assert r.exit_code == 0, r.output
-        payload = json.loads(r.output)["data"]
-        assert payload["session_id"] is None, (
-            "no session should be registered when the task isn't "
-            "materialized in the worktree"
-        )
-        assert active_sessions(portfolio_root) == []
+        assert r.exit_code != 0
+        assert "task_not_materialized" in r.output
+        assert not settings_path(
+            repo_dir / ".clawpm-worktrees" / task.id
+        ).exists(), "nothing should be written when dispatch is refused"
 
 
 class TestSessionStartSidecar:
