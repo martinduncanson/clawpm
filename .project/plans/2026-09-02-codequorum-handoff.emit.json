@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "project": "code-quorum",
+  "root": {
+    "title": "Lens checklists from osmani agent-skills personas + mechanical skip threshold (handoff from clawpm CLAWP-103 ADR)",
+    "predictions": {
+      "complexity": "m",
+      "confidence": 3,
+      "approach": "Fold the substantive content of addyosmani/agent-skills personas (security-auditor STRIDE + OWASP-LLM section; test-engineer scenario table; code-reviewer review-tests-first + Critical-blocks-approval rule) into code-quorum's PRE-REVIEW local pass as lens checklists, and replace prose skip conditions with /ship's mechanical threshold. No persona system; no new subagent type.",
+      "pre_mortem": "The lenses balloon the PRE-REVIEW prompt and slow the local pass; keep each lens to a checklist under ~25 lines and gate the security lens on files touched.",
+      "filled_by": "agent"
+    }
+  },
+  "prd": {
+    "title": "PRD: osmani personas as code-quorum lenses (CLAWP-103 handoff)",
+    "type": "decision",
+    "tags": ["prd", "review", "lenses", "clawp-103"],
+    "body_markdown": "## Objective\ncode-quorum's local PRE-REVIEW pass gains three checklist lenses derived from addyosmani/agent-skills personas, and a mechanical skip rule.\n\n## Why\nclawpm CLAWP-103 (ADR docs/design/ADR-2026-09-02-planning-merge-plan.md in martinduncanson/clawpm, rows A2/A3) decided: no persona system anywhere in the stack; personas are checklists and code-quorum's Sonnet PRE-REVIEW is where a checklist earns its keep. This also closes the open question in specs/spec-conformance-lens.md about whether the personas contribute checklist material.\n\n## Constraints\n- Adapt the ideas, do not vendor the persona files.\n- Lenses are prompt material for the existing local pass, not new surfaces in the quorum table.\n- Skip rule must be testable: <=2 files AND <50 changed lines AND no path under auth/payments/data-access/config globs.\n\n## Out of scope\n- web-performance-auditor (browser apps only; not a standing lens).\n- Any change to the four external surfaces.\n\n## Success definition\nPRE-REVIEW output cites the lens that produced each finding; the skip rule is a function with tests; SKILL.md documents both.\n\n## Chosen approach\nSee objective.\n\n## Open questions\n- Whether the security lens should run only when the diff touches its trigger globs (recommended) or always.\n\n## Traceability\nSource: osmani-scout report 2026-07-14 (session d94ce3c4) and raw persona files at github.com/addyosmani/agent-skills agents/*.md and .claude/commands/ship.md.\n"
+  },
+  "leaves": [
+    {
+      "ref": "C1",
+      "parent_ref": null,
+      "leaf_key": "lenses::osmani-checklists-and-skip-rule",
+      "title": "PRE-REVIEW runs security / test-coverage / correctness lens checklists and applies a mechanical skip threshold",
+      "success_criteria": [
+        {
+          "criterion": "Three lens checklist files exist (security: STRIDE-from-trust-boundaries + OWASP LLM Top 10 items + no-disable-the-control rule; test-coverage: happy/empty/boundary/error/concurrency scenario table + Prove-It for bug fixes; correctness: review tests first, Critical blocks approval), each under 25 lines, and the PRE-REVIEW prompt loads them",
+          "gradeable_signal": "files present; prompt assembly test shows them included; a sample review output tags findings with lens names",
+          "comparator": "eq:present"
+        },
+        {
+          "criterion": "WHEN a diff has <=2 files AND <50 changed lines AND touches no path matching the sensitive globs THEN the skip function returns skip=true with the reason; any single condition failing returns skip=false naming it",
+          "gradeable_signal": "unit tests on the boundary (2/3 files, 49/50 lines, one sensitive path)",
+          "comparator": "eq:pass"
+        },
+        {
+          "criterion": "SKILL.md documents the lenses and the skip rule; specs/spec-conformance-lens.md open question on personas is marked resolved with a pointer",
+          "gradeable_signal": "doc diff",
+          "comparator": "eq:present"
+        }
+      ],
+      "scope": ["SKILL.md", "specs/spec-conformance-lens.md", "scripts/", "prompts/"],
+      "out_of_scope": ["external surfaces", "persona files vendored verbatim", "spec lens implementation (CODE--021)"],
+      "stop_conditions": [
+        "If the PRE-REVIEW pass has no prompt-assembly seam to load lens files, STOP and report; do not inline them into SKILL.md prose."
+      ],
+      "delegability": "agent",
+      "predictions": {
+        "duration_min": 120,
+        "complexity": "m",
+        "confidence": 3,
+        "approach": "Read the current PRE-REVIEW invocation in code-quorum; add a lenses/ directory loaded into the prompt; skip rule as a pure function in scripts with tests. UNGROUNDED-GRAPH effort.",
+        "pre_mortem": "Lens findings duplicate Codex P2s and inflate noise; tag by lens so divergence analysis can measure it.",
+        "filled_by": "agent"
+      }
+    }
+  ]
+}

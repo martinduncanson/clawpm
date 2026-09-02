@@ -53,3 +53,25 @@ Full task body: `.project/tasks/CLAWP-104.md` in this worktree.
 - Seed follow-up clawpm tasks via `clawpm tasks add` (or `clawpm tasks emit-tree` if the merge plan naturally decomposes into a tree) rather than leaving the plan as prose only.
 - Commit + push the branch (`session/fable-merge-planning-20260902`) early and often per git-discipline — don't let a long Fable session sit unpushed.
 - Mark CLAWP-103/104 done (or split into follow-ups + mark the parent done) in the **main** checkout (`F:/Git/clawpm`), never from inside this worktree — that's the exact CLAWP-098 worktree-isolation bug this same session fixed today (PR #55).
+
+## Outcome — Fable planning session, 2026-09-02 (planning only; implementation is for Sonnet sessions)
+
+Both tasks planned and specced in one session. Nothing implemented here by design.
+
+**Deliverables in this branch**
+- `docs/design/ADR-2026-09-02-planning-merge-plan.md` — CLAWP-103 merge plan: 27-row adopt/adapt/skip table, design D1–D6 of the adopted mechanics, routed-elsewhere table, revisit triggers, pre-mortem.
+- `docs/design/calibration-metrics-spec.md` — CLAWP-104 audit (measured corpus facts) + the single definition of every calibration formula, miss-category taxonomy, forward-only two-line ledger, honest actuals, pre-auth lanes (spec only), gbrain dedupe rules.
+- `.project/plans/*.emit.json` — the three emit-tree documents, CLI-validated (`--dry-run` clean) and emitted.
+
+**Trees emitted (live in the main checkout backlog)**
+- `CLAWP-111` decision maps — 6 leaves, parallel_group 1→3: 111-001 kind:decision + resolution · 111-002 root map sections + fog · 111-003 emit-tree depends_refs/kind · 111-004 frontier query · 111-005 planner chart mode docs · 111-006 SKILL rules + plugin commands.
+- `CLAWP-112` calibration — 6 leaves, parallel_group 1→4: 112-001 pre-registered predictions ledger · 112-002 honest actuals · 112-003 miss_category · 112-004 metrics + scorecard · 112-005 nudges + closure alarm · 112-006 docs + COGNI-007 cross-link.
+- `CODE--026` (code-quorum) — osmani personas as PRE-REVIEW lens checklists + mechanical skip threshold.
+
+**Inputs that were found, not reconstructed**: the d94ce3c4 scout reports (osmani, pocock, superpowers) and the Fable meta-learning design review were recovered from the subagent transcripts under `~/.claude/projects/C--Users-Martin-Workspace/d94ce3c4-*/subagents/`. wayfinder `SKILL.md` fetched verbatim. gbrain formulas read from `garrytan/gbrain` source (server unreachable).
+
+**Decisions recorded** in `~/.claude/decisions.md` (four rows dated 2026-09-02): wayfinder adopted into clawpm as a task kind; openspec WONT-DO upheld with a sharpened revisit trigger; no persona system (code-quorum lenses instead); calibration formulas defined once in clawpm and shared with the gbrain bridge.
+
+**Execution order for the Sonnet session**: `clawpm next --project clawpm` will surface parallel_group 1 leaves first. 111-001/002 and 112-001/002 are independent and can run as two parallel pairs. Each leaf is one PR with tests through code-quorum. Read the ADR (for 111) or the spec (for 112) before starting a leaf — the task bodies carry the rubric, the docs carry the design.
+
+**Open items not ticketed**: OpenSpec-style spec deltas folded into `.project/SPEC.md` on close (fog on CLAWP-111); retire/redefine `confidence` if it still shows no discrimination against `held` after 112-004 (research entry, not a leaf); gbrain reconciliation once reachable (cognition-layer COGNI-007, not clawpm).
