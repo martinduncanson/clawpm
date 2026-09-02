@@ -102,6 +102,33 @@ class TestHyphenOnSliceBoundary:
         _make_portfolio(tmp_path, monkeypatch, "arb-prd")
         assert _add("arb-prd", "epic") == "ARB-P-000"
 
+    def test_two_taskless_siblings_on_the_same_slice_boundary_do_not_collide(
+        self, tmp_path, monkeypatch
+    ):
+        # Code-quorum review finding: _portfolio_prefixes' collision-set
+        # placeholder for a still task-less sibling must agree with what
+        # assign_task_prefix's OWN candidate strips to, or two siblings that
+        # both slice-with-boundary-hyphen to "CODE" (here: "code-quorum" and
+        # "code-runner", both registered but neither has minted yet) could
+        # each independently conclude "CODE" is free and collide.
+        #
+        # With the placeholders in agreement, EITHER sibling seeing the
+        # other's not-yet-real "CODE" placeholder is enough to make it
+        # defensively extend past the short prefix -- unlike the arb-prd/
+        # arb-prod case (where the first minter keeps the short prefix
+        # cleanly because the second hasn't registered a same-shaped
+        # placeholder yet), here neither has minted, so it's not knowable in
+        # advance which one "should" get to keep "CODE". Collision-safety
+        # (the actual invariant under test), not who keeps the short prefix,
+        # is what this test asserts.
+        _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        _add_project(tmp_path, "code-runner")  # also task-less at this point
+        first = _add("code-quorum", "e")
+        second = _add("code-runner", "e")
+        pre = lambda tid: tid.rsplit("-", 1)[0]
+        assert pre(second) != pre(first), (first, second)  # distinct namespaces
+        assert len({first, second}) == 2, (first, second)  # no literal id collision
+
 
 # ---------------------------------------------------------------------------
 # CLAWP-048: cross-project prefix uniqueness (near-name-twin projects must not

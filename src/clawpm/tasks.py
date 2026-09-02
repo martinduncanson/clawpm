@@ -1260,19 +1260,6 @@ def resolve_existing_prefix(settings) -> str | None:
     return None
 
 
-def _portfolio_prefixes(config, exclude_id: str) -> set[str]:
-    """Prefixes already claimed by OTHER projects (resolved, or ``[:5]`` for the
-    task-less ones, so a new project can't grab a prefix another would derive)."""
-    from .discovery import discover_projects
-
-    used: set[str] = set()
-    for p in discover_projects(config):
-        if p.id == exclude_id:
-            continue
-        used.add(resolve_existing_prefix(p) or p.id.upper()[:5])
-    return used
-
-
 def _strip_trailing_non_alnum(prefix: str) -> str:
     """Drop trailing non-alphanumeric characters from a derived prefix slice.
 
@@ -1289,6 +1276,37 @@ def _strip_trailing_non_alnum(prefix: str) -> str:
     return stripped or prefix
 
 
+def _naive_prefix_placeholder(project_id: str) -> str:
+    """The prefix a task-less project would derive on its first mint.
+
+    Mirrors ``assign_task_prefix``'s own ``base`` candidate exactly
+    (``id.upper()[:5]`` + the CLAWP-096 trailing-separator strip). Used as
+    the ``_portfolio_prefixes`` collision-set placeholder for a sibling
+    project that has no explicit ``task_prefix`` and no tasks minted yet —
+    if this placeholder disagreed with what ``assign_task_prefix`` actually
+    derives, two still-task-less siblings whose slices land on the same
+    boundary (e.g. two "code-*" projects, both -> "CODE") could each fail to
+    see the other as a collision and independently mint the same prefix.
+    """
+    full = project_id.upper()
+    base = full[:5] if len(full) >= 5 else full
+    return _strip_trailing_non_alnum(base)
+
+
+def _portfolio_prefixes(config, exclude_id: str) -> set[str]:
+    """Prefixes already claimed by OTHER projects (resolved, or the naive
+    first-mint placeholder for the task-less ones, so a new project can't
+    grab a prefix another would derive)."""
+    from .discovery import discover_projects
+
+    used: set[str] = set()
+    for p in discover_projects(config):
+        if p.id == exclude_id:
+            continue
+        used.add(resolve_existing_prefix(p) or _naive_prefix_placeholder(p.id))
+    return used
+
+
 def assign_task_prefix(
     project_id: str, tasks_dir: Path, config, explicit_prefix: str | None = None
 ) -> str:
@@ -1297,9 +1315,13 @@ def assign_task_prefix(
     explicit ``task_prefix`` -> inferred-from-existing (stability) -> shortest
     collision-free extension of ``id.upper()[:5]``. A new project that would
     collide on ``[:5]`` gets the shortest longer prefix no other project uses.
-    Each derived candidate is passed through ``_strip_trailing_non_alnum``
-    (CLAWP-096) so a slice boundary landing on a hyphen never produces a
-    doubled separator once ``-{num:03d}`` is appended.
+    The base candidate is derived via ``_naive_prefix_placeholder`` (CLAWP-096)
+    so a slice boundary landing on a hyphen never produces a doubled separator
+    once ``-{num:03d}`` is appended, and so this function's own candidate
+    always agrees with what ``_portfolio_prefixes`` assumes OTHER task-less
+    projects would derive. Extension-loop candidates beyond the base are
+    stripped the same way; the final fallback is intentionally NOT stripped
+    (see comment below).
     """
     if explicit_prefix:
         return explicit_prefix.upper()
@@ -1308,14 +1330,22 @@ def assign_task_prefix(
         return inferred
     full = project_id.upper()
     used = _portfolio_prefixes(config, project_id)
-    base = _strip_trailing_non_alnum(full[:5] if len(full) >= 5 else full)
+    base = _naive_prefix_placeholder(project_id)
     if base and base not in used:
         return base
     for n in range(6, len(full) + 1):
         candidate = _strip_trailing_non_alnum(full[:n])
         if candidate not in used:
             return candidate
-    return _strip_trailing_non_alnum(full)  # ids are portfolio-unique, so the full id can't collide
+    # ids are portfolio-unique, so the UNSTRIPPED full id can't collide with
+    # anything in `used`. Deliberately not stripped here (unlike the
+    # candidates above): stripping the full id could collapse two distinct
+    # ids that differ only in trailing separators (e.g. "code" vs "code---")
+    # to the same string, reintroducing exactly the collision this function
+    # exists to prevent. This arm is only reached when every shorter
+    # candidate already collided, so returning the guaranteed-unique
+    # unstripped id is the safe last resort even if it ends in a separator.
+    return full
 
 
 def add_task(
