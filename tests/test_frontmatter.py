@@ -60,6 +60,17 @@ class TestParseFrontmatter:
         # Even wholly invalid input must not raise.
         assert parse_frontmatter("") == ({}, "")
 
+    def test_falsy_non_none_values_are_not_coerced_to_empty_dict(self):
+        # CLAWP-091 (Codex P1 + antigravity): the historical `... or {}`
+        # idiom coerced EVERY falsy value to {}, not just None -- silently
+        # hiding a genuinely malformed empty-list/false/zero/empty-string
+        # frontmatter block from require_mapping. Only None (an empty or
+        # null block) normalises to {}; these pass through as parsed.
+        assert parse_frontmatter("---\n[]\n---\n# T\n")[0] == []
+        assert parse_frontmatter("---\nfalse\n---\n# T\n")[0] is False
+        assert parse_frontmatter("---\n0\n---\n# T\n")[0] == 0
+        assert parse_frontmatter('---\n""\n---\n# T\n')[0] == ""
+
 
 class TestSplitFrontmatter:
     def test_valid_frontmatter(self):
@@ -121,10 +132,40 @@ class TestSplitFrontmatter:
         data, _ = split_frontmatter("---\nnull\n---\n# Title\n")
         assert data == {}
 
+    def test_empty_list_frontmatter_raises_not_a_mapping(self):
+        # CLAWP-091 (Codex P1): `[] or {}` used to silently coerce an empty
+        # LIST to {}, bypassing require_mapping entirely -- unlike None,
+        # `[]` is a genuine (if empty) non-mapping document and must raise.
+        with pytest.raises(FrontmatterError) as exc:
+            split_frontmatter("---\n[]\n---\n# Title\n")
+        assert exc.value.reason == "not_a_mapping"
+        assert "list" in str(exc.value)
+
+    def test_false_frontmatter_raises_not_a_mapping(self):
+        with pytest.raises(FrontmatterError) as exc:
+            split_frontmatter("---\nfalse\n---\n# Title\n")
+        assert exc.value.reason == "not_a_mapping"
+
+    def test_zero_frontmatter_raises_not_a_mapping(self):
+        with pytest.raises(FrontmatterError) as exc:
+            split_frontmatter("---\n0\n---\n# Title\n")
+        assert exc.value.reason == "not_a_mapping"
+
+    def test_empty_string_frontmatter_raises_not_a_mapping(self):
+        with pytest.raises(FrontmatterError) as exc:
+            split_frontmatter('---\n""\n---\n# Title\n')
+        assert exc.value.reason == "not_a_mapping"
+
 
 class TestRequireMapping:
     def test_dict_passes_through_unchanged(self):
         d = {"id": "X"}
+        assert require_mapping(d) is d
+
+    def test_empty_dict_passes_through_unchanged(self):
+        # {} is a real (if empty) mapping — must NOT be confused with the
+        # falsy non-mapping values below.
+        d: dict = {}
         assert require_mapping(d) is d
 
     def test_list_raises_not_a_mapping(self):
@@ -132,6 +173,26 @@ class TestRequireMapping:
             require_mapping(["a", "b"])
         assert exc.value.reason == "not_a_mapping"
         assert "list" in str(exc.value)
+
+    def test_empty_list_raises_not_a_mapping(self):
+        # CLAWP-091 (Codex P1): an empty list is still a non-mapping, not to
+        # be confused with the None -> {} normalisation done upstream.
+        with pytest.raises(FrontmatterError) as exc:
+            require_mapping([])
+        assert exc.value.reason == "not_a_mapping"
+
+    def test_false_raises_not_a_mapping(self):
+        with pytest.raises(FrontmatterError) as exc:
+            require_mapping(False)
+        assert exc.value.reason == "not_a_mapping"
+
+    def test_none_raises_not_a_mapping(self):
+        # require_mapping itself does NOT special-case None -- that
+        # normalisation is parse_frontmatter/split_frontmatter's job
+        # (_none_to_empty), applied BEFORE require_mapping is ever called.
+        with pytest.raises(FrontmatterError) as exc:
+            require_mapping(None)
+        assert exc.value.reason == "not_a_mapping"
 
     def test_scalar_raises_not_a_mapping(self):
         with pytest.raises(FrontmatterError) as exc:

@@ -18,13 +18,17 @@ Two entry points:
 
 Both return ``body`` as the RAW remainder after the closing fence (the substring
 the source files reconstruct from); callers ``.strip()`` / ``.lstrip()`` exactly
-as they did before. ``parse_frontmatter``'s ``data`` is the raw
-``yaml.safe_load(...) or {}`` result -- it is NOT coerced to ``dict``, so
-lenient callers that assumed a mapping keep whatever downstream behaviour they
-had for a non-mapping document (typically an ``AttributeError`` on the first
-``.get()``, caught by their own broad ``except``). A caller that intends to
-MUTATE frontmatter parsed via ``parse_frontmatter`` should run it through
-:func:`require_mapping` first (CLAWP-091) -- see that function's docstring.
+as they did before. ``parse_frontmatter``'s ``data`` is the parsed YAML value
+with only ``None`` normalised to ``{}`` (CLAWP-091 -- see :func:`_none_to_empty`;
+this replaced the historical ``yaml.safe_load(...) or {}``, which also
+coerced every OTHER falsy value -- ``[]``, ``""``, ``0``, ``False`` -- hiding
+them from :func:`require_mapping`, Codex P1). It is NOT coerced to ``dict``
+beyond that, so lenient callers that assumed a mapping keep whatever
+downstream behaviour they had for a non-mapping document (typically an
+``AttributeError`` on the first ``.get()``, caught by their own broad
+``except``). A caller that intends to MUTATE frontmatter parsed via
+``parse_frontmatter`` should run it through :func:`require_mapping` first
+(CLAWP-091) -- see that function's docstring.
 
 Serialization is intentionally NOT centralised: the rewrite sites emit with
 divergent ``yaml.dump`` options (``sort_keys``, ``safe_dump`` vs ``dump``,
@@ -40,6 +44,23 @@ from typing import Any
 import yaml
 
 _FENCE = "---"
+
+
+def _none_to_empty(parsed: Any) -> Any:
+    """``yaml.safe_load`` result -> frontmatter data: ``None`` becomes ``{}``
+    (an empty/whitespace-only block, or a bare ``null``/``~``), everything
+    else passes through UNCHANGED.
+
+    This replaces the historical ``yaml.safe_load(...) or {}`` idiom, which
+    coerced every *falsy* value -- ``[]``, ``""``, ``0``, ``False`` -- to
+    ``{}``, not just ``None``. That was harmless before CLAWP-091 (nothing
+    downstream distinguished them from ``None``), but it let a genuinely
+    malformed falsy-non-mapping document (e.g. frontmatter that is just
+    ``false`` or ``[]``) sail past :func:`require_mapping` disguised as an
+    empty mapping -- a mutator would then silently overwrite it instead of
+    raising ``not_a_mapping`` (Codex + antigravity review, CLAWP-091).
+    """
+    return {} if parsed is None else parsed
 
 
 def stamp_updated(frontmatter: dict[str, Any], when: str | None = None) -> None:
@@ -87,8 +108,11 @@ def parse_frontmatter(text: str) -> tuple[Any, str]:
 
     Returns ``(data, body)``:
 
-    - Fenced block with parseable YAML -> ``(yaml.safe_load(...) or {},
-      remainder_after_closing_fence)``.
+    - Fenced block with parseable YAML -> ``(data, remainder_after_closing_fence)``
+      where ``data`` is the parsed value with only ``None`` normalised to
+      ``{}`` (CLAWP-091 -- see :func:`_none_to_empty`); every OTHER falsy or
+      non-mapping value (``[]``, ``""``, ``0``, ``False``, a list, a bare
+      scalar) passes through as-is, unlike the historical ``or {}`` idiom.
     - Fenced block whose YAML is unparseable -> ``({}, remainder_after_closing_fence)``
       -- the malformed YAML is dropped but the body is preserved, so a rewrite
       caller does not rebuild a double-frontmatter file.
@@ -100,7 +124,7 @@ def parse_frontmatter(text: str) -> tuple[Any, str]:
         parts = text.split(_FENCE, 2)
         if len(parts) >= 3:
             try:
-                data = yaml.safe_load(parts[1]) or {}
+                data = _none_to_empty(yaml.safe_load(parts[1]))
             except yaml.YAMLError:
                 return {}, parts[2]
             return data, parts[2]
@@ -140,9 +164,12 @@ def require_mapping(data: Any, *, where: str | None = None) -> dict[str, Any]:
 def split_frontmatter(text: str, *, where: str | None = None) -> tuple[dict[str, Any], str]:
     """Strictly parse YAML frontmatter. Raises on any malformation.
 
-    Returns ``(data, body)`` on success, where ``data`` is
-    ``yaml.safe_load(parts[1]) or {}`` -- guaranteed to be a ``dict`` -- and
-    ``body`` is the raw substring after the closing fence (NOT stripped).
+    Returns ``(data, body)`` on success, where ``data`` is guaranteed to be
+    a ``dict`` (only ``None`` -- an empty/whitespace-only block -- is
+    normalised to ``{}``; every other value, including falsy ones like
+    ``[]``/``""``/``0``/``False``, is checked by :func:`require_mapping`
+    rather than silently coerced -- CLAWP-091, Codex P1) and ``body`` is the
+    raw substring after the closing fence (NOT stripped).
 
     ``where`` (optional, CLAWP-091) is forwarded to :func:`require_mapping`
     so the ``"not_a_mapping"`` message names the file even for a caller that
@@ -165,7 +192,7 @@ def split_frontmatter(text: str, *, where: str | None = None) -> tuple[dict[str,
     if len(parts) < 3:
         raise FrontmatterError("unterminated", "unterminated frontmatter fence")
     try:
-        data = yaml.safe_load(parts[1]) or {}
+        data = _none_to_empty(yaml.safe_load(parts[1]))
     except yaml.YAMLError as exc:
         raise FrontmatterError("unparseable", f"unparseable frontmatter: {exc}") from exc
     return require_mapping(data, where=where), parts[2]
