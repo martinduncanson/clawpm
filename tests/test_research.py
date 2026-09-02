@@ -6,6 +6,7 @@ functions directly against an isolated portfolio.
 
 from __future__ import annotations
 
+import pytest
 import yaml
 
 from clawpm.research import (
@@ -197,4 +198,44 @@ class TestLinkResearchSession:
                 isolated_portfolio.config, "test", "missing", session_key="s"
             )
             is None
+        )
+
+    def test_link_non_mapping_frontmatter_returns_none_not_typeerror(self, isolated_portfolio):
+        """CLAWP-091: pins the (considered, then reverted) not_a_mapping
+        guard in link_research_session as genuinely UNREACHABLE, not just
+        untested — so a future attempt to "fix" it in isolation doesn't
+        get surprised by the same DID-NOT-RAISE failure this one did.
+
+        get_research() resolves items by comparing the FRONTMATTER's own
+        `id` field to research_id (research filenames are date-prefixed,
+        not the research_id itself). Once frontmatter is corrupted into a
+        non-mapping, Research.from_file's lenient fallback can't recover an
+        `id`, so get_research() can never match it — link_research_session's
+        own `if not item: return None` fires before its internal
+        split_frontmatter call ever sees the corrupted text. The result is
+        a plain None (not found), same as the pre-existing absent/
+        unterminated/unparseable policy — critically, NOT a raw TypeError.
+        """
+        item = add_research(
+            isolated_portfolio.config,
+            "test",
+            "Corrupted",
+            ResearchType.SPIKE,
+            research_id="test-research-corrupted",
+        )
+        assert item is not None
+        item.file_path.write_text(
+            "---\n- not\n- a mapping\n---\n# Corrupted\n", encoding="utf-8"
+        )
+
+        result = link_research_session(
+            isolated_portfolio.config,
+            "test",
+            "test-research-corrupted",
+            session_key="sess-1",
+        )
+        assert result is None
+        # And, whatever the outcome, the file must survive untouched.
+        assert item.file_path.read_text(encoding="utf-8") == (
+            "---\n- not\n- a mapping\n---\n# Corrupted\n"
         )

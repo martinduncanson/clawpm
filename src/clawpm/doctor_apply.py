@@ -74,7 +74,7 @@ def _rewrite_frontmatter_state(file_path: Path, new_state: str) -> None:
     """
     text = file_path.read_text(encoding="utf-8")
     try:
-        fm, body = split_frontmatter(text)
+        fm, body = split_frontmatter(text, where=str(file_path))
     except FrontmatterError as exc:
         if exc.reason == "absent":
             # No frontmatter to rewrite — synthesize a minimal one. CLAWP-086:
@@ -89,6 +89,11 @@ def _rewrite_frontmatter_state(file_path: Path, new_state: str) -> None:
         elif exc.reason == "unterminated":
             # Malformed; refuse to silently break the file.
             raise ValueError(f"malformed frontmatter in {file_path}") from None
+        elif exc.reason == "not_a_mapping":
+            # CLAWP-091 — parseable but not a mapping. Name the file the same
+            # way the sibling "unterminated" branch does; the bare FrontmatterError
+            # from require_mapping (via split_frontmatter) has no file context.
+            raise ValueError(f"non-mapping frontmatter in {file_path}: {exc}") from None
         elif exc.reason == "unparseable":
             # Preserve the raw yaml.YAMLError split attached as __cause__ (this
             # site never wrapped it); fall back to the FrontmatterError itself

@@ -20,6 +20,7 @@ from .concurrency import (
 from .frontmatter import (
     FrontmatterError,
     parse_frontmatter,
+    require_mapping,
     split_frontmatter,
     stamp_updated,
 )
@@ -500,6 +501,21 @@ def _set_updated_line(text: str, stamp: str) -> str | None:
             break
     if close_idx is None:
         return None  # unterminated fence
+    # CLAWP-091 — this function bypasses frontmatter.py entirely (surgical
+    # line-splice, not a YAML round-trip), so it was never guarded against
+    # non-mapping frontmatter. Splicing an `updated:` line into a block that
+    # parses to a list/scalar would silently downgrade an already-malformed
+    # file from cleanly-recoverable (a clear FrontmatterError elsewhere) into
+    # genuinely UNPARSEABLE YAML. Refuse the same way an unterminated fence
+    # already does. Real YAML syntax errors are left untouched exactly as
+    # before this fix — that's a pre-existing, out-of-scope case, not the
+    # "parses fine but isn't a mapping" case this task guards against.
+    try:
+        _parsed = yaml.safe_load("\n".join(lines[1:close_idx]))
+    except yaml.YAMLError:
+        _parsed = None
+    if _parsed is not None and not isinstance(_parsed, dict):
+        return None
     new_line = f"updated: '{stamp}'"
     for i in range(1, close_idx):
         if _UPDATED_LINE_RE.match(lines[i]):
@@ -598,7 +614,12 @@ def _write_rejection_frontmatter(
     # Lenient parse: unparseable YAML drops to fm={} while keeping the raw body,
     # so the rewrite replaces the bad frontmatter rather than doubling it. An
     # absent/unterminated fence keeps body=text and synthesises a fence below.
+    # parse_frontmatter never raises, so a non-mapping document (bare YAML
+    # scalar/list) would otherwise pass straight through and TypeError at the
+    # first `fm[key] = ...` below; require_mapping turns that into a clear,
+    # file-naming FrontmatterError instead (CLAWP-091).
     fm, body = parse_frontmatter(text)
+    fm = require_mapping(fm, where=str(file_path))
 
     fm["rationale"] = rationale
     if supersedes:
@@ -1548,11 +1569,12 @@ def edit_task(
 
         # Parse frontmatter and content. An absent fence falls through with
         # frontmatter={}, content=text (a fence is synthesised on rebuild). An
-        # unterminated or unparseable fence is refused rather than rebuilt into
-        # a double-frontmatter, metadata-wiped file (Codex / Grok review).
+        # unterminated, unparseable, or non-mapping fence is refused rather
+        # than rebuilt into a double-frontmatter, metadata-wiped file (Codex /
+        # Grok review; not_a_mapping added CLAWP-091).
         frontmatter: dict
         try:
-            frontmatter, content = split_frontmatter(text)
+            frontmatter, content = split_frontmatter(text, where=str(task.file_path))
         except FrontmatterError as exc:
             if exc.reason == "absent":
                 frontmatter, content = {}, text
@@ -1560,6 +1582,11 @@ def edit_task(
                 raise ValueError(
                     f"Task {task_id} has an unterminated frontmatter fence; "
                     "refusing to edit (would corrupt the file)."
+                ) from None
+            elif exc.reason == "not_a_mapping":
+                raise ValueError(
+                    f"Task {task_id} frontmatter is not a YAML mapping; "
+                    f"refusing to edit (would corrupt the file): {exc}"
                 ) from None
             else:
                 cause = exc.__cause__ or exc
@@ -1736,7 +1763,7 @@ def _child_append_text(parent_path: Path, child_id: str) -> str | None:
     - :class:`ConcurrentModificationError` if the parent ``_task.md`` vanished
       (an external delete/move under the lock).
     - :class:`FrontmatterError` (a ``ValueError``) if its frontmatter is
-      absent / unterminated / unparseable.
+      absent / unterminated / unparseable / not a mapping (CLAWP-091).
     """
     if parent_path.name != "_task.md":
         return None  # not a directory-task parent — genuine no-op
@@ -1747,7 +1774,7 @@ def _child_append_text(parent_path: Path, child_id: str) -> str | None:
         )
     with guard_fs_tamper(f"Parent task '{parent_path}'"):
         text = parent_path.read_text(encoding="utf-8")
-    fm, raw_body = split_frontmatter(text)  # raises FrontmatterError on malformation
+    fm, raw_body = split_frontmatter(text, where=str(parent_path))  # raises FrontmatterError on malformation
     children = fm.get("children")
     if not isinstance(children, list):
         children = []

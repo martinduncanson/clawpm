@@ -1280,8 +1280,21 @@ def _stamp_prd_ref(task_file: Path, prd_ref: str) -> None:
         return
     text = task_file.read_text(encoding="utf-8")
     try:
-        fm, raw_body = split_frontmatter(text)
-    except FrontmatterError:
+        fm, raw_body = split_frontmatter(text, where=str(task_file))
+    except FrontmatterError as exc:
+        if exc.reason == "not_a_mapping":
+            # CLAWP-091 — parseable but not a mapping is a genuine corruption
+            # signal, unlike the other three (benign-absent) reasons this
+            # function otherwise skips silently. This call site has no
+            # surrounding try/except (emit_tree.py's promote step), and
+            # before split_frontmatter validated dict-ness this same input
+            # raised an uncaught AttributeError here (fm.get(...) on a
+            # list/str) -- i.e. it already failed loudly. Keep failing
+            # loudly rather than silently skipping the stamp.
+            raise ValueError(
+                f"Cannot stamp prd_ref on {task_file}: frontmatter is not "
+                f"a YAML mapping: {exc}"
+            ) from None
         return  # no/malformed frontmatter — nothing to stamp
     if fm.get("prd_ref") == prd_ref:
         return  # idempotent
