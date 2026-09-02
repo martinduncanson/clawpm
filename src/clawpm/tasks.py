@@ -1338,14 +1338,25 @@ def assign_task_prefix(
         if candidate not in used:
             return candidate
     # ids are portfolio-unique, so the UNSTRIPPED full id can't collide with
-    # anything in `used`. Deliberately not stripped here (unlike the
-    # candidates above): stripping the full id could collapse two distinct
-    # ids that differ only in trailing separators (e.g. "code" vs "code---")
-    # to the same string, reintroducing exactly the collision this function
-    # exists to prevent. This arm is only reached when every shorter
-    # candidate already collided, so returning the guaranteed-unique
-    # unstripped id is the safe last resort even if it ends in a separator.
-    return full
+    # another project's OWN id-derived prefix. But `used` also holds
+    # EXPLICIT `task_prefix` values, which are arbitrary strings a sibling
+    # can set independent of its own id -- so `full` itself can still
+    # collide (Codex P1, PR #57: siblings with explicit prefixes "ABCDE"
+    # and "ABCDE-F" exhaust every stripped candidate through n=len(full),
+    # leaving `full` == "ABCDE-F" already claimed). Deliberately not
+    # stripped here (unlike the candidates above): stripping the full id
+    # could collapse two distinct ids that differ only in trailing
+    # separators (e.g. "code" vs "code---") to the same string, reintroducing
+    # exactly the collision this function exists to prevent. Verify before
+    # returning; on the rare residual collision, disambiguate with a numeric
+    # suffix -- reached only when every shorter candidate AND the unstripped
+    # id all collided, so any further extension is a safe last resort.
+    if full not in used:
+        return full
+    n = 2
+    while f"{full}{n}" in used:
+        n += 1
+    return f"{full}{n}"
 
 
 def add_task(

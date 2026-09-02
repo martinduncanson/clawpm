@@ -200,6 +200,25 @@ class TestPrefixUniqueness:
         _add("arb-prod", "b")  # twin takes an extended prefix
         assert _add("arb-prd", "c") == "ARB-P-001"  # arb-prd unchanged
 
+    def test_final_fallback_disambiguates_when_explicit_prefixes_exhaust_it(
+        self, tmp_path, monkeypatch
+    ):
+        # Codex P1, PR #57: assign_task_prefix's last-resort `return full`
+        # assumed the unstripped full id can't collide because ids are
+        # portfolio-unique -- true for id-DERIVED prefixes, false for
+        # EXPLICIT ones, which are arbitrary strings a sibling can set
+        # independent of its own id. Two siblings with explicit prefixes
+        # "ABCDE" and "ABCDE-F" exhaust every stripped candidate a new
+        # "abcde-f" project would try (base "ABCDE", extension "ABCDE-F"),
+        # leaving the final fallback `full` == "ABCDE-F" ALREADY claimed.
+        _make_portfolio(tmp_path, monkeypatch, "abcde-f")
+        _add_project(tmp_path, "sib-one", task_prefix="ABCDE")
+        _add_project(tmp_path, "sib-two", task_prefix="ABCDE-F")
+        minted = _add("abcde-f", "e")
+        prefix = minted.rsplit("-", 1)[0]
+        assert prefix not in ("ABCDE", "ABCDE-F"), minted  # no silent collision
+        assert prefix == "ABCDE-F2", minted  # deterministic disambiguation
+
 
 class TestDoctorCollisionCheck:
     def _prefix_collisions(self, res_output):
