@@ -232,13 +232,26 @@ def _replay(portfolio_root: Path) -> dict[str, SessionRecord]:
             continue
         action = ev.get("action")
         session_id = ev.get("session_id")
-        if not session_id or action not in (_REGISTERED, _RELEASED):
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        if action not in (_REGISTERED, _RELEASED):
             continue
         if action == _REGISTERED:
             task_id = ev.get("task_id")
             project_id = ev.get("project_id")
             worktree_path = ev.get("worktree_path")
-            if not task_id or not project_id or not worktree_path:
+            # Codex review, PR #55: a syntactically-valid line whose fields
+            # have the WRONG TYPE (e.g. worktree_path: 42) previously passed
+            # the truthiness checks below straight into Path(worktree_path),
+            # which raises TypeError uncaught -- aborting replay for every
+            # OTHER session, not just this malformed one. Require str for
+            # every field (also covers empty-string, replacing the old
+            # `not x` truthiness checks) before constructing the record.
+            if (
+                not isinstance(task_id, str) or not task_id
+                or not isinstance(project_id, str) or not project_id
+                or not isinstance(worktree_path, str) or not worktree_path
+            ):
                 continue
             sessions[session_id] = SessionRecord(
                 session_id=session_id,

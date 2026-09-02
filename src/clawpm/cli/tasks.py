@@ -1450,8 +1450,34 @@ def tasks_dispatch(
     # task file instead of the worktree's own. See sessions.py.
     if worktree:
         from clawpm.sessions import register_session
-        session_id = str(uuid.uuid4())
-        register_session(config.portfolio_root, session_id, task_id, project_id, resolved_dir)
+        from clawpm.tasks import _candidate_task_paths
+        # CLAWP-098 (Codex P1, PR #55): verify the task is actually
+        # materialized in the worktree BEFORE registering a session for it.
+        # If the task was `tasks add`-ed but never committed, create_worktree
+        # checked out a HEAD that has .project/ (git-tracked) but NOT this
+        # task's file — registering the session anyway would redirect the
+        # worktree's own eval-stop Stop-hook to look for it there, find
+        # nothing, and block termination forever ("task not found"), same
+        # failure shape as the reverted `clawpm agent dispatch` path.
+        #
+        # Checked with an EXPLICIT tasks_dir against resolved_dir, not via
+        # get_task(config, ...) — at this point in the command, cwd is
+        # wherever the OPERATOR invoked `tasks dispatch` from, essentially
+        # never inside the worktree it just created, so a cwd-based lookup
+        # would silently fall through to the OLD registry resolution (main
+        # checkout) and report a false "materialized" even when the
+        # worktree's own copy is missing. _candidate_task_paths is the same
+        # single-source-of-truth every task-file shape (plain file, subtask,
+        # directory-task _task.md, ...) resolves through elsewhere.
+        materialized = any(
+            p.exists()
+            for p in _candidate_task_paths(resolved_dir / ".project" / "tasks", task_id)
+        )
+        if materialized:
+            session_id = str(uuid.uuid4())
+            register_session(config.portfolio_root, session_id, task_id, project_id, resolved_dir)
+        else:
+            session_id = None
 
     # Grant the lease AFTER settings are written (so a settings failure doesn't
     # leave a lease with no heartbeat source).
