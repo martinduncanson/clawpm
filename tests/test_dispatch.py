@@ -873,6 +873,69 @@ class TestWorktreeSessionScopedMutation:
         wt_path = Path(payload["target_dir"])
         assert (wt_path / ".project" / "tasks" / f"{task.id}.md").exists()
 
+    def test_worktree_dispatch_rejects_a_reused_stale_worktree(
+        self, temp_portfolio_with_repo
+    ):
+        """Regression independently caught by BOTH grok-4.6 and Codex on
+        the same commit (PR #55, round 5): the HEAD probe (does git's tree
+        have the task) proves the task is COMMITTED, but create_worktree is
+        idempotent by DIRECTORY EXISTENCE -- if a worktree already exists
+        at the exact path create_worktree would use (e.g. a leftover from
+        an earlier manual `git worktree add`, predating the task's commit),
+        it gets REUSED AS-IS, never refreshed. The HEAD probe alone would
+        pass while the reused checkout on disk still doesn't have the task
+        -- exactly the "dispatch succeeds, isolation silently off" failure
+        this whole gate exists to prevent. The fix re-verifies against the
+        actual worktree filesystem AFTER create_worktree runs too, and
+        aborts (does not silently skip registration) on a mismatch."""
+        config = temp_portfolio_with_repo["config"]
+        repo_dir = temp_portfolio_with_repo["repo_dir"]
+
+        (repo_dir / ".project" / "tasks" / ".gitkeep").write_text("", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo_dir), "add", ".project"], check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=a@b", "-c", "user.name=a",
+             "-C", str(repo_dir), "commit", "-q", "-m", "seed .project scaffolding"],
+            check=True,
+        )
+
+        task = add_task(
+            config, "test", title="Stale-worktree-reuse",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+
+        # Simulate a stale, PRE-EXISTING worktree at the exact path
+        # create_worktree would use for this task, created (as clawpm's own
+        # create_worktree would) BEFORE the task gets committed below --
+        # its checkout predates the commit and genuinely lacks the task.
+        stale_wt = repo_dir / ".clawpm-worktrees" / task.id
+        stale_wt.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "worktree", "add", "-b",
+             f"clawpm/{task.id}", str(stale_wt)],
+            check=True,
+        )
+        assert not (stale_wt / ".project" / "tasks" / f"{task.id}.md").exists()
+
+        # NOW commit the task -- HEAD has it, but the stale worktree above
+        # was already checked out before this commit and won't see it.
+        subprocess.run(["git", "-C", str(repo_dir), "add", ".project"], check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=a@b", "-c", "user.name=a",
+             "-C", str(repo_dir), "commit", "-q", "-m", "commit the task"],
+            check=True,
+        )
+
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code != 0, (
+            "reusing a stale worktree that predates the task's commit must "
+            "be rejected, not silently dispatched with isolation off"
+        )
+        assert "task_not_materialized" in r.output
+        assert not settings_path(stale_wt).exists()
+
     def test_worktree_dispatch_materialization_check_handles_monorepo_subdirectory(
         self, tmp_path, monkeypatch
     ):

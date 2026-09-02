@@ -1446,6 +1446,36 @@ def tasks_dispatch(
                 fmt=fmt,
             )
             sys.exit(1)
+        # CLAWP-098 (grok + Codex review, round 5 — independently caught by
+        # both, third confirmation this exact shape is real): the HEAD
+        # probe above proves the task is committed, but create_worktree is
+        # idempotent by DIRECTORY EXISTENCE — a leftover/stale worktree
+        # from an EARLIER, now-outdated dispatch is reused as-is, without
+        # ever refreshing its contents against the current HEAD. So the
+        # probe can pass while the REUSED checkout on disk still doesn't
+        # have the task. Re-verify against the actual filesystem right
+        # here, before write_dispatch_settings runs, and ABORT (not
+        # silently skip registration) on a mismatch — a successful-looking
+        # dispatch with isolation silently off is exactly the failure this
+        # whole gate exists to prevent.
+        if _head_has_project:
+            from clawpm.tasks import _candidate_task_paths as _ctp
+            if not any(
+                p.exists()
+                for p in _ctp(resolved_dir / ".project" / "tasks", task_id)
+            ):
+                output_error(
+                    "task_not_materialized",
+                    f"Task {task_id!r} is committed at HEAD, but the worktree "
+                    f"at {resolved_dir} still doesn't have it — it's a "
+                    f"leftover checkout from an earlier dispatch that "
+                    f"create_worktree reused as-is (it does not refresh an "
+                    f"existing worktree's contents). Remove it manually "
+                    f"(git worktree remove {resolved_dir}) and re-run "
+                    f"dispatch to get a fresh checkout from the current HEAD.",
+                    fmt=fmt,
+                )
+                sys.exit(1)
     elif target_dir:
         resolved_dir = Path(target_dir)
         resolved_dir.mkdir(parents=True, exist_ok=True)

@@ -70,6 +70,7 @@ import contextvars
 import json
 import logging
 import os
+import stat
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -132,6 +133,24 @@ def _registry_path(portfolio_root: Path) -> Path:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def stat_is_dir(path: Path) -> bool:
+    """``os.stat``-based directory check that does NOT swallow ``OSError``
+    the way ``Path.is_dir()`` does (Codex review, PR #55): per the stdlib
+    docs, ``Path.is_dir()``/``is_file()``/``exists()`` catch ``OSError``
+    internally and just return ``False`` on any stat failure (permission
+    denied, an unavailable network volume, ...) — every ``except OSError``
+    this module (and ``discovery._session_scoped_project_dir``) wrapped
+    around an ``is_dir()`` call was therefore dead code: the exception it
+    was meant to catch and log at ERROR never reached it.
+
+    Raises ``FileNotFoundError`` (a normal "the path doesn't exist" case —
+    callers typically want that treated the same as ``False``, silently)
+    or another ``OSError`` for a genuine stat fault callers should log
+    before falling open.
+    """
+    return stat.S_ISDIR(os.stat(path).st_mode)
 
 
 @dataclass
@@ -338,10 +357,14 @@ def active_sessions(portfolio_root: Path) -> list[SessionRecord]:
         if not s.active:
             continue
         try:
-            if not s.worktree_path.is_dir():
+            if not stat_is_dir(s.worktree_path):
                 continue
+        except FileNotFoundError:
+            continue
         except OSError as exc:
-            # grok review, PR #55 (round 4): log at ERROR before treating
+            # Codex review, PR #55 (round 5): stat_is_dir (unlike
+            # Path.is_dir()) actually raises for a genuine fault here, so
+            # this branch is now reachable. Log at ERROR before treating
             # like "not there" — same severity as _replay's whole-file
             # fail-open, since a transient stat fault (Windows sharing/AV,
             # a flaky network volume) dropping an otherwise-live, already-

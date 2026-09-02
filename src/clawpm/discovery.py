@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .models import PortfolioConfig, ProjectSettings, ProjectStatus
-from .sessions import _suppress_session_resolution, find_session_for_cwd
+from .sessions import _suppress_session_resolution, find_session_for_cwd, stat_is_dir
 
 logger = logging.getLogger(__name__)
 
@@ -321,12 +321,26 @@ def _session_scoped_project_dir(config: PortfolioConfig, project_id: str) -> Pat
         # `git worktree remove`, a permission error, an unmounted drive —
         # must fall open to the registry lookup like every other "no
         # session" case, not crash the caller. The docstring promises
-        # "never raises"; before this guard, resolve()/is_dir() could break
-        # that promise for exactly the class of caller (tasks list/next/
-        # reflect) that must never hard-fail on a rare filesystem hiccup.
+        # "never raises"; before this guard, resolve() could break that
+        # promise for exactly the class of caller (tasks list/next/reflect)
+        # that must never hard-fail on a rare filesystem hiccup.
         candidate = session.worktree_path.resolve() / ".project"
-        if not candidate.is_dir():
+    except OSError as exc:
+        logger.error(
+            "Failed to resolve session worktree %s: %s. Falling through to "
+            "the portfolio registry (main-checkout) lookup for this call.",
+            session.worktree_path, exc,
+        )
+        return None
+    try:
+        # stat_is_dir, not candidate.is_dir() (Codex review, PR #55):
+        # Path.is_dir() catches OSError internally and just returns False,
+        # which made this a silent "not there" for a genuine permission/
+        # unmounted-drive fault too — the ERROR log below never fired.
+        if not stat_is_dir(candidate):
             return None
+    except FileNotFoundError:
+        return None
     except OSError as exc:
         # grok review, PR #55: log at the same ERROR severity as
         # sessions._replay's fail-open path — this is the same class of
@@ -336,9 +350,9 @@ def _session_scoped_project_dir(config: PortfolioConfig, project_id: str) -> Pat
         # crash (breaks read-only callers) and a silent one (CLAWP-039/041
         # fail-open-needs-a-marker doctrine).
         logger.error(
-            "Failed to resolve session worktree %s: %s. Falling through to "
+            "Failed to stat session worktree %s: %s. Falling through to "
             "the portfolio registry (main-checkout) lookup for this call.",
-            session.worktree_path, exc,
+            candidate, exc,
         )
         return None
     return candidate
