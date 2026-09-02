@@ -303,7 +303,15 @@ def _session_scoped_project_dir(config: PortfolioConfig, project_id: str) -> Pat
         return None
     try:
         cwd = Path.cwd()
-    except OSError:
+    except OSError as exc:
+        # antigravity review, PR #55 (round 4): Path.cwd() itself failing
+        # (the process's cwd deleted out from under it — rare, but the
+        # existing fail-open-needs-a-marker doctrine applies regardless of
+        # how rare) must fall open the same as every other miss, but not
+        # silently — logged at ERROR to match the severity of every other
+        # fail-open branch in this module and sessions.py.
+        logger.error("Failed to determine cwd: %s. Session-scoped "
+                      "resolution skipped for this call.", exc)
         return None
     session = find_session_for_cwd(portfolio_root, cwd, project_id=project_id)
     if session is None:

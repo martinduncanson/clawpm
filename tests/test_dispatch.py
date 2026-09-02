@@ -814,9 +814,64 @@ class TestWorktreeSessionScopedMutation:
         )
         assert r.exit_code != 0
         assert "task_not_materialized" in r.output
-        assert not settings_path(
-            repo_dir / ".clawpm-worktrees" / task.id
-        ).exists(), "nothing should be written when dispatch is refused"
+        # Nothing was written -- not the settings file, not even the
+        # worktree DIRECTORY itself (grok round-4: materialization is now
+        # probed via git's tree BEFORE create_worktree runs at all, so
+        # there is nothing to clean up on this path).
+        wt_dir = repo_dir / ".clawpm-worktrees" / task.id
+        assert not wt_dir.exists()
+        assert not settings_path(wt_dir).exists()
+
+    def test_worktree_dispatch_retry_after_commit_succeeds_with_a_fresh_worktree(
+        self, temp_portfolio_with_repo
+    ):
+        """The documented recovery from `task_not_materialized` (commit the
+        task, then re-run dispatch) must actually work. Regression for the
+        bug both Codex and grok independently caught in an earlier version
+        of this fix: create_worktree is idempotent by directory existence,
+        not freshness, so a create-then-check design would have the retry
+        reuse the SAME stale, still-missing-the-task checkout forever.
+        Probing via git's tree before create_worktree ever runs (instead of
+        after) means nothing exists yet to go stale — the retry's
+        create_worktree call creates a brand-new worktree from the new
+        HEAD."""
+        config = temp_portfolio_with_repo["config"]
+        repo_dir = temp_portfolio_with_repo["repo_dir"]
+
+        (repo_dir / ".project" / "tasks" / ".gitkeep").write_text("", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo_dir), "add", ".project"], check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=a@b", "-c", "user.name=a",
+             "-C", str(repo_dir), "commit", "-q", "-m", "seed .project scaffolding"],
+            check=True,
+        )
+
+        task = add_task(
+            config, "test", title="Retry-after-commit",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+
+        r1 = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r1.exit_code != 0
+
+        # Now commit the task and retry -- this is the documented recovery.
+        subprocess.run(["git", "-C", str(repo_dir), "add", ".project"], check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=a@b", "-c", "user.name=a",
+             "-C", str(repo_dir), "commit", "-q", "-m", "commit the task"],
+            check=True,
+        )
+
+        r2 = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r2.exit_code == 0, r2.output
+        payload = json.loads(r2.output)["data"]
+        assert payload["session_id"], "the retry must succeed and register a session"
+        wt_path = Path(payload["target_dir"])
+        assert (wt_path / ".project" / "tasks" / f"{task.id}.md").exists()
 
 
 class TestSessionStartSidecar:

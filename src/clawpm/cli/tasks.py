@@ -1362,6 +1362,67 @@ def tasks_dispatch(
                 fmt=fmt,
             )
             sys.exit(1)
+        # CLAWP-098 (grok + Codex review, PR #55): probe materialization
+        # via git's OWN committed tree BEFORE create_worktree ever runs,
+        # rather than creating the worktree first and checking after.
+        # create_worktree is idempotent by DIRECTORY EXISTENCE, not
+        # freshness — a create-then-check-then-cleanup-on-failure design
+        # was tried first and both Codex and grok independently caught the
+        # same bug in it: the documented recovery ("commit the task, then
+        # re-run dispatch") didn't actually work, because the retry's
+        # create_worktree just returned the SAME stale checkout (still
+        # missing the task, still at the old HEAD) instead of creating a
+        # fresh one from the new commit. Checking git's tree directly,
+        # before anything is created, sidesteps that entirely — nothing to
+        # clean up, and a retry after `git commit` naturally creates a
+        # brand-new worktree from the new HEAD.
+        #
+        # Only checked when the project git-tracks .project/ at HEAD at
+        # all (CLAWP-075's convention) — a project that doesn't never had
+        # anything here to check, and dispatch proceeds unaffected exactly
+        # as before this fix.
+        _head_has_project = subprocess.run(
+            ["git", "-C", str(project.repo_path), "cat-file", "-e", "HEAD:.project"],
+            capture_output=True,
+        ).returncode == 0
+        if _head_has_project:
+            from clawpm.tasks import _candidate_task_paths
+            _rel_candidates = _candidate_task_paths(Path(".project/tasks"), task_id)
+            _materialized = any(
+                subprocess.run(
+                    ["git", "-C", str(project.repo_path), "cat-file", "-e",
+                     f"HEAD:{p.as_posix()}"],
+                    capture_output=True,
+                ).returncode == 0
+                for p in _rel_candidates
+            )
+            if not _materialized:
+                # If this exact worktree already exists (e.g. dispatched
+                # earlier and reused here), name that explicitly — deleting
+                # it is NOT safe (might hold real in-progress work), so the
+                # operator needs to know a plain retry won't self-heal.
+                _existing_wt = project.repo_path / ".clawpm-worktrees" / task_id
+                _extra = (
+                    f" A worktree already exists at {_existing_wt} from an "
+                    f"earlier dispatch — remove it manually (git worktree "
+                    f"remove) before retrying, or it will keep being reused "
+                    f"stale."
+                    if _existing_wt.exists() else ""
+                )
+                output_error(
+                    "task_not_materialized",
+                    f"Task {task_id!r} exists in the current checkout but isn't "
+                    f"committed, and this project git-tracks .project/ — a "
+                    f"worktree checked out from HEAD would be missing this "
+                    f"task's file. Dispatching anyway would either hang the "
+                    f"Stop hook (looking for a task that isn't there) or "
+                    f"silently disable CLAWP-098's worktree isolation for "
+                    f"every task in that checkout. Commit the task file "
+                    f"first, then re-run dispatch — or omit --worktree to "
+                    f"dispatch in-place.{_extra}",
+                    fmt=fmt,
+                )
+                sys.exit(1)
         try:
             resolved_dir = create_worktree(project.repo_path, task_id)
         except subprocess.CalledProcessError as exc:
@@ -1371,43 +1432,6 @@ def tasks_dispatch(
                 fmt=fmt,
             )
             sys.exit(1)
-        # CLAWP-098 (grok review, PR #55): if this worktree's checkout DOES
-        # carry .project/ (the project git-tracks it, CLAWP-075) but the
-        # DISPATCHED task's own file isn't in it (added but never committed
-        # -- create_worktree checks out committed HEAD), fail loudly here,
-        # BEFORE writing anything, rather than silently dispatching with
-        # CLAWP-098's isolation off. A quiet degrade would mean: the Stop
-        # hook this dispatch installs (eval-stop --task <this task_id>)
-        # hangs forever looking for a task that isn't there IF a session
-        # got registered anyway (Codex P1) -- and skipping registration to
-        # avoid that instead silently un-isolates every OTHER task that IS
-        # committed in this same worktree checkout too, since isolation is
-        # per-worktree, not per-task (grok HIGH). Neither silent option is
-        # acceptable when the project has opted into this protection by
-        # tracking .project/ at all; a project that does NOT track
-        # .project/ never had anything to check here and is unaffected
-        # (see the tasks_dir.exists() check just below).
-        _wt_project_dir = resolved_dir / ".project"
-        if _wt_project_dir.is_dir():
-            from clawpm.tasks import _candidate_task_paths
-            _materialized = any(
-                p.exists()
-                for p in _candidate_task_paths(_wt_project_dir / "tasks", task_id)
-            )
-            if not _materialized:
-                output_error(
-                    "task_not_materialized",
-                    f"Task {task_id!r} exists in the current checkout but isn't "
-                    f"committed, and this project git-tracks .project/ — the new "
-                    f"worktree's checkout at {resolved_dir} has .project/ but not "
-                    f"this task's file. Dispatching anyway would either hang the "
-                    f"Stop hook (looking for a task that isn't there) or silently "
-                    f"disable CLAWP-098's worktree isolation for every task in "
-                    f"this checkout. Commit the task file first, then re-run "
-                    f"dispatch — or omit --worktree to dispatch in-place.",
-                    fmt=fmt,
-                )
-                sys.exit(1)
     elif target_dir:
         resolved_dir = Path(target_dir)
         resolved_dir.mkdir(parents=True, exist_ok=True)

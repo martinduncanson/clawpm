@@ -340,9 +340,17 @@ def active_sessions(portfolio_root: Path) -> list[SessionRecord]:
         try:
             if not s.worktree_path.is_dir():
                 continue
-        except OSError:
-            # Unreadable (permissions, transient FS hiccup): treat like "not
-            # there" rather than raising out of every project resolution.
+        except OSError as exc:
+            # grok review, PR #55 (round 4): log at ERROR before treating
+            # like "not there" — same severity as _replay's whole-file
+            # fail-open, since a transient stat fault (Windows sharing/AV,
+            # a flaky network volume) dropping an otherwise-live, already-
+            # decided-active session is the same silent-regression shape.
+            logger.error(
+                "Failed to stat session worktree %s: %s. Treating session "
+                "%s as inactive for this call.",
+                s.worktree_path, exc, s.session_id,
+            )
             continue
         result.append(s)
     return result
@@ -382,12 +390,17 @@ def find_session_for_cwd(
     """
     try:
         resolved_cwd = Path(cwd).resolve()
-    except OSError:
-        # antigravity review, PR #55: an unresolvable cwd (permission error,
-        # a network drive that dropped mid-call) must fall open to "no
+    except OSError as exc:
+        # antigravity review, PR #55 (round 4: log level, not just the
+        # fallback itself): an unresolvable cwd (permission error, a
+        # network drive that dropped mid-call) must fall open to "no
         # session matched" like every other miss, not crash every caller
         # of get_project_dir — including read-only commands (tasks list/
-        # next/reflect) that share this chokepoint.
+        # next/reflect) that share this chokepoint. Logged at ERROR for the
+        # same reason every other fail-open branch in this module is:
+        # CLAWP-039/041's fail-open-needs-a-marker doctrine.
+        logger.error("Failed to resolve cwd %s: %s. Session-scoped "
+                      "resolution skipped for this call.", cwd, exc)
         return None
     cwd_norm = Path(os.path.normcase(str(resolved_cwd)))
     best: Optional[SessionRecord] = None
