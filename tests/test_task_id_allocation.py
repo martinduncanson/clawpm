@@ -219,6 +219,34 @@ class TestPrefixUniqueness:
         assert prefix not in ("ABCDE", "ABCDE-F"), minted  # no silent collision
         assert prefix == "ABCDE-F2", minted  # deterministic disambiguation
 
+    def test_final_fallback_never_mints_a_doubled_separator(self, tmp_path, monkeypatch):
+        # Codex P2, PR #57: the disambiguation added above still fell back to
+        # the UNSTRIPPED `full`, which reintroduced the doubled separator
+        # CLAWP-096 exists to remove. Project "code-" derives base "CODE";
+        # a sibling holding explicit prefix "CODE" claims it, the extension
+        # loop is empty (len("CODE-") == 5), and the old last resort returned
+        # `full` == "CODE-" -> "CODE--000", which inference then pinned.
+        _make_portfolio(tmp_path, monkeypatch, "code-")
+        _add_project(tmp_path, "sib-one", task_prefix="CODE")
+        minted = _add("code-", "d")
+        assert "--" not in minted, minted  # the actual defect
+        prefix = minted.rsplit("-", 1)[0]
+        assert prefix == "CODE2", minted  # stripped stem + numeric suffix
+
+    def test_doubled_separator_fallback_stays_distinct_across_twins(
+        self, tmp_path, monkeypatch
+    ):
+        # The unstripped fallback was protecting one real property: two ids
+        # differing ONLY in trailing separators must not collapse to the same
+        # prefix. The stripped-stem + numeric suffix preserves that.
+        _make_portfolio(tmp_path, monkeypatch, "code-")
+        _add_project(tmp_path, "sib-one", task_prefix="CODE")
+        _add_project(tmp_path, "code---")
+        first = _add("code-", "d")
+        second = _add("code---", "e")
+        assert first.rsplit("-", 1)[0] != second.rsplit("-", 1)[0], (first, second)
+        assert "--" not in first and "--" not in second, (first, second)
+
 
 class TestDoctorCollisionCheck:
     def _prefix_collisions(self, res_output):

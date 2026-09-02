@@ -1320,8 +1320,8 @@ def assign_task_prefix(
     once ``-{num:03d}`` is appended, and so this function's own candidate
     always agrees with what ``_portfolio_prefixes`` assumes OTHER task-less
     projects would derive. Extension-loop candidates beyond the base are
-    stripped the same way; the final fallback is intentionally NOT stripped
-    (see comment below).
+    stripped the same way, as is the numeric-suffix last resort (see comment
+    below) -- no arm of this function can emit a trailing separator.
     """
     if explicit_prefix:
         return explicit_prefix.upper()
@@ -1337,26 +1337,30 @@ def assign_task_prefix(
         candidate = _strip_trailing_non_alnum(full[:n])
         if candidate not in used:
             return candidate
-    # ids are portfolio-unique, so the UNSTRIPPED full id can't collide with
-    # another project's OWN id-derived prefix. But `used` also holds
-    # EXPLICIT `task_prefix` values, which are arbitrary strings a sibling
-    # can set independent of its own id -- so `full` itself can still
-    # collide (Codex P1, PR #57: siblings with explicit prefixes "ABCDE"
-    # and "ABCDE-F" exhaust every stripped candidate through n=len(full),
-    # leaving `full` == "ABCDE-F" already claimed). Deliberately not
-    # stripped here (unlike the candidates above): stripping the full id
-    # could collapse two distinct ids that differ only in trailing
-    # separators (e.g. "code" vs "code---") to the same string, reintroducing
-    # exactly the collision this function exists to prevent. Verify before
-    # returning; on the rare residual collision, disambiguate with a numeric
-    # suffix -- reached only when every shorter candidate AND the unstripped
-    # id all collided, so any further extension is a safe last resort.
-    if full not in used:
-        return full
+    # ids are portfolio-unique, so the id-derived candidates above can't
+    # collide with another project's OWN id-derived prefix. But `used` also
+    # holds EXPLICIT `task_prefix` values -- arbitrary strings a sibling can
+    # set independent of its own id -- so every candidate above can still be
+    # claimed (Codex P1, PR #57: siblings with explicit prefixes "ABCDE" and
+    # "ABCDE-F" exhaust every stripped candidate through n=len(full)).
+    #
+    # Disambiguate from the STRIPPED id, never the raw one. Returning the
+    # unstripped `full` was the previous last resort, but it reintroduced
+    # exactly the doubled separator CLAWP-096 exists to remove: project
+    # "code-" whose stripped "CODE" is claimed by a sibling returned "CODE-",
+    # minting "CODE--000", which inference then pinned (Codex P2, PR #57).
+    # The numeric suffix still keeps two ids differing only in trailing
+    # separators distinct -- "code" gets "CODE2" when "code---" holds "CODE"
+    # -- which is the only property the raw id was protecting.
+    #
+    # `stem` is always already claimed here: `base` covers len(full) <= 5 and
+    # the loop's final iteration (n == len(full)) covers the rest, so both
+    # reach `_strip_trailing_non_alnum(full)`. Hence no bare `stem` return.
+    stem = _strip_trailing_non_alnum(full)
     n = 2
-    while f"{full}{n}" in used:
+    while f"{stem}{n}" in used:
         n += 1
-    return f"{full}{n}"
+    return f"{stem}{n}"
 
 
 def add_task(
