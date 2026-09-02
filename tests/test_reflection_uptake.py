@@ -124,6 +124,46 @@ class TestParseDuration:
         with pytest.raises(click.BadParameter):
             parse_duration("2x")
 
+    def test_combined_hours_and_minutes(self):
+        # CLAWP-096: 2h30m = 2*60 + 30 = 150 minutes.
+        assert parse_duration("2h30m") == 150
+
+    def test_combined_days_and_hours(self):
+        assert parse_duration("1d4h") == 1440 + 240
+
+    def test_combined_weeks_days_hours_minutes(self):
+        assert parse_duration("1w2d3h4m") == (60 * 24 * 7) + (2 * 60 * 24) + (3 * 60) + 4
+
+    def test_combined_units_out_of_order_still_sums(self):
+        # Segment order isn't semantically enforced — still sums correctly.
+        assert parse_duration("30m2h") == 150
+
+    def test_combined_units_partial_garbage_still_raises(self):
+        import click
+
+        with pytest.raises(click.BadParameter):
+            parse_duration("2h30x")
+
+    def test_cli_tasks_add_accepts_combined_units(self, temp_portfolio):
+        """CLI: --predict-duration 2h30m should store 150 minutes."""
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "tasks",
+                "add",
+                "--title",
+                "Combined duration test",
+                "--predict-duration",
+                "2h30m",
+                "--project",
+                "test",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["data"]["predictions"]["duration_min"] == 150
+
     def test_cli_tasks_add_accepts_unit_suffix(self, temp_portfolio):
         """CLI: --predict-duration 2h should store 120 minutes."""
         runner = CliRunner()

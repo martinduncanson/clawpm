@@ -84,6 +84,25 @@ class TestNonHyphenatedPrefixUnaffected:
         assert ids == ["TEST-000", "TEST-001"], ids
 
 
+class TestHyphenOnSliceBoundary:
+    """CLAWP-096: a project id whose ``upper()[:5]`` slice lands EXACTLY on the
+    hyphen (e.g. "code-quorum", where "code" is 4 chars) must not carry a
+    trailing hyphen into the prefix — that doubles the separator once
+    ``-{num:03d}`` is appended ("CODE-" + "-000" -> "CODE--000")."""
+
+    def test_slice_boundary_hyphen_is_stripped(self, tmp_path, monkeypatch):
+        _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        ids = [_add("code-quorum", f"t{i}") for i in range(2)]
+        assert ids == ["CODE-000", "CODE-001"], ids
+        assert "--" not in ids[0]
+
+    def test_internal_hyphen_still_preserved(self, tmp_path, monkeypatch):
+        # Regression guard: the fix must not regress CLAWP-047's intentional
+        # internal-hyphen behaviour ("arb-prd" -> "ARB-P", hyphen mid-prefix).
+        _make_portfolio(tmp_path, monkeypatch, "arb-prd")
+        assert _add("arb-prd", "epic") == "ARB-P-000"
+
+
 # ---------------------------------------------------------------------------
 # CLAWP-048: cross-project prefix uniqueness (near-name-twin projects must not
 # share an ID namespace) + explicit task_prefix override + doctor detection.

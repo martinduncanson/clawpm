@@ -1273,6 +1273,22 @@ def _portfolio_prefixes(config, exclude_id: str) -> set[str]:
     return used
 
 
+def _strip_trailing_non_alnum(prefix: str) -> str:
+    """Drop trailing non-alphanumeric characters from a derived prefix slice.
+
+    A fixed-length slice of an uppercased project id can land exactly on a
+    separator — ``"code-quorum".upper()[:5]`` is ``"CODE-"``, hyphen last.
+    Left alone, the later ``f"{prefix}-{num:03d}"`` join doubles the
+    separator (``"CODE-" + "-000"`` -> ``"CODE--000"``, CLAWP-096). Only the
+    trailing run is trimmed — an internal separator like ``"ARB-P"``
+    (``"arb-prd".upper()[:5]``) is untouched by design (CLAWP-047). Never
+    strips down to empty: an all-punctuation slice is returned unchanged
+    rather than nulled out.
+    """
+    stripped = prefix.rstrip("-_.")
+    return stripped or prefix
+
+
 def assign_task_prefix(
     project_id: str, tasks_dir: Path, config, explicit_prefix: str | None = None
 ) -> str:
@@ -1281,6 +1297,9 @@ def assign_task_prefix(
     explicit ``task_prefix`` -> inferred-from-existing (stability) -> shortest
     collision-free extension of ``id.upper()[:5]``. A new project that would
     collide on ``[:5]`` gets the shortest longer prefix no other project uses.
+    Each derived candidate is passed through ``_strip_trailing_non_alnum``
+    (CLAWP-096) so a slice boundary landing on a hyphen never produces a
+    doubled separator once ``-{num:03d}`` is appended.
     """
     if explicit_prefix:
         return explicit_prefix.upper()
@@ -1289,13 +1308,14 @@ def assign_task_prefix(
         return inferred
     full = project_id.upper()
     used = _portfolio_prefixes(config, project_id)
-    base = full[:5] if len(full) >= 5 else full
+    base = _strip_trailing_non_alnum(full[:5] if len(full) >= 5 else full)
     if base and base not in used:
         return base
     for n in range(6, len(full) + 1):
-        if full[:n] not in used:
-            return full[:n]
-    return full  # ids are portfolio-unique, so the full id can't collide
+        candidate = _strip_trailing_non_alnum(full[:n])
+        if candidate not in used:
+            return candidate
+    return _strip_trailing_non_alnum(full)  # ids are portfolio-unique, so the full id can't collide
 
 
 def add_task(
