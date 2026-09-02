@@ -239,7 +239,7 @@ def link_research_session(
 
     # Parse and update frontmatter — skip (return None) on any malformation.
     try:
-        frontmatter, body = split_frontmatter(text)
+        frontmatter, body = split_frontmatter(text, where=str(item.file_path))
     except FrontmatterError:
         return None
 

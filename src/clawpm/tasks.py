@@ -501,6 +501,21 @@ def _set_updated_line(text: str, stamp: str) -> str | None:
             break
     if close_idx is None:
         return None  # unterminated fence
+    # CLAWP-091 — this function bypasses frontmatter.py entirely (surgical
+    # line-splice, not a YAML round-trip), so it was never guarded against
+    # non-mapping frontmatter. Splicing an `updated:` line into a block that
+    # parses to a list/scalar would silently downgrade an already-malformed
+    # file from cleanly-recoverable (a clear FrontmatterError elsewhere) into
+    # genuinely UNPARSEABLE YAML. Refuse the same way an unterminated fence
+    # already does. Real YAML syntax errors are left untouched exactly as
+    # before this fix — that's a pre-existing, out-of-scope case, not the
+    # "parses fine but isn't a mapping" case this task guards against.
+    try:
+        _parsed = yaml.safe_load("\n".join(lines[1:close_idx]))
+    except yaml.YAMLError:
+        _parsed = None
+    if _parsed is not None and not isinstance(_parsed, dict):
+        return None
     new_line = f"updated: '{stamp}'"
     for i in range(1, close_idx):
         if _UPDATED_LINE_RE.match(lines[i]):
@@ -1559,7 +1574,7 @@ def edit_task(
         # Grok review; not_a_mapping added CLAWP-091).
         frontmatter: dict
         try:
-            frontmatter, content = split_frontmatter(text)
+            frontmatter, content = split_frontmatter(text, where=str(task.file_path))
         except FrontmatterError as exc:
             if exc.reason == "absent":
                 frontmatter, content = {}, text
@@ -1748,7 +1763,7 @@ def _child_append_text(parent_path: Path, child_id: str) -> str | None:
     - :class:`ConcurrentModificationError` if the parent ``_task.md`` vanished
       (an external delete/move under the lock).
     - :class:`FrontmatterError` (a ``ValueError``) if its frontmatter is
-      absent / unterminated / unparseable.
+      absent / unterminated / unparseable / not a mapping (CLAWP-091).
     """
     if parent_path.name != "_task.md":
         return None  # not a directory-task parent — genuine no-op
@@ -1759,7 +1774,7 @@ def _child_append_text(parent_path: Path, child_id: str) -> str | None:
         )
     with guard_fs_tamper(f"Parent task '{parent_path}'"):
         text = parent_path.read_text(encoding="utf-8")
-    fm, raw_body = split_frontmatter(text)  # raises FrontmatterError on malformation
+    fm, raw_body = split_frontmatter(text, where=str(parent_path))  # raises FrontmatterError on malformation
     children = fm.get("children")
     if not isinstance(children, list):
         children = []

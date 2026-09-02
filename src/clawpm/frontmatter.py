@@ -137,12 +137,18 @@ def require_mapping(data: Any, *, where: str | None = None) -> dict[str, Any]:
     return data
 
 
-def split_frontmatter(text: str) -> tuple[dict[str, Any], str]:
+def split_frontmatter(text: str, *, where: str | None = None) -> tuple[dict[str, Any], str]:
     """Strictly parse YAML frontmatter. Raises on any malformation.
 
     Returns ``(data, body)`` on success, where ``data`` is
     ``yaml.safe_load(parts[1]) or {}`` -- guaranteed to be a ``dict`` -- and
     ``body`` is the raw substring after the closing fence (NOT stripped).
+
+    ``where`` (optional, CLAWP-091) is forwarded to :func:`require_mapping`
+    so the ``"not_a_mapping"`` message names the file even for a caller that
+    lets the raw :class:`FrontmatterError` propagate rather than wrapping it
+    in its own file/task-naming message. Omit it and the message just says
+    what type was found, with no location.
 
     Raises :class:`FrontmatterError` with ``reason``:
 
@@ -162,4 +168,4 @@ def split_frontmatter(text: str) -> tuple[dict[str, Any], str]:
         data = yaml.safe_load(parts[1]) or {}
     except yaml.YAMLError as exc:
         raise FrontmatterError("unparseable", f"unparseable frontmatter: {exc}") from exc
-    return require_mapping(data), parts[2]
+    return require_mapping(data, where=where), parts[2]
