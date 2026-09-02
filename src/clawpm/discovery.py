@@ -298,8 +298,18 @@ def _session_scoped_project_dir(config: PortfolioConfig, project_id: str) -> Pat
     session = find_session_for_cwd(portfolio_root, cwd, project_id=project_id)
     if session is None:
         return None
-    candidate = session.worktree_path.resolve() / ".project"
-    if not candidate.is_dir():
+    try:
+        # OSError here (antigravity review, PR #55) — a TOCTOU race against
+        # `git worktree remove`, a permission error, an unmounted drive —
+        # must fall open to the registry lookup like every other "no
+        # session" case, not crash the caller. The docstring promises
+        # "never raises"; before this guard, resolve()/is_dir() could break
+        # that promise for exactly the class of caller (tasks list/next/
+        # reflect) that must never hard-fail on a rare filesystem hiccup.
+        candidate = session.worktree_path.resolve() / ".project"
+        if not candidate.is_dir():
+            return None
+    except OSError:
         return None
     return candidate
 

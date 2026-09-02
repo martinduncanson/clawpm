@@ -187,8 +187,16 @@ def _replay(portfolio_root: Path) -> dict[str, SessionRecord]:
         return {}
     sessions: dict[str, SessionRecord] = {}
     try:
-        raw = path.read_text(encoding="utf-8", errors="strict")
-    except (OSError, UnicodeDecodeError) as exc:
+        # errors="replace" (antigravity review, PR #55), not "strict": a
+        # single invalid byte ANYWHERE in the file must not take down every
+        # OTHER session's replay — that would be strictly worse than the
+        # per-line JSONDecodeError handling below, since one bad byte can
+        # sit in the middle of an otherwise-healthy multi-KB append-only
+        # file. A replaced byte lands inside whichever line it corrupted;
+        # that one line then fails json.loads() below and is skipped same
+        # as any other malformed line, while every other line still parses.
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
         # error, not warning (Codex P1, PR #55): this is the fail-open path
         # that most directly recreates CLAWP-098's original corruption —
         # every ID-based mutator run from inside a dispatched worktree will
