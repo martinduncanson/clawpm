@@ -18,6 +18,7 @@ predictions:
   - local_review.py resolves the correct diff base automatically in a fork-primary
     repo without requiring --pr as a workaround
 priority: 6
+updated: '2026-09-02'
 ---
 # local_review.py --engine grok defaults to wrong diff base in fork-primary repos
 

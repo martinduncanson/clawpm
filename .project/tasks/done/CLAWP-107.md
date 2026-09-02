@@ -23,7 +23,7 @@ predictions:
   - code-quorum review clean on both the clawpm-repo PR and the ~/.claude config change
     before considering done
 priority: 4
-updated: '2026-09-01'
+updated: '2026-09-02'
 ---
 # Package clawpm as its own Claude Code plugin marketplace, retire git-checkout skill mirror
 
