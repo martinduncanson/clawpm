@@ -1,0 +1,261 @@
+{
+  "schema_version": 1,
+  "project": "clawpm",
+  "root": {
+    "title": "Decision maps: wayfinder-shaped decide-before-build inside clawpm (ADR-2026-09-02)",
+    "predictions": {
+      "complexity": "l",
+      "confidence": 3,
+      "approach": "Implement ADR docs/design/ADR-2026-09-02-planning-merge-plan.md: kind:decision tasks + resolution, root map sections + fog, frontier query, emit-tree depends_refs, planner chart mode (docs), plugin commands. Sonnet executors; each leaf is a PR with tests. Sequenced by parallel_group (1 -> 2 -> 3).",
+      "pre_mortem": "Schema widening (kind, destination, not_yet_specified, depends_refs) drifts between tasks add / tasks edit / emit-tree because CLAWP-108 already shows the edit path wholesale-replaces blocks. Every leaf that adds a field must add a round-trip test through all three paths.",
+      "filled_by": "agent"
+    }
+  },
+  "prd": {
+    "title": "PRD: Decision maps in clawpm (CLAWP-103 merge plan)",
+    "type": "decision",
+    "tags": ["prd", "planner", "wayfinder", "clawp-103"],
+    "body_markdown": "## Objective\nclawpm gains wayfinder's decide-before-build shape as a task kind: decision tickets with recorded resolutions, a root map (destination / decisions so far / not yet specified / out of scope), a frontier query, blocking edges at emission, and a planner chart mode. No second tracker, no second spec store.\n\n## Why\nCLAWP-103 gap analysis (ADR docs/design/ADR-2026-09-02-planning-merge-plan.md). clawpm already has predictions, rubric-gated dispatch, leases, won't-do ledger and an emission API; the missing shape is the one wayfinder has: decide first, one decision per session, fog kept coarse until sharp.\n\n## Constraints\n- Extend clawpm core / clawpm-planner only (WONT-DO 2026-07-14: no parallel planning system).\n- New frontmatter keys omitted when default so existing task files are byte-identical.\n- Zero LLM calls in core; all judgment stays in the planner skill.\n- Round-trip tests for every new field through tasks add, tasks edit, emit-tree.\n\n## Out of scope\n- OpenSpec-style spec deltas folded into .project/SPEC.md on close (fog).\n- GitHub-issue distribution of maps (CLAWP-058).\n- Persona system (routed to code-quorum as lens checklists).\n\n## Success definition\nA planner run in chart mode emits a decision map that `clawpm next --frontier <root>` can walk; resolving a decision with `clawpm done --resolution` updates the map's Decisions-so-far; fog graduates via `tasks add --graduates`; the plugin exposes /clawpm:plan, /clawpm:chart, /clawpm:next.\n\n## Chosen approach\nSee ADR sections D1-D6. Leaves are vertical slices per user-visible guarantee.\n\n## Open questions\n- Whether `resolution` should also be mirrored into a research entry of type decision for cross-project recall (deferred; the task file is the record).\n\n## Traceability\nGround: clawpm source at fork/main 06a32b7 read directly (models.py, emit_tree.py, cli/shortcuts.py next, tasks.py get_next_task, leases). No graph consulted; effort estimates are read-based, tagged UNGROUNDED-GRAPH.\n"
+  },
+  "leaves": [
+    {
+      "ref": "L1",
+      "parent_ref": null,
+      "leaf_key": "decision-maps::kind-decision-resolution",
+      "title": "A task can be a decision: kind:decision, done requires --resolution, parent map gains a Decisions-so-far line",
+      "success_criteria": [
+        {
+          "criterion": "WHEN a task file has kind: decision THEN Task.kind loads as decision and a task without the key loads as build with no frontmatter diff on save",
+          "gradeable_signal": "tests: load/save round-trip for both kinds; existing fixture files unchanged byte-for-byte",
+          "comparator": "eq:pass"
+        },
+        {
+          "criterion": "WHEN clawpm done <id> runs on a kind:decision task without --resolution THEN it errors decision_needs_resolution and the task stays open",
+          "gradeable_signal": "CLI test asserting error code and unchanged state",
+          "comparator": "eq:pass"
+        },
+        {
+          "criterion": "WHEN done --resolution runs on a decision leaf with a parent THEN frontmatter resolution/resolved_at are set and the parent body gains one line under ## Decisions so far formatted - [<title>](<id>): <first line>",
+          "gradeable_signal": "test reads parent file after done and asserts the section and line",
+          "comparator": "eq:pass"
+        },
+        {
+          "criterion": "WHEN a decision task closes THEN its task_done reflection event carries kind: decision",
+          "gradeable_signal": "test reads the JSONL event",
+          "comparator": "eq:pass"
+        }
+      ],
+      "scope": ["src/clawpm/models.py", "src/clawpm/tasks.py", "src/clawpm/services/tasks.py", "src/clawpm/cli/tasks.py", "src/clawpm/cli/shortcuts.py", "src/clawpm/reflect.py", "tests/"],
+      "out_of_scope": ["emit-tree changes (L3)", "frontier query (L4)", "planner docs (L5)"],
+      "stop_conditions": [
+        "If adding kind requires changing the directory-encoded state model, STOP and report; kind is a frontmatter attribute, not a state.",
+        "If tasks edit cannot preserve the new fields without fixing CLAWP-108 first, STOP and report the dependency rather than fencing it locally."
+      ],
+      "delegability": "agent",
+      "predictions": {
+        "duration_min": 120,
+        "complexity": "m",
+        "confidence": 4,
+        "approach": "Add kind Literal + resolution/resolved_at to Task; extend parsing/serialisation with omit-when-default; guard in the done transition (services layer, not CLI-only); append to parent body via the existing frontmatter/body writer; tag reflection event. UNGROUNDED-GRAPH effort.",
+        "pre_mortem": "The done path is shared by shortcuts.done and tasks state; guarding only one leaves a bypass.",
+        "filled_by": "agent"
+      },
+      "parallel_group": 1
+    },
+    {
+      "ref": "L2",
+      "parent_ref": null,
+      "leaf_key": "decision-maps::root-sections-fog",
+      "title": "A root task is a map: destination + not_yet_specified sections, fog graduates via tasks add --graduates",
+      "success_criteria": [
+        {
+          "criterion": "WHEN a task has destination or not_yet_specified in frontmatter THEN tasks show renders ## Destination, ## Decisions so far, ## Not yet specified, ## Out of scope sections in that order; absent fields render no section",
+          "gradeable_signal": "render tests for present/absent combinations",
+          "comparator": "eq:pass"
+        },
+        {
+          "criterion": "WHEN tasks add --parent <root> --graduates \"<text>\" matches exactly one fog entry (exact or case-insensitive prefix) THEN the child is created and that entry is removed from the root; zero or multiple matches error listing candidates and create nothing",
+          "gradeable_signal": "CLI tests for one/zero/many matches",
+          "comparator": "eq:pass"
+        },
+        {
+          "criterion": "WHEN tasks fog <root> --add/--drop run THEN the list changes and nothing else in the file changes",
+          "gradeable_signal": "diff test on the task file",
+          "comparator": "eq:pass"
+        }
+      ],
+      "scope": ["src/clawpm/models.py", "src/clawpm/tasks.py", "src/clawpm/cli/tasks.py", "src/clawpm/output.py", "tests/"],
+      "out_of_scope": ["auto-populating Decisions so far (L1 owns it)", "emit-tree root fields (L3)"],
+      "stop_conditions": [
+        "If the body renderer cannot be extended without rewriting existing task bodies, STOP and propose storing sections only in frontmatter."
+      ],
+      "delegability": "agent",
+      "predictions": {
+        "duration_min": 100,
+        "complexity": "m",
+        "confidence": 4,
+        "approach": "Two new Task fields (omit-when-default); a small section renderer used by show; --graduates as an option on tasks add that runs after the child is persisted, in the same file lock. UNGROUNDED-GRAPH effort.",
+        "pre_mortem": "Prefix matching on free text is ambiguous; the error path listing candidates is the safety net and must be tested.",
+        "filled_by": "agent"
+      },
+      "parallel_group": 1
+    },
+    {
+      "ref": "L3",
+      "parent_ref": null,
+      "leaf_key": "decision-maps::emit-tree-depends-refs-kind",
+      "title": "emit-tree can emit a decision map: leaf kind + depends_refs, root destination + not_yet_specified, validated example",
+      "success_criteria": [
+        {
+          "criterion": "WHEN a leaf carries kind: decision and depends_refs: [refs] THEN the minted tasks have kind set and depends resolved to the minted ids of those refs, atomically with the rest of the tree",
+          "gradeable_signal": "emit test asserting depends on the persisted files",
+          "comparator": "eq:pass"
+        },
+        {
+          "criterion": "WHEN depends_refs names an unknown ref or forms a cycle THEN --dry-run and the real emit both fail validation with no writes",
+          "gradeable_signal": "tests for unknown ref and 2-node cycle",
+          "comparator": "eq:pass"
+        },
+        {
+          "criterion": "WHEN depends_refs contains id:<existing-task-id> under attach_to THEN the dependency resolves to that id",
+          "gradeable_signal": "attach_to test",
+          "comparator": "eq:pass"
+        },
+        {
+          "criterion": "skills/clawpm-planner/examples/decision-map.emit.json exists and passes clawpm tasks emit-tree --dry-run; references/emission-contract.md documents the four new keys",
+          "gradeable_signal": "CI example-validation test includes the new example",
+          "comparator": "eq:pass"
+        }
+      ],
+      "scope": ["src/clawpm/emit_tree.py", "skills/clawpm-planner/references/emission-contract.md", "skills/clawpm-planner/examples/", "tests/"],
+      "out_of_scope": ["planner prose (L5)", "Task model fields (L1/L2 must land first)"],
+      "stop_conditions": [
+        "If L1 or L2 have not merged, STOP; this leaf depends on Task.kind, destination and not_yet_specified existing."
+      ],
+      "delegability": "agent",
+      "predictions": {
+        "duration_min": 120,
+        "complexity": "m",
+        "confidence": 3,
+        "approach": "Extend ALLOWED_LEAF_KEYS/ALLOWED_TOP_KEYS; resolve refs after ids are minted, before promote; topological check in validate. UNGROUNDED-GRAPH effort.",
+        "pre_mortem": "Ref resolution happens after id minting but promote is all-or-nothing; a resolution failure after staging must roll back the staged dir.",
+        "filled_by": "agent"
+      },
+      "parallel_group": 2
+    },
+    {
+      "ref": "L4",
+      "parent_ref": null,
+      "leaf_key": "decision-maps::frontier-query",
+      "title": "An agent can see the frontier: clawpm next --frontier <root> and tasks list --frontier <root>",
+      "success_criteria": [
+        {
+          "criterion": "WHEN next --frontier <root> runs THEN JSON has frontier (open children at any depth whose depends are all done and that hold no active lease), blocked [{id, waiting_on}], claimed [{id, lease_holder}], ordered by priority then id",
+          "gradeable_signal": "fixture tree with one of each case; assert membership and order",
+          "comparator": "eq:pass"
+        },
+        {
+          "criterion": "WHEN text format is used THEN every task is printed as its title with the id in brackets after it, never a bare id",
+          "gradeable_signal": "text output test",
+          "comparator": "eq:pass"
+        },
+        {
+          "criterion": "WHEN the root has no open children THEN the command reports the map is clear with exit 0",
+          "gradeable_signal": "empty case test",
+          "comparator": "eq:pass"
+        }
+      ],
+      "scope": ["src/clawpm/tasks.py", "src/clawpm/cli/shortcuts.py", "src/clawpm/cli/tasks.py", "src/clawpm/leases.py", "tests/"],
+      "out_of_scope": ["changing get_next_task's non-frontier behaviour", "cross-project frontiers"],
+      "stop_conditions": [
+        "If lease lookup requires a per-task file read that makes the query O(n^2) on large trees, STOP and report before optimising."
+      ],
+      "delegability": "agent",
+      "predictions": {
+        "duration_min": 90,
+        "complexity": "s",
+        "confidence": 4,
+        "approach": "Reuse list_tasks parent/child linking + depends satisfaction from get_next_task + active-lease set from leases.py; one pure function frontier(config, project, root) shared by both commands. UNGROUNDED-GRAPH effort.",
+        "pre_mortem": "Lease staleness: an expired lease must not count as claimed; use the existing lease-expiry rule, don't reinvent it.",
+        "filled_by": "agent"
+      },
+      "parallel_group": 2
+    },
+    {
+      "ref": "L5",
+      "parent_ref": null,
+      "leaf_key": "decision-maps::planner-chart-mode-docs",
+      "title": "clawpm-planner can chart: chart mode, interview discipline, explorer/architect fan-out, WHEN/THEN criteria, default stop-list",
+      "success_criteria": [
+        {
+          "criterion": "SKILL.md documents chart mode with its trigger (>=2 open decisions block decompose, or operator asks), its output (decision map via emit-tree with kind:decision leaves, depends_refs, destination, fog), its stop rule, and the no-fog exit",
+          "gradeable_signal": "section present; a reviewer can execute chart mode from the text alone against examples/decision-map.emit.json",
+          "comparator": "eq:present"
+        },
+        {
+          "criterion": "stage-playbook.md recon names feature-dev:code-explorer as the fan-out agent when installed with the return-key-files-then-read rule; specify carries the interview discipline (one question at a time, facts looked up not asked, false-yes rejected); l/xl ideate compares minimal/clean/pragmatic lenses and recommends one",
+          "gradeable_signal": "three sections present and cross-linked from SKILL.md",
+          "comparator": "eq:present"
+        },
+        {
+          "criterion": "decompose-vet.md recommends WHEN/THEN criterion phrasing and defines the default stop-list (auth/session, schema migration, bulk deletion, secrets, payment, prod config) seeded into stop_conditions unless waived in the PRD; scale-dial.md places chart mode between m and l",
+          "gradeable_signal": "sections present; example leaves in examples/ updated to the phrasing",
+          "comparator": "eq:present"
+        },
+        {
+          "criterion": "All example documents under skills/clawpm-planner/examples pass emit-tree --dry-run after the edits",
+          "gradeable_signal": "existing example-validation test green",
+          "comparator": "eq:pass"
+        }
+      ],
+      "scope": ["skills/clawpm-planner/SKILL.md", "skills/clawpm-planner/references/", "skills/clawpm-planner/examples/"],
+      "out_of_scope": ["core code", "importing mattpocock or osmani skill files verbatim"],
+      "stop_conditions": [
+        "If L3 has not merged, STOP: the decision-map example cannot validate without depends_refs/kind support."
+      ],
+      "delegability": "agent",
+      "predictions": {
+        "duration_min": 90,
+        "complexity": "m",
+        "confidence": 4,
+        "approach": "Docs-only PR against the planner skill; source text is ADR D5 plus the wayfinder/osmani/feature-dev mechanics cited there. Keep SKILL.md under its current length budget by moving detail into references.",
+        "pre_mortem": "Chart mode written as an option gets ignored; write it as a rule with a trigger.",
+        "filled_by": "agent"
+      },
+      "parallel_group": 3
+    },
+    {
+      "ref": "L6",
+      "parent_ref": null,
+      "leaf_key": "decision-maps::skill-working-rules-plugin-commands",
+      "title": "Working a map is documented and reachable: SKILL.md rules (one decision per session, refer by name, HITL never self-answers) and plugin commands /clawpm:plan /clawpm:chart /clawpm:next",
+      "success_criteria": [
+        {
+          "criterion": "skills/clawpm/SKILL.md has a Working the map section: next --frontier -> start (claim) -> resolve -> done --resolution -> graduate fog; one decision leaf per session with agent research leaves exempt; names wrap ids in narration; human-delegable leaves are never answered by the agent",
+          "gradeable_signal": "section present and consistent with L1/L2/L4 CLI surfaces",
+          "comparator": "eq:present"
+        },
+        {
+          "criterion": "commands/clawpm-plan.md, clawpm-chart.md, clawpm-next.md exist, each <=15 lines of routing into the clawpm-planner skill or clawpm next, and .claude-plugin/marketplace.json lists them",
+          "gradeable_signal": "claude plugin validate passes locally; commands appear in the plugin listing after reinstall",
+          "comparator": "eq:pass"
+        }
+      ],
+      "scope": ["skills/clawpm/SKILL.md", "commands/", ".claude-plugin/marketplace.json"],
+      "out_of_scope": ["new CLI logic", "the harness-side ~/.claude/skills/clawpm mirror (sync hook handles tracked content)"],
+      "stop_conditions": [
+        "If marketplace.json commands schema differs from the memory reference (claude plugin marketplace schema), STOP and check the live schema before guessing."
+      ],
+      "delegability": "agent",
+      "predictions": {
+        "duration_min": 60,
+        "complexity": "s",
+        "confidence": 4,
+        "approach": "Docs + three command files + manifest edit; verify with claude plugin validate and a local marketplace reinstall (note: plugin CLI writes live settings.json - re-diff before trusting the PR).",
+        "pre_mortem": "SKILL.md mirror at ~/.claude/skills/clawpm is a checkout whose SKILL.md was untracked once; confirm the file is tracked so the sync hook carries it.",
+        "filled_by": "agent"
+      },
+      "parallel_group": 3
+    }
+  ]
+}
