@@ -311,17 +311,31 @@ def find_session_for_cwd(
     majority of usage. Callers must treat ``None`` as "fall through to the
     existing portfolio-registry lookup", never as an error.
 
-    Path comparison uses ``os.path.normcase`` (grok review, PR #55) — the
-    same normalisation ``concurrency.file_lock`` already applies for its
-    lock-path keys. Windows filesystems are case-insensitive but
-    ``pathlib.Path`` equality and ``in .parents`` are NOT, so a
+    Path comparison case-normalises via ``os.path.normcase`` (grok review,
+    PR #55) — the same normalisation ``concurrency.file_lock`` already
+    applies for its lock-path keys. Windows filesystems are case-insensitive
+    but ``pathlib.Path`` equality and ``in .parents`` are NOT, so a
     case-mismatched cwd (a different drive-letter spelling, a shell that
     preserves different casing than the one that minted the worktree) would
     otherwise silently miss an active session and fail open to exactly the
-    main-checkout corruption this module exists to prevent.
+    main-checkout corruption this module exists to prevent. The
+    case-normalised strings are then wrapped back in ``Path`` and compared
+    via equality / ``in .parents`` (antigravity review, PR #55), not raw
+    string ``.startswith(wt + os.sep)`` — a Windows drive root resolves with
+    a trailing separator (``"W:\\"``), which made the string-concat version
+    double up separators and silently miss every path nested under a
+    worktree that happened to sit at a drive root.
     """
-    resolved_cwd = Path(cwd).resolve()
-    cwd_key = os.path.normcase(str(resolved_cwd))
+    try:
+        resolved_cwd = Path(cwd).resolve()
+    except OSError:
+        # antigravity review, PR #55: an unresolvable cwd (permission error,
+        # a network drive that dropped mid-call) must fall open to "no
+        # session matched" like every other miss, not crash every caller
+        # of get_project_dir — including read-only commands (tasks list/
+        # next/reflect) that share this chokepoint.
+        return None
+    cwd_norm = Path(os.path.normcase(str(resolved_cwd)))
     best: Optional[SessionRecord] = None
     best_depth = -1
     for record in active_sessions(portfolio_root):
@@ -331,8 +345,8 @@ def find_session_for_cwd(
             wt = record.worktree_path.resolve()
         except OSError:
             continue
-        wt_key = os.path.normcase(str(wt))
-        if cwd_key != wt_key and not cwd_key.startswith(wt_key + os.sep):
+        wt_norm = Path(os.path.normcase(str(wt)))
+        if cwd_norm != wt_norm and wt_norm not in cwd_norm.parents:
             continue
         depth = len(wt.parts)
         if depth > best_depth:
