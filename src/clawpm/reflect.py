@@ -20,6 +20,10 @@ from typing import Any
 from .models import Actuals, Predictions, TaskComplexity, WorkLogAction, WorkLogEntry
 
 
+_DURATION_UNIT_MULTIPLIER = {"m": 1, "h": 60, "d": 60 * 24, "w": 60 * 24 * 7}
+_DURATION_COMBO_SEGMENT_RE = re.compile(r"(\d+)([mhdw])")
+
+
 def parse_duration(value: "str | int | None") -> "int | None":
     """Parse a human-friendly duration string into an integer number of minutes.
 
@@ -28,6 +32,7 @@ def parse_duration(value: "str | int | None") -> "int | None":
       - ``2h``             → 120 minutes
       - ``3d``             → 4320 minutes  (24 h/day — wall-clock, not 8-hour workday)
       - ``1w``             → 10080 minutes (7 × 24 h)
+      - ``2h30m``, ``1d4h``, ``1w2d3h4m`` → combined units, summed (CLAWP-096)
 
     Wall-clock days/weeks are intentional: calibration compares predicted elapsed
     time against actual elapsed time, not scheduled working hours.
@@ -39,8 +44,8 @@ def parse_duration(value: "str | int | None") -> "int | None":
     if isinstance(value, int):
         return value
     s = str(value).strip().lower()
-    match = re.fullmatch(r"(\d+)([mhdw]?)", s)
-    if not match:
+
+    def _bad_duration() -> None:
         # Lazy import so this module (imported by the click-free service layer's
         # transition() via write_reflection_event / _compute_actuals) does not
         # pull click into the MCP import chain — click.BadParameter is only
@@ -48,11 +53,23 @@ def parse_duration(value: "str | int | None") -> "int | None":
         # from CLI command handlers (CLAWP-077 Codex review).
         import click
         raise click.BadParameter(
-            f"Bad duration: {value!r}. Use 90, 90m, 2h, 1d, or 1w."
+            f"Bad duration: {value!r}. Use 90, 90m, 2h, 1d, 1w, or a combination like 2h30m."
         )
-    n, unit = int(match.group(1)), match.group(2) or "m"
-    multiplier = {"m": 1, "h": 60, "d": 60 * 24, "w": 60 * 24 * 7}[unit]
-    return n * multiplier
+
+    # Bare integer (no unit) -> minutes, unchanged from the original contract.
+    if re.fullmatch(r"\d+", s):
+        return int(s)
+    # One or more back-to-back (digits+unit) segments, e.g. "2h30m", "1d4h",
+    # "1w2d3h4m" — each segment must carry an explicit unit letter. The
+    # fullmatch on the same digit+unit alternation guarantees the whole
+    # string is consumed, so stray/unrecognised characters can't slip through
+    # between segments.
+    if not re.fullmatch(r"(?:\d+[mhdw])+", s):
+        _bad_duration()
+    total = 0
+    for n_str, unit in _DURATION_COMBO_SEGMENT_RE.findall(s):
+        total += int(n_str) * _DURATION_UNIT_MULTIPLIER[unit]
+    return total
 
 
 def _reflections_dir(portfolio_root: Path) -> Path:
