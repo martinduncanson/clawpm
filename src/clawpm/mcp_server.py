@@ -212,7 +212,7 @@ def _build_predictions(
         parsed_duration = _parse_duration(predict_duration)
     except BadParameter as exc:
         raise ValueError(str(exc)) from exc
-    return Predictions(
+    result = Predictions(
         duration_min=parsed_duration,
         complexity=TaskComplexity(predict_complexity) if predict_complexity else None,
         files_changed=predict_files_changed,
@@ -229,6 +229,24 @@ def _build_predictions(
         predicted_iterations=predict_iterations,
         filled_by=predicted_by if predicted_by is not None else "agent",
     )
+    if result.is_empty():
+        # has_predictions fired (something was `is not None`) but every
+        # field that actually counts toward Predictions.is_empty() ended up
+        # empty — e.g. predict_complexity="" (an empty string IS-NOT-None,
+        # but `TaskComplexity(x) if x else None` coerces it to None). Left
+        # unchecked, edit_task treats an is_empty() Predictions as "clear the
+        # whole block" and silently wipes every OTHER existing prediction
+        # field on a tasks_edit call that only meant to touch one of them —
+        # the same full-wipe risk already reasoned about for the list
+        # fields, just reachable through a scalar empty string instead
+        # (grok-4.6 round 5). Reject explicitly rather than silently wiping
+        # or silently no-op'ing.
+        raise ValueError(
+            "predictions fields were supplied but all resolved to empty "
+            "(e.g. an empty string) — omit them entirely rather than "
+            "passing empty markers"
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +433,11 @@ def tasks_add(
     predict_duration: str | None = None,
     predict_complexity: str | None = None,
     predict_files_changed: int | None = None,
+    predict_scope: list[str] | None = None,
+    predict_frameworks: list[str] | None = None,
+    predict_pitfalls: str | None = None,
+    unknowns: str | None = None,
+    predict_iterations: int | None = None,
     confidence: int | None = None,
     pre_mortem: str | None = None,
     predict_approach: str | None = None,
@@ -426,11 +449,14 @@ def tasks_add(
     strings — this tool's schema is `list[str]`; the CLI's structured
     `{"criterion","gradeable_signal","comparator"}` object form isn't
     accepted here) plus predictions (`predict_duration` like '4h',
-    `confidence` 1-5, `pre_mortem`, `predict_approach`, `reference_tasks`) so
-    the task is gradeable and feeds calibration. Predictions are attributed
-    `filled_by="agent"` by default (pass `predicted_by="operator"` for a
-    human-in-the-loop host). `delegability` is agent|human|either. Returns
-    the created task."""
+    `confidence` 1-5, `pre_mortem`, `predict_approach`, `reference_tasks`,
+    `predict_scope`, `predict_frameworks`, `predict_pitfalls`, `unknowns`,
+    `predict_iterations`) so the task is gradeable and feeds calibration.
+    Predictions are attributed `filled_by="agent"` by default (pass
+    `predicted_by="operator"` for a human-in-the-loop host). `delegability`
+    is agent|human|either. `depends` accepts short ids (expanded the same
+    way as `task_id` elsewhere). Returns the created task."""
+    from clawpm.context import expand_task_id
     from clawpm.models import TaskComplexity
     from clawpm.tasks import add_task
 
@@ -451,17 +477,17 @@ def tasks_add(
             predict_duration=predict_duration,
             predict_complexity=predict_complexity,
             predict_files_changed=predict_files_changed,
-            predict_scope=None,
-            predict_frameworks=None,
-            predict_pitfalls=None,
+            predict_scope=predict_scope,
+            predict_frameworks=predict_frameworks,
+            predict_pitfalls=predict_pitfalls,
             hypothesis=hypothesis,
             success_criteria=success_criteria,
             predict_approach=predict_approach,
-            unknowns=None,
+            unknowns=unknowns,
             confidence=confidence,
             reference_tasks=reference_tasks,
             pre_mortem=pre_mortem,
-            predict_iterations=None,
+            predict_iterations=predict_iterations,
             predicted_by=predicted_by,
         )
     except ValueError as exc:
@@ -473,7 +499,12 @@ def tasks_add(
         title=title,
         priority=priority,
         complexity=cmplx,
-        depends=list(depends) if depends else None,
+        # expand_task_id: SERVER_INSTRUCTIONS advertises short-id support
+        # generally ("'68' -> 'CLAWP-068'") — depends is a task-id-bearing
+        # field just like task_id itself, and get_next_task's dependency
+        # gate does an exact string match against done_ids, so an
+        # unexpanded short id here silently never resolves (grok-4.5 round 5).
+        depends=[expand_task_id(d, project_id) for d in depends] if depends else None,
         scope=list(scope) if scope else None,
         tags=list(tags) if tags else None,
         description=description,
@@ -583,13 +614,14 @@ def tasks_edit(
     never a silent wipe). `edit_task` REPLACES the whole predictions block
     whenever ANY predict_*/success_criteria/confidence/pre_mortem argument is
     supplied — so to change one prediction field without erasing the others
-    (pitfalls, unknowns, scope, frameworks, iterations, `filled_by`), pass the
-    existing values for the rest too (fetch them via `tasks_get` first);
-    otherwise `filled_by` resets to `"agent"` (pass `predicted_by` to
-    override). Returns the updated task."""
+    (pitfalls, unknowns, scope, frameworks, iterations), pass the existing
+    values for the rest too (fetch them via `tasks_get` first). `filled_by`
+    is preserved from the task's existing predictions unless `predicted_by`
+    is supplied (falls back to `"agent"` only if the task had none). Returns
+    the updated task."""
     from clawpm.context import expand_task_id
     from clawpm.models import TaskComplexity
-    from clawpm.tasks import edit_task
+    from clawpm.tasks import edit_task, get_task
 
     config = _load_config()
     project_id, _ = _resolve_project(project)
@@ -603,6 +635,17 @@ def tasks_edit(
     if delegability is not None and delegability not in ("agent", "human", "either"):
         return {"ok": False, "error": "bad_delegability",
                 "message": f"invalid delegability '{delegability}' (agent|human|either)"}
+
+    # Preserve the existing filled_by unless the caller overrides it —
+    # _build_predictions REPLACES the whole predictions block, and its own
+    # default ("agent" when predicted_by is omitted) would otherwise silently
+    # overwrite e.g. an "operator-edited" attribution just because a caller
+    # only meant to bump `confidence` (grok-4.5 round 5).
+    effective_predicted_by = predicted_by
+    if effective_predicted_by is None:
+        existing_task = get_task(config, project_id, full_id)
+        if existing_task and existing_task.predictions:
+            effective_predicted_by = existing_task.predictions.filled_by
 
     try:
         predictions = _build_predictions(
@@ -620,7 +663,7 @@ def tasks_edit(
             reference_tasks=reference_tasks,
             pre_mortem=pre_mortem,
             predict_iterations=predict_iterations,
-            predicted_by=predicted_by,
+            predicted_by=effective_predicted_by,
         )
     except ValueError as exc:
         return {"ok": False, "error": "bad_predictions", "message": str(exc)}
@@ -631,11 +674,23 @@ def tasks_edit(
     # tags+clear_tags (or parallel_group+clear_parallel_group) conflict lets
     # edit_task's clear-wins-silently ordering discard the value the caller
     # just supplied, with no signal that the "set" half was ignored.
+    #
+    # `tags`/`complexity` use bare truthiness here (not `is not None`),
+    # matching the CLI and the downstream coercion two blocks below
+    # (`TaskComplexity(complexity) if complexity else None`,
+    # `list(tags) if tags else None`) — `tags: []` or `complexity: ""` would
+    # otherwise pass this guard as "a real change" and then silently coerce
+    # to "unchanged", still rewriting the file for nothing (grok-4.5 AND
+    # grok-4.6, round 5, independently). `scope`/`out_of_scope`/
+    # `stop_conditions` stay `is not None` deliberately — for THOSE fields an
+    # explicit `[]` legitimately means "clear it" (see the docstring above),
+    # so treating it as "no change" would reintroduce the exact bug the
+    # None-vs-[] fix (round 2) closed.
     if not any([
-        title is not None, priority is not None, complexity is not None, body is not None,
+        title is not None, priority is not None, complexity, body is not None,
         scope is not None, predictions is not None, parallel_group is not None,
         clear_parallel_group, out_of_scope is not None, stop_conditions is not None,
-        delegability is not None, tags is not None, clear_tags,
+        delegability is not None, tags, clear_tags,
     ]):
         return {"ok": False, "error": "no_changes",
                 "message": "Specify at least one field to edit"}
@@ -796,13 +851,24 @@ def _catch_unhandled(fn: Callable[..., Any]) -> Callable[..., Any]:
             # but stderr is free on stdio transport (only stdout carries
             # JSON-RPC), so log it there for anyone watching the server
             # process rather than only the caller (grok-4.5 review).
-            import traceback
-            print(
-                f"[clawpm-mcp] unhandled {type(exc).__name__} in tool "
-                f"{getattr(fn, '__name__', '?')}: {exc}",
-                file=sys.stderr,
-            )
-            traceback.print_exc(file=sys.stderr)
+            #
+            # The logging itself must never be able to prevent the return
+            # below: if stderr.reconfigure() (module top) was skipped
+            # because the stream was already closed/replaced, and `exc`'s
+            # text is non-ASCII, an unguarded print/traceback here would
+            # raise ITS OWN UnicodeEncodeError and escape the wrapper —
+            # defeating the exact JSON contract this except-block exists to
+            # guarantee (grok-4.6 round 5).
+            try:
+                import traceback
+                print(
+                    f"[clawpm-mcp] unhandled {type(exc).__name__} in tool "
+                    f"{getattr(fn, '__name__', '?')}: {exc}",
+                    file=sys.stderr,
+                )
+                traceback.print_exc(file=sys.stderr)
+            except Exception:  # noqa: BLE001 - logging must never break the contract
+                pass
             return {"ok": False, "error": "internal_error", "message": str(exc)}
 
     return wrapper

@@ -849,3 +849,199 @@ def test_catch_unhandled_maps_known_mutator_exceptions():
 
     other_result = M._catch_unhandled(_raises(RuntimeError("weird")))()
     assert other_result == {"ok": False, "error": "internal_error", "message": "weird"}
+
+
+def test_catch_unhandled_survives_broken_stderr_logging(monkeypatch):
+    """The diagnostic print/traceback in the Exception branch must never be
+    able to prevent the {"ok": false, ...} return — if logging itself
+    raises (e.g. a closed/replaced stderr), the JSON contract still has to
+    come back (grok-4.6 round 5)."""
+    def _boom_print(*args, **kwargs):
+        raise OSError("stderr is closed")
+
+    monkeypatch.setattr("builtins.print", _boom_print)
+
+    def fn():
+        raise RuntimeError("weird")
+
+    result = M._catch_unhandled(fn)()
+    assert result == {"ok": False, "error": "internal_error", "message": "weird"}
+
+
+# ---------------------------------------------------------------------------
+# empty-string prediction fields no longer silently wipe the whole block
+# (CLAWP-068 review, grok-4.6 round 5)
+# ---------------------------------------------------------------------------
+
+def test_wire_level_empty_predict_complexity_rejected(isolated_portfolio):
+    """`predict_complexity: ""` alone (nothing else supplied) previously
+    fired has_predictions (`is not None`) but coerced to an empty
+    Predictions object, which edit_task treats as "clear the whole block" —
+    silently wiping any OTHER existing prediction field. Now rejected as
+    bad_predictions instead."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    pid = isolated_portfolio.project_id
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+
+            added = await _call(client, "tasks_add", {
+                "project": pid, "title": "x", "confidence": 3,
+            })
+            task_id = added["task"]["id"]
+
+            edited = await _call(client, "tasks_edit", {
+                "project": pid, "task_id": task_id, "predict_complexity": "",
+            })
+            assert edited["ok"] is False
+            assert edited["error"] == "bad_predictions"
+
+            # Existing predictions survived the rejected request.
+            got = await _call(client, "tasks_get", {"project": pid, "task_id": task_id})
+            assert got["task"]["predictions"]["confidence"] == 3
+
+    _run(scenario)
+
+
+# ---------------------------------------------------------------------------
+# tasks_add depends short-id expansion (CLAWP-068 review, grok-4.5 round 5)
+# ---------------------------------------------------------------------------
+
+def test_wire_level_tasks_add_expands_short_depends(isolated_portfolio):
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    pid = isolated_portfolio.project_id
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+
+            dep = await _call(client, "tasks_add", {"project": pid, "title": "dep"})
+            dep_id = dep["task"]["id"]
+            dep_num = dep_id.split("-")[1]
+
+            dependent = await _call(client, "tasks_add", {
+                "project": pid, "title": "dependent", "depends": [dep_num],
+            })
+            assert dependent["ok"] is True
+            assert dependent["task"]["depends"] == [dep_id]
+
+    _run(scenario)
+
+
+# ---------------------------------------------------------------------------
+# tasks_edit no_changes truthiness fix for tags/complexity (CLAWP-068
+# review, grok-4.5 + grok-4.6 round 5, independently convergent)
+# ---------------------------------------------------------------------------
+
+def test_wire_level_tasks_edit_empty_tags_and_complexity_are_no_changes(isolated_portfolio):
+    """`tags: []` and `complexity: ""` coerce to "unchanged" downstream
+    (tags clearing is exclusively via clear_tags; empty complexity ->
+    None) — the no_changes guard must see through that coercion using the
+    same truthiness, or it lets a request past that then silently
+    rewrites the file for nothing."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    pid = isolated_portfolio.project_id
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+
+            added = await _call(client, "tasks_add", {"project": pid, "title": "x"})
+            task_id = added["task"]["id"]
+
+            empty_tags = await _call(client, "tasks_edit", {
+                "project": pid, "task_id": task_id, "tags": [],
+            })
+            assert empty_tags["ok"] is False
+            assert empty_tags["error"] == "no_changes"
+
+            empty_complexity = await _call(client, "tasks_edit", {
+                "project": pid, "task_id": task_id, "complexity": "",
+            })
+            assert empty_complexity["ok"] is False
+            assert empty_complexity["error"] == "no_changes"
+
+    _run(scenario)
+
+
+# ---------------------------------------------------------------------------
+# filled_by preservation on tasks_edit (CLAWP-068 review, grok-4.5 round 5)
+# ---------------------------------------------------------------------------
+
+def test_wire_level_tasks_edit_preserves_filled_by(isolated_portfolio):
+    """Editing only `confidence` on a task whose predictions were
+    attributed "operator-edited" must NOT silently reset filled_by to the
+    "agent" default — _build_predictions replaces the whole block, so the
+    edit path must resolve the existing value first."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    pid = isolated_portfolio.project_id
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+
+            added = await _call(client, "tasks_add", {
+                "project": pid, "title": "x", "confidence": 3,
+                "predicted_by": "operator-edited",
+            })
+            task_id = added["task"]["id"]
+            assert added["task"]["predictions"]["filled_by"] == "operator-edited"
+
+            edited = await _call(client, "tasks_edit", {
+                "project": pid, "task_id": task_id, "confidence": 4,
+            })
+            assert edited["ok"] is True
+            assert edited["task"]["predictions"]["confidence"] == 4
+            assert edited["task"]["predictions"]["filled_by"] == "operator-edited"
+
+            # Explicit predicted_by still overrides.
+            edited2 = await _call(client, "tasks_edit", {
+                "project": pid, "task_id": task_id, "confidence": 5,
+                "predicted_by": "agent",
+            })
+            assert edited2["task"]["predictions"]["filled_by"] == "agent"
+
+    _run(scenario)
+
+
+# ---------------------------------------------------------------------------
+# tasks_add predictions parameter symmetry with tasks_edit (CLAWP-068
+# review, grok-4.5 round 5)
+# ---------------------------------------------------------------------------
+
+def test_wire_level_tasks_add_accepts_full_predictions(isolated_portfolio):
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    pid = isolated_portfolio.project_id
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+
+            added = await _call(client, "tasks_add", {
+                "project": pid, "title": "x",
+                "predict_scope": ["a.py"],
+                "predict_frameworks": ["pytest"],
+                "predict_pitfalls": "flaky mocks",
+                "unknowns": "concurrency behavior",
+                "predict_iterations": 2,
+            })
+            assert added["ok"] is True
+            preds = added["task"]["predictions"]
+            assert preds["files_scope"] == ["a.py"]
+            assert preds["frameworks"] == ["pytest"]
+            assert preds["pitfalls"] == "flaky mocks"
+            assert preds["unknowns"] == "concurrency behavior"
+            assert preds["predicted_iterations"] == 2
+
+    _run(scenario)
