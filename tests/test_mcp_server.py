@@ -678,6 +678,88 @@ def test_wire_level_tasks_edit_empty_list_clears_scope(isolated_portfolio):
 
 
 # ---------------------------------------------------------------------------
+# tasks_edit no_changes / conflicting_flags guards (CLAWP-068 review,
+# grok-4.5 round 4)
+# ---------------------------------------------------------------------------
+
+def test_wire_level_tasks_edit_no_changes(isolated_portfolio):
+    """tasks_edit with no mutable field supplied must be rejected, matching
+    the CLI's no_changes guard — otherwise edit_task still rewrites the file
+    and bumps `updated` for a request that changed nothing."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    pid = isolated_portfolio.project_id
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+
+            added = await _call(client, "tasks_add", {"project": pid, "title": "x"})
+            task_id = added["task"]["id"]
+
+            result = await _call(client, "tasks_edit", {"project": pid, "task_id": task_id})
+            assert result["ok"] is False
+            assert result["error"] == "no_changes"
+
+    _run(scenario)
+
+
+def test_wire_level_tasks_edit_conflicting_flags(isolated_portfolio):
+    """tags+clear_tags and parallel_group+clear_parallel_group must be
+    rejected, matching the CLI's conflicting_flags guard — otherwise
+    edit_task's clear-wins-silently ordering discards the supplied value
+    with no signal that half the request was ignored."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    pid = isolated_portfolio.project_id
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+
+            added = await _call(client, "tasks_add", {"project": pid, "title": "x"})
+            task_id = added["task"]["id"]
+
+            tags_conflict = await _call(client, "tasks_edit", {
+                "project": pid, "task_id": task_id,
+                "tags": ["a"], "clear_tags": True,
+            })
+            assert tags_conflict["ok"] is False
+            assert tags_conflict["error"] == "conflicting_flags"
+
+            pg_conflict = await _call(client, "tasks_edit", {
+                "project": pid, "task_id": task_id,
+                "parallel_group": 1, "clear_parallel_group": True,
+            })
+            assert pg_conflict["ok"] is False
+            assert pg_conflict["error"] == "conflicting_flags"
+
+    _run(scenario)
+
+
+# ---------------------------------------------------------------------------
+# context() negative log_limit clamp (CLAWP-068 review, grok-4.5 round 4)
+# ---------------------------------------------------------------------------
+
+def test_wire_level_context_negative_log_limit_clamped(isolated_portfolio):
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    pid = isolated_portfolio.project_id
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+
+            result = await _call(client, "context", {"project": pid, "log_limit": -1})
+            assert result["ok"] is True
+
+    _run(scenario)
+
+
+# ---------------------------------------------------------------------------
 # mission_list status validation (CLAWP-068 review, grok-4.6)
 # ---------------------------------------------------------------------------
 
@@ -703,16 +785,15 @@ def test_wire_level_mission_list_bad_status(isolated_portfolio):
 # grok-4.5 round 3 — see _build_predictions's NOTE for why)
 # ---------------------------------------------------------------------------
 
-def test_wire_level_predict_scope_alone_is_a_noop(isolated_portfolio):
-    """`predict_scope: []` as the SOLE tasks_edit argument is a documented
-    no-op, matching the CLI's own `_has_predictions` truthiness check. Grok
-    flagged this as a possible clear-vs-omit gap (like the top-level scope
-    fix), but switching to `is not None` trades a silent no-op for a silent
-    full-wipe of every OTHER existing prediction field (Predictions.is_empty()
-    doesn't know about filled_by, so an otherwise-empty object gets popped
-    entirely by edit_task) — a design call, not a clear defect, left as-is
-    and flagged in the PR thread rather than auto-decided. This test locks in
-    the current (safer) behavior so it doesn't silently change later."""
+def test_wire_level_predict_scope_alone_is_rejected_as_no_changes(isolated_portfolio):
+    """`predict_scope: []` as the SOLE tasks_edit argument doesn't register
+    as a predictions edit (matches the CLI's own `_has_predictions`
+    truthiness check — see _build_predictions's NOTE for why switching to
+    `is not None` would trade this for a worse bug, a silent full-wipe of
+    every OTHER existing prediction field). Now that tasks_edit has a
+    no_changes guard (grok-4.5 round 4), a call that registers nothing to
+    change is rejected outright rather than silently succeeding with no
+    effect — strictly better than the earlier no-op-but-ok:true behavior."""
     from mcp.shared.memory import create_connected_server_and_client_session
 
     pid = isolated_portfolio.project_id
@@ -731,10 +812,12 @@ def test_wire_level_predict_scope_alone_is_a_noop(isolated_portfolio):
             edited = await _call(client, "tasks_edit", {
                 "project": pid, "task_id": task_id, "predict_scope": [],
             })
-            assert edited["ok"] is True
-            # No-op: existing predictions (confidence) survive untouched,
-            # rather than being wiped by an unintended "empty" replacement.
-            assert edited["task"]["predictions"]["confidence"] == 3
+            assert edited["ok"] is False
+            assert edited["error"] == "no_changes"
+
+            # Existing predictions are untouched by the rejected request.
+            got = await _call(client, "tasks_get", {"project": pid, "task_id": task_id})
+            assert got["task"]["predictions"]["confidence"] == 3
 
     _run(scenario)
 

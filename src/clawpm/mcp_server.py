@@ -317,6 +317,14 @@ def context(project: str | None = None, log_limit: int = 5) -> dict:
     project_id, source = _resolve_project(project)
     from clawpm.context import build_agent_context
 
+    # worklog.read_entries does a bare entries[:limit] — a negative log_limit
+    # silently drops the OLDEST entry via Python end-slicing rather than being
+    # ignored or rejected (same latent bug the CLI's own --log-limit has;
+    # clamping here rather than in the shared worklog module, which is out of
+    # this PR's scope — grok-4.5 round 4).
+    if log_limit < 0:
+        log_limit = 5
+
     ctx = build_agent_context(config, project_id, source=source, log_limit=log_limit)
     if ctx is None:
         return {"ok": False, "error": "not_found", "message": f"Project '{project_id}' not found"}
@@ -616,6 +624,29 @@ def tasks_edit(
         )
     except ValueError as exc:
         return {"ok": False, "error": "bad_predictions", "message": str(exc)}
+
+    # Mirror the CLI's own guards (cli/tasks.py tasks_edit) — without them,
+    # MCP silently accepts requests the CLI refuses outright (grok-4.5 round 4):
+    # a no-op edit still rewrites the file and bumps `updated`, and a
+    # tags+clear_tags (or parallel_group+clear_parallel_group) conflict lets
+    # edit_task's clear-wins-silently ordering discard the value the caller
+    # just supplied, with no signal that the "set" half was ignored.
+    if not any([
+        title is not None, priority is not None, complexity is not None, body is not None,
+        scope is not None, predictions is not None, parallel_group is not None,
+        clear_parallel_group, out_of_scope is not None, stop_conditions is not None,
+        delegability is not None, tags is not None, clear_tags,
+    ]):
+        return {"ok": False, "error": "no_changes",
+                "message": "Specify at least one field to edit"}
+
+    if parallel_group is not None and clear_parallel_group:
+        return {"ok": False, "error": "conflicting_flags",
+                "message": "Cannot supply both parallel_group and clear_parallel_group"}
+
+    if tags and clear_tags:
+        return {"ok": False, "error": "conflicting_flags",
+                "message": "Cannot supply both tags and clear_tags"}
 
     task = edit_task(
         config,
