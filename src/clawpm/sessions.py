@@ -452,7 +452,16 @@ def find_session_for_cwd(
             continue
         try:
             wt = record.worktree_path.resolve()
-        except OSError:
+        except OSError as exc:
+            # grok review, PR #55 (round 5): log at ERROR — same fail-open
+            # class as every other guard in this module, just triggered by
+            # a TOCTOU race (active_sessions already confirmed this exact
+            # path was a directory moments ago via stat_is_dir).
+            logger.error(
+                "Failed to resolve candidate session worktree %s (session "
+                "%s): %s. Skipping this candidate for this call.",
+                record.worktree_path, record.session_id, exc,
+            )
             continue
         wt_norm = Path(os.path.normcase(str(wt)))
         if cwd_norm != wt_norm and wt_norm not in cwd_norm.parents:
