@@ -755,15 +755,22 @@ def project_doctor(
 
     # --- Phase 1.6 Check c: Cross-project prefix collisions (CLAWP-048) ---
     # Use each project's RESOLVED prefix (explicit task_prefix -> inferred from
-    # existing tasks -> [:5] for the as-yet-unminted), so the check reflects the
-    # IDs actually being minted: a task_prefix override clears a false collision,
-    # and an inferred/derived prefix surfaces a real one the naive [:5] missed.
+    # existing tasks -> the naive first-mint placeholder for the as-yet-unminted),
+    # so the check reflects the IDs actually being minted: a task_prefix override
+    # clears a false collision, and an inferred/derived prefix surfaces a real one
+    # the naive placeholder missed. The placeholder itself must come from
+    # ``_naive_prefix_placeholder`` (CLAWP-096), not a bare ``id.upper()[:5]`` --
+    # that bare slice can end in a trailing separator (``"code-quorum"`` ->
+    # ``"CODE-"``) that ``assign_task_prefix`` no longer actually mints, which
+    # would key this map under a prefix nothing ever gets and hide the real
+    # collision it derives instead (``"CODE"``).
+    from clawpm.tasks import _naive_prefix_placeholder as _naive_prefix
     from clawpm.tasks import resolve_existing_prefix as _resolve_prefix
 
     prefix_map: dict[str, list[str]] = {}
     all_projects = discover_projects(config)
     for proj in all_projects:
-        prefix = _resolve_prefix(proj) or proj.id.upper()[:5]
+        prefix = _resolve_prefix(proj) or _naive_prefix(proj.id)
         prefix_map.setdefault(prefix, []).append(proj.id)
     prefix_collisions = [
         {"prefix": pfx, "projects": pids}

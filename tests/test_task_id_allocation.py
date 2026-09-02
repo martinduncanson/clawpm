@@ -236,3 +236,26 @@ class TestDoctorCollisionCheck:
         cols = self._prefix_collisions(res.output)
         assert cols is not None, res.output
         assert not any(c["prefix"] == "ARB-P" and len(c["projects"]) > 1 for c in cols), cols
+
+    def test_doctor_uses_stripped_placeholder_for_taskless_hyphen_boundary_sibling(
+        self, tmp_path, monkeypatch
+    ):
+        # CLAWP-096 (grok review finding, cli/project.py): doctor's collision
+        # map must key a still-task-less sibling under the SAME placeholder
+        # assign_task_prefix would actually derive for it
+        # (_naive_prefix_placeholder), not a bare unstripped id.upper()[:5].
+        # "code-quorum" has already minted (real resolved prefix "CODE");
+        # "code-runner" is still task-less. A bare [:5] keys code-runner
+        # under "CODE-" (never keyed alongside code-quorum's "CODE"),
+        # silently hiding the real collision the two would hit on
+        # code-runner's first mint.
+        _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        (tmp_path / "projects" / "code-quorum" / ".project" / "tasks" / "CODE-000.md").write_text(
+            "---\nid: CODE-000\n---\n", encoding="utf-8"
+        )
+        _add_project(tmp_path, "code-runner")  # task-less
+        res = CliRunner().invoke(main, ["--format", "json", "doctor"])
+        cols = self._prefix_collisions(res.output)
+        assert cols is not None, res.output
+        code_col = [c for c in cols if c["prefix"] == "CODE"]
+        assert code_col and set(code_col[0]["projects"]) == {"code-quorum", "code-runner"}, cols
