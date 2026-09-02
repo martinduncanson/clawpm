@@ -415,6 +415,12 @@ def add_mission_mini_goal(
                 raise ValueError(f"Task {task_id} has no frontmatter") from None
             if exc.reason == "unterminated":
                 raise ValueError(f"Task {task_id} frontmatter malformed") from None
+            if exc.reason == "not_a_mapping":
+                # CLAWP-091 — parseable but not a mapping; distinct from the
+                # "unparseable" wording below, which would be misleading here.
+                raise ValueError(
+                    f"Task {task_id} frontmatter is not a YAML mapping: {exc}"
+                ) from None
             cause = exc.__cause__ or exc
             raise ValueError(
                 f"Task {task_id} frontmatter unparseable: {cause}"

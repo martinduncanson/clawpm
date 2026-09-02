@@ -1,9 +1,14 @@
-"""Tests for the canonical frontmatter parse helpers (CLAWP-079).
+"""Tests for the canonical frontmatter parse helpers (CLAWP-079, CLAWP-091).
 
 These pin the malformed-input contract that every migrated call site relies on:
 
 - ``parse_frontmatter`` never raises and yields ``({}, ...)`` on failure.
 - ``split_frontmatter`` raises ``FrontmatterError`` with a specific ``reason``.
+- ``require_mapping`` (CLAWP-091) guards mutation sites against frontmatter
+  that parses successfully but to a non-mapping (a hand-edited file whose
+  frontmatter is a bare YAML scalar or list), turning what would otherwise be
+  a raw ``TypeError`` at the first ``frontmatter[key] = value`` into a clear,
+  file-naming ``FrontmatterError``.
 """
 
 import pytest
@@ -12,6 +17,7 @@ import yaml
 from clawpm.frontmatter import (
     FrontmatterError,
     parse_frontmatter,
+    require_mapping,
     split_frontmatter,
 )
 
@@ -86,3 +92,57 @@ class TestSplitFrontmatter:
     def test_frontmatter_error_is_value_error(self):
         # Existing `except ValueError` handlers must keep catching it.
         assert issubclass(FrontmatterError, ValueError)
+
+    def test_list_frontmatter_raises_not_a_mapping(self):
+        # Hand-edited file whose frontmatter is a bare YAML list.
+        text = "---\n- a\n- b\n---\n# Title\n"
+        with pytest.raises(FrontmatterError) as exc:
+            split_frontmatter(text)
+        assert exc.value.reason == "not_a_mapping"
+        assert "list" in str(exc.value)
+
+    def test_scalar_frontmatter_raises_not_a_mapping(self):
+        # Hand-edited file whose frontmatter is a bare YAML scalar string.
+        text = "---\njust a string\n---\n# Title\n"
+        with pytest.raises(FrontmatterError) as exc:
+            split_frontmatter(text)
+        assert exc.value.reason == "not_a_mapping"
+        assert "str" in str(exc.value)
+
+    def test_int_frontmatter_raises_not_a_mapping(self):
+        text = "---\n42\n---\n# Title\n"
+        with pytest.raises(FrontmatterError) as exc:
+            split_frontmatter(text)
+        assert exc.value.reason == "not_a_mapping"
+
+    def test_none_frontmatter_is_lenient_empty_dict(self):
+        # An empty/None-valued block (`or {}`) is NOT a "not_a_mapping" case —
+        # it coerces to {} same as before, matching the empty-block test above.
+        data, _ = split_frontmatter("---\nnull\n---\n# Title\n")
+        assert data == {}
+
+
+class TestRequireMapping:
+    def test_dict_passes_through_unchanged(self):
+        d = {"id": "X"}
+        assert require_mapping(d) is d
+
+    def test_list_raises_not_a_mapping(self):
+        with pytest.raises(FrontmatterError) as exc:
+            require_mapping(["a", "b"])
+        assert exc.value.reason == "not_a_mapping"
+        assert "list" in str(exc.value)
+
+    def test_scalar_raises_not_a_mapping(self):
+        with pytest.raises(FrontmatterError) as exc:
+            require_mapping("just a string")
+        assert exc.value.reason == "not_a_mapping"
+
+    def test_error_names_the_file_when_where_given(self):
+        with pytest.raises(FrontmatterError) as exc:
+            require_mapping([1, 2], where="/tmp/TASK-001.md")
+        assert "/tmp/TASK-001.md" in str(exc.value)
+
+    def test_omitted_where_still_raises_cleanly(self):
+        with pytest.raises(FrontmatterError):
+            require_mapping([1, 2])

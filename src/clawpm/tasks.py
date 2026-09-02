@@ -20,6 +20,7 @@ from .concurrency import (
 from .frontmatter import (
     FrontmatterError,
     parse_frontmatter,
+    require_mapping,
     split_frontmatter,
     stamp_updated,
 )
@@ -598,7 +599,12 @@ def _write_rejection_frontmatter(
     # Lenient parse: unparseable YAML drops to fm={} while keeping the raw body,
     # so the rewrite replaces the bad frontmatter rather than doubling it. An
     # absent/unterminated fence keeps body=text and synthesises a fence below.
+    # parse_frontmatter never raises, so a non-mapping document (bare YAML
+    # scalar/list) would otherwise pass straight through and TypeError at the
+    # first `fm[key] = ...` below; require_mapping turns that into a clear,
+    # file-naming FrontmatterError instead (CLAWP-091).
     fm, body = parse_frontmatter(text)
+    fm = require_mapping(fm, where=str(file_path))
 
     fm["rationale"] = rationale
     if supersedes:
@@ -1548,8 +1554,9 @@ def edit_task(
 
         # Parse frontmatter and content. An absent fence falls through with
         # frontmatter={}, content=text (a fence is synthesised on rebuild). An
-        # unterminated or unparseable fence is refused rather than rebuilt into
-        # a double-frontmatter, metadata-wiped file (Codex / Grok review).
+        # unterminated, unparseable, or non-mapping fence is refused rather
+        # than rebuilt into a double-frontmatter, metadata-wiped file (Codex /
+        # Grok review; not_a_mapping added CLAWP-091).
         frontmatter: dict
         try:
             frontmatter, content = split_frontmatter(text)
@@ -1560,6 +1567,11 @@ def edit_task(
                 raise ValueError(
                     f"Task {task_id} has an unterminated frontmatter fence; "
                     "refusing to edit (would corrupt the file)."
+                ) from None
+            elif exc.reason == "not_a_mapping":
+                raise ValueError(
+                    f"Task {task_id} frontmatter is not a YAML mapping; "
+                    f"refusing to edit (would corrupt the file): {exc}"
                 ) from None
             else:
                 cause = exc.__cause__ or exc
