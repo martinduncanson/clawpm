@@ -569,6 +569,19 @@ def teardown_dispatch_settings(
 
     No exception is raised in the not-removed paths — the caller reads
     the bool to decide what to surface.
+
+    CLAWP-098: this function does NOT release the task's session-scoped
+    worktree pointer (see sessions.py). An earlier version did, and Codex
+    review (PR #55) caught the resulting regression: dispatch-settings
+    teardown and worktree lifetime are NOT the same thing. A bulk
+    ``tasks state A B done`` run with cwd inside A's worktree tears down A's
+    settings mid-loop; if that also released A's session, task B — processed
+    next in the SAME invocation, same cwd — would find no active session and
+    silently fall through to the portfolio registry (main checkout) for the
+    rest of the command. Session liveness is instead purely a function of
+    whether the worktree directory still exists on disk (see
+    ``sessions.active_sessions``) — correct without any explicit release,
+    and immune to this ordering hazard.
     """
     path = settings_path(target_dir)
     sidecar = session_start_payload_path(target_dir)
@@ -615,13 +628,6 @@ def teardown_dispatch_settings(
                 target_dir,
                 project_id=resolved_project,
             )
-            # CLAWP-098: retire any session_id -> worktree pointer registered
-            # for this (task_id, project_id) at dispatch time, so a torn-down
-            # dispatch's session doesn't outlive it. No-op (returns 0) for
-            # non-worktree dispatches, which never registered a session.
-            if resolved_project:
-                from .sessions import release_sessions_for_task
-                release_sessions_for_task(portfolio_root, resolved_task, resolved_project)
     return True
 
 

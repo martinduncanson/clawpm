@@ -602,9 +602,18 @@ class TestWorktreeSessionScopedMutation:
         assert r.exit_code == 0, r.output
         assert (main_tasks_dir / "done" / f"{task.id}.md").exists()
 
-    def test_teardown_releases_the_session(self, temp_portfolio_with_repo, monkeypatch):
-        """Tearing down a dispatch retires its session so a stale worktree
-        pointer doesn't linger as 'active' after the dispatch is done."""
+    def test_teardown_does_not_release_the_session_while_worktree_still_exists(
+        self, temp_portfolio_with_repo, monkeypatch
+    ):
+        """CLAWP-098 review (Codex, PR #55): tearing down ONE dispatch's
+        settings.local.json must NOT retire its session while the worktree
+        directory itself is still there -- dispatch-settings teardown and
+        worktree lifetime are different things. (An earlier version of this
+        fix released on teardown; see test_bulk_state_from_worktree_only_
+        touches_worktree_copies below for the exact regression that caused.)
+        Session liveness now tracks worktree_path.is_dir() instead -- see
+        test_active_sessions_excludes_removed_worktree in test_sessions.py
+        for that half of the contract."""
         from clawpm.sessions import active_sessions
 
         config = temp_portfolio_with_repo["config"]
@@ -634,7 +643,120 @@ class TestWorktreeSessionScopedMutation:
         )
         assert r2.exit_code == 0, r2.output
 
-        assert active_sessions(portfolio_root) == []
+        # Settings are torn down (auto-teardown on done)...
+        from clawpm.dispatch import settings_path
+        assert not settings_path(wt_path).exists()
+        # ...but the session stays active, because wt_path still exists.
+        assert len(active_sessions(portfolio_root)) == 1
+
+    def test_bulk_state_from_worktree_only_touches_worktree_copies(
+        self, temp_portfolio_with_repo, monkeypatch
+    ):
+        """Regression for the Codex P1 finding on PR #55's first pass: a
+        bulk `tasks state A B done` run with cwd inside A's dispatched
+        worktree must resolve BOTH A and B against that worktree's own
+        .project/tasks/ for the ENTIRE invocation -- even though A's own
+        dispatch (and its settings.local.json) gets torn down mid-loop by
+        the auto-teardown that fires the moment A transitions to done. If
+        that teardown also released A's session (the earlier, buggy
+        design), B -- processed next in the same command, same cwd -- would
+        find no active session and silently fall through to the portfolio
+        registry, corrupting the MAIN checkout instead of the worktree's
+        own copy of B."""
+        config = temp_portfolio_with_repo["config"]
+        repo_dir = temp_portfolio_with_repo["repo_dir"]
+        main_tasks_dir = temp_portfolio_with_repo["tasks_dir"]
+
+        task_a = add_task(
+            config, "test", title="Bulk A",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+        task_b = add_task(
+            config, "test", title="Bulk B",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+        main_a_open = main_tasks_dir / f"{task_a.id}.md"
+        main_b_open = main_tasks_dir / f"{task_b.id}.md"
+        assert main_a_open.exists() and main_b_open.exists()
+
+        # Commit BOTH tasks so A's worktree checkout carries its own copy of
+        # B too -- a worktree is a full checkout of the commit, not just the
+        # one task it was dispatched for.
+        subprocess.run(["git", "-C", str(repo_dir), "add", ".project"], check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=a@b", "-c", "user.name=a",
+             "-C", str(repo_dir), "commit", "-q", "-m", "seed .project"],
+            check=True,
+        )
+
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task_a.id, "--worktree"]
+        )
+        assert r.exit_code == 0, r.output
+        wt_path = Path(json.loads(r.output)["data"]["target_dir"])
+        wt_tasks_dir = wt_path / ".project" / "tasks"
+        assert (wt_tasks_dir / f"{task_a.id}.md").exists()
+        assert (wt_tasks_dir / f"{task_b.id}.md").exists()
+
+        monkeypatch.chdir(wt_path)
+        r2 = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "state", task_a.id, task_b.id, "done"]
+        )
+        assert r2.exit_code == 0, r2.output
+
+        # Both moved to the WORKTREE's own done/.
+        assert (wt_tasks_dir / "done" / f"{task_a.id}.md").exists()
+        assert (wt_tasks_dir / "done" / f"{task_b.id}.md").exists()
+        assert not (wt_tasks_dir / f"{task_a.id}.md").exists()
+        assert not (wt_tasks_dir / f"{task_b.id}.md").exists()
+
+        # Neither main-checkout copy was touched -- this is the corruption
+        # the bug (and the earlier buggy release-on-teardown fix) produced.
+        assert main_a_open.exists()
+        assert main_b_open.exists()
+        assert not (main_tasks_dir / "done" / f"{task_a.id}.md").exists()
+        assert not (main_tasks_dir / "done" / f"{task_b.id}.md").exists()
+
+    def test_failed_dispatch_settings_write_does_not_register_a_session(
+        self, temp_portfolio_with_repo
+    ):
+        """CLAWP-098 review finding: session registration happens AFTER
+        write_dispatch_settings succeeds, not right after the worktree is
+        created — so a dispatch that fails to write its settings.local.json
+        (e.g. re-dispatching over a corrupted one without --force) never
+        leaves an orphaned session for a dispatch that didn't actually
+        happen. Without this ordering, a failed retry would silently double
+        the active-session count for one worktree."""
+        from clawpm.dispatch import settings_path
+        from clawpm.sessions import active_sessions
+
+        config = temp_portfolio_with_repo["config"]
+        portfolio_root = temp_portfolio_with_repo["root"]
+        task = add_task(
+            config, "test", title="WT-fail",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code == 0, r.output
+        wt_path = Path(json.loads(r.output)["data"]["target_dir"])
+        assert len(active_sessions(portfolio_root)) == 1
+
+        # Corrupt the settings file so a re-dispatch (worktree reused --
+        # create_worktree is idempotent) hits write_dispatch_settings's
+        # not-valid-JSON guard and raises FileExistsError before this CLI
+        # command would register a second session.
+        settings_path(wt_path).write_text("not json", encoding="utf-8")
+
+        r2 = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r2.exit_code != 0
+
+        # Still exactly the ORIGINAL session -- no orphan from the failed retry.
+        assert len(active_sessions(portfolio_root)) == 1
 
 
 class TestSessionStartSidecar:

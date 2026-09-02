@@ -268,8 +268,25 @@ def _session_scoped_project_dir(config: PortfolioConfig, project_id: str) -> Pat
     """Return the ``.project/`` dir of the worktree registered for cwd, if any.
 
     Returns ``None`` (never raises) when there is no portfolio root, no cwd,
-    or no active session whose registered worktree contains cwd — the caller
-    treats ``None`` as "fall through to the registry lookup".
+    no active session whose registered worktree contains cwd, OR — critically
+    — the session matched but its worktree has no ``.project/`` of its own
+    (review finding, CLAWP-098): a worktree only inherits ``.project/`` when
+    the project git-tracks it (CLAWP-075's convention; this repo does, most
+    don't). Redirecting unconditionally would silently arm every WRITER that
+    calls this (``add_task``, ``add_research``, ``save_constitution``, ...)
+    to ``mkdir(parents=True, exist_ok=True)`` a brand-new, untracked task
+    store inside the worktree for a project that doesn't carry one — exactly
+    the "ledger forks per worktree" failure this module's own docstring
+    warns against, and silent since those callers never see a `None` to
+    trigger their existing not-found handling. Gating on existence keeps
+    this a pure REDIRECT of an already-present tree, never a fork point: a
+    worktree with no ``.project/`` falls through to the registry lookup
+    exactly like before this fix (which may itself resolve to the main
+    checkout — unavoidable, since there's nothing worktree-local to point
+    at; this is the write-corruption case ``get_project_dir``'s caller must
+    still guard against some other way, unchanged from pre-CLAWP-098).
+
+    The caller treats ``None`` as "fall through to the registry lookup".
     """
     portfolio_root = getattr(config, "portfolio_root", None)
     if not portfolio_root:
@@ -281,7 +298,10 @@ def _session_scoped_project_dir(config: PortfolioConfig, project_id: str) -> Pat
     session = find_session_for_cwd(portfolio_root, cwd, project_id=project_id)
     if session is None:
         return None
-    return session.worktree_path.resolve() / ".project"
+    candidate = session.worktree_path.resolve() / ".project"
+    if not candidate.is_dir():
+        return None
+    return candidate
 
 
 def _read_project_id_from_settings(settings_file: Path) -> str | None:

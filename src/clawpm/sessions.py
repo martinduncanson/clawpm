@@ -36,30 +36,46 @@ only see session-scoped resolution when their cwd is actually inside a
 registered worktree, which is exactly the case where that resolution is
 correct.
 
-Sessions are retired (a ``released`` event appended) by
-``dispatch.teardown_dispatch_settings`` — the same moment a dispatch's
-``.claude/settings.local.json`` is torn down, whether that happens via the
-explicit ``tasks teardown-dispatch`` command or the automatic teardown that
-runs when a dispatched task transitions to done/blocked. A crashed dispatch
-that never tears down leaves its session ``active`` forever in the ledger;
-that is a leftover append-only record, not filesystem corruption, and is the
-same lifecycle tradeoff ``leases.jsonl`` already accepts (a stale lease is
-reaped by ``doctor``/next-dispatch sweep; a stale session record is inert —
-it only ever redirects resolution to a worktree path that either still
-exists, in which case redirecting to it remains correct, or has been removed,
-in which case ``get_tasks_dir`` finds no ``tasks/`` there and falls through
-exactly like today's "no project" case).
+SESSION LIFETIME (revised after Codex review, PR #55): a session is NOT
+released when its dispatch's ``.claude/settings.local.json`` is torn down.
+An earlier version did release there, and Codex caught the resulting
+regression: dispatch-settings teardown and worktree lifetime are different
+things. A bulk ``tasks state A B done`` run with cwd inside A's dispatched
+worktree tears down A's settings — and, under the old design, released A's
+session — mid-loop; task B, processed next in the SAME invocation with the
+SAME cwd, would then find no active session for that path and silently fall
+through to the portfolio registry (the main checkout) instead. Same hazard
+for an operator who keeps working inside an already-torn-down worktree.
+
+Instead, :func:`active_sessions` treats a session as active iff BOTH the
+ledger says so (no ``released`` event — ``release_session`` /
+``release_sessions_for_task`` remain available as library API for a future
+caller that genuinely knows the worktree itself is gone, e.g. a
+``worktree remove`` integration) AND its ``worktree_path`` still exists on
+disk. Directory existence is the correct lifecycle boundary — it needs no
+explicit ledger write to detect, is immune to the mid-invocation release
+hazard above, and self-heals the moment ``git worktree remove`` actually
+deletes the checkout. A crashed dispatch whose worktree is never removed
+leaves its session record in the ledger forever, but harmlessly: the same
+task_id always resolves to the same worktree path (``create_worktree``
+scopes the path by task_id), so a stale-but-still-correct entry never
+misdirects a different dispatch — the same "inert leftover, not corruption"
+tradeoff ``dispatches.jsonl`` already accepts with no reaping of its own.
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from .concurrency import append_jsonl_line
+
+logger = logging.getLogger(__name__)
 
 SESSION_REGISTRY_FILENAME = "sessions.jsonl"
 
@@ -156,7 +172,15 @@ def _replay(portfolio_root: Path) -> dict[str, SessionRecord]:
     """Reconstruct current session state per session_id from the log.
 
     Corrupted lines are skipped (defensive — a half-written line must not
-    nuke resolution for every other registered session).
+    nuke resolution for every other registered session). A whole-file read
+    failure falls back to "no active sessions", which is fail-OPEN (every
+    caller of ``find_session_for_cwd`` treats an empty result as "fall
+    through to the registry lookup") but must not be fail-SILENT (CLAWP-098
+    review finding — this repo's own fail-open-needs-a-marker doctrine, see
+    CLAWP-039/041): a silently swallowed read failure here means an ID-based
+    mutator run from inside a dispatched worktree quietly regresses to the
+    exact main-checkout corruption this module exists to prevent, with
+    nothing in the logs to explain why. Log it.
     """
     path = _registry_path(portfolio_root)
     if not path.exists():
@@ -164,7 +188,23 @@ def _replay(portfolio_root: Path) -> dict[str, SessionRecord]:
     sessions: dict[str, SessionRecord] = {}
     try:
         raw = path.read_text(encoding="utf-8", errors="strict")
-    except (OSError, UnicodeDecodeError):
+    except (OSError, UnicodeDecodeError) as exc:
+        # error, not warning (Codex P1, PR #55): this is the fail-open path
+        # that most directly recreates CLAWP-098's original corruption —
+        # every ID-based mutator run from inside a dispatched worktree will
+        # silently mutate the MAIN checkout again until this clears. A
+        # genuinely hard fail-closed (raise out of get_project_dir) would
+        # take down read-only commands too (tasks list/next/reflect share
+        # this chokepoint) over what should be a rare, narrow corruption —
+        # judged worse than a loud, high-severity log. Escalate here if that
+        # tradeoff needs revisiting.
+        logger.error(
+            "Failed to read session registry %s: %s. Session-scoped project "
+            "resolution is DISABLED until this clears — ID-based mutator "
+            "commands run from inside a dispatched worktree will fall "
+            "through to the portfolio registry (main-checkout) lookup.",
+            path, exc,
+        )
         return {}
     for line in raw.splitlines():
         line = line.strip()
@@ -173,6 +213,14 @@ def _replay(portfolio_root: Path) -> dict[str, SessionRecord]:
         try:
             ev = json.loads(line)
         except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict):
+            # A syntactically-valid JSON line that isn't an object (a bare
+            # list/string/number/null) — same "corrupted line, skip only
+            # this one" contract as the JSONDecodeError above, just a
+            # different way a line can fail to be a real event (antigravity
+            # review, PR #55: unguarded `.get()` would otherwise raise
+            # AttributeError and abort replay for every OTHER session too).
             continue
         action = ev.get("action")
         session_id = ev.get("session_id")
@@ -199,8 +247,30 @@ def _replay(portfolio_root: Path) -> dict[str, SessionRecord]:
 
 
 def active_sessions(portfolio_root: Path) -> list[SessionRecord]:
-    """All sessions whose latest event leaves them active."""
-    return [s for s in _replay(portfolio_root).values() if s.active]
+    """Sessions whose latest event leaves them active AND whose worktree
+    still exists on disk.
+
+    The directory-existence check (Codex review, PR #55) is what makes
+    session liveness track the worktree's actual lifetime instead of the
+    dispatch-settings teardown moment — see the module docstring's "SESSION
+    LIFETIME" section for why that distinction matters. A worktree removed
+    out from under a still-``registered`` session (``git worktree remove``,
+    a crashed dispatch's directory manually cleaned up, ...) naturally stops
+    being returned here — no explicit ``released`` event needed.
+    """
+    result: list[SessionRecord] = []
+    for s in _replay(portfolio_root).values():
+        if not s.active:
+            continue
+        try:
+            if not s.worktree_path.is_dir():
+                continue
+        except OSError:
+            # Unreadable (permissions, transient FS hiccup): treat like "not
+            # there" rather than raising out of every project resolution.
+            continue
+        result.append(s)
+    return result
 
 
 def find_session_for_cwd(
@@ -219,8 +289,18 @@ def find_session_for_cwd(
     NOT running inside a dispatched worktree, which is the overwhelming
     majority of usage. Callers must treat ``None`` as "fall through to the
     existing portfolio-registry lookup", never as an error.
+
+    Path comparison uses ``os.path.normcase`` (grok review, PR #55) — the
+    same normalisation ``concurrency.file_lock`` already applies for its
+    lock-path keys. Windows filesystems are case-insensitive but
+    ``pathlib.Path`` equality and ``in .parents`` are NOT, so a
+    case-mismatched cwd (a different drive-letter spelling, a shell that
+    preserves different casing than the one that minted the worktree) would
+    otherwise silently miss an active session and fail open to exactly the
+    main-checkout corruption this module exists to prevent.
     """
     resolved_cwd = Path(cwd).resolve()
+    cwd_key = os.path.normcase(str(resolved_cwd))
     best: Optional[SessionRecord] = None
     best_depth = -1
     for record in active_sessions(portfolio_root):
@@ -230,7 +310,8 @@ def find_session_for_cwd(
             wt = record.worktree_path.resolve()
         except OSError:
             continue
-        if resolved_cwd != wt and wt not in resolved_cwd.parents:
+        wt_key = os.path.normcase(str(wt))
+        if cwd_key != wt_key and not cwd_key.startswith(wt_key + os.sep):
             continue
         depth = len(wt.parts)
         if depth > best_depth:

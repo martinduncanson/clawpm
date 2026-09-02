@@ -51,14 +51,12 @@ Design tradeoffs:
 from __future__ import annotations
 
 import subprocess
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
 from .discovery import get_project
 from .dispatch import create_worktree, write_dispatch_settings
-from .sessions import register_session
 from .judges.stop_condition import (
     JudgeVerdict,
     evaluate_stop_condition,
@@ -264,15 +262,6 @@ def dispatch_agent(
             f"git worktree add failed: {error_detail}"
         ) from exc
 
-    # CLAWP-098: register a session-scoped pointer from a fresh session_id
-    # to this worktree's filesystem path, same as `tasks dispatch --worktree`
-    # (this command mirrors that flag — see module docstring). Without it,
-    # an ID-based mutator command the subagent runs with cwd inside
-    # target_dir would resolve its project via the portfolio registry —
-    # cwd-independent — straight back to the MAIN checkout and corrupt its
-    # task file instead of the worktree's own.
-    register_session(config.portfolio_root, str(uuid.uuid4()), subtask_id, project_id, target_dir)
-
     # CLAWP-029: initialise CodeGraph in the worktree so the subagent
     # has the index from turn one. Best-effort — failure (codegraph not
     # installed, indexing timeout) silently degrades; the dispatch
@@ -320,6 +309,22 @@ def dispatch_agent(
         raise AgentDispatchError(
             f"write_dispatch_settings failed: {error_detail}"
         ) from exc
+
+    # CLAWP-098 scope note (Codex review, PR #55): this command deliberately
+    # does NOT register a session for its worktree, unlike `tasks dispatch
+    # --worktree`. Step 1 (add_task) writes the new subtask into the CALLER's
+    # checkout — uncommitted — and step 2 (create_worktree) checks out
+    # committed HEAD, so the new subtask file never actually lands in
+    # target_dir. Registering a session anyway would redirect the worktree's
+    # own Stop-hook (`eval-stop`, wired below) to look up the task inside
+    # target_dir's .project/tasks/, find nothing, and block termination
+    # forever ("task not found") — the hook worked before this PR only
+    # because unregistered lookups fell through to the portfolio registry
+    # (the main checkout, where the task genuinely lives). Fixing this
+    # properly needs the new subtask file materialized into the worktree
+    # (copy, not commit) before registering — left as follow-up work; this
+    # command still gets CLAWP-098's other guarantee (normal single-checkout
+    # `tasks state/done/block` runs are unaffected either way).
 
     # 4. Invoke the subagent. Tests pass `judge_invoker`; the CLI passes
     # `judge_cmd_override` or falls through to CLAWPM_JUDGE_CMD /

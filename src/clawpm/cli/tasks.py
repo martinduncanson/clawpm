@@ -1371,15 +1371,6 @@ def tasks_dispatch(
                 fmt=fmt,
             )
             sys.exit(1)
-        # CLAWP-098: register a session-scoped pointer from a fresh session_id
-        # to the worktree's actual filesystem path. Without this, an ID-based
-        # mutator command (tasks state/done/block) run with cwd inside this
-        # worktree resolves its project via the portfolio registry — which is
-        # cwd-independent — straight back to the MAIN checkout, and mutates
-        # its task file instead of the worktree's own. See sessions.py.
-        from clawpm.sessions import register_session
-        session_id = str(uuid.uuid4())
-        register_session(config.portfolio_root, session_id, task_id, project_id, resolved_dir)
     elif target_dir:
         resolved_dir = Path(target_dir)
         resolved_dir.mkdir(parents=True, exist_ok=True)
@@ -1446,6 +1437,21 @@ def tasks_dispatch(
     except (FileExistsError, ValueError) as exc:
         output_error("dispatch_blocked", str(exc), fmt=fmt)
         sys.exit(1)
+
+    # CLAWP-098 (review finding): register the session AFTER settings are
+    # written — same ordering rationale as the lease grant below — so a
+    # write_dispatch_settings failure (dispatch_blocked, above) doesn't leave
+    # an orphaned session registered for a dispatch that never actually
+    # happened. Register a session-scoped pointer from a fresh session_id to
+    # the worktree's actual filesystem path: without this, an ID-based
+    # mutator command (tasks state/done/block) run with cwd inside this
+    # worktree resolves its project via the portfolio registry — which is
+    # cwd-independent — straight back to the MAIN checkout, and mutates its
+    # task file instead of the worktree's own. See sessions.py.
+    if worktree:
+        from clawpm.sessions import register_session
+        session_id = str(uuid.uuid4())
+        register_session(config.portfolio_root, session_id, task_id, project_id, resolved_dir)
 
     # Grant the lease AFTER settings are written (so a settings failure doesn't
     # leave a lease with no heartbeat source).
