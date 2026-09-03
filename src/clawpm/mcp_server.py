@@ -1,0 +1,903 @@
+"""Stdio MCP server exposing clawpm's core (CLAWP-068).
+
+Any MCP host (Cursor, Windsurf, VS Code, Claude Code, Amazon Q, …) can drive
+clawpm task / research / mission management through this server — not only the
+Claude Code skill. It is launched by ``clawpm mcp`` over stdio.
+
+Design:
+
+- **Direct core calls, zero subprocess.** Every tool wraps the existing core
+  functions (``clawpm.tasks`` / ``clawpm.research`` / ``clawpm.mission`` /
+  ``clawpm.context``) and the CLAWP-077 service layer
+  (``clawpm.services.tasks.transition``) directly. Nothing shells out to the
+  ``clawpm`` CLI, so the whole cp1252 / spaced-path / ``UnicodeEncodeError``
+  class is avoided and results are structured JSON natively.
+- **Project discovery matches the CLI.** Each tool resolves the project via
+  ``clawpm.context.resolve_project`` (explicit arg → cwd → ``clawpm use``
+  context) and loads the portfolio via ``load_portfolio_config`` (which honours
+  ``CLAWPM_PORTFOLIO`` / ``CLAWPM_PROJECT_ROOTS``). The per-project ``.mcp.json``
+  registration pattern (documented in the README) launches the server with cwd
+  inside the project, so cwd detection Just Works.
+- **Tool-count discipline.** Exposed tools are gated by a min-tier tag +
+  ``CLAWPM_MCP_TOOLS`` (``core`` | ``standard`` | ``all``, default ``core``) so a
+  host's tool list stays lean. Future dispatch / agent tools slot into higher
+  tiers without polluting ``core``.
+- **No bespoke write-safety layer.** Write tools route through the same
+  validated paths the CLI uses (``transition`` validates the surprise taxonomy,
+  gates the parent rollup, normalises tags; ``add_task`` / ``edit_task`` /
+  ``add_research`` carry their own contracts). Adding a second confirmation
+  layer here would duplicate that, so writes rely on the service layer's
+  existing guarantees.
+"""
+
+from __future__ import annotations
+
+import functools
+import os
+import sys
+from dataclasses import dataclass
+from typing import Any, Callable
+
+# Root-cause cp1252 fix (mirrors clawpm.cli's package-level reconfigure,
+# CLAWP-045/046): this module's _catch_unhandled wrapper writes diagnostics to
+# stderr, and on Windows the default console encoding is cp1252, which raises
+# UnicodeEncodeError on non-ASCII exception text. `clawpm mcp` always goes
+# through `clawpm.cli` first (which does the same reconfigure), but this
+# module is also importable/testable standalone, so it carries its own
+# guarded reconfigure rather than relying on import order. Guarded because a
+# wrapped/redirected stream (a test runner, a closed pipe) may lack
+# reconfigure() or reject it — never crash the server over a display setting.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, ValueError, OSError):  # pragma: no cover
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Tool-tier gating
+# ---------------------------------------------------------------------------
+
+TIERS: dict[str, int] = {"core": 0, "standard": 1, "all": 2}
+DEFAULT_TIER = "core"
+TOOLS_ENV_VAR = "CLAWPM_MCP_TOOLS"
+
+SERVER_INSTRUCTIONS = (
+    "clawpm task / research / mission management for the current project. "
+    "Most tools auto-detect the project from the server's working directory; "
+    "pass `project` to target a different one. Task ids accept short forms "
+    "(e.g. '68' -> 'CLAWP-068'). State changes go through the same calibration-"
+    "aware path as the CLI."
+)
+
+
+def resolve_tier(value: str | None) -> int:
+    """Map a ``CLAWPM_MCP_TOOLS`` value to a numeric tier ceiling.
+
+    Unknown / empty values fall back to ``core`` — the safe, lean default — so a
+    typo can never silently expose a wider surface than intended.
+    """
+    if not value:
+        return TIERS[DEFAULT_TIER]
+    return TIERS.get(value.strip().lower(), TIERS[DEFAULT_TIER])
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    name: str
+    min_tier: str
+    fn: Callable[..., Any]
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def _load_config():
+    """Load the portfolio config fresh (honours CLAWPM_PORTFOLIO).
+
+    Loaded per-call rather than cached at startup so a long-lived server picks
+    up newly-registered projects without a restart. It is a cheap TOML read.
+    """
+    from clawpm.discovery import load_portfolio_config
+
+    config = load_portfolio_config()
+    if config is None:
+        raise ValueError("No clawpm portfolio configured (CLAWPM_PORTFOLIO unset and no default found)")
+    return config
+
+
+def _resolve_project(explicit: str | None) -> tuple[str, str]:
+    """Resolve the target project id, or raise a friendly usage error."""
+    from clawpm.context import resolve_project
+
+    project_id, source = resolve_project(explicit)
+    if not project_id:
+        raise ValueError(
+            "No project specified or detected. Pass project=<id>, or launch the "
+            "server with its working directory inside a clawpm project."
+        )
+    return project_id, source
+
+
+def _build_predictions(
+    *,
+    predict_duration: str | None,
+    predict_complexity: str | None,
+    predict_files_changed: int | None,
+    predict_scope: list[str] | None,
+    predict_frameworks: list[str] | None,
+    predict_pitfalls: str | None,
+    hypothesis: str | None,
+    success_criteria: list[str] | None,
+    predict_approach: str | None,
+    unknowns: str | None,
+    confidence: int | None,
+    reference_tasks: list[str] | None,
+    pre_mortem: str | None,
+    predict_iterations: int | None,
+    predicted_by: str | None = None,
+):
+    """Assemble a ``Predictions`` from tool params, or ``None`` if none supplied.
+
+    Mirrors the CLI's ``tasks add`` / ``tasks edit`` prediction assembly so the
+    calibration data captured through MCP is identical to the CLI's. Returns a
+    validation error string via ValueError for a bad ``--confidence`` / duration.
+
+    ``filled_by`` defaults to ``"agent"`` when any prediction field is set and
+    ``predicted_by`` isn't given — MCP is inherently an agent surface (the CLI's
+    own default is ``"operator"``, since a human types CLI flags). Pass
+    ``predicted_by="operator"`` explicitly for a human-in-the-loop MCP host
+    (CLAWP-068 review — grok-4.5/4.6 convergent finding).
+    """
+    from clawpm.models import Predictions, SuccessCriterion, TaskComplexity
+
+    # NOTE (grok-4.5 round 3): the four list fields below use bare truthiness,
+    # matching the CLI's own `_has_predictions` check (cli/tasks.py) exactly —
+    # not a bug for the CLI, since Click's `multiple=True` can't distinguish
+    # "flag omitted" from "flag passed zero times" (both yield `()`). MCP's
+    # JSON args CAN make that distinction, so `predict_scope: []` alone (no
+    # other field) currently no-ops rather than registering as a predictions
+    # edit. Deliberately NOT switched to `is not None` here: doing so makes
+    # such a call NOT a no-op, but `Predictions.is_empty()` (models.py) then
+    # sees an otherwise-empty object and `edit_task` POPS the entire
+    # predictions block — replacing "silently ignored" with "silently wipes
+    # every existing prediction field" for a caller who likely only meant to
+    # touch scope. Neither behavior is clearly correct for this atomic-
+    # replace-only-supplied-fields design (already true for scalar fields
+    # too — see this function's own "resupply everything" contract note on
+    # tasks_edit); flagged in the PR thread as a design call rather than
+    # auto-fixed either way.
+    has_predictions = any([
+        predict_duration is not None,
+        predict_complexity is not None,
+        predict_files_changed is not None,
+        predict_scope,
+        predict_frameworks,
+        predict_pitfalls is not None,
+        hypothesis is not None,
+        success_criteria,
+        predict_approach is not None,
+        unknowns is not None,
+        confidence is not None,
+        reference_tasks,
+        pre_mortem is not None,
+        predict_iterations is not None,
+    ])
+    if not has_predictions:
+        return None
+
+    if confidence is not None and not (1 <= confidence <= 5):
+        raise ValueError(f"confidence must be 1-5, got {confidence}")
+
+    # Mirrors the CLI's `--predicted-by` click.Choice — an unvalidated string
+    # here would let an MCP caller write any value into filled_by, polluting
+    # calibration bucketing (e.g. reflect summarize groups by this field)
+    # with values the rest of the codebase never expects (Codex round 3).
+    _valid_filled_by = {"agent", "operator", "operator-edited", "retroactive"}
+    if predicted_by is not None and predicted_by not in _valid_filled_by:
+        raise ValueError(
+            f"predicted_by must be one of {sorted(_valid_filled_by)}, got {predicted_by!r}"
+        )
+
+    from click import BadParameter
+
+    from clawpm.reflect import parse_duration as _parse_duration
+
+    try:
+        # parse_duration is a Click-option callback and raises click.BadParameter
+        # (not ValueError) on a malformed string outside a CLI context — both
+        # tasks_add and tasks_edit only catch ValueError, so re-raise as one
+        # (CLAWP-068 review F2).
+        parsed_duration = _parse_duration(predict_duration)
+    except BadParameter as exc:
+        raise ValueError(str(exc)) from exc
+    result = Predictions(
+        duration_min=parsed_duration,
+        complexity=TaskComplexity(predict_complexity) if predict_complexity else None,
+        files_changed=predict_files_changed,
+        files_scope=list(predict_scope or []),
+        frameworks=list(predict_frameworks or []),
+        pitfalls=predict_pitfalls,
+        hypothesis=hypothesis,
+        success_criteria=[SuccessCriterion.from_cli(s) for s in (success_criteria or [])],
+        approach=predict_approach,
+        unknowns=unknowns,
+        confidence=confidence,
+        reference_tasks=list(reference_tasks or []),
+        pre_mortem=pre_mortem,
+        predicted_iterations=predict_iterations,
+        filled_by=predicted_by if predicted_by is not None else "agent",
+    )
+    if result.is_empty():
+        # has_predictions fired (something was `is not None`) but every
+        # field that actually counts toward Predictions.is_empty() ended up
+        # empty — e.g. predict_complexity="" (an empty string IS-NOT-None,
+        # but `TaskComplexity(x) if x else None` coerces it to None). Left
+        # unchecked, edit_task treats an is_empty() Predictions as "clear the
+        # whole block" and silently wipes every OTHER existing prediction
+        # field on a tasks_edit call that only meant to touch one of them —
+        # the same full-wipe risk already reasoned about for the list
+        # fields, just reachable through a scalar empty string instead
+        # (grok-4.6 round 5). Reject explicitly rather than silently wiping
+        # or silently no-op'ing.
+        raise ValueError(
+            "predictions fields were supplied but all resolved to empty "
+            "(e.g. an empty string) — omit them entirely rather than "
+            "passing empty markers"
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Read tools
+# ---------------------------------------------------------------------------
+
+def tasks_list(
+    project: str | None = None,
+    state: str | None = None,
+    tag: str | None = None,
+    limit: int | None = None,
+) -> dict:
+    """List tasks for a project.
+
+    `state` filters by one of open|progress|blocked|done|rejected (omit for the
+    active view: open/progress/blocked — matches the CLI's default, done and
+    rejected tasks are excluded unless `state` asks for them explicitly).
+    `tag` narrows to tasks carrying that workstream tag. `limit` caps the
+    result count after filtering + sorting (default: unlimited). `project`
+    auto-detects from the server's cwd if omitted.
+    """
+    from clawpm.models import TaskState
+    from clawpm.tasks import list_tasks
+
+    config = _load_config()
+    project_id, source = _resolve_project(project)
+
+    if state:
+        try:
+            state_filter = TaskState(state)
+        except ValueError:
+            return {"ok": False, "error": "bad_state", "message": f"invalid state '{state}'"}
+        tasks = list_tasks(config, project_id, state_filter=state_filter)
+    else:
+        # Mirror the CLI's default (cli/tasks.py _collect_project_tasks): the
+        # "active view" is open+progress+blocked, NOT an unfiltered scan — an
+        # unfiltered list_tasks(state_filter=None) also walks the done/
+        # directory (CLAWP-068 review F3).
+        tasks = []
+        for s in (TaskState.OPEN, TaskState.PROGRESS, TaskState.BLOCKED):
+            tasks.extend(list_tasks(config, project_id, state_filter=s))
+        tasks.sort(key=lambda t: (t.priority, t.id))
+
+    if tag:
+        tag_l = tag.strip().lower()
+        tasks = [t for t in tasks if tag_l in [x.lower() for x in t.tags]]
+
+    total = len(tasks)
+    # Mirror the CLI's guard (cli/tasks.py: `limit is not None and limit >= 0`)
+    # — a bare `tasks[:limit]` treats a negative limit as Python end-slicing
+    # (drops the last N tasks) instead of capping or rejecting it
+    # (CLAWP-068 review, grok-4.5).
+    if limit is not None and limit >= 0:
+        tasks = tasks[:limit]
+
+    return {
+        "ok": True,
+        "project": project_id,
+        "source": source,
+        "count": len(tasks),
+        "total": total,
+        "tasks": [t.to_dict() for t in tasks],
+    }
+
+
+def tasks_get(task_id: str, project: str | None = None) -> dict:
+    """Get one task's full detail by id (short forms like '68' are expanded)."""
+    from clawpm.context import expand_task_id
+    from clawpm.tasks import get_task
+
+    config = _load_config()
+    project_id, _ = _resolve_project(project)
+    full_id = expand_task_id(task_id, project_id)
+    task = get_task(config, project_id, full_id)
+    if not task:
+        return {"ok": False, "error": "not_found", "task_id": full_id,
+                "message": f"No task '{full_id}' in project '{project_id}'"}
+    return {"ok": True, "project": project_id, "task": task.to_dict()}
+
+
+def context(project: str | None = None, log_limit: int = 5) -> dict:
+    """Full agent-resume context: project, spec, in-progress/next/blocked tasks,
+    open counts, recent work-log, git status, open issues. Everything needed to
+    resume work on a project in one call."""
+    config = _load_config()
+    project_id, source = _resolve_project(project)
+    from clawpm.context import build_agent_context
+
+    # worklog.read_entries does a bare entries[:limit] — a negative log_limit
+    # silently drops the OLDEST entry via Python end-slicing rather than being
+    # ignored or rejected (same latent bug the CLI's own --log-limit has;
+    # clamping here rather than in the shared worklog module, which is out of
+    # this PR's scope — grok-4.5 round 4).
+    if log_limit < 0:
+        log_limit = 5
+
+    ctx = build_agent_context(config, project_id, source=source, log_limit=log_limit)
+    if ctx is None:
+        return {"ok": False, "error": "not_found", "message": f"Project '{project_id}' not found"}
+    ctx["ok"] = True
+    return ctx
+
+
+def next_task(project: str | None = None) -> dict:
+    """Get the next task to work on (highest-priority open task with satisfied
+    dependencies), or null if none is ready."""
+    from clawpm.tasks import get_next_task
+
+    config = _load_config()
+    project_id, _ = _resolve_project(project)
+    task = get_next_task(config, project_id)
+    return {"ok": True, "project": project_id, "task": task.to_dict() if task else None}
+
+
+def research_list(
+    project: str | None = None,
+    status: str | None = None,
+    tag: str | None = None,
+) -> dict:
+    """List research entries for a project. `status` filters by
+    open|in-progress|complete|stale; `tag` narrows to entries with that tag."""
+    from clawpm.models import ResearchStatus
+    from clawpm.research import list_research
+
+    config = _load_config()
+    project_id, _ = _resolve_project(project)
+
+    status_filter = None
+    if status:
+        try:
+            status_filter = ResearchStatus(status)
+        except ValueError:
+            return {"ok": False, "error": "bad_status", "message": f"invalid status '{status}'"}
+
+    tags_filter = [tag] if tag else None
+    items = list_research(config, project_id, status_filter=status_filter, tags_filter=tags_filter)
+    return {
+        "ok": True,
+        "project": project_id,
+        "count": len(items),
+        "research": [r.to_dict() for r in items],
+    }
+
+
+def mission_list(project: str | None = None, status: str | None = None) -> dict:
+    """List missions for a project. `status` filters by
+    active|complete|failed|cancelled."""
+    from clawpm.mission import list_missions
+
+    config = _load_config()
+    project_id, _ = _resolve_project(project)
+
+    if status is not None and status not in ("active", "complete", "failed", "cancelled"):
+        return {"ok": False, "error": "bad_status", "message": f"invalid status '{status}'"}
+
+    missions = list_missions(config, project_id, status_filter=status)
+    return {
+        "ok": True,
+        "project": project_id,
+        "count": len(missions),
+        "missions": [m.to_dict() for m in missions],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Write tools
+# ---------------------------------------------------------------------------
+
+def tasks_add(
+    title: str,
+    project: str | None = None,
+    priority: int = 5,
+    complexity: str = "m",
+    depends: list[str] | None = None,
+    scope: list[str] | None = None,
+    tags: list[str] | None = None,
+    description: str = "",
+    parallel_group: int | None = None,
+    agent_profile: str | None = None,
+    out_of_scope: list[str] | None = None,
+    stop_conditions: list[str] | None = None,
+    delegability: str | None = None,
+    success_criteria: list[str] | None = None,
+    predict_duration: str | None = None,
+    predict_complexity: str | None = None,
+    predict_files_changed: int | None = None,
+    predict_scope: list[str] | None = None,
+    predict_frameworks: list[str] | None = None,
+    predict_pitfalls: str | None = None,
+    unknowns: str | None = None,
+    predict_iterations: int | None = None,
+    confidence: int | None = None,
+    pre_mortem: str | None = None,
+    predict_approach: str | None = None,
+    reference_tasks: list[str] | None = None,
+    hypothesis: str | None = None,
+    predicted_by: str | None = None,
+) -> dict:
+    """Create a task. Prefer verifiable goals: pass `success_criteria` (plain
+    strings — this tool's schema is `list[str]`; the CLI's structured
+    `{"criterion","gradeable_signal","comparator"}` object form isn't
+    accepted here) plus predictions (`predict_duration` like '4h',
+    `confidence` 1-5, `pre_mortem`, `predict_approach`, `reference_tasks`,
+    `predict_scope`, `predict_frameworks`, `predict_pitfalls`, `unknowns`,
+    `predict_iterations`) so the task is gradeable and feeds calibration.
+    Predictions are attributed `filled_by="agent"` by default (pass
+    `predicted_by="operator"` for a human-in-the-loop host). `delegability`
+    is agent|human|either. `depends` accepts short ids (expanded the same
+    way as `task_id` elsewhere). Returns the created task."""
+    from clawpm.context import expand_task_id
+    from clawpm.models import TaskComplexity
+    from clawpm.tasks import add_task
+
+    config = _load_config()
+    project_id, _ = _resolve_project(project)
+
+    try:
+        cmplx = TaskComplexity(complexity) if complexity else None
+    except ValueError:
+        return {"ok": False, "error": "bad_complexity", "message": f"invalid complexity '{complexity}' (s|m|l|xl)"}
+
+    if delegability is not None and delegability not in ("agent", "human", "either"):
+        return {"ok": False, "error": "bad_delegability",
+                "message": f"invalid delegability '{delegability}' (agent|human|either)"}
+
+    try:
+        predictions = _build_predictions(
+            predict_duration=predict_duration,
+            predict_complexity=predict_complexity,
+            predict_files_changed=predict_files_changed,
+            predict_scope=predict_scope,
+            predict_frameworks=predict_frameworks,
+            predict_pitfalls=predict_pitfalls,
+            hypothesis=hypothesis,
+            success_criteria=success_criteria,
+            predict_approach=predict_approach,
+            unknowns=unknowns,
+            confidence=confidence,
+            reference_tasks=reference_tasks,
+            pre_mortem=pre_mortem,
+            predict_iterations=predict_iterations,
+            predicted_by=predicted_by,
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": "bad_predictions", "message": str(exc)}
+
+    task = add_task(
+        config,
+        project_id,
+        title=title,
+        priority=priority,
+        complexity=cmplx,
+        # expand_task_id: SERVER_INSTRUCTIONS advertises short-id support
+        # generally ("'68' -> 'CLAWP-068'") — depends is a task-id-bearing
+        # field just like task_id itself, and get_next_task's dependency
+        # gate does an exact string match against done_ids, so an
+        # unexpanded short id here silently never resolves (grok-4.5 round 5).
+        depends=[expand_task_id(d, project_id) for d in depends] if depends else None,
+        scope=list(scope) if scope else None,
+        tags=list(tags) if tags else None,
+        description=description,
+        predictions=predictions,
+        parallel_group=parallel_group,
+        agent_profile=agent_profile,
+        out_of_scope=list(out_of_scope) if out_of_scope else None,
+        stop_conditions=list(stop_conditions) if stop_conditions else None,
+        delegability=delegability,
+    )
+    if not task:
+        return {"ok": False, "error": "add_failed",
+                "message": f"Could not create task in project '{project_id}' (project has no tasks dir?)"}
+    return {"ok": True, "project": project_id, "task": task.to_dict()}
+
+
+def tasks_state(
+    task_id: str,
+    new_state: str,
+    project: str | None = None,
+    note: str | None = None,
+    force: bool = False,
+    reflect_note: str | None = None,
+    surprise_tags: list[str] | None = None,
+    rationale: str | None = None,
+    supersedes: str | None = None,
+) -> dict:
+    """Transition a task to a new state (open|progress|done|blocked|rejected).
+
+    Routes through the same calibration-aware service path as the CLI: it gates
+    parent rollup (pass `force=True` to complete over incomplete subtasks),
+    appends the work-log, runs the dependency cascade, and writes the reflection
+    event on done/blocked. `surprise_tags` (validated against the fixed
+    taxonomy) and `reflect_note` enrich that calibration event. `rationale` /
+    `supersedes` document a `rejected` won't-do decision. Returns the updated
+    task plus any cascade/teardown side-effects."""
+    from clawpm.context import expand_task_id
+    from clawpm.models import TaskState
+    from clawpm.services.tasks import transition
+
+    config = _load_config()
+    project_id, _ = _resolve_project(project)
+    full_id = expand_task_id(task_id, project_id)
+
+    try:
+        TaskState(new_state)
+    except ValueError:
+        return {"ok": False, "task_id": full_id, "error": "bad_state",
+                "message": f"invalid state '{new_state}' (open|progress|done|blocked|rejected)"}
+
+    try:
+        return transition(
+            config,
+            project_id=project_id,
+            task_id=full_id,
+            new_state=new_state,
+            note=note,
+            force=force,
+            reflect_note=reflect_note,
+            surprise_tags=tuple(surprise_tags or ()),
+            rationale=rationale,
+            supersedes=supersedes,
+        )
+    except ValueError as exc:
+        # transition validates the surprise taxonomy up front and raises
+        # ValueError for an out-of-vocab tag (part of the mutator contract).
+        return {"ok": False, "task_id": full_id, "error": "invalid_argument", "message": str(exc)}
+
+
+def tasks_edit(
+    task_id: str,
+    project: str | None = None,
+    title: str | None = None,
+    priority: int | None = None,
+    complexity: str | None = None,
+    body: str | None = None,
+    scope: list[str] | None = None,
+    tags: list[str] | None = None,
+    clear_tags: bool = False,
+    parallel_group: int | None = None,
+    clear_parallel_group: bool = False,
+    out_of_scope: list[str] | None = None,
+    stop_conditions: list[str] | None = None,
+    delegability: str | None = None,
+    success_criteria: list[str] | None = None,
+    predict_duration: str | None = None,
+    predict_complexity: str | None = None,
+    predict_files_changed: int | None = None,
+    predict_scope: list[str] | None = None,
+    predict_frameworks: list[str] | None = None,
+    predict_pitfalls: str | None = None,
+    unknowns: str | None = None,
+    predict_iterations: int | None = None,
+    confidence: int | None = None,
+    pre_mortem: str | None = None,
+    predict_approach: str | None = None,
+    reference_tasks: list[str] | None = None,
+    hypothesis: str | None = None,
+    predicted_by: str | None = None,
+) -> dict:
+    """Edit an existing task's metadata (title, priority, complexity, body,
+    scope, tags, dispatch-contract fields, predictions). Only the fields you
+    pass are changed — EXCEPT `scope`/`out_of_scope`/`stop_conditions`, where
+    an explicit empty list `[]` clears the field (matches `edit_task`'s own
+    contract) while omitting the argument entirely leaves it unchanged; `tags`
+    clearing is exclusively via `clear_tags` (an empty `tags` list is a no-op,
+    never a silent wipe). `edit_task` REPLACES the whole predictions block
+    whenever ANY predict_*/success_criteria/confidence/pre_mortem argument is
+    supplied — so to change one prediction field without erasing the others
+    (pitfalls, unknowns, scope, frameworks, iterations), pass the existing
+    values for the rest too (fetch them via `tasks_get` first). `filled_by`
+    is preserved from the task's existing predictions unless `predicted_by`
+    is supplied (falls back to `"agent"` only if the task had none). Returns
+    the updated task."""
+    from clawpm.context import expand_task_id
+    from clawpm.models import TaskComplexity
+    from clawpm.tasks import edit_task, get_task
+
+    config = _load_config()
+    project_id, _ = _resolve_project(project)
+    full_id = expand_task_id(task_id, project_id)
+
+    try:
+        cmplx = TaskComplexity(complexity) if complexity else None
+    except ValueError:
+        return {"ok": False, "error": "bad_complexity", "message": f"invalid complexity '{complexity}' (s|m|l|xl)"}
+
+    if delegability is not None and delegability not in ("agent", "human", "either"):
+        return {"ok": False, "error": "bad_delegability",
+                "message": f"invalid delegability '{delegability}' (agent|human|either)"}
+
+    # Preserve the existing filled_by unless the caller overrides it —
+    # _build_predictions REPLACES the whole predictions block, and its own
+    # default ("agent" when predicted_by is omitted) would otherwise silently
+    # overwrite e.g. an "operator-edited" attribution just because a caller
+    # only meant to bump `confidence` (grok-4.5 round 5).
+    effective_predicted_by = predicted_by
+    if effective_predicted_by is None:
+        existing_task = get_task(config, project_id, full_id)
+        if existing_task and existing_task.predictions:
+            effective_predicted_by = existing_task.predictions.filled_by
+
+    try:
+        predictions = _build_predictions(
+            predict_duration=predict_duration,
+            predict_complexity=predict_complexity,
+            predict_files_changed=predict_files_changed,
+            predict_scope=predict_scope,
+            predict_frameworks=predict_frameworks,
+            predict_pitfalls=predict_pitfalls,
+            hypothesis=hypothesis,
+            success_criteria=success_criteria,
+            predict_approach=predict_approach,
+            unknowns=unknowns,
+            confidence=confidence,
+            reference_tasks=reference_tasks,
+            pre_mortem=pre_mortem,
+            predict_iterations=predict_iterations,
+            predicted_by=effective_predicted_by,
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": "bad_predictions", "message": str(exc)}
+
+    # Mirror the CLI's own guards (cli/tasks.py tasks_edit) — without them,
+    # MCP silently accepts requests the CLI refuses outright (grok-4.5 round 4):
+    # a no-op edit still rewrites the file and bumps `updated`, and a
+    # tags+clear_tags (or parallel_group+clear_parallel_group) conflict lets
+    # edit_task's clear-wins-silently ordering discard the value the caller
+    # just supplied, with no signal that the "set" half was ignored.
+    #
+    # `tags`/`complexity` use bare truthiness here (not `is not None`),
+    # matching the CLI and the downstream coercion two blocks below
+    # (`TaskComplexity(complexity) if complexity else None`,
+    # `list(tags) if tags else None`) — `tags: []` or `complexity: ""` would
+    # otherwise pass this guard as "a real change" and then silently coerce
+    # to "unchanged", still rewriting the file for nothing (grok-4.5 AND
+    # grok-4.6, round 5, independently). `scope`/`out_of_scope`/
+    # `stop_conditions` stay `is not None` deliberately — for THOSE fields an
+    # explicit `[]` legitimately means "clear it" (see the docstring above),
+    # so treating it as "no change" would reintroduce the exact bug the
+    # None-vs-[] fix (round 2) closed.
+    if not any([
+        title is not None, priority is not None, complexity, body is not None,
+        scope is not None, predictions is not None, parallel_group is not None,
+        clear_parallel_group, out_of_scope is not None, stop_conditions is not None,
+        delegability is not None, tags, clear_tags,
+    ]):
+        return {"ok": False, "error": "no_changes",
+                "message": "Specify at least one field to edit"}
+
+    if parallel_group is not None and clear_parallel_group:
+        return {"ok": False, "error": "conflicting_flags",
+                "message": "Cannot supply both parallel_group and clear_parallel_group"}
+
+    if tags and clear_tags:
+        return {"ok": False, "error": "conflicting_flags",
+                "message": "Cannot supply both tags and clear_tags"}
+
+    task = edit_task(
+        config,
+        project_id,
+        full_id,
+        title=title,
+        priority=priority,
+        complexity=cmplx,
+        # None if x is None else list(x): an explicit [] must reach edit_task
+        # as [] (its own contract treats that as "clear the field"), not be
+        # coerced to None ("leave unchanged") — `x if x else None` silently
+        # broke JSON callers' ability to clear these via an empty array
+        # (CLAWP-068 review, grok-4.6).
+        scope=None if scope is None else list(scope),
+        tags=list(tags) if tags else None,
+        clear_tags=clear_tags,
+        body=body,
+        predictions=predictions,
+        parallel_group=parallel_group,
+        clear_parallel_group=clear_parallel_group,
+        out_of_scope=None if out_of_scope is None else list(out_of_scope),
+        stop_conditions=None if stop_conditions is None else list(stop_conditions),
+        delegability=delegability,
+    )
+    if not task:
+        return {"ok": False, "error": "not_found", "task_id": full_id,
+                "message": f"No task '{full_id}' in project '{project_id}'"}
+    return {"ok": True, "project": project_id, "task": task.to_dict()}
+
+
+def research_add(
+    title: str,
+    project: str | None = None,
+    research_type: str = "investigation",
+    tags: list[str] | None = None,
+    question: str = "",
+    summary: str = "",
+    findings: list[str] | None = None,
+    conclusion: str = "",
+    research_id: str | None = None,
+) -> dict:
+    """Add a research entry. `research_type` is investigation|spike|decision|
+    reference. Supplying `summary`/`findings`/`conclusion` records a single-shot
+    verdict; omitting them creates a progressive (to-fill-in) template. Returns
+    the created entry."""
+    from clawpm.models import ResearchType
+    from clawpm.research import add_research
+
+    config = _load_config()
+    project_id, _ = _resolve_project(project)
+
+    try:
+        rtype = ResearchType(research_type)
+    except ValueError:
+        return {"ok": False, "error": "bad_type",
+                "message": f"invalid research_type '{research_type}' (investigation|spike|decision|reference)"}
+
+    item = add_research(
+        config,
+        project_id,
+        title=title,
+        research_type=rtype,
+        research_id=research_id,
+        tags=list(tags) if tags else None,
+        question=question,
+        summary=summary,
+        findings=list(findings) if findings else None,
+        conclusion=conclusion,
+    )
+    if not item:
+        return {"ok": False, "error": "add_failed",
+                "message": f"Could not create research in project '{project_id}' (project not found?)"}
+    return {"ok": True, "project": project_id, "research": item.to_dict()}
+
+
+# ---------------------------------------------------------------------------
+# Registry + server construction
+# ---------------------------------------------------------------------------
+
+# All 10 tools are `core` for v1 (the operator-specified initial set). The tier
+# tag is the seam for later expansion: dispatch / agent-spawning tools will be
+# added at `standard` / `all` so they never bloat a default host's tool list.
+TOOL_SPECS: list[ToolSpec] = [
+    ToolSpec("tasks_list", "core", tasks_list),
+    ToolSpec("tasks_get", "core", tasks_get),
+    ToolSpec("context", "core", context),
+    ToolSpec("next", "core", next_task),
+    ToolSpec("research_list", "core", research_list),
+    ToolSpec("mission_list", "core", mission_list),
+    ToolSpec("tasks_add", "core", tasks_add),
+    ToolSpec("tasks_state", "core", tasks_state),
+    ToolSpec("tasks_edit", "core", tasks_edit),
+    ToolSpec("research_add", "core", research_add),
+]
+
+
+def _catch_unhandled(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap a tool so an exception it didn't already catch still returns the
+    documented ``{"ok": false, ...}`` JSON shape instead of an MCP ``isError``
+    text blob.
+
+    Every tool already catches its OWN known validation errors (bad_state,
+    bad_complexity, ...) and returns a dict. But several paths can still raise
+    past that — ``_resolve_project`` when no project is detected, ``edit_task``
+    on a corrupted task file, etc. Left unwrapped, those exceptions escape to
+    the MCP SDK's generic handler, which returns a plain-text ``isError``
+    result — a structurally different, unparseable shape next to every other
+    error this server returns (CLAWP-068 review F11). ``functools.wraps``
+    preserves ``__wrapped__``, which ``inspect.signature`` follows by default —
+    FastMCP's schema generation still sees the original signature/docstring.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        from clawpm.concurrency import LockTimeout
+
+        try:
+            return fn(*args, **kwargs)
+        except ValueError as exc:
+            # ValueError is this module's convention for "bad input/state"
+            # (see tasks_state's own except ValueError below) — give it the
+            # same error code a caller would get from a caught one.
+            return {"ok": False, "error": "invalid_argument", "message": str(exc)}
+        except LockTimeout as exc:
+            # add_task/edit_task/add_research don't have transition()'s own
+            # exception-to-dict mapping, so their mutator-contract exceptions
+            # would otherwise fall into the generic internal_error branch
+            # below, losing the distinction a caller needs to decide whether
+            # a retry is sensible (grok-4.5 review) — mirror transition()'s
+            # own codes (services/tasks.py) for the classes that matter.
+            return {"ok": False, "error": "lock_timeout", "message": str(exc)}
+        except FileNotFoundError as exc:
+            return {"ok": False, "error": "not_found", "message": str(exc)}
+        except FileExistsError as exc:
+            return {"ok": False, "error": "already_exists", "message": str(exc)}
+        except Exception as exc:  # noqa: BLE001 - deliberate tool-boundary catch-all
+            # Genuinely unanticipated. Whether the mutation partially landed
+            # before this raised is NOT distinguishable here — that needs
+            # every core mutator to expose its own atomicity guarantee, which
+            # is the deferred CLAWP-071 work, not something to improvise in
+            # this wrapper. internal_error means "re-check state before
+            # retrying", not "nothing happened".
+            # A truly unexpected exception (not this module's ValueError
+            # convention) may indicate more than a normal domain failure —
+            # e.g. a write tool raising mid-mutation. The JSON contract still
+            # wins (F11 is BLOCKING; a hosts needs ONE parseable error shape),
+            # but stderr is free on stdio transport (only stdout carries
+            # JSON-RPC), so log it there for anyone watching the server
+            # process rather than only the caller (grok-4.5 review).
+            #
+            # The logging itself must never be able to prevent the return
+            # below: if stderr.reconfigure() (module top) was skipped
+            # because the stream was already closed/replaced, and `exc`'s
+            # text is non-ASCII, an unguarded print/traceback here would
+            # raise ITS OWN UnicodeEncodeError and escape the wrapper —
+            # defeating the exact JSON contract this except-block exists to
+            # guarantee (grok-4.6 round 5).
+            try:
+                import traceback
+                print(
+                    f"[clawpm-mcp] unhandled {type(exc).__name__} in tool "
+                    f"{getattr(fn, '__name__', '?')}: {exc}",
+                    file=sys.stderr,
+                )
+                traceback.print_exc(file=sys.stderr)
+            except Exception:  # noqa: BLE001 - logging must never break the contract
+                pass
+            return {"ok": False, "error": "internal_error", "message": str(exc)}
+
+    return wrapper
+
+
+def specs_for_tier(tools_tier: str | None) -> list[ToolSpec]:
+    """The subset of tool specs exposed at the requested tier ceiling."""
+    ceiling = resolve_tier(tools_tier)
+    return [s for s in TOOL_SPECS if TIERS[s.min_tier] <= ceiling]
+
+
+def build_server(tools_tier: str | None = None, *, name: str = "clawpm"):
+    """Build the FastMCP server with the tier-appropriate tool set.
+
+    `tools_tier` defaults to the ``CLAWPM_MCP_TOOLS`` env var, then ``core``.
+    The heavy ``mcp`` import is deferred to here so importing this module (e.g.
+    for the tool functions, or in tests) doesn't require the SDK.
+    """
+    from mcp.server.fastmcp import FastMCP
+
+    if tools_tier is None:
+        tools_tier = os.environ.get(TOOLS_ENV_VAR)
+
+    server = FastMCP(name, instructions=SERVER_INSTRUCTIONS)
+    for spec in specs_for_tier(tools_tier):
+        server.add_tool(_catch_unhandled(spec.fn), name=spec.name)
+    return server
+
+
+def run_stdio(tools_tier: str | None = None) -> None:
+    """Launch the stdio MCP server (blocks until the host disconnects)."""
+    build_server(tools_tier).run()
