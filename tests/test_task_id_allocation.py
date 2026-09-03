@@ -217,7 +217,12 @@ class TestPrefixUniqueness:
         minted = _add("abcde-f", "e")
         prefix = minted.rsplit("-", 1)[0]
         assert prefix not in ("ABCDE", "ABCDE-F"), minted  # no silent collision
-        assert prefix == "ABCDE-F2", minted  # deterministic disambiguation
+        # The disambiguator is a digest of the project id, not a scanned
+        # counter (see test_fallback_is_deterministic_not_scan_dependent for
+        # why). Assert the PROPERTY rather than the literal, so the test
+        # doesn't pin the digest width.
+        assert prefix.startswith("ABCDE-F"), minted
+        assert prefix[-1].isalnum(), minted
 
     def test_final_fallback_never_mints_a_doubled_separator(self, tmp_path, monkeypatch):
         # Codex P2, PR #57: the disambiguation added above still fell back to
@@ -231,7 +236,9 @@ class TestPrefixUniqueness:
         minted = _add("code-", "d")
         assert "--" not in minted, minted  # the actual defect
         prefix = minted.rsplit("-", 1)[0]
-        assert prefix == "CODE2", minted  # stripped stem + numeric suffix
+        assert prefix.startswith("CODE"), minted  # stripped stem + digest
+        assert prefix != "CODE", minted  # actually disambiguated
+        assert prefix.rstrip("-_.") == prefix, minted  # no trailing separator
 
     def test_doubled_separator_fallback_stays_distinct_across_twins(
         self, tmp_path, monkeypatch
@@ -246,6 +253,78 @@ class TestPrefixUniqueness:
         second = _add("code---", "e")
         assert first.rsplit("-", 1)[0] != second.rsplit("-", 1)[0], (first, second)
         assert "--" not in first and "--" not in second, (first, second)
+
+    def test_fallback_is_deterministic_not_scan_dependent(self, tmp_path, monkeypatch):
+        """Codex P1, PR #57 round 4: concurrent FIRST mints must not collide.
+
+        The previous fallback picked its suffix with
+        ``while f"{stem}{n}" in used: n += 1`` — a scan of a portfolio
+        snapshot. Nothing pins that choice until the task file is written,
+        and ``add_task`` locks per-project task dirs, so two task-less twin
+        projects minting concurrently both saw the same snapshot and both
+        selected ``CODE2``.
+
+        The sequential test above passes either way, because the first mint
+        pins its prefix before the second allocation runs. This one closes
+        that gap WITHOUT threads: it calls ``assign_task_prefix`` for both
+        projects against the same pre-mint state — exactly the interleaving
+        two concurrent callers produce — and requires the answers to differ.
+        Against the pre-fix code both return ``CODE2``.
+        """
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        tasks_a = _make_portfolio(tmp_path, monkeypatch, "code-")
+        _add_project(tmp_path, "sib-one", task_prefix="CODE")
+        _add_project(tmp_path, "code---")
+        tasks_b = tmp_path / "projects" / "code---" / ".project" / "tasks"
+
+        config = load_portfolio_config(tmp_path)
+        # Neither project has minted yet: both calls see identical state.
+        first = assign_task_prefix("code-", tasks_a, config)
+        second = assign_task_prefix("code---", tasks_b, config)
+
+        assert first != second, (first, second)
+        for prefix in (first, second):
+            assert prefix.rstrip("-_.") == prefix, prefix
+            assert prefix.startswith("CODE"), prefix
+
+    def test_fallback_is_stable_across_repeated_calls(self, tmp_path, monkeypatch):
+        """A pure function of the project id: same inputs, same answer."""
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        tasks_a = _make_portfolio(tmp_path, monkeypatch, "code-")
+        _add_project(tmp_path, "sib-one", task_prefix="CODE")
+        config = load_portfolio_config(tmp_path)
+
+        assert (
+            assign_task_prefix("code-", tasks_a, config)
+            == assign_task_prefix("code-", tasks_a, config)
+        )
+
+    def test_exhausted_fallback_raises_rather_than_colliding(
+        self, tmp_path, monkeypatch
+    ):
+        """If even the digest candidate is claimed, fail loudly.
+
+        Silently extending would put the allocator back on a scanned, racy
+        counter; minting the claimed prefix anyway is the duplicate-ID
+        corruption the function exists to prevent.
+        """
+        import hashlib
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        tasks_a = _make_portfolio(tmp_path, monkeypatch, "code-")
+        _add_project(tmp_path, "sib-one", task_prefix="CODE")
+        digest = hashlib.sha256(b"code-").hexdigest()[:6].upper()
+        _add_project(tmp_path, "sib-two", task_prefix=f"CODE{digest}")
+
+        config = load_portfolio_config(tmp_path)
+        with pytest.raises(ValueError, match="collision-free task prefix"):
+            assign_task_prefix("code-", tasks_a, config)
 
 
 class TestDoctorCollisionCheck:
