@@ -411,3 +411,72 @@ class TestDoctorCollisionCheck:
         assert not any(
             c["prefix"] == minted and len(c["projects"]) > 1 for c in cols
         ), cols
+
+
+class TestDigestFallbackFitsTheTaskIdCap:
+    """Codex P2, PR #57 round 7.
+
+    A 29-character project id whose base and extension candidates are all
+    claimed produced `<29-char stem><32 hex>-000` — 65 characters, one past
+    `dispatch._SAFE_TASK_ID_RE`. The task was created and then refused by
+    `tasks dispatch`: a valid id the tool cannot use. The pre-round-5
+    unstripped-`full` fallback stayed inside the cap for that input, so this
+    was a regression rather than a pre-existing gap.
+    """
+
+    def test_constants_match_dispatch(self):
+        from clawpm.dispatch import _SAFE_TASK_ID_RE
+        from clawpm.tasks import _TASK_ID_MAX_LEN
+
+        # Pin the mirrored cap to the regex that actually enforces it.
+        assert _SAFE_TASK_ID_RE.match("A" * _TASK_ID_MAX_LEN)
+        assert not _SAFE_TASK_ID_RE.match("A" * (_TASK_ID_MAX_LEN + 1))
+
+    def test_long_project_id_still_mints_a_dispatchable_task_id(
+        self, tmp_path, monkeypatch
+    ):
+        import hashlib
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.dispatch import _SAFE_TASK_ID_RE
+        from clawpm.tasks import assign_task_prefix
+
+        # 29 characters — the length Codex identified as breaching the cap.
+        long_id = "a" * 29
+        assert len(long_id) == 29
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, long_id)
+
+        # Claim the base and every extension so the digest arm is reached.
+        full = long_id.upper()
+        _add_project(tmp_path, "sib-base", task_prefix=full[:5])
+        for n in range(6, len(full) + 1):
+            _add_project(tmp_path, f"sib-{n}", task_prefix=full[:n])
+
+        config = load_portfolio_config(tmp_path)
+        prefix = assign_task_prefix(long_id, tasks_dir, config)
+
+        digest = hashlib.sha256(long_id.encode("utf-8")).hexdigest()[:32].upper()
+        assert prefix.endswith(digest), prefix
+
+        task_id = f"{prefix}-000"
+        assert _SAFE_TASK_ID_RE.match(task_id), (
+            f"generated id is {len(task_id)} chars and dispatch will refuse it: "
+            f"{task_id}"
+        )
+        # And a subtask of it, since add_subtask appends to the parent id.
+        assert _SAFE_TASK_ID_RE.match(f"{task_id}-000")
+
+    def test_truncating_the_stem_keeps_distinct_ids_distinct(self):
+        """Injectivity comes from the digest over the FULL id, not the stem."""
+        from clawpm.tasks import _TASK_ID_MAX_LEN, _TASK_ID_SUFFIX_RESERVE
+
+        import hashlib
+
+        a, b = "a" * 40 + "-one", "a" * 40 + "-two"
+        cap = _TASK_ID_MAX_LEN - _TASK_ID_SUFFIX_RESERVE - 32
+        stem_a, stem_b = a.upper()[:cap], b.upper()[:cap]
+        assert stem_a == stem_b, "stems deliberately collide after truncation"
+
+        d_a = hashlib.sha256(a.encode("utf-8")).hexdigest()[:32].upper()
+        d_b = hashlib.sha256(b.encode("utf-8")).hexdigest()[:32].upper()
+        assert f"{stem_a}{d_a}" != f"{stem_b}{d_b}"

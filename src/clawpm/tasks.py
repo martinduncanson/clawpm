@@ -1277,6 +1277,24 @@ def _strip_trailing_non_alnum(prefix: str) -> str:
     return stripped or prefix
 
 
+_TASK_ID_MAX_LEN = 64
+"""Longest task id ``dispatch._SAFE_TASK_ID_RE`` will accept.
+
+Mirrored here rather than imported: ``tasks`` must not pull in ``dispatch``
+just to mint an id, and the two are pinned together by a test.
+"""
+
+_TASK_ID_SUFFIX_RESERVE = 8
+"""Characters reserved AFTER a generated prefix, for the numeric suffixes.
+
+``-NNN`` for the task itself (``f"{prefix}-{next_num:03d}"``), and ``-NNN``
+again for one subtask level — ``add_subtask`` appends to the PARENT id, so a
+subtask is the parent id plus four more characters. Deeper nesting or a
+five-digit counter can still exceed the cap, but only for a prefix already
+near it, and the digest fallback is the only arm that gets close.
+"""
+
+
 def _naive_prefix_placeholder(project_id: str) -> str:
     """The prefix a task-less project would derive on its first mint.
 
@@ -1415,10 +1433,25 @@ def assign_task_prefix(
     # provably injective — provable injectivity here means coordinating
     # selection with the task-file write, which is CLAWP-116.
     #
-    # Width is bounded by the task-id charset cap (64): stem + 32 hex + the
-    # "-NNN" suffix stays well inside it.
-    stem = _strip_trailing_non_alnum(full)
+    # The stem is TRUNCATED so the finished id fits dispatch's 64-character
+    # `_SAFE_TASK_ID_RE` (Codex P2, PR #57 round 7). The previous comment here
+    # asserted the width "stays well inside" the cap. It does not: a 29-char
+    # stem plus the 32-hex digest plus "-000" is 65, so the task was created
+    # happily and then refused by `tasks dispatch` — a valid id the tool
+    # cannot use. The old unstripped-`full` fallback happened to stay inside
+    # the cap for that input, so this was a regression, not a pre-existing gap.
+    #
+    # Truncating the stem does NOT weaken injectivity: the digest is taken
+    # over the FULL project_id, so two ids sharing a truncated stem still
+    # differ in the digest to the same cryptographic bound. The stem is
+    # legibility, the digest is correctness.
+    #
+    # This is the only arm that comes near the cap — every other candidate is
+    # a slice of the project id.
     digest = hashlib.sha256(project_id.encode("utf-8")).hexdigest()[:32].upper()
+    stem = _strip_trailing_non_alnum(full)[
+        : _TASK_ID_MAX_LEN - _TASK_ID_SUFFIX_RESERVE - len(digest)
+    ]
     candidate = f"{stem}{digest}"
     if candidate not in used:
         return candidate
