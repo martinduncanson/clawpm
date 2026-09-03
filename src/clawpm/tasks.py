@@ -680,33 +680,57 @@ def _append_decision_to_parent(
     """Append a one-line pointer under the parent's ``## Decisions so far``
     section when a ``kind: decision`` child closes (CLAWP-111).
 
-    Creates the heading if absent. Lenient like
-    ``_append_child_to_parent_frontmatter``: a vanished parent is skipped
-    rather than raising, so a missing parent file can never block the child's
-    own (already durable) completion.
+    Creates the heading if absent. IDEMPOTENT (review fix): if a line for
+    ``child_id`` already exists under the heading — a retry after a partial
+    failure, or ``done --resolution`` simply re-run on an already-closed
+    decision — it is REPLACED in place (so a corrected resolution still
+    updates) rather than duplicated.
+
+    Lenient like ``_append_child_to_parent_frontmatter``: a vanished parent
+    is skipped rather than raising, so a missing parent file can never block
+    the child's own (already durable) completion. Narrowly so (review fix):
+    only the specific "parent no longer exists" case is swallowed — the same
+    scope ``_append_child_to_parent_frontmatter`` allows (its
+    ``ConcurrentModificationError``/``FrontmatterError`` catch), not every
+    ``OSError``. A genuine read failure (permissions, disk error) propagates
+    instead of being silently dropped (fail-open != fail-silent).
     """
+    if not parent_path.exists():
+        return
     try:
         text = parent_path.read_text(encoding="utf-8")
-    except (FileNotFoundError, OSError):
-        return
+    except FileNotFoundError:
+        return  # vanished in the race between the exists() check and the read
 
     first_line = next(
         (ln for ln in resolution.strip().splitlines() if ln.strip()), ""
     )
     new_line = f"- [{child_title}]({child_id}): {first_line}"
     heading = "## Decisions so far"
+    # Matches THIS child's existing line regardless of the title text it was
+    # written with (a task can be retitled between runs) — the (id) anchor is
+    # the stable identity.
+    child_line_re = re.compile(r"^-\s*\[.*?\]\(" + re.escape(child_id) + r"\):")
 
     lines = text.split("\n")
     h_idx = next((i for i, l in enumerate(lines) if l.strip() == heading), None)
     if h_idx is not None:
-        insert_idx = len(lines)
+        section_end = len(lines)
         for i in range(h_idx + 1, len(lines)):
             if lines[i].startswith("## "):
-                insert_idx = i
+                section_end = i
                 break
-        while insert_idx > h_idx + 1 and lines[insert_idx - 1].strip() == "":
-            insert_idx -= 1
-        lines.insert(insert_idx, new_line)
+        existing_idx = next(
+            (i for i in range(h_idx + 1, section_end) if child_line_re.match(lines[i])),
+            None,
+        )
+        if existing_idx is not None:
+            lines[existing_idx] = new_line
+        else:
+            insert_idx = section_end
+            while insert_idx > h_idx + 1 and lines[insert_idx - 1].strip() == "":
+                insert_idx -= 1
+            lines.insert(insert_idx, new_line)
         new_text = "\n".join(lines)
     else:
         sep = "" if text.endswith("\n") else "\n"
@@ -1793,6 +1817,25 @@ def edit_task(
         # (the default) pops the key so a reclassify-back-to-build task drops
         # the key rather than persisting an explicit "build".
         if kind is not None:
+            # Review fix — close-gate bypass: `edit` has no --resolution flag,
+            # so retroactively reclassifying an ALREADY-done, resolution-less
+            # task as kind: decision would leave it in a state the done gate
+            # (change_task_state) can never produce on its own (done without
+            # a resolution). Refuse rather than silently create that
+            # inconsistent combination; a task can still be reclassified
+            # BEFORE it's done, or AFTER if it already carries a resolution
+            # (e.g. corrected via a hand edit).
+            if (
+                kind == "decision"
+                and task.state == TaskState.DONE
+                and not frontmatter.get("resolution")
+            ):
+                raise ValueError(
+                    f"Task {task_id} is already done without a resolution. "
+                    "Reclassifying it as kind: decision now would bypass the "
+                    "done-requires-resolution gate. Reopen it first (or leave "
+                    "its kind as build)."
+                )
             if kind != "build":
                 frontmatter["kind"] = kind
             else:
