@@ -480,3 +480,38 @@ class TestDigestFallbackFitsTheTaskIdCap:
         d_a = hashlib.sha256(a.encode("utf-8")).hexdigest()[:32].upper()
         d_b = hashlib.sha256(b.encode("utf-8")).hexdigest()[:32].upper()
         assert f"{stem_a}{d_a}" != f"{stem_b}{d_b}"
+
+
+class TestDigestFallbackRound8Edges:
+    """Codex P2 ×2, PR #57 round 8 — two ways round 7's bound was too narrow."""
+
+    def test_dotted_project_id_is_matched_whole_by_the_history_regex(self):
+        """`_SAFE_TASK_ID_RE` permits dots, so a stem can retain one. A
+        dotless history arm matched only the tail and recorded a task id that
+        does not exist — worse than the miss it replaced."""
+        import hashlib
+
+        from clawpm.history import TASK_ID_RE
+        from clawpm.tasks import _TASK_ID_MAX_LEN, _TASK_ID_SUFFIX_RESERVE
+
+        pid = "abcde.foo"
+        digest = hashlib.sha256(pid.encode("utf-8")).hexdigest()[:32].upper()
+        stem = pid.upper()[: _TASK_ID_MAX_LEN - _TASK_ID_SUFFIX_RESERVE - 32]
+        assert "." in stem
+        task_id = f"{stem}{digest}-000"
+
+        assert TASK_ID_RE.findall(f"see {task_id} for details") == [task_id]
+
+    def test_reserve_covers_a_four_digit_ordinal_with_a_subtask(self):
+        """`:03d` is a minimum width, so the suffix grows at task 1000 — not
+        only at five digits, as round 7's comment assumed."""
+        from clawpm.dispatch import _SAFE_TASK_ID_RE
+        from clawpm.tasks import _TASK_ID_MAX_LEN, _TASK_ID_SUFFIX_RESERVE
+
+        widest_prefix = "P" * (_TASK_ID_MAX_LEN - _TASK_ID_SUFFIX_RESERVE)
+        for parent_ordinal in ("000", "1000", "99999"):
+            for child_ordinal in ("001", "1000", "99999"):
+                candidate = f"{widest_prefix}-{parent_ordinal}-{child_ordinal}"
+                assert _SAFE_TASK_ID_RE.match(candidate), (
+                    f"{len(candidate)} chars: {candidate}"
+                )
