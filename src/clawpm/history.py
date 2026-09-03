@@ -39,7 +39,15 @@ TASK_ID_RE = re.compile(
     # match this shape anyway (they need a `-` where the digest begins), but
     # ordering the specific case ahead of the general one keeps that a fact
     # about the pattern rather than about backtracking.
-    r"[A-Z0-9][A-Z0-9_-]{0,25}[0-9A-F]{32}"
+    #
+    # The stem class carries `.` as well as `_` and `-` (Codex P2, PR #57
+    # round 8). `dispatch._SAFE_TASK_ID_RE` permits dots, so a project id
+    # like `abcde.foo` mints `ABCDE.FOO<digest>-000`; a dotless class matched
+    # only the `FOO<digest>-000` tail and recorded a task id that does not
+    # exist, which is worse than the miss it replaced — `by_task` and
+    # `unique_task_ids` would both carry the truncated form. The class must
+    # cover every character the stem can retain.
+    r"[A-Z0-9][A-Z0-9_.-]{0,25}[0-9A-F]{32}"
     r"|"
     # Multi-segment: each segment >=1 letter, 2-5 segments total, each
     # capped at 10 chars. Catches multi-hyphen prefixes like MY-PR or

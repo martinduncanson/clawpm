@@ -1284,14 +1284,30 @@ Mirrored here rather than imported: ``tasks`` must not pull in ``dispatch``
 just to mint an id, and the two are pinned together by a test.
 """
 
-_TASK_ID_SUFFIX_RESERVE = 8
+_TASK_ID_MAX_ORDINAL_WIDTH = 5
+"""Widest task ordinal budgeted for: ``99999``.
+
+``:03d`` is a MINIMUM width, not a maximum (Codex P2, PR #57 round 8), so
+the suffix starts growing at task 1000 — not only at five digits. A project
+with 100,000 top-level tasks is outside what this reserve covers, and would
+need an ordinal limit rather than a wider prefix budget.
+"""
+
+_TASK_ID_SUFFIX_LEVELS = 2
+"""Suffix levels budgeted for: the task, and one subtask beneath it.
+
+``add_subtask`` appends ``-{n:03d}`` to the PARENT id, so a subtask is its
+parent's id plus another suffix. Nesting deeper than one level under a
+digest-fallback prefix is not covered; ``clawpm`` already treats depth > 2
+as a smell.
+"""
+
+_TASK_ID_SUFFIX_RESERVE = _TASK_ID_SUFFIX_LEVELS * (1 + _TASK_ID_MAX_ORDINAL_WIDTH)
 """Characters reserved AFTER a generated prefix, for the numeric suffixes.
 
-``-NNN`` for the task itself (``f"{prefix}-{next_num:03d}"``), and ``-NNN``
-again for one subtask level — ``add_subtask`` appends to the PARENT id, so a
-subtask is the parent id plus four more characters. Deeper nesting or a
-five-digit counter can still exceed the cap, but only for a prefix already
-near it, and the digest fallback is the only arm that gets close.
+One separator plus the ordinal, per level. The digest fallback is the only
+arm that comes anywhere near the cap — every other candidate is a slice of
+the project id.
 """
 
 
