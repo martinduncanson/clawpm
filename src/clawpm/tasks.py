@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -1281,16 +1282,84 @@ def resolve_existing_prefix(settings) -> str | None:
     return None
 
 
+def _strip_trailing_non_alnum(prefix: str) -> str:
+    """Drop trailing non-alphanumeric characters from a derived prefix slice.
+
+    A fixed-length slice of an uppercased project id can land exactly on a
+    separator — ``"code-quorum".upper()[:5]`` is ``"CODE-"``, hyphen last.
+    Left alone, the later ``f"{prefix}-{num:03d}"`` join doubles the
+    separator (``"CODE-" + "-000"`` -> ``"CODE--000"``, CLAWP-096). Only the
+    trailing run is trimmed — an internal separator like ``"ARB-P"``
+    (``"arb-prd".upper()[:5]``) is untouched by design (CLAWP-047). Never
+    strips down to empty: an all-punctuation slice is returned unchanged
+    rather than nulled out.
+    """
+    stripped = prefix.rstrip("-_.")
+    return stripped or prefix
+
+
+_TASK_ID_MAX_LEN = 64
+"""Longest task id ``dispatch._SAFE_TASK_ID_RE`` will accept.
+
+Mirrored here rather than imported: ``tasks`` must not pull in ``dispatch``
+just to mint an id, and the two are pinned together by a test.
+"""
+
+_TASK_ID_MAX_ORDINAL_WIDTH = 5
+"""Widest task ordinal budgeted for: ``99999``.
+
+``:03d`` is a MINIMUM width, not a maximum (Codex P2, PR #57 round 8), so
+the suffix starts growing at task 1000 — not only at five digits. A project
+with 100,000 top-level tasks is outside what this reserve covers, and would
+need an ordinal limit rather than a wider prefix budget.
+"""
+
+_TASK_ID_SUFFIX_LEVELS = 2
+"""Suffix levels budgeted for: the task, and one subtask beneath it.
+
+``add_subtask`` appends ``-{n:03d}`` to the PARENT id, so a subtask is its
+parent's id plus another suffix. Nesting deeper than one level under a
+digest-fallback prefix is not covered; ``clawpm`` already treats depth > 2
+as a smell.
+"""
+
+_TASK_ID_SUFFIX_RESERVE = _TASK_ID_SUFFIX_LEVELS * (1 + _TASK_ID_MAX_ORDINAL_WIDTH)
+"""Characters reserved AFTER a generated prefix, for the numeric suffixes.
+
+One separator plus the ordinal, per level. The digest fallback is the only
+arm that comes anywhere near the cap — every other candidate is a slice of
+the project id.
+"""
+
+
+def _naive_prefix_placeholder(project_id: str) -> str:
+    """The prefix a task-less project would derive on its first mint.
+
+    Mirrors ``assign_task_prefix``'s own ``base`` candidate exactly
+    (``id.upper()[:5]`` + the CLAWP-096 trailing-separator strip). Used as
+    the ``_portfolio_prefixes`` collision-set placeholder for a sibling
+    project that has no explicit ``task_prefix`` and no tasks minted yet —
+    if this placeholder disagreed with what ``assign_task_prefix`` actually
+    derives, two still-task-less siblings whose slices land on the same
+    boundary (e.g. two "code-*" projects, both -> "CODE") could each fail to
+    see the other as a collision and independently mint the same prefix.
+    """
+    full = project_id.upper()
+    base = full[:5] if len(full) >= 5 else full
+    return _strip_trailing_non_alnum(base)
+
+
 def _portfolio_prefixes(config, exclude_id: str) -> set[str]:
-    """Prefixes already claimed by OTHER projects (resolved, or ``[:5]`` for the
-    task-less ones, so a new project can't grab a prefix another would derive)."""
+    """Prefixes already claimed by OTHER projects (resolved, or the naive
+    first-mint placeholder for the task-less ones, so a new project can't
+    grab a prefix another would derive)."""
     from .discovery import discover_projects
 
     used: set[str] = set()
     for p in discover_projects(config):
         if p.id == exclude_id:
             continue
-        used.add(resolve_existing_prefix(p) or p.id.upper()[:5])
+        used.add(resolve_existing_prefix(p) or _naive_prefix_placeholder(p.id))
     return used
 
 
@@ -1302,6 +1371,24 @@ def assign_task_prefix(
     explicit ``task_prefix`` -> inferred-from-existing (stability) -> shortest
     collision-free extension of ``id.upper()[:5]``. A new project that would
     collide on ``[:5]`` gets the shortest longer prefix no other project uses.
+    The base candidate is derived via ``_naive_prefix_placeholder`` (CLAWP-096)
+    so a slice boundary landing on a hyphen never produces a doubled separator
+    once ``-{num:03d}`` is appended, and so this function's own candidate
+    always agrees with what ``_portfolio_prefixes`` assumes OTHER task-less
+    projects would derive. Extension-loop candidates beyond the base are
+    stripped the same way, as is the digest last resort (see comment below) --
+    no arm of this function can emit a trailing separator.
+
+    EVERY arm is a pure function of ``project_id`` and the portfolio's other
+    prefixes; none depends on a scanned counter. That is what makes concurrent
+    first mints safe without a lock: two different projects cannot converge on
+    the same candidate, so there is nothing to serialise (Codex P1, PR #57 --
+    see the last-resort comment for why a lock would not have fixed it).
+
+    Raises:
+        ValueError: if every id-derived candidate, including the digest
+            fallback, is already claimed. Only reachable when sibling projects
+            set explicit ``task_prefix`` values that exhaust them.
     """
     if explicit_prefix:
         return explicit_prefix.upper()
@@ -1310,13 +1397,111 @@ def assign_task_prefix(
         return inferred
     full = project_id.upper()
     used = _portfolio_prefixes(config, project_id)
-    base = full[:5] if len(full) >= 5 else full
+    base = _naive_prefix_placeholder(project_id)
     if base and base not in used:
         return base
     for n in range(6, len(full) + 1):
-        if full[:n] not in used:
-            return full[:n]
-    return full  # ids are portfolio-unique, so the full id can't collide
+        candidate = _strip_trailing_non_alnum(full[:n])
+        if candidate not in used:
+            return candidate
+    # ids are portfolio-unique, so the id-derived candidates above can't
+    # collide with another project's OWN id-derived prefix. But `used` also
+    # holds EXPLICIT `task_prefix` values -- arbitrary strings a sibling can
+    # set independent of its own id -- so every candidate above can still be
+    # claimed (Codex P1, PR #57: siblings with explicit prefixes "ABCDE" and
+    # "ABCDE-F" exhaust every stripped candidate through n=len(full)).
+    #
+    # Disambiguate from the STRIPPED id, never the raw one. Returning the
+    # unstripped `full` was the previous last resort, but it reintroduced
+    # exactly the doubled separator CLAWP-096 exists to remove: project
+    # "code-" whose stripped "CODE" is claimed by a sibling returned "CODE-",
+    # minting "CODE--000", which inference then pinned (Codex P2, PR #57).
+    # The numeric suffix still keeps two ids differing only in trailing
+    # separators distinct -- "code" gets "CODE2" when "code---" holds "CODE"
+    # -- which is the only property the raw id was protecting.
+    #
+    # `stem` is always already claimed here: `base` covers len(full) <= 5 and
+    # the loop's final iteration (n == len(full)) covers the rest, so both
+    # reach `_strip_trailing_non_alnum(full)`. Hence no bare `stem` return.
+    #
+    # The disambiguator is a DIGEST OF THE PROJECT ID, not a scanned counter
+    # (Codex P1, PR #57 round 4). A `while f"{stem}{n}" in used: n += 1` loop
+    # reads a snapshot of `used`, and nothing pins the value it picks until
+    # the task file is written: `add_task` locks per-project task dirs, so two
+    # task-less projects minting their FIRST task concurrently take the same
+    # snapshot and independently select the same suffix, minting duplicate
+    # portfolio-wide IDs. `_portfolio_prefixes` cannot close that, because it
+    # models only the `base` arm (via `_naive_prefix_placeholder`) — a
+    # sibling's fallback choice is invisible until its first task exists.
+    #
+    # A portfolio-wide lock does NOT fix this: the lock would have to be held
+    # from selection all the way through the task-file write that reserves the
+    # prefix, since releasing it after selection leaves the second mint's
+    # snapshot exactly as stale as before.
+    #
+    # Determinism does fix it, with no coordination at all: when the candidate
+    # is a pure function of the project id, two DIFFERENT projects can never
+    # converge on the same fallback, so there is nothing to serialise. Every
+    # other member of `used` is already deterministic — explicit prefixes are
+    # static config, placeholders are pure functions of sibling ids, resolved
+    # prefixes come from tasks that already exist — so this was the sole
+    # scan-dependent arm and the sole race.
+    #
+    # It must be a digest rather than something prettier. The obvious short
+    # encodings are not injective: the trailing-separator RUN LENGTH collapses
+    # "code-" and "code_" (both stem "CODE", both length 1) onto the same
+    # candidate, which reintroduces the very collision this arm exists to
+    # avoid, just deterministically. Injectivity over the raw id is the whole
+    # requirement — it is the one property the old unstripped-`full` return
+    # was protecting — and a digest is the simple way to get it while
+    # guaranteeing an alphanumeric last character.
+    #
+    # This arm is reached only when the base AND every extension through
+    # len(full) are claimed, which needs siblings with explicit prefixes
+    # engineered to exhaust them. An ugly prefix in that corner is a fair
+    # trade for never minting a duplicate ID.
+    # 128 bits, not 24 (Codex P1, PR #57 round 5). A six-hex truncation is
+    # deterministic but NOT injective, and that is the property this arm
+    # actually needs: Codex produced a real collision by brute force —
+    # "code.--..--_" and "code--_._-_-_" both digest to 3384EB (verified
+    # locally), so two task-less projects could each see CODE3384EB as free
+    # and both mint CODE3384EB-000. 24 bits is trivially searchable; 128 is
+    # not, by anyone. This is injective to a cryptographic bound rather than
+    # provably injective — provable injectivity here means coordinating
+    # selection with the task-file write, which is CLAWP-116.
+    #
+    # The stem is TRUNCATED so the finished id fits dispatch's 64-character
+    # `_SAFE_TASK_ID_RE` (Codex P2, PR #57 round 7). The previous comment here
+    # asserted the width "stays well inside" the cap. It does not: a 29-char
+    # stem plus the 32-hex digest plus "-000" is 65, so the task was created
+    # happily and then refused by `tasks dispatch` — a valid id the tool
+    # cannot use. The old unstripped-`full` fallback happened to stay inside
+    # the cap for that input, so this was a regression, not a pre-existing gap.
+    #
+    # Truncating the stem does NOT weaken injectivity: the digest is taken
+    # over the FULL project_id, so two ids sharing a truncated stem still
+    # differ in the digest to the same cryptographic bound. The stem is
+    # legibility, the digest is correctness.
+    #
+    # This is the only arm that comes near the cap — every other candidate is
+    # a slice of the project id.
+    digest = hashlib.sha256(project_id.encode("utf-8")).hexdigest()[:32].upper()
+    stem = _strip_trailing_non_alnum(full)[
+        : _TASK_ID_MAX_LEN - _TASK_ID_SUFFIX_RESERVE - len(digest)
+    ]
+    candidate = f"{stem}{digest}"
+    if candidate not in used:
+        return candidate
+    # An explicit `task_prefix` collided with a 24-bit digest of this id.
+    # Fail loudly: silently extending would put us back on a scanned,
+    # racy counter, and minting a duplicate portfolio-wide prefix is the
+    # corruption this whole function exists to prevent.
+    raise ValueError(
+        f"Cannot derive a collision-free task prefix for project "
+        f"{project_id!r}: every id-derived candidate through {full!r} is "
+        f"claimed by another project, and the fallback {candidate!r} is too. "
+        f"Set an explicit `task_prefix` in this project's settings.toml."
+    )
 
 
 def add_task(

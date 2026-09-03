@@ -462,27 +462,68 @@ class TestDoctorChecks:
         assert not any("ALPHA-011" in f for f in drift_files)
 
     def test_prefix_collision_detected(self, temp_portfolio):
-        """Projects 'alpha' and 'alpha-extra' both prefix to 'ALPHA' (5 chars)."""
+        """A prefix two projects have BOTH ALREADY MINTED is a real collision."""
+        # Both fixture projects mint ALPHA directly, as a pre-CLAWP-048
+        # portfolio would have. Their resolved prefixes are then identical and
+        # doctor must say so.
+        for pid in ("alpha", "alpha-extra"):
+            (temp_portfolio["root"] / "projects" / pid / ".project" / "tasks"
+             / "ALPHA-000.md").write_text(
+                "---\nid: ALPHA-000\n---\n", encoding="utf-8"
+            )
         runner = CliRunner()
         result = runner.invoke(main, ["doctor"])
         assert result.exit_code == 0, result.output
         data = json.loads(result.output)
         collisions = data.get("prefix_collisions", [])
         assert len(collisions) >= 1
-        # "alpha" → "ALPHA", "alpha-extra" → "ALPHA-"[:5] = "ALPHA"
         collision_prefixes = {c["prefix"] for c in collisions}
         assert "ALPHA" in collision_prefixes
         alpha_collision = next(c for c in collisions if c["prefix"] == "ALPHA")
         assert "alpha" in alpha_collision["projects"]
         assert "alpha-extra" in alpha_collision["projects"]
 
+    def test_taskless_siblings_are_not_a_collision(self, temp_portfolio):
+        """Codex P2, PR #57 round 6.
+
+        This test previously asserted the opposite, on the premise that two
+        task-less `alpha*` projects both mint the naive base ALPHA. They do
+        not: the base is only the allocator's first candidate, and each sees
+        the other's reservation and extends — verified here by asking the
+        allocator rather than by asserting a remembered value ('alpha' has no
+        6th character to extend into, so it takes the digest fallback, while
+        'alpha-extra' becomes ALPHA-E).
+
+        Reporting ALPHA as a collision failed `doctor --strict` in CI and told
+        the operator to rename a project over a namespace nothing mints.
+        """
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        root = temp_portfolio["root"]
+        config = load_portfolio_config(root)
+        minted = {
+            pid: assign_task_prefix(
+                pid, root / "projects" / pid / ".project" / "tasks", config
+            )
+            for pid in ("alpha", "alpha-extra")
+        }
+        assert len(set(minted.values())) == 2, minted
+        assert "ALPHA" not in set(minted.values()), minted
+
+        runner = CliRunner()
+        result = runner.invoke(main, ["doctor"])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert not any(
+            c["prefix"] == "ALPHA" for c in data.get("prefix_collisions", [])
+        ), data.get("prefix_collisions")
+
     def test_no_prefix_collision_with_unique_projects(self, temp_portfolio):
-        """The two projects in the fixture collide; test that a unique prefix doesn't."""
-        # Check that "alpha" prefix doesn't spuriously collide with itself
+        """Whatever collisions doctor reports, each names >1 project."""
         runner = CliRunner()
         result = runner.invoke(main, ["doctor"])
         data = json.loads(result.output)
-        # Only one collision should exist (ALPHA), not more
         for c in data.get("prefix_collisions", []):
             assert len(c["projects"]) >= 2
 

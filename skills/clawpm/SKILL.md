@@ -465,10 +465,11 @@ workday — calibration compares elapsed time, not scheduled hours):
 | `2h` | 120 minutes |
 | `3d` | 4 320 minutes (3 × 24 h) |
 | `1w` | 10 080 minutes (7 × 24 h) |
+| `2h30m` | 150 minutes (combined units, CLAWP-096) |
 
 **Phase 1 prediction flags** (on `tasks add` and `tasks edit`):
 ```
---predict-duration      Predicted duration: 90, 90m, 2h, 3d, 1w
+--predict-duration      Predicted duration: 90, 90m, 2h, 2h30m, 3d, 1w
 --predict-complexity    s|m|l|xl
 --predict-files-changed Number of files expected to change
 --predict-scope         File glob scope (repeatable)
@@ -919,7 +920,7 @@ clawpm log tail            # See recent activity
 **`add_failed` after `project init`?** Check `.project/settings.toml` — `repo_path` must use forward slashes on Windows (`F:/Git/...` not `F:\Git\...`). The CLI now warns when this is suspected, but old settings.toml files written by earlier versions may still be broken.
 
 **Windows CLI caveats (observed 2026-07-05):**
-- `--predict-scope` values containing glob metacharacters (`scripts/**`) get expanded into extra positional arguments and fail `tasks add` with "Got unexpected extra arguments". Use plain directory prefixes (`scripts/`) or exact file paths — the conflict heuristic strips glob chars anyway.
-- `--predict-duration` rejects combined units (`2h30m`) — use a single unit (`150m`, `2h`).
+- `--predict-scope`/`--scope` values containing glob metacharacters (`scripts/**`) can be expanded into extra positional arguments by the Windows launcher before this CLI ever sees them, failing `tasks add` with "Got unexpected extra arguments" — this happens before Python's own argument parsing runs, so it isn't fixable by quoting. Use `--predict-scope-file`/`--scope-file`/`--out-of-scope-file` instead: read patterns from a file (one per line), which never touches argv and is immune to the expansion (CLAWP-060).
+- `--predict-duration` (and any other duration-parsing flag) accepts combined units, e.g. `2h30m` -> 150 minutes, in addition to a single unit (`150m`, `2h`) (CLAWP-096).
 - If multiple `clawpm.exe` shims are on PATH, a stale one can shadow the working install (`ModuleNotFoundError: No module named 'clawpm'`). Check with `where.exe clawpm` and invoke the shim next to the Python install that has clawpm importable.
 - **`tasks edit` replaces the predictions block wholesale, not field-by-field.** Editing only `--hypothesis` nulls duration/complexity/confidence/pre-mortem/scope/filled_by. When editing any prediction field, re-pass ALL prediction flags you want to keep. Also: `--predicted-by` exists on `tasks add` but not `tasks edit`, so `filled_by` is lost on any prediction edit.

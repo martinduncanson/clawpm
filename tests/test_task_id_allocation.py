@@ -84,6 +84,52 @@ class TestNonHyphenatedPrefixUnaffected:
         assert ids == ["TEST-000", "TEST-001"], ids
 
 
+class TestHyphenOnSliceBoundary:
+    """CLAWP-096: a project id whose ``upper()[:5]`` slice lands EXACTLY on the
+    hyphen (e.g. "code-quorum", where "code" is 4 chars) must not carry a
+    trailing hyphen into the prefix — that doubles the separator once
+    ``-{num:03d}`` is appended ("CODE-" + "-000" -> "CODE--000")."""
+
+    def test_slice_boundary_hyphen_is_stripped(self, tmp_path, monkeypatch):
+        _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        ids = [_add("code-quorum", f"t{i}") for i in range(2)]
+        assert ids == ["CODE-000", "CODE-001"], ids
+        assert "--" not in ids[0]
+
+    def test_internal_hyphen_still_preserved(self, tmp_path, monkeypatch):
+        # Regression guard: the fix must not regress CLAWP-047's intentional
+        # internal-hyphen behaviour ("arb-prd" -> "ARB-P", hyphen mid-prefix).
+        _make_portfolio(tmp_path, monkeypatch, "arb-prd")
+        assert _add("arb-prd", "epic") == "ARB-P-000"
+
+    def test_two_taskless_siblings_on_the_same_slice_boundary_do_not_collide(
+        self, tmp_path, monkeypatch
+    ):
+        # Code-quorum review finding: _portfolio_prefixes' collision-set
+        # placeholder for a still task-less sibling must agree with what
+        # assign_task_prefix's OWN candidate strips to, or two siblings that
+        # both slice-with-boundary-hyphen to "CODE" (here: "code-quorum" and
+        # "code-runner", both registered but neither has minted yet) could
+        # each independently conclude "CODE" is free and collide.
+        #
+        # With the placeholders in agreement, EITHER sibling seeing the
+        # other's not-yet-real "CODE" placeholder is enough to make it
+        # defensively extend past the short prefix -- unlike the arb-prd/
+        # arb-prod case (where the first minter keeps the short prefix
+        # cleanly because the second hasn't registered a same-shaped
+        # placeholder yet), here neither has minted, so it's not knowable in
+        # advance which one "should" get to keep "CODE". Collision-safety
+        # (the actual invariant under test), not who keeps the short prefix,
+        # is what this test asserts.
+        _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        _add_project(tmp_path, "code-runner")  # also task-less at this point
+        first = _add("code-quorum", "e")
+        second = _add("code-runner", "e")
+        pre = lambda tid: tid.rsplit("-", 1)[0]
+        assert pre(second) != pre(first), (first, second)  # distinct namespaces
+        assert len({first, second}) == 2, (first, second)  # no literal id collision
+
+
 # ---------------------------------------------------------------------------
 # CLAWP-048: cross-project prefix uniqueness (near-name-twin projects must not
 # share an ID namespace) + explicit task_prefix override + doctor detection.
@@ -154,6 +200,132 @@ class TestPrefixUniqueness:
         _add("arb-prod", "b")  # twin takes an extended prefix
         assert _add("arb-prd", "c") == "ARB-P-001"  # arb-prd unchanged
 
+    def test_final_fallback_disambiguates_when_explicit_prefixes_exhaust_it(
+        self, tmp_path, monkeypatch
+    ):
+        # Codex P1, PR #57: assign_task_prefix's last-resort `return full`
+        # assumed the unstripped full id can't collide because ids are
+        # portfolio-unique -- true for id-DERIVED prefixes, false for
+        # EXPLICIT ones, which are arbitrary strings a sibling can set
+        # independent of its own id. Two siblings with explicit prefixes
+        # "ABCDE" and "ABCDE-F" exhaust every stripped candidate a new
+        # "abcde-f" project would try (base "ABCDE", extension "ABCDE-F"),
+        # leaving the final fallback `full` == "ABCDE-F" ALREADY claimed.
+        _make_portfolio(tmp_path, monkeypatch, "abcde-f")
+        _add_project(tmp_path, "sib-one", task_prefix="ABCDE")
+        _add_project(tmp_path, "sib-two", task_prefix="ABCDE-F")
+        minted = _add("abcde-f", "e")
+        prefix = minted.rsplit("-", 1)[0]
+        assert prefix not in ("ABCDE", "ABCDE-F"), minted  # no silent collision
+        # The disambiguator is a digest of the project id, not a scanned
+        # counter (see test_fallback_is_deterministic_not_scan_dependent for
+        # why). Assert the PROPERTY rather than the literal, so the test
+        # doesn't pin the digest width.
+        assert prefix.startswith("ABCDE-F"), minted
+        assert prefix[-1].isalnum(), minted
+
+    def test_final_fallback_never_mints_a_doubled_separator(self, tmp_path, monkeypatch):
+        # Codex P2, PR #57: the disambiguation added above still fell back to
+        # the UNSTRIPPED `full`, which reintroduced the doubled separator
+        # CLAWP-096 exists to remove. Project "code-" derives base "CODE";
+        # a sibling holding explicit prefix "CODE" claims it, the extension
+        # loop is empty (len("CODE-") == 5), and the old last resort returned
+        # `full` == "CODE-" -> "CODE--000", which inference then pinned.
+        _make_portfolio(tmp_path, monkeypatch, "code-")
+        _add_project(tmp_path, "sib-one", task_prefix="CODE")
+        minted = _add("code-", "d")
+        assert "--" not in minted, minted  # the actual defect
+        prefix = minted.rsplit("-", 1)[0]
+        assert prefix.startswith("CODE"), minted  # stripped stem + digest
+        assert prefix != "CODE", minted  # actually disambiguated
+        assert prefix.rstrip("-_.") == prefix, minted  # no trailing separator
+
+    def test_doubled_separator_fallback_stays_distinct_across_twins(
+        self, tmp_path, monkeypatch
+    ):
+        # The unstripped fallback was protecting one real property: two ids
+        # differing ONLY in trailing separators must not collapse to the same
+        # prefix. The stripped-stem + numeric suffix preserves that.
+        _make_portfolio(tmp_path, monkeypatch, "code-")
+        _add_project(tmp_path, "sib-one", task_prefix="CODE")
+        _add_project(tmp_path, "code---")
+        first = _add("code-", "d")
+        second = _add("code---", "e")
+        assert first.rsplit("-", 1)[0] != second.rsplit("-", 1)[0], (first, second)
+        assert "--" not in first and "--" not in second, (first, second)
+
+    def test_fallback_is_deterministic_not_scan_dependent(self, tmp_path, monkeypatch):
+        """Codex P1, PR #57 round 4: concurrent FIRST mints must not collide.
+
+        The previous fallback picked its suffix with
+        ``while f"{stem}{n}" in used: n += 1`` — a scan of a portfolio
+        snapshot. Nothing pins that choice until the task file is written,
+        and ``add_task`` locks per-project task dirs, so two task-less twin
+        projects minting concurrently both saw the same snapshot and both
+        selected ``CODE2``.
+
+        The sequential test above passes either way, because the first mint
+        pins its prefix before the second allocation runs. This one closes
+        that gap WITHOUT threads: it calls ``assign_task_prefix`` for both
+        projects against the same pre-mint state — exactly the interleaving
+        two concurrent callers produce — and requires the answers to differ.
+        Against the pre-fix code both return ``CODE2``.
+        """
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        tasks_a = _make_portfolio(tmp_path, monkeypatch, "code-")
+        _add_project(tmp_path, "sib-one", task_prefix="CODE")
+        _add_project(tmp_path, "code---")
+        tasks_b = tmp_path / "projects" / "code---" / ".project" / "tasks"
+
+        config = load_portfolio_config(tmp_path)
+        # Neither project has minted yet: both calls see identical state.
+        first = assign_task_prefix("code-", tasks_a, config)
+        second = assign_task_prefix("code---", tasks_b, config)
+
+        assert first != second, (first, second)
+        for prefix in (first, second):
+            assert prefix.rstrip("-_.") == prefix, prefix
+            assert prefix.startswith("CODE"), prefix
+
+    def test_fallback_is_stable_across_repeated_calls(self, tmp_path, monkeypatch):
+        """A pure function of the project id: same inputs, same answer."""
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        tasks_a = _make_portfolio(tmp_path, monkeypatch, "code-")
+        _add_project(tmp_path, "sib-one", task_prefix="CODE")
+        config = load_portfolio_config(tmp_path)
+
+        assert (
+            assign_task_prefix("code-", tasks_a, config)
+            == assign_task_prefix("code-", tasks_a, config)
+        )
+
+    def test_exhausted_fallback_raises_rather_than_colliding(
+        self, tmp_path, monkeypatch
+    ):
+        """If even the digest candidate is claimed, fail loudly.
+
+        Silently extending would put the allocator back on a scanned, racy
+        counter; minting the claimed prefix anyway is the duplicate-ID
+        corruption the function exists to prevent.
+        """
+        import hashlib
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        tasks_a = _make_portfolio(tmp_path, monkeypatch, "code-")
+        _add_project(tmp_path, "sib-one", task_prefix="CODE")
+        digest = hashlib.sha256(b"code-").hexdigest()[:32].upper()
+        _add_project(tmp_path, "sib-two", task_prefix=f"CODE{digest}")
+
+        config = load_portfolio_config(tmp_path)
+        with pytest.raises(ValueError, match="collision-free task prefix"):
+            assign_task_prefix("code-", tasks_a, config)
+
 
 class TestDoctorCollisionCheck:
     def _prefix_collisions(self, res_output):
@@ -190,3 +362,156 @@ class TestDoctorCollisionCheck:
         cols = self._prefix_collisions(res.output)
         assert cols is not None, res.output
         assert not any(c["prefix"] == "ARB-P" and len(c["projects"]) > 1 for c in cols), cols
+
+    def test_doctor_keys_a_taskless_sibling_under_what_the_allocator_mints(
+        self, tmp_path, monkeypatch
+    ):
+        # CLAWP-096 (grok review, cli/project.py): doctor's collision map must
+        # key a still-task-less sibling under the prefix that project will
+        # ACTUALLY get, not a bare unstripped `id.upper()[:5]`.
+        #
+        # Codex P2, PR #57 round 6 corrected what "actually get" means. This
+        # test previously asserted a CODE collision between the two, on the
+        # premise that a task-less sibling derives the naive base. It does
+        # not: the naive base is only the allocator's FIRST candidate, and
+        # `assign_task_prefix` sees code-quorum's minted CODE in `used` and
+        # extends to CODE-R. Reporting CODE was a false positive — and since
+        # `prefix_collisions` feeds `has_warnings`, it failed `doctor
+        # --strict` in CI over a namespace nothing would ever mint.
+        _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        (tmp_path / "projects" / "code-quorum" / ".project" / "tasks" / "CODE-000.md").write_text(
+            "---\nid: CODE-000\n---\n", encoding="utf-8"
+        )
+        _add_project(tmp_path, "code-runner")  # task-less
+
+        # What the allocator really mints for the task-less sibling.
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        minted = assign_task_prefix(
+            "code-runner",
+            tmp_path / "projects" / "code-runner" / ".project" / "tasks",
+            config,
+        )
+        assert minted == "CODE-R", minted
+
+        res = CliRunner().invoke(main, ["--format", "json", "doctor"])
+        cols = self._prefix_collisions(res.output)
+        assert cols is not None, res.output
+        assert not any(
+            c["prefix"] == "CODE" and "code-runner" in c["projects"] for c in cols
+        ), (
+            "code-runner never mints under CODE — reporting it as a collision "
+            "fails doctor --strict and tells the operator to rename a project "
+            "that needs no rename"
+        )
+        # And it must not be dropped from the check either: whatever prefix it
+        # is keyed under, a genuine clash on THAT prefix still has to surface.
+        assert not any(
+            c["prefix"] == minted and len(c["projects"]) > 1 for c in cols
+        ), cols
+
+
+class TestDigestFallbackFitsTheTaskIdCap:
+    """Codex P2, PR #57 round 7.
+
+    A 29-character project id whose base and extension candidates are all
+    claimed produced `<29-char stem><32 hex>-000` — 65 characters, one past
+    `dispatch._SAFE_TASK_ID_RE`. The task was created and then refused by
+    `tasks dispatch`: a valid id the tool cannot use. The pre-round-5
+    unstripped-`full` fallback stayed inside the cap for that input, so this
+    was a regression rather than a pre-existing gap.
+    """
+
+    def test_constants_match_dispatch(self):
+        from clawpm.dispatch import _SAFE_TASK_ID_RE
+        from clawpm.tasks import _TASK_ID_MAX_LEN
+
+        # Pin the mirrored cap to the regex that actually enforces it.
+        assert _SAFE_TASK_ID_RE.match("A" * _TASK_ID_MAX_LEN)
+        assert not _SAFE_TASK_ID_RE.match("A" * (_TASK_ID_MAX_LEN + 1))
+
+    def test_long_project_id_still_mints_a_dispatchable_task_id(
+        self, tmp_path, monkeypatch
+    ):
+        import hashlib
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.dispatch import _SAFE_TASK_ID_RE
+        from clawpm.tasks import assign_task_prefix
+
+        # 29 characters — the length Codex identified as breaching the cap.
+        long_id = "a" * 29
+        assert len(long_id) == 29
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, long_id)
+
+        # Claim the base and every extension so the digest arm is reached.
+        full = long_id.upper()
+        _add_project(tmp_path, "sib-base", task_prefix=full[:5])
+        for n in range(6, len(full) + 1):
+            _add_project(tmp_path, f"sib-{n}", task_prefix=full[:n])
+
+        config = load_portfolio_config(tmp_path)
+        prefix = assign_task_prefix(long_id, tasks_dir, config)
+
+        digest = hashlib.sha256(long_id.encode("utf-8")).hexdigest()[:32].upper()
+        assert prefix.endswith(digest), prefix
+
+        task_id = f"{prefix}-000"
+        assert _SAFE_TASK_ID_RE.match(task_id), (
+            f"generated id is {len(task_id)} chars and dispatch will refuse it: "
+            f"{task_id}"
+        )
+        # And a subtask of it, since add_subtask appends to the parent id.
+        assert _SAFE_TASK_ID_RE.match(f"{task_id}-000")
+
+    def test_truncating_the_stem_keeps_distinct_ids_distinct(self):
+        """Injectivity comes from the digest over the FULL id, not the stem."""
+        from clawpm.tasks import _TASK_ID_MAX_LEN, _TASK_ID_SUFFIX_RESERVE
+
+        import hashlib
+
+        a, b = "a" * 40 + "-one", "a" * 40 + "-two"
+        cap = _TASK_ID_MAX_LEN - _TASK_ID_SUFFIX_RESERVE - 32
+        stem_a, stem_b = a.upper()[:cap], b.upper()[:cap]
+        assert stem_a == stem_b, "stems deliberately collide after truncation"
+
+        d_a = hashlib.sha256(a.encode("utf-8")).hexdigest()[:32].upper()
+        d_b = hashlib.sha256(b.encode("utf-8")).hexdigest()[:32].upper()
+        assert f"{stem_a}{d_a}" != f"{stem_b}{d_b}"
+
+
+class TestDigestFallbackRound8Edges:
+    """Codex P2 ×2, PR #57 round 8 — two ways round 7's bound was too narrow."""
+
+    def test_dotted_project_id_is_matched_whole_by_the_history_regex(self):
+        """`_SAFE_TASK_ID_RE` permits dots, so a stem can retain one. A
+        dotless history arm matched only the tail and recorded a task id that
+        does not exist — worse than the miss it replaced."""
+        import hashlib
+
+        from clawpm.history import TASK_ID_RE
+        from clawpm.tasks import _TASK_ID_MAX_LEN, _TASK_ID_SUFFIX_RESERVE
+
+        pid = "abcde.foo"
+        digest = hashlib.sha256(pid.encode("utf-8")).hexdigest()[:32].upper()
+        stem = pid.upper()[: _TASK_ID_MAX_LEN - _TASK_ID_SUFFIX_RESERVE - 32]
+        assert "." in stem
+        task_id = f"{stem}{digest}-000"
+
+        assert TASK_ID_RE.findall(f"see {task_id} for details") == [task_id]
+
+    def test_reserve_covers_a_four_digit_ordinal_with_a_subtask(self):
+        """`:03d` is a minimum width, so the suffix grows at task 1000 — not
+        only at five digits, as round 7's comment assumed."""
+        from clawpm.dispatch import _SAFE_TASK_ID_RE
+        from clawpm.tasks import _TASK_ID_MAX_LEN, _TASK_ID_SUFFIX_RESERVE
+
+        widest_prefix = "P" * (_TASK_ID_MAX_LEN - _TASK_ID_SUFFIX_RESERVE)
+        for parent_ordinal in ("000", "1000", "99999"):
+            for child_ordinal in ("001", "1000", "99999"):
+                candidate = f"{widest_prefix}-{parent_ordinal}-{child_ordinal}"
+                assert _SAFE_TASK_ID_RE.match(candidate), (
+                    f"{len(candidate)} chars: {candidate}"
+                )

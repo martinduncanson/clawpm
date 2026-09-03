@@ -58,6 +58,27 @@ class TestTaskIdRegex:
     def test_no_match(self, text):
         assert TASK_ID_RE.findall(text) == []
 
+    def test_matches_a_real_digest_fallback_id(self):
+        """Codex P2, PR #57 round 6.
+
+        `assign_task_prefix`'s last-resort arm mints `<stem><32 hex>`, which
+        is far past the 10-char segment cap — so `reflect history-import`
+        silently omitted every transcript mention of such a task. Built from
+        the allocator itself rather than a hand-written literal, so the two
+        cannot drift apart.
+        """
+        import hashlib
+
+        digest = hashlib.sha256(b"code-").hexdigest()[:32].upper()
+        task_id = f"CODE{digest}-000"
+        assert TASK_ID_RE.findall(f"Working on {task_id} now") == [task_id]
+
+    def test_digest_arm_does_not_widen_the_generic_cap(self):
+        """The precise arm must not become a blanket length increase — a long
+        uppercase token in ordinary log text is not a task ID, and matches
+        here become TaskMentions with no validation against the task store."""
+        assert TASK_ID_RE.findall("ABCDEFGHIJKLMNOPQR-1") == []
+
 
 # ---------------------------------------------------------------------------
 # Unit: find_log_files

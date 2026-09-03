@@ -22,7 +22,9 @@ From 2026-07-05 observation issue (tag cli-ergonomics), hit while batch-filing 1
 
 ## Acceptance Criteria
 
-- [ ] (Add criteria here)
+- [x] --predict-scope/--scope glob patterns pass through clawpm's own click parsing verbatim (regression-tested); the Windows CRT/launcher-level expansion upstream of Python was already fully covered by --scope-file/--predict-scope-file (CLAWP-060) — help text on the plain flags now points there
+- [x] --predict-duration (and every duration-parsing call site, via the shared parse_duration) accepts combined units like 2h30m, summing to 150 minutes
+- [x] Project-id prefix derivation strips a trailing hyphen landing on the slice boundary (code-quorum -> CODE-000, not CODE--000) while preserving CLAWP-047's intentional internal-hyphen behaviour (arb-prd -> ARB-P)
 
 ## Notes
 

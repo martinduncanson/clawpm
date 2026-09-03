@@ -755,15 +755,51 @@ def project_doctor(
 
     # --- Phase 1.6 Check c: Cross-project prefix collisions (CLAWP-048) ---
     # Use each project's RESOLVED prefix (explicit task_prefix -> inferred from
-    # existing tasks -> [:5] for the as-yet-unminted), so the check reflects the
-    # IDs actually being minted: a task_prefix override clears a false collision,
-    # and an inferred/derived prefix surfaces a real one the naive [:5] missed.
+    # existing tasks -> the naive first-mint placeholder for the as-yet-unminted),
+    # so the check reflects the IDs actually being minted: a task_prefix override
+    # clears a false collision, and an inferred/derived prefix surfaces a real one
+    # the naive placeholder missed. The placeholder itself must come from
+    # ``_naive_prefix_placeholder`` (CLAWP-096), not a bare ``id.upper()[:5]`` --
+    # that bare slice can end in a trailing separator (``"code-quorum"`` ->
+    # ``"CODE-"``) that ``assign_task_prefix`` no longer actually mints, which
+    # would key this map under a prefix nothing ever gets and hide the real
+    # collision it derives instead (``"CODE"``).
+    # For a task-less project, ask the ALLOCATOR what it would mint rather
+    # than assuming the naive base (Codex P2, PR #57 round 6). The naive
+    # placeholder is only the allocator's FIRST candidate: when a sibling has
+    # already minted under it, `assign_task_prefix` sees it in `used` and
+    # extends instead ("code-runner" -> CODE-R, not CODE). Reporting the base
+    # here manufactured a collision for a namespace the allocator will never
+    # use — and because `prefix_collisions` feeds `has_warnings`, that false
+    # positive failed `doctor --strict` in CI and told the operator to rename
+    # a project that needed no rename.
+    #
+    # `assign_task_prefix` is a pure function of the project id and the other
+    # projects' prefixes, so iteration order does not affect the result.
+    from clawpm.tasks import _naive_prefix_placeholder as _naive_prefix
+    from clawpm.tasks import assign_task_prefix as _assign_prefix
     from clawpm.tasks import resolve_existing_prefix as _resolve_prefix
 
     prefix_map: dict[str, list[str]] = {}
     all_projects = discover_projects(config)
     for proj in all_projects:
-        prefix = _resolve_prefix(proj) or proj.id.upper()[:5]
+        prefix = _resolve_prefix(proj)
+        if prefix is None:
+            try:
+                prefix = _assign_prefix(
+                    proj.id,
+                    (proj.project_dir / ".project" / "tasks")
+                    if getattr(proj, "project_dir", None) else Path("."),
+                    config,
+                )
+            except Exception:
+                # The allocator refuses when every id-derived candidate is
+                # claimed by an explicit sibling prefix. That is itself a real
+                # condition, but doctor's job here is to report collisions,
+                # not to fail on one — fall back to the naive base so the
+                # project still appears in the map rather than vanishing
+                # from the check entirely.
+                prefix = _naive_prefix(proj.id)
         prefix_map.setdefault(prefix, []).append(proj.id)
     prefix_collisions = [
         {"prefix": pfx, "projects": pids}
