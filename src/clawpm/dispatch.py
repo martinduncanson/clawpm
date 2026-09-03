@@ -540,7 +540,19 @@ def read_dispatch_marker(target_dir: Path) -> Optional[dict]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return None
-    return data.get(CLAWPM_MARKER_KEY)
+    # Shape guards (Codex P2, PR #55 round 7). A settings file whose top
+    # level is valid JSON but not an object (a bare list/string/number) made
+    # `data.get` raise AttributeError, and a truthy non-object marker value
+    # pushed the same failure onto every caller of `marker.get`. That was
+    # survivable while this function was only read by dispatch teardown; it
+    # stopped being survivable once session rediscovery began calling it
+    # during ORDINARY project resolution, where an unrelated malformed
+    # settings file in any ancestor directory would crash a read-only
+    # command instead of falling through.
+    if not isinstance(data, dict):
+        return None
+    marker = data.get(CLAWPM_MARKER_KEY)
+    return marker if isinstance(marker, dict) else None
 
 
 def teardown_dispatch_settings(
@@ -711,13 +723,50 @@ def head_object_sha(repo_path: Path, rel_path: str) -> Optional[str]:
         return result.stdout.strip() or None
     stderr = (result.stderr or "").strip()
     if result.returncode == 1 and not stderr:
-        # The documented "does not resolve" signal: --quiet suppresses the
-        # diagnostic ONLY for a clean non-resolution.
-        return None
+        # Exit 1 with empty stderr means "this object name did not resolve" —
+        # but that covers BOTH "the path isn't in the tree" and "HEAD itself
+        # doesn't resolve", because --quiet suppresses the diagnostic for any
+        # invalid object name, not just a missing path (Codex P2, PR #55
+        # round 7, verified against git 2.43.0: `HEAD:nope` and `HEAD:f` are
+        # indistinguishable once HEAD points at a nonexistent ref). Reading
+        # that as a clean miss is the same fail-open this helper replaced
+        # `git cat-file -e` to close — an unborn or broken HEAD would set
+        # _head_has_project false and skip the materialization guards.
+        #
+        # So validate HEAD independently before believing the miss. Only on
+        # the miss path, so the common hit costs nothing extra.
+        if _head_resolves(repo_path):
+            return None
+        raise GitProbeError(
+            f"HEAD does not resolve in {repo_path} (unborn branch, detached "
+            f"at a missing object, or a corrupt ref), so HEAD:{rel_path} "
+            f"cannot be probed"
+        )
     raise GitProbeError(
         f"git rev-parse HEAD:{rel_path} in {repo_path} failed "
         f"(exit {result.returncode}): {stderr or '<no stderr>'}"
     )
+
+
+def _head_resolves(repo_path: Path) -> bool:
+    """Whether ``HEAD`` names a real commit in *repo_path*.
+
+    Deliberately narrow: this only ever runs to disambiguate an exit-1
+    non-resolution in :func:`head_object_sha`, so it answers one question and
+    treats any failure to answer as "no". Its caller turns that into a
+    ``GitProbeError``, which is the fail-closed outcome either way — an
+    unresolvable HEAD and an unanswerable probe both mean the materialization
+    guards must not be skipped.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "rev-parse", "--verify", "--quiet",
+             "HEAD^{commit}"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except OSError:
+        return False
+    return result.returncode == 0 and bool(result.stdout.strip())
 
 
 def working_tree_blob_sha(path: Path) -> Optional[str]:

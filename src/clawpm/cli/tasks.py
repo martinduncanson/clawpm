@@ -1403,16 +1403,29 @@ def tasks_dispatch(
         from clawpm.dispatch import (
             GitProbeError, head_object_sha, repo_prefix, working_tree_blob_sha,
         )
-        _existing_wt = project.repo_path / ".clawpm-worktrees" / task_id
+        from clawpm.discovery import get_repo_path
+        # Probe — and branch from — the checkout that actually SUPPLIED the
+        # task (Codex P2, PR #55 round 7). `get_task` above resolves through
+        # get_project_dir, which is session-scoped: running
+        # `tasks dispatch B --worktree` from inside registered worktree A
+        # loads B from A's `.project/`. Taking the candidates from the
+        # canonical `project.repo_path` instead compared a task loaded from A
+        # against main's HEAD — so if A held a newer B while main matched its
+        # own HEAD, the gate passed, B's worktree was created from main, and
+        # the hooks and rubric were rendered from A's different revision.
+        # `_source_repo` is used for the probe AND for create_worktree below,
+        # so the two cannot diverge again.
+        _source_repo = get_repo_path(config, project_id) or project.repo_path
+        _existing_wt = _source_repo / ".clawpm-worktrees" / task_id
         try:
-            _repo_prefix = repo_prefix(project.repo_path)
+            _repo_prefix = repo_prefix(_source_repo)
             _head_has_project = head_object_sha(
-                project.repo_path, f"{_repo_prefix}.project"
+                _source_repo, f"{_repo_prefix}.project"
             ) is not None
         except GitProbeError as exc:
             output_error(
                 "git_probe_failed",
-                f"Could not determine whether {project.repo_path} git-tracks "
+                f"Could not determine whether {_source_repo} git-tracks "
                 f".project/ at HEAD: {exc}. Refusing to dispatch --worktree: "
                 f"treating this as 'not tracked' would skip the materialization "
                 f"guards and could register a stale checkout as an isolated "
@@ -1436,19 +1449,25 @@ def tasks_dispatch(
             # same first-match order `get_task` resolves), then require THAT
             # path to be in HEAD with byte-identical content.
             _live_candidates = _candidate_task_paths(
-                project.repo_path / ".project" / "tasks", task_id
+                _source_repo / ".project" / "tasks", task_id
             )
             _live_path = next((p for p in _live_candidates if p.exists()), None)
+            # The blob this gate approves. Carried to the post-create check
+            # so the worktree can be verified to hold THIS revision, not
+            # merely some file for this id.
+            _validated_sha = None
             try:
                 if _live_path is not None:
-                    _rel_live = _live_path.relative_to(project.repo_path).as_posix()
+                    _rel_live = _live_path.relative_to(_source_repo).as_posix()
                     _head_sha = head_object_sha(
-                        project.repo_path, f"{_repo_prefix}{_rel_live}"
+                        _source_repo, f"{_repo_prefix}{_rel_live}"
                     )
                     _live_sha = working_tree_blob_sha(_live_path)
                     _materialized = (
                         _head_sha is not None and _head_sha == _live_sha
                     )
+                    if _materialized:
+                        _validated_sha = _head_sha
                     # Two distinct ways to be stale, and both must be
                     # reported as staleness rather than as "the task isn't
                     # committed" — the worktree WOULD get a file, just the
@@ -1466,7 +1485,7 @@ def tasks_dispatch(
                         _head_sha is not None
                         or any(
                             head_object_sha(
-                                project.repo_path, f"{_repo_prefix}{p.as_posix()}"
+                                _source_repo, f"{_repo_prefix}{p.as_posix()}"
                             ) is not None
                             for p in _rel_candidates
                         )
@@ -1477,7 +1496,7 @@ def tasks_dispatch(
                     # when there is no current revision to compare against.
                     _materialized = any(
                         head_object_sha(
-                            project.repo_path, f"{_repo_prefix}{p.as_posix()}"
+                            _source_repo, f"{_repo_prefix}{p.as_posix()}"
                         ) is not None
                         for p in _rel_candidates
                     )
@@ -1486,7 +1505,7 @@ def tasks_dispatch(
                 output_error(
                     "git_probe_failed",
                     f"Could not verify whether task {task_id!r} is materialized "
-                    f"at HEAD in {project.repo_path}: {exc}. Refusing to "
+                    f"at HEAD in {_source_repo}: {exc}. Refusing to "
                     f"dispatch --worktree rather than assuming either answer — "
                     f"guessing 'materialized' risks a worktree without the "
                     f"task (hanging its Stop hook), and guessing 'not' would "
@@ -1540,7 +1559,7 @@ def tasks_dispatch(
                     )
                 sys.exit(1)
         try:
-            resolved_dir = create_worktree(project.repo_path, task_id)
+            resolved_dir = create_worktree(_source_repo, task_id)
         except subprocess.CalledProcessError as exc:
             output_error(
                 "worktree_failed",
@@ -1562,14 +1581,45 @@ def tasks_dispatch(
         # whole gate exists to prevent.
         if _head_has_project:
             from clawpm.tasks import _candidate_task_paths as _ctp
-            if not any(
-                p.exists()
-                for p in _ctp(resolved_dir / ".project" / "tasks", task_id)
+            # Compare the CONTENT, not just existence (Codex P2, PR #55
+            # round 7). The SHA comparison before create_worktree validates
+            # the SOURCE checkout against its own HEAD; it says nothing
+            # about a directory create_worktree reused unchanged. A reused
+            # worktree holding an older revision of this same task passed an
+            # existence-only check and was registered — the stale-revision
+            # dispatch the pre-create gate exists to prevent, arriving by
+            # the one route that gate can't see.
+            _wt_path = next(
+                (p for p in _ctp(resolved_dir / ".project" / "tasks", task_id)
+                 if p.exists()),
+                None,
+            )
+            _wt_sha = None
+            if _wt_path is not None:
+                try:
+                    _wt_sha = working_tree_blob_sha(_wt_path)
+                except GitProbeError as exc:
+                    output_error(
+                        "git_probe_failed",
+                        f"Could not hash the task file in the worktree at "
+                        f"{resolved_dir}: {exc}. Refusing to register it "
+                        f"rather than assume it holds the right revision.",
+                        fmt=fmt,
+                    )
+                    sys.exit(1)
+            # `_validated_sha` is the revision the pre-create gate approved.
+            if _wt_path is None or (
+                _validated_sha is not None and _wt_sha != _validated_sha
             ):
+                _why = (
+                    "still doesn't have it"
+                    if _wt_path is None
+                    else f"has a DIFFERENT revision of it ({_wt_path})"
+                )
                 output_error(
                     "task_not_materialized",
                     f"Task {task_id!r} is committed at HEAD, but the worktree "
-                    f"at {resolved_dir} still doesn't have it — it's a "
+                    f"at {resolved_dir} {_why} — it's a "
                     f"leftover checkout from an earlier dispatch that "
                     f"create_worktree reused as-is (it does not refresh an "
                     f"existing worktree's contents). Remove it manually "
@@ -1628,6 +1678,38 @@ def tasks_dispatch(
         # hides a broken janitor (Codex/silent-failure).
         swept = []
         sweep_error = f"{type(exc).__name__}: {exc}"
+
+    # Snapshot whatever dispatch state already exists at the target, so a
+    # rollback can RESTORE it rather than delete it (Codex P2, PR #55 round
+    # 7). `write_dispatch_settings` overwrites an existing settings file
+    # without a usable backup, so the earlier rollback — an unconditional
+    # teardown — turned a failed RE-dispatch into the removal of a
+    # previously working Stop hook, and then reported that nothing had been
+    # left installed. Bytes, not parsed JSON: restoring must reproduce the
+    # prior file exactly, including any operator formatting.
+    from clawpm.dispatch import session_start_payload_path, settings_path
+    _prior_settings_path = settings_path(resolved_dir)
+    _prior_sidecar_path = session_start_payload_path(resolved_dir)
+    _prior_settings = None
+    _prior_sidecar = None
+    try:
+        if _prior_settings_path.exists():
+            _prior_settings = _prior_settings_path.read_bytes()
+        if _prior_sidecar_path.exists():
+            _prior_sidecar = _prior_sidecar_path.read_bytes()
+    except OSError as exc:
+        # Couldn't snapshot. Say so now rather than discovering it only if a
+        # rollback is needed — proceeding would silently downgrade the
+        # rollback back to the destructive version this fixes.
+        output_error(
+            "dispatch_blocked",
+            f"Could not read the existing dispatch settings at {resolved_dir} "
+            f"({type(exc).__name__}: {exc}). Refusing to overwrite them, "
+            f"because a failure later in this command could then not restore "
+            f"them.",
+            fmt=fmt,
+        )
+        sys.exit(1)
 
     try:
         path = write_dispatch_settings(
@@ -1697,34 +1779,60 @@ def tasks_dispatch(
                 # dispatch fails clean and a retry starts from nothing.
                 session_id = None
                 teardown_error = None
+                # Restore what was there BEFORE this command, rather than
+                # unconditionally tearing down (Codex P2, PR #55 round 7):
+                # a failed re-dispatch must not remove the previously
+                # working dispatch it was replacing.
+                _restored = _prior_settings is not None
                 try:
-                    from clawpm.dispatch import teardown_dispatch_settings
-                    teardown_dispatch_settings(
-                        target_dir=resolved_dir,
-                        task_id=task_id,
-                        portfolio_root=config.portfolio_root,
-                        project_id=project_id,
-                    )
+                    if _prior_settings is not None:
+                        _prior_settings_path.parent.mkdir(
+                            parents=True, exist_ok=True
+                        )
+                        _prior_settings_path.write_bytes(_prior_settings)
+                        if _prior_sidecar is not None:
+                            _prior_sidecar_path.write_bytes(_prior_sidecar)
+                        elif _prior_sidecar_path.exists():
+                            _prior_sidecar_path.unlink()
+                    else:
+                        from clawpm.dispatch import teardown_dispatch_settings
+                        teardown_dispatch_settings(
+                            target_dir=resolved_dir,
+                            task_id=task_id,
+                            portfolio_root=config.portfolio_root,
+                            project_id=project_id,
+                        )
                 except Exception as teardown_exc:
                     # Rollback itself failed — report BOTH, since the operator
-                    # now has artifacts on disk that need manual removal
+                    # now has artifacts on disk that need manual attention
                     # (fail-open WITH a marker, CLAWP-039/041 doctrine).
                     teardown_error = f"{type(teardown_exc).__name__}: {teardown_exc}"
+                if teardown_error:
+                    _outcome = (
+                        f"Rolling those settings back ALSO failed "
+                        f"({teardown_error}) — inspect "
+                        f"{_prior_settings_path} manually before retrying, or "
+                        f"commands run from that worktree will mutate the "
+                        f"main checkout."
+                    )
+                elif _restored:
+                    _outcome = (
+                        "The dispatch settings that were in place before this "
+                        "command have been restored, so the previous dispatch "
+                        "is intact. Fix the portfolio state and re-run "
+                        "dispatch."
+                    )
+                else:
+                    _outcome = (
+                        "The dispatch settings have been rolled back; nothing "
+                        "was left installed. Fix the portfolio state and "
+                        "re-run dispatch."
+                    )
                 output_error(
                     "session_registration_failed",
                     f"Dispatch settings were written to {resolved_dir} but "
-                    f"registering its session failed: {type(exc).__name__}: {exc}. "
-                    + (
-                        f"Rolling those settings back ALSO failed "
-                        f"({teardown_error}) — remove "
-                        f"{resolved_dir / '.claude' / 'settings.local.json'} "
-                        f"manually before retrying, or commands run from that "
-                        f"worktree will mutate the main checkout."
-                        if teardown_error
-                        else "The dispatch settings have been rolled back; "
-                             "nothing was left installed. Fix the portfolio "
-                             "state and re-run dispatch."
-                    ),
+                    f"registering its session failed: {type(exc).__name__}: "
+                    f"{exc}. " + _outcome,
                     fmt=fmt,
                 )
                 sys.exit(1)

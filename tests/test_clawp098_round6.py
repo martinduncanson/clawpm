@@ -363,31 +363,77 @@ class TestMovedWorktreeRediscovery:
             isolated_portfolio.root, new, project_id="test"
         ) is None
 
-    def test_rediscovery_does_not_write_back_to_the_ledger(
+    def test_rediscovery_persists_the_correction(
         self, isolated_portfolio, tmp_path
     ):
-        from clawpm.sessions import SESSION_REGISTRY_FILENAME
+        """Codex P1, PR #55 round 7.
 
+        An earlier revision resolved for the current call only. That breaks
+        the moved-then-torn-down case: `teardown_dispatch_settings` removes
+        the marker but leaves the session active until the directory
+        disappears, so without a persisted correction the next command finds
+        neither a matching path nor a marker.
+        """
         old = tmp_path / "old-wt"
         old.mkdir()
         register_session(
             isolated_portfolio.root, "sess-1", "TEST-001", "test", old
         )
-        ledger = isolated_portfolio.root / SESSION_REGISTRY_FILENAME
-        before = ledger.read_text(encoding="utf-8")
+        new = tmp_path / "new-wt"
+        old.rename(new)
+        _write_marker(new, "TEST-001", "test")
+
+        assert find_session_for_cwd(
+            isolated_portfolio.root, new, project_id="test"
+        ) is not None
+
+        # The marker is now gone (teardown), but the ledger carries the
+        # corrected path, so resolution still works.
+        from clawpm.dispatch import settings_path
+
+        settings_path(new).unlink()
+        again = find_session_for_cwd(
+            isolated_portfolio.root, new, project_id="test"
+        )
+        assert again is not None, (
+            "the correction must outlive the dispatch marker it was derived "
+            "from — that is the whole reason it is persisted"
+        )
+        assert again.worktree_path.resolve() == new.resolve()
+        assert again.session_id == "sess-1"
+
+    def test_duplicate_sessions_for_one_path_are_coalesced(
+        self, isolated_portfolio, tmp_path
+    ):
+        """Codex P1, PR #55 round 7.
+
+        `register_session` appends a FRESH session per dispatch, so a
+        re-dispatched task normally has several active records for the same
+        worktree. A bare `len(matches) != 1` read those as ambiguous — so
+        the more a task had been dispatched, the less likely relocation was
+        to be recovered, which is backwards.
+        """
+        old = tmp_path / "old-wt"
+        old.mkdir()
+        register_session(isolated_portfolio.root, "s1", "TEST-001", "test", old)
+        register_session(isolated_portfolio.root, "s2", "TEST-001", "test", old)
+        register_session(isolated_portfolio.root, "s3", "TEST-001", "test", old)
 
         new = tmp_path / "new-wt"
         old.rename(new)
         _write_marker(new, "TEST-001", "test")
-        find_session_for_cwd(isolated_portfolio.root, new, project_id="test")
 
-        assert ledger.read_text(encoding="utf-8") == before
+        found = find_session_for_cwd(
+            isolated_portfolio.root, new, project_id="test"
+        )
+        assert found is not None
+        assert found.worktree_path.resolve() == new.resolve()
 
-    def test_ambiguous_match_resolves_to_nothing(
+    def test_genuinely_different_paths_stay_ambiguous(
         self, isolated_portfolio, tmp_path
     ):
-        """Two registered sessions for the same (task, project) — refuse to
-        guess which one the relocated checkout is."""
+        """Coalescing must not weaken the guard: records disagreeing on the
+        path really are ambiguous, and must resolve to nothing."""
         a = tmp_path / "a"
         a.mkdir()
         b = tmp_path / "b"
@@ -404,3 +450,80 @@ class TestMovedWorktreeRediscovery:
         assert find_session_for_cwd(
             isolated_portfolio.root, new, project_id="test"
         ) is None
+
+    def test_malformed_settings_file_does_not_crash_resolution(
+        self, isolated_portfolio, tmp_path
+    ):
+        """Codex P2, PR #55 round 7.
+
+        Rediscovery walks ancestors on every session miss — which is the
+        common case for ordinary commands — so an unrelated settings file
+        whose JSON isn't an object must not raise out of `get_project_dir`.
+        """
+        from clawpm.dispatch import settings_path
+
+        wt = tmp_path / "wt"
+        nested = wt / "inner"
+        nested.mkdir(parents=True)
+        bad = settings_path(wt)
+        bad.parent.mkdir(parents=True, exist_ok=True)
+        bad.write_text('["not", "an", "object"]', encoding="utf-8")
+
+        assert find_session_for_cwd(
+            isolated_portfolio.root, nested, project_id="test"
+        ) is None
+
+    def test_non_object_marker_value_does_not_crash_resolution(
+        self, isolated_portfolio, tmp_path
+    ):
+        from clawpm.dispatch import CLAWPM_MARKER_KEY, settings_path
+
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        path = settings_path(wt)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({CLAWPM_MARKER_KEY: "truthy-but-not-a-dict"}),
+            encoding="utf-8",
+        )
+
+        assert find_session_for_cwd(
+            isolated_portfolio.root, wt, project_id="test"
+        ) is None
+
+
+class TestHeadValidityProbe:
+    """Codex P2, PR #55 round 7: `rev-parse --verify --quiet` returns exit 1
+    with EMPTY stderr for an invalid HEAD as well as for a missing path, so
+    the round-6 probe's core distinction was wrong — an unborn or broken
+    HEAD read as a clean 'not tracked' and skipped the guards."""
+
+    def test_unborn_head_raises_rather_than_reporting_absent(self, tmp_path):
+        from clawpm.dispatch import GitProbeError, head_object_sha
+
+        repo = _init_repo(tmp_path / "repo")  # init'd, nothing committed
+        with pytest.raises(GitProbeError, match="HEAD does not resolve"):
+            head_object_sha(repo, ".project")
+
+    def test_head_pointing_at_a_missing_ref_raises(self, tmp_path):
+        from clawpm.dispatch import GitProbeError, head_object_sha
+
+        repo = _init_repo(tmp_path / "repo")
+        (repo / "a.txt").write_text("x\n", encoding="utf-8")
+        _git(repo, "add", "a.txt")
+        _git(repo, "commit", "-qm", "init")
+        # Repoint HEAD at a branch that doesn't exist.
+        (repo / ".git" / "HEAD").write_text(
+            "ref: refs/heads/nonexistent\n", encoding="utf-8"
+        )
+        with pytest.raises(GitProbeError, match="HEAD does not resolve"):
+            head_object_sha(repo, "a.txt")
+
+    def test_valid_head_still_reports_a_genuine_miss_as_none(self, tmp_path):
+        from clawpm.dispatch import head_object_sha
+
+        repo = _init_repo(tmp_path / "repo")
+        (repo / "a.txt").write_text("x\n", encoding="utf-8")
+        _git(repo, "add", "a.txt")
+        _git(repo, "commit", "-qm", "init")
+        assert head_object_sha(repo, "definitely-not-here") is None

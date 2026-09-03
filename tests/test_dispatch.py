@@ -1465,3 +1465,92 @@ class TestDispatchGateRejectsStaleRevision:
         )
         assert r.exit_code == 0, r.output
         assert json.loads(r.output)["data"]["session_id"]
+
+
+class TestRollbackRestoresPriorSettings:
+    """Codex P2, PR #55 round 7: a failed RE-dispatch must not delete the
+    dispatch it was replacing.
+
+    `write_dispatch_settings` overwrites without a usable backup, so an
+    unconditional teardown-on-rollback turned a transient session-append
+    failure into the removal of a previously working Stop hook — and then
+    reported that nothing had been left installed.
+    """
+
+    def test_prior_dispatch_survives_a_failed_redispatch(
+        self, temp_portfolio_with_repo, monkeypatch
+    ):
+        config = temp_portfolio_with_repo["config"]
+        repo_dir = temp_portfolio_with_repo["repo_dir"]
+        task = add_task(config, "test", title="Redispatch",
+                        predictions=Predictions(success_criteria=["C1"]))
+        _commit_project(repo_dir)
+
+        # First dispatch succeeds and installs settings.
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code == 0, r.output
+        wt_path = Path(json.loads(r.output)["data"]["target_dir"])
+        original = settings_path(wt_path).read_bytes()
+
+        # Re-dispatch, with session registration failing this time.
+        def _boom(*args, **kwargs):
+            raise OSError("simulated sessions.jsonl append failure")
+
+        monkeypatch.setattr("clawpm.sessions.register_session", _boom)
+        r2 = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree",
+                   "--force"]
+        )
+        assert r2.exit_code == 1, r2.output
+        assert "session_registration_failed" in r2.output
+
+        assert settings_path(wt_path).exists(), (
+            "the previously working dispatch must not be deleted by a failed "
+            "re-dispatch"
+        )
+        assert settings_path(wt_path).read_bytes() == original, (
+            "and it must be restored byte-for-byte, not merely left present"
+        )
+        assert "restored" in r2.output
+
+
+class TestReusedWorktreeRevisionCheck:
+    """Codex P2, PR #55 round 7: the post-create check was existence-only, so
+    a reused worktree holding an OLDER revision of the same task passed and
+    was registered — the stale-revision dispatch the pre-create gate exists
+    to prevent, arriving by the one route that gate cannot see."""
+
+    def test_reused_worktree_with_stale_task_content_is_rejected(
+        self, temp_portfolio_with_repo
+    ):
+        config = temp_portfolio_with_repo["config"]
+        repo_dir = temp_portfolio_with_repo["repo_dir"]
+        task = add_task(config, "test", title="StaleWt",
+                        predictions=Predictions(success_criteria=["C1"]))
+        _commit_project(repo_dir)
+
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code == 0, r.output
+        wt_path = Path(json.loads(r.output)["data"]["target_dir"])
+        wt_task = wt_path / ".project" / "tasks" / f"{task.id}.md"
+        assert wt_task.exists()
+
+        # Simulate the reused checkout holding a different revision: the file
+        # exists (so an existence-only check passes) but its content differs
+        # from the revision the pre-create gate validated.
+        wt_task.write_text(
+            wt_task.read_text(encoding="utf-8") + "\nstale drift\n",
+            encoding="utf-8",
+        )
+
+        r2 = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree",
+                   "--force"]
+        )
+        assert r2.exit_code == 1, r2.output
+        assert "task_not_materialized" in r2.output
+        assert "DIFFERENT revision" in r2.output

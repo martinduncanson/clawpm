@@ -1334,10 +1334,17 @@ def add_task(
     # CLAWP-055 — resolve baseline_ref BEFORE entering the lock: this may
     # invoke a git subprocess, which must not be held inside a critical section.
     from .baseline import resolve_baseline_ref
-    from .discovery import get_project as _get_project_for_baseline
+    from .discovery import get_repo_path as _get_repo_path_for_baseline
 
-    _proj_settings = _get_project_for_baseline(config, project_id)
-    _repo_path = getattr(_proj_settings, "repo_path", None) if _proj_settings else None
+    # Session-scoped, like the task store itself (CLAWP-098, Codex P2 on
+    # PR #55). `get_tasks_dir` above already redirects into a registered
+    # worktree, so resolving the baseline from the cwd-independent
+    # `get_project(...).repo_path` stamped a task created in that worktree
+    # against the MAIN checkout's HEAD. When the two sit on different
+    # commits the baseline is simply wrong, and every later scope-drift
+    # decision inherits the error. Git metadata has to come from whichever
+    # checkout the task store was redirected to.
+    _repo_path = _get_repo_path_for_baseline(config, project_id)
     _baseline_ref = resolve_baseline_ref(_repo_path)
 
     # CLAWP-051 — per-project file lock serialises ID allocation (scan→write)

@@ -500,24 +500,32 @@ def _rediscover_moved_session(
     - the marker must exist at or above cwd (positive evidence that cwd is
       inside a clawpm-dispatched checkout at all);
     - the marker's project must match the project being resolved;
-    - exactly one registered-and-active session may match the marker's
-      ``(task_id, project_id)`` — an ambiguous match resolves to nothing
-      rather than guessing;
-    - that session's RECORDED path must no longer be a directory. This is
-      the one that matters: while the old path still exists, the session is
-      legitimately live there and rebinding it to cwd would corrupt the
+    - every registered-and-active session matching the marker's
+      ``(task_id, project_id)`` must agree on ONE recorded path. Duplicate
+      records for the same path are normal — ``register_session`` appends a
+      fresh session on every dispatch — so they are coalesced first;
+      genuinely different paths are ambiguous and resolve to nothing;
+    - that path must no longer be a directory. This is the one that
+      matters: while the old path still exists, the session is legitimately
+      live there and rebinding it to cwd would corrupt the
       genuinely-active worktree. Only a vanished recorded path is evidence
       of a move.
 
-    Returns a record with ``worktree_path`` corrected to the discovered
-    root, for THIS CALL ONLY — nothing is written back to the ledger. A
-    read path must not mutate portfolio state: the rediscovery is cheap,
-    deterministic, and repeats on the next call, whereas an append here
-    would race concurrent dispatches and permanently rewrite a session's
-    identity on the strength of one process's cwd.
+    On success the correction is PERSISTED back to the ledger, not just
+    returned. An earlier revision resolved for the current call only, on the
+    principle that a read path shouldn't mutate portfolio state; that was
+    wrong, and the counter-example is concrete.
+    ``teardown_dispatch_settings`` removes the dispatch marker while
+    deliberately leaving the session active until the directory disappears
+    — so a worktree that is moved and then torn down still works, but the
+    marker this function depends on is gone. Without a persisted
+    correction the next mutator finds neither a matching path nor a marker
+    and falls through to the main checkout. The write has to happen once
+    for the recovery to outlive the marker.
 
     Never raises; every failure returns ``None`` and falls through to the
-    registry lookup like any other miss.
+    registry lookup like any other miss, and a failed persist is logged but
+    does not affect the answer returned for this call.
     """
     from .dispatch import read_dispatch_marker
 
@@ -526,16 +534,19 @@ def _rediscover_moved_session(
     for candidate in (cwd, *cwd.parents):
         try:
             found = read_dispatch_marker(candidate)
-        except OSError:
-            # An unreadable settings file mid-walk is not a reason to abort
-            # the walk — keep climbing, same fail-open contract as the rest
-            # of this module.
+        except Exception:
+            # Not just OSError (Codex P2, PR #55 round 7). This walk now runs
+            # during ORDINARY project resolution, so an unrelated malformed
+            # settings file in any ancestor must not crash a read-only
+            # command. read_dispatch_marker validates its own JSON shapes
+            # now; this stays as the belt to that braces, because the blast
+            # radius of a raise here is every caller of get_project_dir.
             continue
         if found:
             marker = found
             marker_root = candidate
             break
-    if not marker or marker_root is None:
+    if not isinstance(marker, dict) or marker_root is None:
         return None
     marker_task = marker.get("task_id")
     marker_project = marker.get("project_id")
@@ -550,9 +561,24 @@ def _rediscover_moved_session(
         s for s in _replay(portfolio_root).values()
         if s.active and s.task_id == marker_task and s.project_id == marker_project
     ]
-    if len(matches) != 1:
+    if not matches:
         return None
-    record = matches[0]
+    # Coalesce before applying the ambiguity guard (Codex P1, PR #55 round 7).
+    # `register_session` intentionally appends a FRESH session on every
+    # dispatch, so re-dispatching a task commonly leaves several active
+    # records pointing at the same worktree path. A bare `len(matches) != 1`
+    # read those as ambiguous and refused to rediscover — so the more a task
+    # had been dispatched, the less likely relocation was to be recovered,
+    # which is backwards. Records agreeing on the path are not ambiguous;
+    # only genuinely DIFFERENT recorded paths are.
+    distinct_paths = {
+        os.path.normcase(str(s.worktree_path)) for s in matches
+    }
+    if len(distinct_paths) != 1:
+        return None
+    # Any of them will do for identity now that they agree on the path; take
+    # the last replayed, which is the most recent registration.
+    record = matches[-1]
     try:
         if stat_is_dir(record.worktree_path):
             # Recorded path is still a live directory — this is NOT a move.
@@ -568,12 +594,46 @@ def _rediscover_moved_session(
     logger.warning(
         "Session %s's registered worktree %s no longer exists, but cwd %s is "
         "inside a clawpm dispatch for the same task (%s/%s) at %s — treating "
-        "the worktree as MOVED and resolving against %s for this call. Re-run "
-        "`clawpm tasks dispatch --worktree` if this mapping should be "
-        "made permanent.",
+        "the worktree as MOVED and re-registering it at that path.",
         record.session_id, record.worktree_path, cwd, marker_project,
-        marker_task, marker_root, marker_root,
+        marker_task, marker_root,
     )
+    # Persist the correction (Codex P1, PR #55 round 7). An earlier revision
+    # deliberately resolved for the current call only, on the principle that a
+    # read path should not mutate portfolio state. That was wrong here, and
+    # the counter-example is specific: `teardown_dispatch_settings` removes
+    # the dispatch marker but deliberately leaves the session active until the
+    # DIRECTORY disappears. A worktree that is moved and then torn down keeps
+    # working, but the marker this rediscovery depends on is gone — so with no
+    # persisted correction the next mutator finds neither a matching path nor
+    # a marker, and falls through to the main checkout. Rediscovery has to
+    # write once for the recovery to outlive the marker.
+    #
+    # The race this was avoiding is bounded by the guards above: the marker
+    # must be present, the project must match, every candidate record must
+    # agree on the old path, and that path must be gone. `register_session`
+    # appends through the same locked writer as every other registration, and
+    # replay is last-event-wins, so a concurrent dispatch's registration
+    # simply supersedes this one rather than corrupting it.
+    try:
+        register_session(
+            portfolio_root,
+            record.session_id,
+            record.task_id,
+            record.project_id,
+            marker_root,
+        )
+    except Exception as exc:
+        # Persistence is an optimisation over re-deriving next call, not a
+        # correctness requirement for THIS call — the resolution below is
+        # already correct. Log and continue rather than failing a command
+        # because the ledger was momentarily unwritable.
+        logger.error(
+            "Failed to persist the corrected worktree path for session %s "
+            "(%s): %s. Resolution for this call is unaffected, but the "
+            "correction will have to be re-derived next time.",
+            record.session_id, marker_root, exc,
+        )
     return SessionRecord(
         session_id=record.session_id,
         task_id=record.task_id,
