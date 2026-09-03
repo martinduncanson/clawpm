@@ -11,9 +11,14 @@ pre-fix code:
 3. ``tasks state`` collects ``files_changed`` from the session-scoped
    checkout, not the main one.
 4. A failed session registration rolls the dispatch artifacts back.
-5. A worktree relocated with ``git worktree move`` is rediscovered via its
-   dispatch marker instead of silently falling through to the main
-   checkout.
+5. ``read_dispatch_marker`` never raises on a malformed settings file,
+   whatever shape the JSON takes.
+
+Finding 5 originally shipped as moved-worktree rediscovery. That feature
+was split out of PR #55 in round 8 (it generated five findings across two
+rounds and is a distributed-state problem of its own); its marker shape
+guards were independently correct and stayed, so they are now tested
+directly rather than through the rediscovery walk.
 """
 
 from __future__ import annotations
@@ -24,11 +29,11 @@ from pathlib import Path
 
 import pytest
 
-from clawpm.sessions import find_session_for_cwd, register_session
+from clawpm.sessions import register_session
 
 # The probe helpers are imported INSIDE the tests that need them, not at
-# module scope: the behavioural classes below (rediscovery, session-scoped
-# repo path) must still collect and RUN against pre-fix source, so that
+# module scope: the behavioural classes below (session-scoped repo path,
+# marker shape guards) must still collect and RUN against pre-fix source, so that
 # "verified failing before the fix" means the assertion failed, not that
 # collection died on a missing import.
 
@@ -260,236 +265,88 @@ class TestSessionScopedRepoPath:
 
 
 # ---------------------------------------------------------------------------
-# 5. Moved-worktree rediscovery
+# 5. Dispatch-marker shape guards
 # ---------------------------------------------------------------------------
 
 
-def _write_marker(target: Path, task_id: str, project_id: str) -> None:
-    from clawpm.dispatch import CLAWPM_MARKER_KEY, settings_path
+class TestDispatchMarkerShapeGuards:
+    """Codex P2, PR #55 round 7: `read_dispatch_marker` must never raise.
 
-    path = settings_path(target)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({CLAWPM_MARKER_KEY: {"task_id": task_id, "project_id": project_id}}),
-        encoding="utf-8",
-    )
+    These were originally exercised indirectly, through the moved-worktree
+    rediscovery walk that called this function on every ancestor of cwd.
+    That feature was split out of PR #55 (round 8), so the guards are now
+    tested where they live. They are kept regardless of rediscovery: a
+    settings file whose top level is valid JSON but not an object made
+    `data.get` raise AttributeError, and a truthy non-object marker value
+    pushed the same failure onto every caller of `marker.get` — including
+    dispatch teardown, which reads this on a path the operator controls.
+    """
 
+    def test_absent_settings_file_is_none(self, tmp_path):
+        from clawpm.dispatch import read_dispatch_marker
 
-class TestMovedWorktreeRediscovery:
-    def test_moved_worktree_is_rediscovered_via_its_marker(
-        self, isolated_portfolio, tmp_path
-    ):
-        old = tmp_path / "old-wt"
-        old.mkdir()
-        register_session(
-            isolated_portfolio.root, "sess-1", "TEST-001", "test", old
+        assert read_dispatch_marker(tmp_path) is None
+
+    def test_invalid_json_is_none(self, tmp_path):
+        from clawpm.dispatch import read_dispatch_marker, settings_path
+
+        path = settings_path(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json at all", encoding="utf-8")
+
+        assert read_dispatch_marker(tmp_path) is None
+
+    def test_non_object_top_level_is_none(self, tmp_path):
+        from clawpm.dispatch import read_dispatch_marker, settings_path
+
+        path = settings_path(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('["not", "an", "object"]', encoding="utf-8")
+
+        assert read_dispatch_marker(tmp_path) is None
+
+    def test_non_object_marker_value_is_none(self, tmp_path):
+        from clawpm.dispatch import (
+            CLAWPM_MARKER_KEY, read_dispatch_marker, settings_path,
         )
-        new = tmp_path / "new-wt"
-        old.rename(new)  # `git worktree move`
-        _write_marker(new, "TEST-001", "test")
 
-        found = find_session_for_cwd(
-            isolated_portfolio.root, new, project_id="test"
-        )
-        assert found is not None
-        assert found.session_id == "sess-1"
-        assert found.worktree_path == new
-
-    def test_rediscovery_works_from_a_subdirectory(
-        self, isolated_portfolio, tmp_path
-    ):
-        old = tmp_path / "old-wt"
-        old.mkdir()
-        register_session(
-            isolated_portfolio.root, "sess-1", "TEST-001", "test", old
-        )
-        new = tmp_path / "new-wt"
-        old.rename(new)
-        _write_marker(new, "TEST-001", "test")
-        nested = new / "src" / "pkg"
-        nested.mkdir(parents=True)
-
-        found = find_session_for_cwd(
-            isolated_portfolio.root, nested, project_id="test"
-        )
-        assert found is not None
-        assert found.worktree_path == new
-
-    def test_no_rediscovery_while_the_recorded_path_still_exists(
-        self, isolated_portfolio, tmp_path
-    ):
-        """The guard that matters: rebinding a session whose original
-        worktree is still live would corrupt the genuinely-active one."""
-        live = tmp_path / "live-wt"
-        live.mkdir()
-        register_session(
-            isolated_portfolio.root, "sess-1", "TEST-001", "test", live
-        )
-        other = tmp_path / "other"
-        other.mkdir()
-        _write_marker(other, "TEST-001", "test")
-
-        assert find_session_for_cwd(
-            isolated_portfolio.root, other, project_id="test"
-        ) is None
-
-    def test_no_rediscovery_without_a_marker(self, isolated_portfolio, tmp_path):
-        old = tmp_path / "old-wt"
-        old.mkdir()
-        register_session(
-            isolated_portfolio.root, "sess-1", "TEST-001", "test", old
-        )
-        new = tmp_path / "new-wt"
-        old.rename(new)
-        # no marker written
-
-        assert find_session_for_cwd(
-            isolated_portfolio.root, new, project_id="test"
-        ) is None
-
-    def test_marker_for_a_different_project_is_not_matched(
-        self, isolated_portfolio, tmp_path
-    ):
-        old = tmp_path / "old-wt"
-        old.mkdir()
-        register_session(
-            isolated_portfolio.root, "sess-1", "TEST-001", "test", old
-        )
-        new = tmp_path / "new-wt"
-        old.rename(new)
-        _write_marker(new, "TEST-001", "other-project")
-
-        assert find_session_for_cwd(
-            isolated_portfolio.root, new, project_id="test"
-        ) is None
-
-    def test_rediscovery_persists_the_correction(
-        self, isolated_portfolio, tmp_path
-    ):
-        """Codex P1, PR #55 round 7.
-
-        An earlier revision resolved for the current call only. That breaks
-        the moved-then-torn-down case: `teardown_dispatch_settings` removes
-        the marker but leaves the session active until the directory
-        disappears, so without a persisted correction the next command finds
-        neither a matching path nor a marker.
-        """
-        old = tmp_path / "old-wt"
-        old.mkdir()
-        register_session(
-            isolated_portfolio.root, "sess-1", "TEST-001", "test", old
-        )
-        new = tmp_path / "new-wt"
-        old.rename(new)
-        _write_marker(new, "TEST-001", "test")
-
-        assert find_session_for_cwd(
-            isolated_portfolio.root, new, project_id="test"
-        ) is not None
-
-        # The marker is now gone (teardown), but the ledger carries the
-        # corrected path, so resolution still works.
-        from clawpm.dispatch import settings_path
-
-        settings_path(new).unlink()
-        again = find_session_for_cwd(
-            isolated_portfolio.root, new, project_id="test"
-        )
-        assert again is not None, (
-            "the correction must outlive the dispatch marker it was derived "
-            "from — that is the whole reason it is persisted"
-        )
-        assert again.worktree_path.resolve() == new.resolve()
-        assert again.session_id == "sess-1"
-
-    def test_duplicate_sessions_for_one_path_are_coalesced(
-        self, isolated_portfolio, tmp_path
-    ):
-        """Codex P1, PR #55 round 7.
-
-        `register_session` appends a FRESH session per dispatch, so a
-        re-dispatched task normally has several active records for the same
-        worktree. A bare `len(matches) != 1` read those as ambiguous — so
-        the more a task had been dispatched, the less likely relocation was
-        to be recovered, which is backwards.
-        """
-        old = tmp_path / "old-wt"
-        old.mkdir()
-        register_session(isolated_portfolio.root, "s1", "TEST-001", "test", old)
-        register_session(isolated_portfolio.root, "s2", "TEST-001", "test", old)
-        register_session(isolated_portfolio.root, "s3", "TEST-001", "test", old)
-
-        new = tmp_path / "new-wt"
-        old.rename(new)
-        _write_marker(new, "TEST-001", "test")
-
-        found = find_session_for_cwd(
-            isolated_portfolio.root, new, project_id="test"
-        )
-        assert found is not None
-        assert found.worktree_path.resolve() == new.resolve()
-
-    def test_genuinely_different_paths_stay_ambiguous(
-        self, isolated_portfolio, tmp_path
-    ):
-        """Coalescing must not weaken the guard: records disagreeing on the
-        path really are ambiguous, and must resolve to nothing."""
-        a = tmp_path / "a"
-        a.mkdir()
-        b = tmp_path / "b"
-        b.mkdir()
-        register_session(isolated_portfolio.root, "sess-a", "TEST-001", "test", a)
-        register_session(isolated_portfolio.root, "sess-b", "TEST-001", "test", b)
-        a.rmdir()
-        b.rmdir()
-
-        new = tmp_path / "new-wt"
-        new.mkdir()
-        _write_marker(new, "TEST-001", "test")
-
-        assert find_session_for_cwd(
-            isolated_portfolio.root, new, project_id="test"
-        ) is None
-
-    def test_malformed_settings_file_does_not_crash_resolution(
-        self, isolated_portfolio, tmp_path
-    ):
-        """Codex P2, PR #55 round 7.
-
-        Rediscovery walks ancestors on every session miss — which is the
-        common case for ordinary commands — so an unrelated settings file
-        whose JSON isn't an object must not raise out of `get_project_dir`.
-        """
-        from clawpm.dispatch import settings_path
-
-        wt = tmp_path / "wt"
-        nested = wt / "inner"
-        nested.mkdir(parents=True)
-        bad = settings_path(wt)
-        bad.parent.mkdir(parents=True, exist_ok=True)
-        bad.write_text('["not", "an", "object"]', encoding="utf-8")
-
-        assert find_session_for_cwd(
-            isolated_portfolio.root, nested, project_id="test"
-        ) is None
-
-    def test_non_object_marker_value_does_not_crash_resolution(
-        self, isolated_portfolio, tmp_path
-    ):
-        from clawpm.dispatch import CLAWPM_MARKER_KEY, settings_path
-
-        wt = tmp_path / "wt"
-        wt.mkdir()
-        path = settings_path(wt)
+        path = settings_path(tmp_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             json.dumps({CLAWPM_MARKER_KEY: "truthy-but-not-a-dict"}),
             encoding="utf-8",
         )
 
-        assert find_session_for_cwd(
-            isolated_portfolio.root, wt, project_id="test"
-        ) is None
+        assert read_dispatch_marker(tmp_path) is None
+
+    def test_settings_without_the_marker_key_is_none(self, tmp_path):
+        from clawpm.dispatch import read_dispatch_marker, settings_path
+
+        path = settings_path(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"hooks": {"SessionStart": []}}), encoding="utf-8"
+        )
+
+        assert read_dispatch_marker(tmp_path) is None
+
+    def test_well_formed_marker_is_returned(self, tmp_path):
+        from clawpm.dispatch import (
+            CLAWPM_MARKER_KEY, read_dispatch_marker, settings_path,
+        )
+
+        path = settings_path(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {CLAWPM_MARKER_KEY: {"task_id": "TEST-001", "project_id": "test"}}
+            ),
+            encoding="utf-8",
+        )
+
+        assert read_dispatch_marker(tmp_path) == {
+            "task_id": "TEST-001", "project_id": "test",
+        }
 
 
 class TestHeadValidityProbe:

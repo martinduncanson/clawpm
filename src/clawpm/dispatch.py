@@ -543,12 +543,12 @@ def read_dispatch_marker(target_dir: Path) -> Optional[dict]:
     # Shape guards (Codex P2, PR #55 round 7). A settings file whose top
     # level is valid JSON but not an object (a bare list/string/number) made
     # `data.get` raise AttributeError, and a truthy non-object marker value
-    # pushed the same failure onto every caller of `marker.get`. That was
-    # survivable while this function was only read by dispatch teardown; it
-    # stopped being survivable once session rediscovery began calling it
-    # during ORDINARY project resolution, where an unrelated malformed
-    # settings file in any ancestor directory would crash a read-only
-    # command instead of falling through.
+    # pushed the same failure onto every caller of `marker.get`. The path
+    # into this function is `.claude/settings.local.json` — a file the
+    # OPERATOR edits, and one any editor or unrelated tool may have written
+    # — so a malformed shape is an ordinary condition, not a corrupted
+    # invariant. Teardown must report "no clawpm marker here" and leave the
+    # file alone, which is exactly what returning None does.
     if not isinstance(data, dict):
         return None
     marker = data.get(CLAWPM_MARKER_KEY)

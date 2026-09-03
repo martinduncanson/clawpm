@@ -1199,6 +1199,26 @@ def tasks_emit_rubric(
             click.echo(_json_rub.dumps(payload, indent=2))
 
 
+_UNREADABLE = object()
+
+
+def _read_bytes_or_none(path: Path):
+    """Current bytes at *path*, ``None`` if absent, a sentinel if unreadable.
+
+    Used by dispatch's rollback to decide whether the artifacts on disk are
+    still the ones this invocation wrote. An absent file and an unreadable
+    one are DIFFERENT answers: absent legitimately compares equal to "we
+    wrote no sidecar", while unreadable proves nothing and must never
+    compare equal to anything — hence a sentinel rather than ``None``, which
+    would let an EACCES read masquerade as a match and re-arm the very
+    clobber the comparison exists to prevent.
+    """
+    try:
+        return path.read_bytes() if path.exists() else None
+    except OSError:
+        return _UNREADABLE
+
+
 @tasks.command("dispatch")
 @click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
 @click.argument("task_id")
@@ -1403,19 +1423,18 @@ def tasks_dispatch(
         from clawpm.dispatch import (
             GitProbeError, head_object_sha, repo_prefix, working_tree_blob_sha,
         )
-        from clawpm.discovery import get_repo_path
-        # Probe — and branch from — the checkout that actually SUPPLIED the
-        # task (Codex P2, PR #55 round 7). `get_task` above resolves through
-        # get_project_dir, which is session-scoped: running
-        # `tasks dispatch B --worktree` from inside registered worktree A
-        # loads B from A's `.project/`. Taking the candidates from the
-        # canonical `project.repo_path` instead compared a task loaded from A
-        # against main's HEAD — so if A held a newer B while main matched its
-        # own HEAD, the gate passed, B's worktree was created from main, and
-        # the hooks and rubric were rendered from A's different revision.
-        # `_source_repo` is used for the probe AND for create_worktree below,
-        # so the two cannot diverge again.
-        _source_repo = get_repo_path(config, project_id) or project.repo_path
+        # Probe — and branch from — the canonical project checkout.
+        #
+        # A session-scoped variant of this (`get_repo_path(config,
+        # project_id)`, PR #55 round 7) was reverted in round 8: pointing
+        # `create_worktree` at a dispatched worktree makes re-dispatching an
+        # existing task branch fail, because `clawpm/<task>` is already
+        # checked out there. Probing one checkout while branching from
+        # another is the mismatch that motivated the change in the first
+        # place, so the two halves cannot be separated — and getting the
+        # scoping right is a distributed-state problem in its own right.
+        # Split out with moved-worktree rediscovery; see the follow-up task.
+        _source_repo = project.repo_path
         _existing_wt = _source_repo / ".clawpm-worktrees" / task_id
         try:
             _repo_prefix = repo_prefix(_source_repo)
@@ -1567,6 +1586,17 @@ def tasks_dispatch(
                 fmt=fmt,
             )
             sys.exit(1)
+        # `git worktree add` checks out the REPOSITORY ROOT, so a project
+        # whose repo_path is a subdirectory (`packages/proj`) keeps its
+        # `.project/` under that same prefix inside the new checkout — not at
+        # its root (Codex P2, PR #55 round 8). `_repo_prefix` is git's
+        # `--show-prefix`: "" at the repo root, "packages/proj/" below it.
+        # Bound here rather than beside its first use, because BOTH
+        # materialization checks below need it and the second one runs
+        # precisely when the first was skipped.
+        _wt_project_root = (
+            resolved_dir / _repo_prefix if _repo_prefix else resolved_dir
+        )
         # CLAWP-098 (grok + Codex review, round 5 — independently caught by
         # both, third confirmation this exact shape is real): the HEAD
         # probe above proves the task is committed, but create_worktree is
@@ -1589,8 +1619,11 @@ def tasks_dispatch(
             # existence-only check and was registered — the stale-revision
             # dispatch the pre-create gate exists to prevent, arriving by
             # the one route that gate can't see.
+            # Prefixed via `_wt_project_root` (bound above): dropping the
+            # prefix here made every committed `--worktree` dispatch in a
+            # monorepo look unmaterialized and abort.
             _wt_path = next(
-                (p for p in _ctp(resolved_dir / ".project" / "tasks", task_id)
+                (p for p in _ctp(_wt_project_root / ".project" / "tasks", task_id)
                  if p.exists()),
                 None,
             )
@@ -1622,9 +1655,14 @@ def tasks_dispatch(
                     f"at {resolved_dir} {_why} — it's a "
                     f"leftover checkout from an earlier dispatch that "
                     f"create_worktree reused as-is (it does not refresh an "
-                    f"existing worktree's contents). Remove it manually "
-                    f"(git worktree remove {resolved_dir}) and re-run "
-                    f"dispatch to get a fresh checkout from the current HEAD.",
+                    f"existing worktree's contents). Recover with BOTH of: "
+                    f"`git worktree remove {resolved_dir}` and "
+                    f"`git branch -D clawpm/{task_id}`, then re-run dispatch. "
+                    f"Removing the worktree alone is not enough — the "
+                    f"`clawpm/{task_id}` branch survives removal at its old "
+                    f"revision, and create_worktree checks it out again, so "
+                    f"every retry rebuilds the same stale checkout and lands "
+                    f"back here (Codex P2, PR #55 round 8).",
                     fmt=fmt,
                 )
                 sys.exit(1)
@@ -1727,6 +1765,35 @@ def tasks_dispatch(
         output_error("dispatch_blocked", str(exc), fmt=fmt)
         sys.exit(1)
 
+    # Record what THIS invocation wrote, so the rollback below can prove the
+    # file it is about to restore over is still ours (Codex P1, PR #55 round
+    # 8). Two dispatches targeting the same directory can both snapshot the
+    # same prior settings before either writes. If one then succeeds and the
+    # other's session registration fails, the failing one would restore its
+    # now-stale snapshot — or, with no prior settings, tear the file down —
+    # straight over the SUCCESSFUL dispatch's freshly installed hooks. That
+    # command reports success while its worktree is left with obsolete or
+    # missing settings, which is the corruption CLAWP-098 exists to prevent,
+    # arriving through the rollback path added to prevent it.
+    #
+    # Bytes, not a lock: the harm is confined to the rollback, and a
+    # comparison establishes exactly the fact the restore depends on — that
+    # nothing has replaced our file since we wrote it — without a lock file
+    # inside the operator's target directory or a critical section spanning
+    # the registry write. A read failure yields None, which reads as "can't
+    # prove it's ours" and skips the restore: the conservative direction,
+    # since leaving a live dispatch's settings alone is recoverable and
+    # destroying them is not.
+    _our_settings = None
+    _our_sidecar = None
+    try:
+        if _prior_settings_path.exists():
+            _our_settings = _prior_settings_path.read_bytes()
+        if _prior_sidecar_path.exists():
+            _our_sidecar = _prior_sidecar_path.read_bytes()
+    except OSError:
+        pass
+
     # CLAWP-098 (review finding): register the session AFTER settings are
     # written — same ordering rationale as the lease grant below — so a
     # write_dispatch_settings failure (dispatch_blocked, above) doesn't leave
@@ -1753,9 +1820,18 @@ def tasks_dispatch(
         # worktree it just created, so a cwd-based lookup would silently
         # fall through to the OLD registry resolution and report a false
         # "materialized" even when the worktree's own copy is missing.
+        # Prefixed, for the same monorepo reason as the post-create check
+        # above: the worktree holds the repo ROOT, so a project living at
+        # `packages/proj` keeps its `.project/` under that prefix. Codex
+        # flagged only the other site (P2, round 8); this one is the same
+        # defect, and dropping the prefix here would report every monorepo
+        # dispatch as unmaterialized and skip session registration —
+        # silently disabling CLAWP-098's isolation instead of aborting.
         materialized = any(
             p.exists()
-            for p in _candidate_task_paths(resolved_dir / ".project" / "tasks", task_id)
+            for p in _candidate_task_paths(
+                _wt_project_root / ".project" / "tasks", task_id
+            )
         )
         if materialized:
             session_id = str(uuid.uuid4())
@@ -1779,13 +1855,28 @@ def tasks_dispatch(
                 # dispatch fails clean and a retry starts from nothing.
                 session_id = None
                 teardown_error = None
-                # Restore what was there BEFORE this command, rather than
-                # unconditionally tearing down (Codex P2, PR #55 round 7):
-                # a failed re-dispatch must not remove the previously
-                # working dispatch it was replacing.
-                _restored = _prior_settings is not None
+                # Only roll back while the file on disk is still the one THIS
+                # command wrote (Codex P1, PR #55 round 8). A concurrent
+                # dispatch to the same directory may have replaced it and
+                # succeeded; restoring our snapshot over it — or tearing it
+                # down, when we had no snapshot — would leave that command
+                # reporting success with obsolete or missing hooks. Compare
+                # the bytes we recorded after our own write; anything else on
+                # disk (different content, or nothing at all) means the
+                # artifacts are no longer ours to undo.
+                _still_ours = (
+                    _our_settings is not None
+                    and _read_bytes_or_none(_prior_settings_path) == _our_settings
+                    and _read_bytes_or_none(_prior_sidecar_path) == _our_sidecar
+                )
+                _restored = _still_ours and _prior_settings is not None
                 try:
-                    if _prior_settings is not None:
+                    if not _still_ours:
+                        # Deliberately nothing: the artifacts on disk belong
+                        # to a concurrent dispatch now (see above). The
+                        # operator is told so in `_outcome` below.
+                        pass
+                    elif _prior_settings is not None:
                         _prior_settings_path.parent.mkdir(
                             parents=True, exist_ok=True
                         )
@@ -1814,6 +1905,17 @@ def tasks_dispatch(
                         f"{_prior_settings_path} manually before retrying, or "
                         f"commands run from that worktree will mutate the "
                         f"main checkout."
+                    )
+                elif not _still_ours:
+                    _outcome = (
+                        f"The dispatch settings at {_prior_settings_path} are "
+                        f"no longer the ones this command wrote — another "
+                        f"dispatch has since replaced them — so they were "
+                        f"left ALONE rather than rolled back over a "
+                        f"concurrent dispatch that may have succeeded. No "
+                        f"session was registered for THIS command; fix the "
+                        f"portfolio state and re-run dispatch, and check "
+                        f"whether the other dispatch is the one you want."
                     )
                 elif _restored:
                     _outcome = (
