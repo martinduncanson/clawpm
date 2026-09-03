@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -1320,8 +1321,19 @@ def assign_task_prefix(
     once ``-{num:03d}`` is appended, and so this function's own candidate
     always agrees with what ``_portfolio_prefixes`` assumes OTHER task-less
     projects would derive. Extension-loop candidates beyond the base are
-    stripped the same way, as is the numeric-suffix last resort (see comment
-    below) -- no arm of this function can emit a trailing separator.
+    stripped the same way, as is the digest last resort (see comment below) --
+    no arm of this function can emit a trailing separator.
+
+    EVERY arm is a pure function of ``project_id`` and the portfolio's other
+    prefixes; none depends on a scanned counter. That is what makes concurrent
+    first mints safe without a lock: two different projects cannot converge on
+    the same candidate, so there is nothing to serialise (Codex P1, PR #57 --
+    see the last-resort comment for why a lock would not have fixed it).
+
+    Raises:
+        ValueError: if every id-derived candidate, including the digest
+            fallback, is already claimed. Only reachable when sibling projects
+            set explicit ``task_prefix`` values that exhaust them.
     """
     if explicit_prefix:
         return explicit_prefix.upper()
@@ -1356,11 +1368,58 @@ def assign_task_prefix(
     # `stem` is always already claimed here: `base` covers len(full) <= 5 and
     # the loop's final iteration (n == len(full)) covers the rest, so both
     # reach `_strip_trailing_non_alnum(full)`. Hence no bare `stem` return.
+    #
+    # The disambiguator is a DIGEST OF THE PROJECT ID, not a scanned counter
+    # (Codex P1, PR #57 round 4). A `while f"{stem}{n}" in used: n += 1` loop
+    # reads a snapshot of `used`, and nothing pins the value it picks until
+    # the task file is written: `add_task` locks per-project task dirs, so two
+    # task-less projects minting their FIRST task concurrently take the same
+    # snapshot and independently select the same suffix, minting duplicate
+    # portfolio-wide IDs. `_portfolio_prefixes` cannot close that, because it
+    # models only the `base` arm (via `_naive_prefix_placeholder`) — a
+    # sibling's fallback choice is invisible until its first task exists.
+    #
+    # A portfolio-wide lock does NOT fix this: the lock would have to be held
+    # from selection all the way through the task-file write that reserves the
+    # prefix, since releasing it after selection leaves the second mint's
+    # snapshot exactly as stale as before.
+    #
+    # Determinism does fix it, with no coordination at all: when the candidate
+    # is a pure function of the project id, two DIFFERENT projects can never
+    # converge on the same fallback, so there is nothing to serialise. Every
+    # other member of `used` is already deterministic — explicit prefixes are
+    # static config, placeholders are pure functions of sibling ids, resolved
+    # prefixes come from tasks that already exist — so this was the sole
+    # scan-dependent arm and the sole race.
+    #
+    # It must be a digest rather than something prettier. The obvious short
+    # encodings are not injective: the trailing-separator RUN LENGTH collapses
+    # "code-" and "code_" (both stem "CODE", both length 1) onto the same
+    # candidate, which reintroduces the very collision this arm exists to
+    # avoid, just deterministically. Injectivity over the raw id is the whole
+    # requirement — it is the one property the old unstripped-`full` return
+    # was protecting — and a digest is the simple way to get it while
+    # guaranteeing an alphanumeric last character.
+    #
+    # This arm is reached only when the base AND every extension through
+    # len(full) are claimed, which needs siblings with explicit prefixes
+    # engineered to exhaust them. An ugly prefix in that corner is a fair
+    # trade for never minting a duplicate ID.
     stem = _strip_trailing_non_alnum(full)
-    n = 2
-    while f"{stem}{n}" in used:
-        n += 1
-    return f"{stem}{n}"
+    digest = hashlib.sha256(project_id.encode("utf-8")).hexdigest()[:6].upper()
+    candidate = f"{stem}{digest}"
+    if candidate not in used:
+        return candidate
+    # An explicit `task_prefix` collided with a 24-bit digest of this id.
+    # Fail loudly: silently extending would put us back on a scanned,
+    # racy counter, and minting a duplicate portfolio-wide prefix is the
+    # corruption this whole function exists to prevent.
+    raise ValueError(
+        f"Cannot derive a collision-free task prefix for project "
+        f"{project_id!r}: every id-derived candidate through {full!r} is "
+        f"claimed by another project, and the fallback {candidate!r} is too. "
+        f"Set an explicit `task_prefix` in this project's settings.toml."
+    )
 
 
 def add_task(
