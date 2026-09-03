@@ -363,25 +363,51 @@ class TestDoctorCollisionCheck:
         assert cols is not None, res.output
         assert not any(c["prefix"] == "ARB-P" and len(c["projects"]) > 1 for c in cols), cols
 
-    def test_doctor_uses_stripped_placeholder_for_taskless_hyphen_boundary_sibling(
+    def test_doctor_keys_a_taskless_sibling_under_what_the_allocator_mints(
         self, tmp_path, monkeypatch
     ):
-        # CLAWP-096 (grok review finding, cli/project.py): doctor's collision
-        # map must key a still-task-less sibling under the SAME placeholder
-        # assign_task_prefix would actually derive for it
-        # (_naive_prefix_placeholder), not a bare unstripped id.upper()[:5].
-        # "code-quorum" has already minted (real resolved prefix "CODE");
-        # "code-runner" is still task-less. A bare [:5] keys code-runner
-        # under "CODE-" (never keyed alongside code-quorum's "CODE"),
-        # silently hiding the real collision the two would hit on
-        # code-runner's first mint.
+        # CLAWP-096 (grok review, cli/project.py): doctor's collision map must
+        # key a still-task-less sibling under the prefix that project will
+        # ACTUALLY get, not a bare unstripped `id.upper()[:5]`.
+        #
+        # Codex P2, PR #57 round 6 corrected what "actually get" means. This
+        # test previously asserted a CODE collision between the two, on the
+        # premise that a task-less sibling derives the naive base. It does
+        # not: the naive base is only the allocator's FIRST candidate, and
+        # `assign_task_prefix` sees code-quorum's minted CODE in `used` and
+        # extends to CODE-R. Reporting CODE was a false positive — and since
+        # `prefix_collisions` feeds `has_warnings`, it failed `doctor
+        # --strict` in CI over a namespace nothing would ever mint.
         _make_portfolio(tmp_path, monkeypatch, "code-quorum")
         (tmp_path / "projects" / "code-quorum" / ".project" / "tasks" / "CODE-000.md").write_text(
             "---\nid: CODE-000\n---\n", encoding="utf-8"
         )
         _add_project(tmp_path, "code-runner")  # task-less
+
+        # What the allocator really mints for the task-less sibling.
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        minted = assign_task_prefix(
+            "code-runner",
+            tmp_path / "projects" / "code-runner" / ".project" / "tasks",
+            config,
+        )
+        assert minted == "CODE-R", minted
+
         res = CliRunner().invoke(main, ["--format", "json", "doctor"])
         cols = self._prefix_collisions(res.output)
         assert cols is not None, res.output
-        code_col = [c for c in cols if c["prefix"] == "CODE"]
-        assert code_col and set(code_col[0]["projects"]) == {"code-quorum", "code-runner"}, cols
+        assert not any(
+            c["prefix"] == "CODE" and "code-runner" in c["projects"] for c in cols
+        ), (
+            "code-runner never mints under CODE — reporting it as a collision "
+            "fails doctor --strict and tells the operator to rename a project "
+            "that needs no rename"
+        )
+        # And it must not be dropped from the check either: whatever prefix it
+        # is keyed under, a genuine clash on THAT prefix still has to surface.
+        assert not any(
+            c["prefix"] == minted and len(c["projects"]) > 1 for c in cols
+        ), cols
