@@ -264,6 +264,87 @@ def get_project_dir(config: PortfolioConfig, project_id: str) -> Path | None:
     return None
 
 
+def get_repo_path(config: PortfolioConfig, project_id: str) -> Path | None:
+    """The checkout to run git in for *project_id* — session-scoped.
+
+    CLAWP-098 (Codex review, PR #55): ``get_project_dir`` already redirects
+    an ID-based mutator running inside a dispatched worktree to that
+    worktree's own ``.project/``, but every SECONDARY step that shells out
+    to git kept using ``get_project(...).repo_path``, which is
+    cwd-independent and therefore always the MAIN checkout. The concrete
+    symptom is the work-log's ``files_changed`` enrichment on
+    ``tasks state/start/done/block``: run from a dispatched worktree, it
+    recorded the main checkout's ``git diff`` — omitting every file the
+    agent actually touched, and attributing whatever unrelated edits
+    happened to be sitting in main to this task instead.
+
+    Resolution is keyed on the active SESSION rather than on
+    :func:`_session_scoped_project_dir`, which additionally requires the
+    worktree to carry its own ``.project/``. That extra gate exists to stop
+    a WRITER forking a new task store into a worktree that never had one —
+    a hazard that simply does not apply to reading a diff. So when cwd sits
+    in a registered worktree, git runs there whether or not the project
+    git-tracks ``.project/``; a worktree without one still holds the work
+    being described.
+
+    Returns ``None`` when the project cannot be located at all, matching
+    ``get_project_dir``'s contract. Never raises: every failure inside
+    session resolution falls through to the registry answer.
+    """
+    session_root = _session_scoped_repo_path(config, project_id)
+    if session_root is not None:
+        return session_root
+    project = get_project(config, project_id)
+    return project.repo_path if project else None
+
+
+def _session_scoped_repo_path(config: PortfolioConfig, project_id: str) -> Path | None:
+    """Worktree root of the session registered for cwd, or ``None``.
+
+    Same suppression and fail-open contract as
+    :func:`_session_scoped_project_dir` — in particular it returns ``None``
+    inside a ``sessions.suppress_session_resolution()`` block, so the
+    portfolio-wide lease-fallback sweep never inherits the caller's
+    worktree for a task the operator did not name.
+    """
+    if _suppress_session_resolution.get():
+        return None
+    portfolio_root = getattr(config, "portfolio_root", None)
+    if not portfolio_root:
+        return None
+    try:
+        cwd = Path.cwd()
+    except OSError as exc:
+        logger.error("Failed to determine cwd: %s. Session-scoped repo "
+                     "resolution skipped for this call.", exc)
+        return None
+    session = find_session_for_cwd(portfolio_root, cwd, project_id=project_id)
+    if session is None:
+        return None
+    try:
+        root = session.worktree_path.resolve()
+    except OSError as exc:
+        logger.error(
+            "Failed to resolve session worktree %s: %s. Falling through to "
+            "the portfolio registry (main-checkout) repo_path for this call.",
+            session.worktree_path, exc,
+        )
+        return None
+    try:
+        if not stat_is_dir(root):
+            return None
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        logger.error(
+            "Failed to stat session worktree %s: %s. Falling through to the "
+            "portfolio registry (main-checkout) repo_path for this call.",
+            root, exc,
+        )
+        return None
+    return root
+
+
 def _session_scoped_project_dir(config: PortfolioConfig, project_id: str) -> Path | None:
     """Return the ``.project/`` dir of the worktree registered for cwd, if any.
 

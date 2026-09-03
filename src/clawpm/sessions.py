@@ -470,4 +470,114 @@ def find_session_for_cwd(
         if depth > best_depth:
             best = record
             best_depth = depth
+    if best is None:
+        best = _rediscover_moved_session(portfolio_root, resolved_cwd, project_id)
     return best
+
+
+def _rediscover_moved_session(
+    portfolio_root: Path, cwd: Path, project_id: Optional[str]
+) -> Optional[SessionRecord]:
+    """Recover a session whose worktree was RELOCATED out from under the ledger.
+
+    Codex review, PR #55: ``git worktree move <worktree> <new-path>`` is a
+    supported git operation, and the ledger records only the path the
+    worktree had when it was registered. After a move, no active session's
+    path contains cwd, so resolution silently fell through to the main
+    checkout — recreating exactly the mutation corruption this module
+    exists to prevent, via a first-class git command.
+
+    Recovery is evidence-driven and deliberately narrow. A dispatched
+    worktree carries its own ``.claude/settings.local.json`` with clawpm's
+    dispatch marker, and that file MOVES WITH THE CHECKOUT — so it is a
+    self-describing identity that survives relocation while the ledger's
+    path does not. Walking up from cwd to find it, then matching its
+    ``task_id``/``project_id`` back to a registered session, re-establishes
+    the mapping without trusting anything about the path.
+
+    Four guards keep this from hijacking an unrelated session:
+
+    - the marker must exist at or above cwd (positive evidence that cwd is
+      inside a clawpm-dispatched checkout at all);
+    - the marker's project must match the project being resolved;
+    - exactly one registered-and-active session may match the marker's
+      ``(task_id, project_id)`` — an ambiguous match resolves to nothing
+      rather than guessing;
+    - that session's RECORDED path must no longer be a directory. This is
+      the one that matters: while the old path still exists, the session is
+      legitimately live there and rebinding it to cwd would corrupt the
+      genuinely-active worktree. Only a vanished recorded path is evidence
+      of a move.
+
+    Returns a record with ``worktree_path`` corrected to the discovered
+    root, for THIS CALL ONLY — nothing is written back to the ledger. A
+    read path must not mutate portfolio state: the rediscovery is cheap,
+    deterministic, and repeats on the next call, whereas an append here
+    would race concurrent dispatches and permanently rewrite a session's
+    identity on the strength of one process's cwd.
+
+    Never raises; every failure returns ``None`` and falls through to the
+    registry lookup like any other miss.
+    """
+    from .dispatch import read_dispatch_marker
+
+    marker = None
+    marker_root: Optional[Path] = None
+    for candidate in (cwd, *cwd.parents):
+        try:
+            found = read_dispatch_marker(candidate)
+        except OSError:
+            # An unreadable settings file mid-walk is not a reason to abort
+            # the walk — keep climbing, same fail-open contract as the rest
+            # of this module.
+            continue
+        if found:
+            marker = found
+            marker_root = candidate
+            break
+    if not marker or marker_root is None:
+        return None
+    marker_task = marker.get("task_id")
+    marker_project = marker.get("project_id")
+    if not isinstance(marker_task, str) or not marker_task:
+        return None
+    if not isinstance(marker_project, str) or not marker_project:
+        return None
+    if project_id is not None and marker_project != project_id:
+        return None
+
+    matches = [
+        s for s in _replay(portfolio_root).values()
+        if s.active and s.task_id == marker_task and s.project_id == marker_project
+    ]
+    if len(matches) != 1:
+        return None
+    record = matches[0]
+    try:
+        if stat_is_dir(record.worktree_path):
+            # Recorded path is still a live directory — this is NOT a move.
+            return None
+    except FileNotFoundError:
+        pass
+    except OSError:
+        # Can't establish that the old path is gone, so can't establish a
+        # move. Fail open to the registry lookup rather than rebind on a
+        # guess.
+        return None
+
+    logger.warning(
+        "Session %s's registered worktree %s no longer exists, but cwd %s is "
+        "inside a clawpm dispatch for the same task (%s/%s) at %s — treating "
+        "the worktree as MOVED and resolving against %s for this call. Re-run "
+        "`clawpm tasks dispatch --worktree` if this mapping should be "
+        "made permanent.",
+        record.session_id, record.worktree_path, cwd, marker_project,
+        marker_task, marker_root, marker_root,
+    )
+    return SessionRecord(
+        session_id=record.session_id,
+        task_id=record.task_id,
+        project_id=record.project_id,
+        worktree_path=marker_root,
+        active=True,
+    )

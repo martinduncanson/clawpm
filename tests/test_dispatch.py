@@ -1342,3 +1342,126 @@ class TestAutoTeardownOnDone:
             t["task_id"] == task.id for t in payload["dispatch_teardowns"]
         )
         assert not settings_path(repo_dir).exists()
+
+
+# ---------------------------------------------------------------------------
+# CLAWP-098 round-6 review (Codex, PR #55): end-to-end dispatch-gate coverage
+# ---------------------------------------------------------------------------
+
+
+def _commit_project(repo_dir: Path, message: str = "seed .project") -> None:
+    subprocess.run(["git", "-C", str(repo_dir), "add", ".project"], check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=a@b", "-c", "user.name=a",
+         "-C", str(repo_dir), "commit", "-q", "-m", message],
+        check=True,
+    )
+
+
+class TestDispatchRollsBackOnSessionRegistrationFailure:
+    """A failed sessions.jsonl append must not leave dispatch artifacts installed.
+
+    Before the fix the exception escaped after write_dispatch_settings had
+    already installed the managed settings and sidecar: the command reported
+    failure while leaving an ACTIVE Stop hook and dispatch-registry entry
+    with no session mapping, so an operator entering that worktree got
+    ID-based commands falling straight through to the main checkout — the
+    original CLAWP-098 corruption, re-armed by this feature's own failure
+    path.
+    """
+
+    def test_settings_are_removed_when_register_session_raises(
+        self, temp_portfolio_with_repo, monkeypatch
+    ):
+        config = temp_portfolio_with_repo["config"]
+        repo_dir = temp_portfolio_with_repo["repo_dir"]
+        task = add_task(config, "test", title="RollbackMe",
+                        predictions=Predictions(success_criteria=["C1"]))
+        _commit_project(repo_dir)
+
+        def _boom(*args, **kwargs):
+            raise OSError("simulated sessions.jsonl append failure")
+
+        monkeypatch.setattr("clawpm.sessions.register_session", _boom)
+
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code == 1, r.output
+        assert "session_registration_failed" in r.output
+
+        wt_path = repo_dir / ".clawpm-worktrees" / task.id
+        assert not settings_path(wt_path).exists(), (
+            "dispatch settings must be rolled back when session registration "
+            "fails — leaving them installed re-arms CLAWP-098's corruption"
+        )
+
+
+class TestDispatchGateFailsClosedOnProbeError:
+    def test_non_git_repo_path_aborts_rather_than_skipping_the_guards(
+        self, temp_portfolio_with_repo, monkeypatch, tmp_path
+    ):
+        """An operational git failure must abort, not read as 'untracked'.
+
+        The old `git cat-file -e` probe folded every nonzero exit into
+        "`.project` isn't tracked at HEAD", which skipped both
+        materialization guards entirely.
+        """
+        config = temp_portfolio_with_repo["config"]
+        task = add_task(config, "test", title="ProbeFail",
+                        predictions=Predictions(success_criteria=["C1"]))
+
+        from clawpm.dispatch import GitProbeError
+
+        def _boom(*args, **kwargs):
+            raise GitProbeError("simulated object-store failure")
+
+        monkeypatch.setattr("clawpm.dispatch.repo_prefix", _boom)
+
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code == 1, r.output
+        assert "git_probe_failed" in r.output
+
+
+class TestDispatchGateRejectsStaleRevision:
+    def test_uncommitted_progress_rename_is_refused(
+        self, temp_portfolio_with_repo
+    ):
+        """`tasks start` renames T.md -> T.progress.md. Until that is
+        committed, HEAD carries the stale open-state file, and dispatching
+        --worktree would check out that stale revision."""
+        config = temp_portfolio_with_repo["config"]
+        repo_dir = temp_portfolio_with_repo["repo_dir"]
+        task = add_task(config, "test", title="StaleRev",
+                        predictions=Predictions(success_criteria=["C1"]))
+        _commit_project(repo_dir)
+
+        # Move it to progress — an uncommitted rename in the main checkout.
+        change_task_state(config, "test", task.id, TaskState.PROGRESS)
+
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code == 1, r.output
+        assert "task_not_materialized" in r.output
+        assert "STALE" in r.output or "stale" in r.output
+
+    def test_committed_progress_rename_dispatches_cleanly(
+        self, temp_portfolio_with_repo
+    ):
+        """The same task, once committed, must still dispatch — the gate
+        must reject staleness, not every progress-state task."""
+        config = temp_portfolio_with_repo["config"]
+        repo_dir = temp_portfolio_with_repo["repo_dir"]
+        task = add_task(config, "test", title="FreshRev",
+                        predictions=Predictions(success_criteria=["C1"]))
+        change_task_state(config, "test", task.id, TaskState.PROGRESS)
+        _commit_project(repo_dir)
+
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code == 0, r.output
+        assert json.loads(r.output)["data"]["session_id"]

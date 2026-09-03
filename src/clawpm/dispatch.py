@@ -631,6 +631,124 @@ def teardown_dispatch_settings(
     return True
 
 
+class GitProbeError(RuntimeError):
+    """A git tree probe failed for an OPERATIONAL reason, not because the
+    probed path is absent.
+
+    CLAWP-098 (Codex review, PR #55): the materialization gate previously
+    probed with ``git cat-file -e`` and read *any* nonzero exit as "this
+    path isn't in HEAD". ``cat-file -e`` only reports object existence and
+    cannot distinguish a missing path from a broken object database, an
+    unreadable HEAD, or git missing from PATH — so a transient repository
+    fault silently set ``_head_has_project`` false, skipped BOTH
+    materialization guards, and could register a stale reused checkout as
+    an isolated worktree. That is precisely the fail-open this gate exists
+    to close, reached through the gate's own probe.
+
+    Probes therefore raise this instead of folding the failure into a bool,
+    and the caller aborts the dispatch rather than treating an operational
+    error as the supported untracked-``.project`` case.
+    """
+
+
+def repo_prefix(repo_path: Path) -> str:
+    """Path from the repo root down to *repo_path* (empty when it IS the root).
+
+    Raises :class:`GitProbeError` rather than silently returning ``""`` on
+    failure — an empty prefix is indistinguishable from the legitimate
+    repo-root case, so swallowing the error would make every subsequent
+    probe address the wrong location in a mono-repo layout while looking
+    like it succeeded.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "rev-parse", "--show-prefix"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except OSError as exc:
+        raise GitProbeError(
+            f"could not run git rev-parse --show-prefix in {repo_path}: {exc}"
+        ) from exc
+    if result.returncode != 0:
+        raise GitProbeError(
+            f"git rev-parse --show-prefix in {repo_path} failed "
+            f"(exit {result.returncode}): "
+            f"{(result.stderr or '').strip() or '<no stderr>'}"
+        )
+    return result.stdout.strip()
+
+
+def head_object_sha(repo_path: Path, rel_path: str) -> Optional[str]:
+    """SHA of ``HEAD:<rel_path>``, or ``None`` when that path is not in HEAD.
+
+    Raises :class:`GitProbeError` when the probe itself fails.
+
+    ``git rev-parse --verify --quiet`` is used rather than ``cat-file -e``
+    precisely because it separates the two outcomes the gate must never
+    conflate: a path that cleanly does not resolve exits 1 with EMPTY
+    stderr, while an operational fault (corrupt or unavailable object
+    store, unreadable HEAD, not a repository) exits nonzero WITH a
+    diagnostic on stderr. It also returns the object id, which the caller
+    needs in order to compare a committed blob against the working tree.
+
+    ``rel_path`` resolves relative to the REPO ROOT, not ``-C``'s
+    directory, so callers must already have applied :func:`repo_prefix`
+    for a project whose repo_path is a subdirectory of a larger repo.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "rev-parse", "--verify", "--quiet",
+             f"HEAD:{rel_path}"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except OSError as exc:
+        # git missing from PATH, repo_path unreadable, process limits — an
+        # operational failure by definition, never "the path is absent".
+        raise GitProbeError(
+            f"could not run git rev-parse in {repo_path}: {exc}"
+        ) from exc
+    if result.returncode == 0:
+        return result.stdout.strip() or None
+    stderr = (result.stderr or "").strip()
+    if result.returncode == 1 and not stderr:
+        # The documented "does not resolve" signal: --quiet suppresses the
+        # diagnostic ONLY for a clean non-resolution.
+        return None
+    raise GitProbeError(
+        f"git rev-parse HEAD:{rel_path} in {repo_path} failed "
+        f"(exit {result.returncode}): {stderr or '<no stderr>'}"
+    )
+
+
+def working_tree_blob_sha(path: Path) -> Optional[str]:
+    """SHA git WOULD record for *path*'s current contents, or ``None`` if absent.
+
+    Lets the materialization gate tell "this task is committed" from "a
+    task with this id is committed, but the revision dispatch just loaded
+    differs from it" — the distinction that stops a worktree being checked
+    out at a stale task revision (Codex review, PR #55). Raises
+    :class:`GitProbeError` on an operational failure, same contract as
+    :func:`head_object_sha`.
+    """
+    if not path.exists():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "hash-object", "--", str(path)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except OSError as exc:
+        raise GitProbeError(
+            f"could not run git hash-object for {path}: {exc}"
+        ) from exc
+    if result.returncode != 0:
+        raise GitProbeError(
+            f"git hash-object {path} failed (exit {result.returncode}): "
+            f"{(result.stderr or '').strip() or '<no stderr>'}"
+        )
+    return result.stdout.strip() or None
+
+
 def create_worktree(repo_path: Path, task_id: str) -> Path:
     """Create a git worktree under ``<repo_path>/.clawpm-worktrees/<task_id>/``.
 

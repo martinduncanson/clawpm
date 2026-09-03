@@ -1382,40 +1382,124 @@ def tasks_dispatch(
         # anything here to check, and dispatch proceeds unaffected exactly
         # as before this fix.
         #
-        # `git cat-file -e HEAD:<path>` resolves <path> relative to the
-        # REPO ROOT, not `-C`'s directory (antigravity review, PR #55) —
-        # for a project whose repo_path is a SUBDIRECTORY of a larger repo
-        # (a mono-repo layout), an unprefixed ".project" would probe the
-        # wrong location entirely. `git rev-parse --show-prefix` gives the
-        # path from the repo root down to repo_path (empty when repo_path
-        # IS the root), which every probed path below is prefixed with.
-        _prefix_result = subprocess.run(
-            ["git", "-C", str(project.repo_path), "rev-parse", "--show-prefix"],
-            capture_output=True, text=True,
+        # Probed paths resolve relative to the REPO ROOT, not `-C`'s
+        # directory (antigravity review, PR #55) — for a project whose
+        # repo_path is a SUBDIRECTORY of a larger repo (a mono-repo
+        # layout), an unprefixed ".project" would probe the wrong location
+        # entirely. `git rev-parse --show-prefix` gives the path from the
+        # repo root down to repo_path (empty when repo_path IS the root),
+        # which every probed path below is prefixed with.
+        #
+        # Every probe FAILS CLOSED (Codex review, PR #55). `git cat-file
+        # -e` was used here before and only reports object existence: it
+        # cannot tell a missing path from a broken object store, an
+        # unreadable HEAD, or git missing from PATH, so any operational
+        # fault read as "`.project` isn't tracked", skipped both guards
+        # below, and could dispatch/register a stale reused checkout — the
+        # exact fail-open this gate exists to close, through the gate's own
+        # probe. `head_object_sha` raises GitProbeError on an operational
+        # failure and returns None only for a clean non-resolution; we
+        # abort on the former rather than guessing.
+        from clawpm.dispatch import (
+            GitProbeError, head_object_sha, repo_prefix, working_tree_blob_sha,
         )
-        _repo_prefix = _prefix_result.stdout.strip() if _prefix_result.returncode == 0 else ""
-        _head_has_project = subprocess.run(
-            ["git", "-C", str(project.repo_path), "cat-file", "-e",
-             f"HEAD:{_repo_prefix}.project"],
-            capture_output=True,
-        ).returncode == 0
+        _existing_wt = project.repo_path / ".clawpm-worktrees" / task_id
+        try:
+            _repo_prefix = repo_prefix(project.repo_path)
+            _head_has_project = head_object_sha(
+                project.repo_path, f"{_repo_prefix}.project"
+            ) is not None
+        except GitProbeError as exc:
+            output_error(
+                "git_probe_failed",
+                f"Could not determine whether {project.repo_path} git-tracks "
+                f".project/ at HEAD: {exc}. Refusing to dispatch --worktree: "
+                f"treating this as 'not tracked' would skip the materialization "
+                f"guards and could register a stale checkout as an isolated "
+                f"worktree. Fix the repository state (or omit --worktree to "
+                f"dispatch in-place) and retry.",
+                fmt=fmt,
+            )
+            sys.exit(1)
         if _head_has_project:
             from clawpm.tasks import _candidate_task_paths
             _rel_candidates = _candidate_task_paths(Path(".project/tasks"), task_id)
-            _materialized = any(
-                subprocess.run(
-                    ["git", "-C", str(project.repo_path), "cat-file", "-e",
-                     f"HEAD:{_repo_prefix}{p.as_posix()}"],
-                    capture_output=True,
-                ).returncode == 0
-                for p in _rel_candidates
+            # Verify the CURRENT revision, not merely that some candidate
+            # path for this id exists in HEAD (Codex review, PR #55).
+            # `tasks start` renames `T.md` -> `T.progress.md` in the working
+            # tree; until that rename is committed, HEAD still carries the
+            # old open-state `T.md`, so a bare any-candidate-exists check
+            # passed and the worktree was created at the STALE revision —
+            # losing the metadata dispatch had just loaded and rendered, and
+            # setting up conflicting transitions when the branch merges.
+            # So: find the path the task actually occupies on disk now (the
+            # same first-match order `get_task` resolves), then require THAT
+            # path to be in HEAD with byte-identical content.
+            _live_candidates = _candidate_task_paths(
+                project.repo_path / ".project" / "tasks", task_id
             )
+            _live_path = next((p for p in _live_candidates if p.exists()), None)
+            try:
+                if _live_path is not None:
+                    _rel_live = _live_path.relative_to(project.repo_path).as_posix()
+                    _head_sha = head_object_sha(
+                        project.repo_path, f"{_repo_prefix}{_rel_live}"
+                    )
+                    _live_sha = working_tree_blob_sha(_live_path)
+                    _materialized = (
+                        _head_sha is not None and _head_sha == _live_sha
+                    )
+                    # Two distinct ways to be stale, and both must be
+                    # reported as staleness rather than as "the task isn't
+                    # committed" — the worktree WOULD get a file, just the
+                    # wrong revision of it, which is the more dangerous
+                    # outcome because nothing downstream trips over it:
+                    #   (a) same path in HEAD, different content — the task
+                    #       was edited in place and not committed;
+                    #   (b) a DIFFERENT candidate path for this id is in
+                    #       HEAD — `tasks start` renamed T.md to
+                    #       T.progress.md and the rename is uncommitted, so
+                    #       HEAD still carries the old open-state file. The
+                    #       Stop hook then finds that stale file happily and
+                    #       the agent works against superseded state.
+                    _stale_revision = not _materialized and (
+                        _head_sha is not None
+                        or any(
+                            head_object_sha(
+                                project.repo_path, f"{_repo_prefix}{p.as_posix()}"
+                            ) is not None
+                            for p in _rel_candidates
+                        )
+                    )
+                else:
+                    # No on-disk copy in the main checkout at all — fall back
+                    # to the any-candidate probe, which is the right question
+                    # when there is no current revision to compare against.
+                    _materialized = any(
+                        head_object_sha(
+                            project.repo_path, f"{_repo_prefix}{p.as_posix()}"
+                        ) is not None
+                        for p in _rel_candidates
+                    )
+                    _stale_revision = False
+            except GitProbeError as exc:
+                output_error(
+                    "git_probe_failed",
+                    f"Could not verify whether task {task_id!r} is materialized "
+                    f"at HEAD in {project.repo_path}: {exc}. Refusing to "
+                    f"dispatch --worktree rather than assuming either answer — "
+                    f"guessing 'materialized' risks a worktree without the "
+                    f"task (hanging its Stop hook), and guessing 'not' would "
+                    f"block a legitimate dispatch. Fix the repository state "
+                    f"and retry.",
+                    fmt=fmt,
+                )
+                sys.exit(1)
             if not _materialized:
                 # If this exact worktree already exists (e.g. dispatched
                 # earlier and reused here), name that explicitly — deleting
                 # it is NOT safe (might hold real in-progress work), so the
                 # operator needs to know a plain retry won't self-heal.
-                _existing_wt = project.repo_path / ".clawpm-worktrees" / task_id
                 _extra = (
                     f" A worktree already exists at {_existing_wt} from an "
                     f"earlier dispatch — remove it manually (git worktree "
@@ -1423,19 +1507,37 @@ def tasks_dispatch(
                     f"stale."
                     if _existing_wt.exists() else ""
                 )
-                output_error(
-                    "task_not_materialized",
-                    f"Task {task_id!r} exists in the current checkout but isn't "
-                    f"committed, and this project git-tracks .project/ — a "
-                    f"worktree checked out from HEAD would be missing this "
-                    f"task's file. Dispatching anyway would either hang the "
-                    f"Stop hook (looking for a task that isn't there) or "
-                    f"silently disable CLAWP-098's worktree isolation for "
-                    f"every task in that checkout. Commit the task file "
-                    f"first, then re-run dispatch — or omit --worktree to "
-                    f"dispatch in-place.{_extra}",
-                    fmt=fmt,
-                )
+                if _stale_revision:
+                    output_error(
+                        "task_not_materialized",
+                        f"Task {task_id!r} is committed at HEAD, but not at "
+                        f"the revision the current checkout holds "
+                        f"({_live_path} is uncommitted — either edited in "
+                        f"place, or renamed by a state transition such as "
+                        f"`tasks start`). A worktree checked out from HEAD "
+                        f"would carry the STALE revision, and — unlike a "
+                        f"missing task file — nothing downstream trips over "
+                        f"it: the Stop hook resolves the old file happily "
+                        f"and the agent works against superseded state, "
+                        f"which then conflicts when the branch merges. "
+                        f"Commit the task file first, then re-run dispatch — "
+                        f"or omit --worktree to dispatch in-place.{_extra}",
+                        fmt=fmt,
+                    )
+                else:
+                    output_error(
+                        "task_not_materialized",
+                        f"Task {task_id!r} exists in the current checkout but isn't "
+                        f"committed, and this project git-tracks .project/ — a "
+                        f"worktree checked out from HEAD would be missing this "
+                        f"task's file. Dispatching anyway would either hang the "
+                        f"Stop hook (looking for a task that isn't there) or "
+                        f"silently disable CLAWP-098's worktree isolation for "
+                        f"every task in that checkout. Commit the task file "
+                        f"first, then re-run dispatch — or omit --worktree to "
+                        f"dispatch in-place.{_extra}",
+                        fmt=fmt,
+                    )
                 sys.exit(1)
         try:
             resolved_dir = create_worktree(project.repo_path, task_id)
@@ -1575,7 +1677,57 @@ def tasks_dispatch(
         )
         if materialized:
             session_id = str(uuid.uuid4())
-            register_session(config.portfolio_root, session_id, task_id, project_id, resolved_dir)
+            try:
+                register_session(
+                    config.portfolio_root, session_id, task_id, project_id, resolved_dir
+                )
+            except Exception as exc:
+                # Make settings-install + session-registration transactional
+                # (Codex review, PR #55). Appending to sessions.jsonl can fail
+                # for reasons entirely outside this command — the file is
+                # read-only, its lock times out under a concurrent dispatch,
+                # the portfolio volume filled after the dispatch-registry
+                # append. Letting that escape reported failure while leaving
+                # an ACTIVE Stop hook and dispatch-registry entry installed
+                # with no session mapping: the worst of both states, because
+                # an operator who then entered the worktree got ID-based
+                # commands silently falling through to the main checkout —
+                # exactly CLAWP-098's original corruption, re-armed by the
+                # fix's own failure path. Roll the artifacts back so the
+                # dispatch fails clean and a retry starts from nothing.
+                session_id = None
+                teardown_error = None
+                try:
+                    from clawpm.dispatch import teardown_dispatch_settings
+                    teardown_dispatch_settings(
+                        target_dir=resolved_dir,
+                        task_id=task_id,
+                        portfolio_root=config.portfolio_root,
+                        project_id=project_id,
+                    )
+                except Exception as teardown_exc:
+                    # Rollback itself failed — report BOTH, since the operator
+                    # now has artifacts on disk that need manual removal
+                    # (fail-open WITH a marker, CLAWP-039/041 doctrine).
+                    teardown_error = f"{type(teardown_exc).__name__}: {teardown_exc}"
+                output_error(
+                    "session_registration_failed",
+                    f"Dispatch settings were written to {resolved_dir} but "
+                    f"registering its session failed: {type(exc).__name__}: {exc}. "
+                    + (
+                        f"Rolling those settings back ALSO failed "
+                        f"({teardown_error}) — remove "
+                        f"{resolved_dir / '.claude' / 'settings.local.json'} "
+                        f"manually before retrying, or commands run from that "
+                        f"worktree will mutate the main checkout."
+                        if teardown_error
+                        else "The dispatch settings have been rolled back; "
+                             "nothing was left installed. Fix the portfolio "
+                             "state and re-run dispatch."
+                    ),
+                    fmt=fmt,
+                )
+                sys.exit(1)
         else:
             session_id = None
 
