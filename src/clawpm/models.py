@@ -544,6 +544,14 @@ class Task:
     # Opaque string: git short-SHA when the project is a git repo, else a
     # "ts:<ISO8601-UTC>" timestamp. None for legacy tasks (backward-compat).
     baseline_ref: str | None = None
+    # CLAWP-111 — a task can BE a decision instead of a unit of build work.
+    # kind: "build" (default) | "decision". Omitted from frontmatter when at
+    # the default, so every pre-111 task file round-trips byte-for-byte.
+    # resolution/resolved_at are only meaningful for kind=="decision" and are
+    # set when the decision closes (`done --resolution "..."`); None until then.
+    kind: str = "build"
+    resolution: str | None = None
+    resolved_at: str | None = None
     # CLAWP-084 — runtime-only project scope for cross-project views
     # (``tasks list --all-projects``). NOT persisted: never read from
     # frontmatter (from_file omits it) and never written (writes use explicit
@@ -717,6 +725,20 @@ class Task:
             else None
         )
 
+        # CLAWP-111 — kind: absent, non-string, or any value outside the
+        # vocabulary falls back to "build" (backward-compat default).
+        kind_raw = frontmatter.get("kind")
+        kind: str = kind_raw if kind_raw in ("build", "decision") else "build"
+        resolution_raw = frontmatter.get("resolution")
+        resolution: str | None = (
+            resolution_raw if isinstance(resolution_raw, str) and resolution_raw.strip()
+            else None
+        )
+        resolved_at_raw = frontmatter.get("resolved_at")
+        resolved_at: str | None = (
+            str(resolved_at_raw) if resolved_at_raw is not None else None
+        )
+
         return cls(
             id=frontmatter.get("id", path.stem.replace(".progress", "")),
             title=title,
@@ -744,6 +766,9 @@ class Task:
             stop_conditions=stop_conditions,
             delegability=delegability,
             baseline_ref=baseline_ref,
+            kind=kind,
+            resolution=resolution,
+            resolved_at=resolved_at,
         )
 
     @property
@@ -801,6 +826,12 @@ class Task:
             "delegability": self.delegability,
             # CLAWP-055 — baseline ref (opaque; None for legacy tasks)
             "baseline_ref": self.baseline_ref,
+            # CLAWP-111 — decision-kind fields. resolution/resolved_at are None
+            # until a kind=="decision" task closes; included unconditionally so
+            # the schema is stable (mirrors rationale/supersedes above).
+            "kind": self.kind,
+            "resolution": self.resolution,
+            "resolved_at": self.resolved_at,
         }
         # CLAWP-084 — cross-project scope. Emitted ONLY when set (the
         # all-projects view sets it); single-project output stays byte-identical

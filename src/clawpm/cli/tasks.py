@@ -400,6 +400,13 @@ def tasks_archive(ctx: click.Context, project_id: str | None, older_than: str, d
     default=None,
     help="Who may execute this task. 'human' means auto-dispatch is REFUSED.",
 )
+# CLAWP-111 — decision-kind tasks
+@click.option(
+    "--kind", "kind",
+    type=click.Choice(["build", "decision"]),
+    default=None,
+    help="'decision' means this task IS a decision — done requires --resolution.",
+)
 @click.pass_context
 def tasks_edit(
     ctx: click.Context,
@@ -434,6 +441,7 @@ def tasks_edit(
     out_of_scope_file: str | None = None,
     stop_conditions: tuple[str, ...] = (),
     delegability: str | None = None,
+    kind: str | None = None,
 ) -> None:
     """Edit task metadata (title, priority, complexity, body, scope)."""
     fmt = get_format(ctx)
@@ -474,8 +482,8 @@ def tasks_edit(
     ])
 
     if not any([title, priority is not None, complexity, body, scope, scope_file, has_predictions, parallel_group is not None, clear_parallel_group,
-                 out_of_scope, out_of_scope_file, stop_conditions, delegability is not None, tags, clear_tags]):
-        output_error("no_changes", "Specify at least one field to edit (--title, --priority, --complexity, --body, --scope, --scope-file, --parallel-group, --clear-parallel-group, --tag, --clear-tags, --predict-*, --out-of-scope, --out-of-scope-file, --stop-condition, or --delegability)", fmt=fmt)
+                 out_of_scope, out_of_scope_file, stop_conditions, delegability is not None, tags, clear_tags, kind is not None]):
+        output_error("no_changes", "Specify at least one field to edit (--title, --priority, --complexity, --body, --scope, --scope-file, --parallel-group, --clear-parallel-group, --tag, --clear-tags, --predict-*, --out-of-scope, --out-of-scope-file, --stop-condition, --delegability, or --kind)", fmt=fmt)
         sys.exit(1)
 
     if parallel_group is not None and clear_parallel_group:
@@ -534,6 +542,7 @@ def tasks_edit(
             out_of_scope=list(out_of_scope) if out_of_scope else None,
             stop_conditions=list(stop_conditions) if stop_conditions else None,
             delegability=delegability,
+            kind=kind,
         )
 
     if not task:
@@ -630,8 +639,12 @@ def _render_state_results(
               help="Required when state=rejected: one-line reason this idea was considered and rejected.")
 @click.option("--supersedes", "supersedes", default=None,
               help="Optional task-id that supersedes this rejected task (e.g. a replacement task).")
+# CLAWP-111 — decision-kind tasks: resolution is required when new_state is
+# 'done' on a kind: decision task.
+@click.option("--resolution", "resolution", default=None,
+              help="Required to complete (done) a kind: decision task: the decision's outcome.")
 @click.pass_context
-def tasks_state(ctx: click.Context, project_id: str | None, task_ids: tuple[str, ...], new_state: str, note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...], rationale: str | None, supersedes: str | None) -> None:
+def tasks_state(ctx: click.Context, project_id: str | None, task_ids: tuple[str, ...], new_state: str, note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...], rationale: str | None, supersedes: str | None, resolution: str | None) -> None:
     """Change one or many tasks' state (CLAWP-083 bulk mode).
 
     ``clawpm tasks state 72 73 74 done`` transitions each listed task with
@@ -697,6 +710,7 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_ids: tuple[str,
                 reflect_note=reflect_note, meta_reflect=meta_reflect,
                 process_lesson=process_lesson, surprise_tags=surprise_tags,
                 rationale=rationale, supersedes=supersedes,
+                resolution=resolution,
             )
         )
 
@@ -872,6 +886,13 @@ def tasks_decompose(
     default=None,
     help="Who may execute this task. 'human' means auto-dispatch is REFUSED. Default: either.",
 )
+# CLAWP-111 — decision-kind tasks
+@click.option(
+    "--kind", "kind",
+    type=click.Choice(["build", "decision"]),
+    default=None,
+    help="'decision' means this task IS a decision — done requires --resolution. Default: build.",
+)
 @click.pass_context
 def tasks_add(
     ctx: click.Context,
@@ -911,6 +932,7 @@ def tasks_add(
     out_of_scope_file: str | None = None,
     stop_conditions: tuple[str, ...] = (),
     delegability: str | None = None,
+    kind: str | None = None,
 ) -> None:
     """Add a new task (or subtask with --parent)."""
     fmt = get_format(ctx)
@@ -1020,6 +1042,7 @@ def tasks_add(
                 stop_conditions=list(stop_conditions) if stop_conditions else None,
                 delegability=delegability,
                 tags=tags_list,
+                kind=kind,
             )
         else:
             deps = list(depends) if depends else None
@@ -1040,6 +1063,7 @@ def tasks_add(
                 out_of_scope=list(out_of_scope) if out_of_scope else None,
                 stop_conditions=list(stop_conditions) if stop_conditions else None,
                 delegability=delegability,
+                kind=kind,
             )
 
     if not task:
