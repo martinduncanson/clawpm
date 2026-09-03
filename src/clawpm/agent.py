@@ -288,13 +288,15 @@ def dispatch_agent(
     # crashes and leaves the subtask OPEN with no dispatch artifacts —
     # retries create duplicates.
     try:
+        # `.path`, not the whole tuple: write_dispatch_settings also returns
+        # the bytes it wrote, which only dispatch's rollback needs.
         settings_path = write_dispatch_settings(
             target_dir=target_dir,
             task_id=subtask_id,
             project_id=project_id,
             rubric_markdown=rubric_markdown,
             portfolio_root=config.portfolio_root,
-        )
+        ).path
     except (FileExistsError, ValueError, OSError) as exc:
         error_detail = str(exc)
         try:
@@ -309,6 +311,22 @@ def dispatch_agent(
         raise AgentDispatchError(
             f"write_dispatch_settings failed: {error_detail}"
         ) from exc
+
+    # CLAWP-098 scope note (Codex review, PR #55): this command deliberately
+    # does NOT register a session for its worktree, unlike `tasks dispatch
+    # --worktree`. Step 1 (add_task) writes the new subtask into the CALLER's
+    # checkout — uncommitted — and step 2 (create_worktree) checks out
+    # committed HEAD, so the new subtask file never actually lands in
+    # target_dir. Registering a session anyway would redirect the worktree's
+    # own Stop-hook (`eval-stop`, wired below) to look up the task inside
+    # target_dir's .project/tasks/, find nothing, and block termination
+    # forever ("task not found") — the hook worked before this PR only
+    # because unregistered lookups fell through to the portfolio registry
+    # (the main checkout, where the task genuinely lives). Fixing this
+    # properly needs the new subtask file materialized into the worktree
+    # (copy, not commit) before registering — left as follow-up work; this
+    # command still gets CLAWP-098's other guarantee (normal single-checkout
+    # `tasks state/done/block` runs are unaffected either way).
 
     # 4. Invoke the subagent. Tests pass `judge_invoker`; the CLI passes
     # `judge_cmd_override` or falls through to CLAWPM_JUDGE_CMD /

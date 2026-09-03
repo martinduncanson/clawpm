@@ -575,3 +575,77 @@ class TestCorruptionResilience:
         grant_lease(root, "GOOD", "test", ttl_seconds=60, fallback_policy=FallbackPolicy.FAIL)
         assert get_lease(root, "BAD", "test") is None      # malformed → skipped
         assert get_lease(root, "GOOD", "test") is not None  # replay didn't abort
+
+
+# ---------------------------------------------------------------------------
+# CLAWP-098 (Codex round-3 P1, PR #55): apply_fallback must resolve the
+# EXPIRED task's own canonical location, never the caller's unrelated
+# session-registered worktree.
+# ---------------------------------------------------------------------------
+
+
+class TestApplyFallbackIgnoresCallerSession:
+    def test_sweep_does_not_redirect_an_unrelated_tasks_fallback_into_the_callers_worktree(
+        self, portfolio, tmp_path, monkeypatch
+    ):
+        """The opportunistic lease sweep (run by `tasks dispatch`/`doctor`)
+        processes whichever task's lease expired -- a task the operator did
+        NOT explicitly name in the command that triggered the sweep. Run
+        with cwd inside an unrelated dispatched worktree A (a session
+        registered for task A), an expired lease on a completely different
+        task B must still resolve and transition against B's OWN canonical
+        location, never silently fork into A's checkout just because cwd
+        happens to be there and both share a project_id."""
+        from clawpm.sessions import register_session
+
+        config = portfolio["config"]
+        root = portfolio["root"]
+
+        task_a = add_task(config, "test", title="A",
+                           predictions=Predictions(success_criteria=["c"]))
+        task_b_id = _dispatched_task(config, in_state=TaskState.PROGRESS)
+
+        # Simulate a worktree dispatched for task A that also happens to
+        # carry a (stale) copy of task B -- a real `git worktree add`
+        # checkout snapshots the whole tree, not just the dispatched task
+        # (see test_bulk_state_from_worktree_only_touches_worktree_copies
+        # in test_dispatch.py for the real-worktree version of this shape).
+        fake_wt = tmp_path / "wt-A"
+        wt_tasks_dir = fake_wt / ".project" / "tasks"
+        wt_tasks_dir.mkdir(parents=True)
+        (wt_tasks_dir / f"{task_b_id}.progress.md").write_text(
+            "stale worktree copy — must never be touched by the sweep",
+            encoding="utf-8",
+        )
+        register_session(root, "sess-a", task_a.id, "test", fake_wt)
+
+        grant_lease(root, task_b_id, "test", ttl_seconds=1,
+                    fallback_policy=FallbackPolicy.REQUEUE)
+        expired_now = datetime.now(timezone.utc) + timedelta(seconds=10)
+
+        # Run the sweep with cwd inside A's registered worktree.
+        monkeypatch.chdir(fake_wt)
+        results = sweep(config, root, now=expired_now, project_id="test")
+
+        assert len(results) == 1
+        assert results[0]["task_id"] == task_b_id
+        assert results[0]["transitioned"] is True
+
+        # Verify from OUTSIDE any registered worktree -- cwd is still
+        # fake_wt at this point (monkeypatch only undoes at test teardown),
+        # and get_task's own cwd-based session resolution would otherwise
+        # read the STALE fake_wt copy back (exactly the bug this test
+        # guards against, now manifesting in the assertion itself instead
+        # of in apply_fallback -- which is what proves apply_fallback's
+        # OWN suppression worked: it read/wrote B's real location while
+        # cwd was in fake_wt, this plain get_task call would not).
+        monkeypatch.chdir(tmp_path)
+        b_task = get_task(config, "test", task_b_id)
+        assert b_task is not None
+        assert b_task.state == TaskState.OPEN
+
+        # A's fake worktree's stale copy of B was NEVER touched.
+        assert (wt_tasks_dir / f"{task_b_id}.progress.md").read_text(
+            encoding="utf-8"
+        ) == "stale worktree copy — must never be touched by the sweep"
+        assert not (wt_tasks_dir / f"{task_b_id}.md").exists()

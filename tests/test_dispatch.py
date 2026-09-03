@@ -281,10 +281,14 @@ class TestConfirmCloseAutoGate:
 
 class TestWriteReadTeardown:
     def test_write_creates_file(self, tmp_path):
-        path = write_dispatch_settings(tmp_path, "TEST-001", "test")
-        assert path.exists()
-        data = json.loads(path.read_text(encoding="utf-8"))
+        written = write_dispatch_settings(tmp_path, "TEST-001", "test")
+        assert written.path.exists()
+        data = json.loads(written.path.read_text(encoding="utf-8"))
         assert data[CLAWPM_MARKER_KEY]["task_id"] == "TEST-001"
+        # The returned bytes are what is actually on disk — that equality is
+        # the whole point of returning them (Codex P2, PR #55 round 10).
+        assert written.settings_bytes == written.path.read_bytes()
+        assert written.sidecar_bytes is None  # no rubric rendered
 
     def test_read_marker_returns_block(self, tmp_path):
         write_dispatch_settings(tmp_path, "TEST-001", "test")
@@ -497,8 +501,534 @@ class TestCLITeardown:
 
 
 # ---------------------------------------------------------------------------
-# Auto-teardown on done
+# CLAWP-098: worktree-dispatched ID-mutator commands must resolve against
+# the worktree's OWN task tree, never the portfolio registry's canonical
+# (main-checkout) location — regardless of cwd, that registry lookup used
+# to be the only resolution path.
 # ---------------------------------------------------------------------------
+
+
+class TestWorktreeSessionScopedMutation:
+    def test_state_mutator_from_worktree_cwd_does_not_corrupt_main_checkout(
+        self, temp_portfolio_with_repo, monkeypatch
+    ):
+        """Regression for CLAWP-098.
+
+        Before the fix: ``get_project_dir`` resolved a project id purely via
+        the portfolio registry scan (100% cwd-independent), so running
+        ``tasks state <id> done`` with cwd inside a dispatched --worktree
+        checkout moved the MAIN checkout's task file to its ``done/`` dir
+        and left the worktree's own (git-tracked) copy of that same file
+        completely untouched — silent cross-checkout corruption.
+
+        After the fix: an active session registered at dispatch time (see
+        ``sessions.register_session`` / ``discovery.get_project_dir``) is
+        checked before the registry scan, so the SAME command mutates the
+        worktree's own task file and leaves the main checkout's copy alone.
+
+        The worktree needs its own copy of ``.project/tasks/<id>.md`` to
+        mutate in the first place -- exactly like clawpm's own dogfooded
+        repo (``.project/`` is git-tracked here, see this repo's
+        CLAUDE.md), which is the actual scenario CLAWP-098 was filed
+        against. So this test commits the freshly-added task file into the
+        fixture repo before dispatching, giving the worktree its own
+        checked-out copy via ``git worktree add``.
+        """
+        config = temp_portfolio_with_repo["config"]
+        repo_dir = temp_portfolio_with_repo["repo_dir"]
+        main_tasks_dir = temp_portfolio_with_repo["tasks_dir"]
+
+        task = add_task(
+            config, "test", title="WT-mutate",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+        main_open_path = main_tasks_dir / f"{task.id}.md"
+        assert main_open_path.exists()
+
+        # Commit .project/ (including the new task file) so the worktree
+        # this test dispatches next actually carries its own copy.
+        subprocess.run(["git", "-C", str(repo_dir), "add", ".project"], check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=a@b", "-c", "user.name=a",
+             "-C", str(repo_dir), "commit", "-q", "-m", "seed .project"],
+            check=True,
+        )
+
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code == 0, r.output
+        payload = json.loads(r.output)["data"]
+        assert payload["session_id"], "dispatch --worktree must register a session_id"
+        wt_path = Path(payload["target_dir"])
+        wt_open_path = wt_path / ".project" / "tasks" / f"{task.id}.md"
+        assert wt_open_path.exists(), (
+            "worktree checkout should carry its own copy of the task file "
+            "(committed into the fixture repo above)"
+        )
+
+        # Run the mutator FROM INSIDE the worktree — the exact scenario a
+        # dispatched subagent (or an operator cd'd into a worktree) hits.
+        monkeypatch.chdir(wt_path)
+        r2 = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "state", task.id, "done"]
+        )
+        assert r2.exit_code == 0, r2.output
+
+        # The worktree's OWN task file moved to ITS OWN done/.
+        assert not wt_open_path.exists()
+        assert (wt_path / ".project" / "tasks" / "done" / f"{task.id}.md").exists()
+
+        # The MAIN checkout's task file must be untouched — still open,
+        # never moved. This is the corruption CLAWP-098 fixes.
+        assert main_open_path.exists(), (
+            "main checkout's task file was corrupted by a mutator run from "
+            "inside the dispatched worktree"
+        )
+        assert not (main_tasks_dir / "done" / f"{task.id}.md").exists()
+
+    def test_state_mutator_outside_any_worktree_still_uses_registry(
+        self, temp_portfolio_with_repo
+    ):
+        """Sanity check: normal single-checkout usage (cwd matches no active
+        session) is completely unaffected by the session-scoped lookup —
+        the registry-lookup fallback still resolves and mutates the main
+        checkout's own task file exactly as before CLAWP-098."""
+        config = temp_portfolio_with_repo["config"]
+        main_tasks_dir = temp_portfolio_with_repo["tasks_dir"]
+        task = add_task(
+            config, "test", title="No worktree",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "state", task.id, "done"]
+        )
+        assert r.exit_code == 0, r.output
+        assert (main_tasks_dir / "done" / f"{task.id}.md").exists()
+
+    def test_teardown_does_not_release_the_session_while_worktree_still_exists(
+        self, temp_portfolio_with_repo, monkeypatch
+    ):
+        """CLAWP-098 review (Codex, PR #55): tearing down ONE dispatch's
+        settings.local.json must NOT retire its session while the worktree
+        directory itself is still there -- dispatch-settings teardown and
+        worktree lifetime are different things. (An earlier version of this
+        fix released on teardown; see test_bulk_state_from_worktree_only_
+        touches_worktree_copies below for the exact regression that caused.)
+        Session liveness now tracks worktree_path.is_dir() instead -- see
+        test_active_sessions_excludes_removed_worktree in test_sessions.py
+        for that half of the contract."""
+        from clawpm.sessions import active_sessions
+
+        config = temp_portfolio_with_repo["config"]
+        repo_dir = temp_portfolio_with_repo["repo_dir"]
+        portfolio_root = temp_portfolio_with_repo["root"]
+        task = add_task(
+            config, "test", title="WT-teardown",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+        subprocess.run(["git", "-C", str(repo_dir), "add", ".project"], check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=a@b", "-c", "user.name=a",
+             "-C", str(repo_dir), "commit", "-q", "-m", "seed .project"],
+            check=True,
+        )
+
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code == 0, r.output
+        wt_path = Path(json.loads(r.output)["data"]["target_dir"])
+        assert len(active_sessions(portfolio_root)) == 1
+
+        monkeypatch.chdir(wt_path)
+        r2 = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "state", task.id, "done"]
+        )
+        assert r2.exit_code == 0, r2.output
+
+        # Settings are torn down (auto-teardown on done)...
+        from clawpm.dispatch import settings_path
+        assert not settings_path(wt_path).exists()
+        # ...but the session stays active, because wt_path still exists.
+        assert len(active_sessions(portfolio_root)) == 1
+
+    def test_bulk_state_from_worktree_only_touches_worktree_copies(
+        self, temp_portfolio_with_repo, monkeypatch
+    ):
+        """Regression for the Codex P1 finding on PR #55's first pass: a
+        bulk `tasks state A B done` run with cwd inside A's dispatched
+        worktree must resolve BOTH A and B against that worktree's own
+        .project/tasks/ for the ENTIRE invocation -- even though A's own
+        dispatch (and its settings.local.json) gets torn down mid-loop by
+        the auto-teardown that fires the moment A transitions to done. If
+        that teardown also released A's session (the earlier, buggy
+        design), B -- processed next in the same command, same cwd -- would
+        find no active session and silently fall through to the portfolio
+        registry, corrupting the MAIN checkout instead of the worktree's
+        own copy of B."""
+        config = temp_portfolio_with_repo["config"]
+        repo_dir = temp_portfolio_with_repo["repo_dir"]
+        main_tasks_dir = temp_portfolio_with_repo["tasks_dir"]
+
+        task_a = add_task(
+            config, "test", title="Bulk A",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+        task_b = add_task(
+            config, "test", title="Bulk B",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+        main_a_open = main_tasks_dir / f"{task_a.id}.md"
+        main_b_open = main_tasks_dir / f"{task_b.id}.md"
+        assert main_a_open.exists() and main_b_open.exists()
+
+        # Commit BOTH tasks so A's worktree checkout carries its own copy of
+        # B too -- a worktree is a full checkout of the commit, not just the
+        # one task it was dispatched for.
+        subprocess.run(["git", "-C", str(repo_dir), "add", ".project"], check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=a@b", "-c", "user.name=a",
+             "-C", str(repo_dir), "commit", "-q", "-m", "seed .project"],
+            check=True,
+        )
+
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task_a.id, "--worktree"]
+        )
+        assert r.exit_code == 0, r.output
+        wt_path = Path(json.loads(r.output)["data"]["target_dir"])
+        wt_tasks_dir = wt_path / ".project" / "tasks"
+        assert (wt_tasks_dir / f"{task_a.id}.md").exists()
+        assert (wt_tasks_dir / f"{task_b.id}.md").exists()
+
+        monkeypatch.chdir(wt_path)
+        r2 = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "state", task_a.id, task_b.id, "done"]
+        )
+        assert r2.exit_code == 0, r2.output
+
+        # Both moved to the WORKTREE's own done/.
+        assert (wt_tasks_dir / "done" / f"{task_a.id}.md").exists()
+        assert (wt_tasks_dir / "done" / f"{task_b.id}.md").exists()
+        assert not (wt_tasks_dir / f"{task_a.id}.md").exists()
+        assert not (wt_tasks_dir / f"{task_b.id}.md").exists()
+
+        # Neither main-checkout copy was touched -- this is the corruption
+        # the bug (and the earlier buggy release-on-teardown fix) produced.
+        assert main_a_open.exists()
+        assert main_b_open.exists()
+        assert not (main_tasks_dir / "done" / f"{task_a.id}.md").exists()
+        assert not (main_tasks_dir / "done" / f"{task_b.id}.md").exists()
+
+    def test_failed_dispatch_settings_write_does_not_register_a_session(
+        self, temp_portfolio_with_repo
+    ):
+        """CLAWP-098 review finding: session registration happens AFTER
+        write_dispatch_settings succeeds, not right after the worktree is
+        created — so a dispatch that fails to write its settings.local.json
+        (e.g. re-dispatching over a corrupted one without --force) never
+        leaves an orphaned session for a dispatch that didn't actually
+        happen. Without this ordering, a failed retry would silently double
+        the active-session count for one worktree."""
+        from clawpm.dispatch import settings_path
+        from clawpm.sessions import active_sessions
+
+        config = temp_portfolio_with_repo["config"]
+        repo_dir = temp_portfolio_with_repo["repo_dir"]
+        portfolio_root = temp_portfolio_with_repo["root"]
+        task = add_task(
+            config, "test", title="WT-fail",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+        # Commit .project/ (incl. this task) so the worktree carries its own
+        # copy -- materialization is required before a session registers.
+        subprocess.run(["git", "-C", str(repo_dir), "add", ".project"], check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=a@b", "-c", "user.name=a",
+             "-C", str(repo_dir), "commit", "-q", "-m", "seed .project"],
+            check=True,
+        )
+
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code == 0, r.output
+        wt_path = Path(json.loads(r.output)["data"]["target_dir"])
+        assert len(active_sessions(portfolio_root)) == 1
+
+        # Corrupt the settings file so a re-dispatch (worktree reused --
+        # create_worktree is idempotent) hits write_dispatch_settings's
+        # not-valid-JSON guard and raises FileExistsError before this CLI
+        # command would register a second session.
+        settings_path(wt_path).write_text("not json", encoding="utf-8")
+
+        r2 = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r2.exit_code != 0
+
+        # Still exactly the ORIGINAL session -- no orphan from the failed retry.
+        assert len(active_sessions(portfolio_root)) == 1
+
+    def test_worktree_dispatch_with_uncommitted_task_is_blocked_not_silently_degraded(
+        self, temp_portfolio_with_repo
+    ):
+        """Regression for Codex P1 (round 2) + grok HIGH (round 3): if a
+        task is `tasks add`-ed but never committed, create_worktree checks
+        out a HEAD whose .project/ exists (git-tracked) but does NOT contain
+        the new task's file.
+
+        An earlier version of this fix silently skipped session
+        registration in this case (falling back to pre-CLAWP-098
+        resolution) -- but grok correctly flagged that as its own footgun:
+        isolation is per-WORKTREE, not per-task, so skipping registration
+        entirely also silently un-isolates any OTHER, already-committed
+        sibling task that DOES live in that same checkout, with no warning
+        that isolation is off. Since the project has opted into this
+        protection by git-tracking .project/ at all, `tasks dispatch
+        --worktree` now REFUSES the dispatch outright with a clear,
+        actionable error -- before writing anything (no worktree settings,
+        no dispatch registry entry, no session) -- rather than silently
+        degrading. Committing the task first, or omitting --worktree,
+        unblocks it."""
+        config = temp_portfolio_with_repo["config"]
+        repo_dir = temp_portfolio_with_repo["repo_dir"]
+
+        # Commit the .project/ SCAFFOLDING (settings.toml + an empty tasks
+        # dir) WITHOUT any task yet -- a project that git-tracks .project/
+        # but hasn't committed THIS in-flight task, the realistic case both
+        # findings describe (tasks add then dispatch without an intervening
+        # commit).
+        (repo_dir / ".project" / "tasks" / ".gitkeep").write_text("", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo_dir), "add", ".project"], check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=a@b", "-c", "user.name=a",
+             "-C", str(repo_dir), "commit", "-q", "-m", "seed .project scaffolding"],
+            check=True,
+        )
+
+        task = add_task(
+            config, "test", title="Uncommitted",
+            predictions=Predictions(success_criteria=["C1"]),
+        )  # deliberately NOT committed
+
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code != 0
+        assert "task_not_materialized" in r.output
+        # Nothing was written -- not the settings file, not even the
+        # worktree DIRECTORY itself (grok round-4: materialization is now
+        # probed via git's tree BEFORE create_worktree runs at all, so
+        # there is nothing to clean up on this path).
+        wt_dir = repo_dir / ".clawpm-worktrees" / task.id
+        assert not wt_dir.exists()
+        assert not settings_path(wt_dir).exists()
+
+    def test_worktree_dispatch_retry_after_commit_succeeds_with_a_fresh_worktree(
+        self, temp_portfolio_with_repo
+    ):
+        """The documented recovery from `task_not_materialized` (commit the
+        task, then re-run dispatch) must actually work. Regression for the
+        bug both Codex and grok independently caught in an earlier version
+        of this fix: create_worktree is idempotent by directory existence,
+        not freshness, so a create-then-check design would have the retry
+        reuse the SAME stale, still-missing-the-task checkout forever.
+        Probing via git's tree before create_worktree ever runs (instead of
+        after) means nothing exists yet to go stale — the retry's
+        create_worktree call creates a brand-new worktree from the new
+        HEAD."""
+        config = temp_portfolio_with_repo["config"]
+        repo_dir = temp_portfolio_with_repo["repo_dir"]
+
+        (repo_dir / ".project" / "tasks" / ".gitkeep").write_text("", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo_dir), "add", ".project"], check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=a@b", "-c", "user.name=a",
+             "-C", str(repo_dir), "commit", "-q", "-m", "seed .project scaffolding"],
+            check=True,
+        )
+
+        task = add_task(
+            config, "test", title="Retry-after-commit",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+
+        r1 = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r1.exit_code != 0
+
+        # Now commit the task and retry -- this is the documented recovery.
+        subprocess.run(["git", "-C", str(repo_dir), "add", ".project"], check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=a@b", "-c", "user.name=a",
+             "-C", str(repo_dir), "commit", "-q", "-m", "commit the task"],
+            check=True,
+        )
+
+        r2 = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r2.exit_code == 0, r2.output
+        payload = json.loads(r2.output)["data"]
+        assert payload["session_id"], "the retry must succeed and register a session"
+        wt_path = Path(payload["target_dir"])
+        assert (wt_path / ".project" / "tasks" / f"{task.id}.md").exists()
+
+    def test_worktree_dispatch_rejects_a_reused_stale_worktree(
+        self, temp_portfolio_with_repo
+    ):
+        """Regression independently caught by BOTH grok-4.6 and Codex on
+        the same commit (PR #55, round 5): the HEAD probe (does git's tree
+        have the task) proves the task is COMMITTED, but create_worktree is
+        idempotent by DIRECTORY EXISTENCE -- if a worktree already exists
+        at the exact path create_worktree would use (e.g. a leftover from
+        an earlier manual `git worktree add`, predating the task's commit),
+        it gets REUSED AS-IS, never refreshed. The HEAD probe alone would
+        pass while the reused checkout on disk still doesn't have the task
+        -- exactly the "dispatch succeeds, isolation silently off" failure
+        this whole gate exists to prevent. The fix re-verifies against the
+        actual worktree filesystem AFTER create_worktree runs too, and
+        aborts (does not silently skip registration) on a mismatch."""
+        config = temp_portfolio_with_repo["config"]
+        repo_dir = temp_portfolio_with_repo["repo_dir"]
+
+        (repo_dir / ".project" / "tasks" / ".gitkeep").write_text("", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo_dir), "add", ".project"], check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=a@b", "-c", "user.name=a",
+             "-C", str(repo_dir), "commit", "-q", "-m", "seed .project scaffolding"],
+            check=True,
+        )
+
+        task = add_task(
+            config, "test", title="Stale-worktree-reuse",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+
+        # Simulate a stale, PRE-EXISTING worktree at the exact path
+        # create_worktree would use for this task, created (as clawpm's own
+        # create_worktree would) BEFORE the task gets committed below --
+        # its checkout predates the commit and genuinely lacks the task.
+        stale_wt = repo_dir / ".clawpm-worktrees" / task.id
+        stale_wt.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "worktree", "add", "-b",
+             f"clawpm/{task.id}", str(stale_wt)],
+            check=True,
+        )
+        assert not (stale_wt / ".project" / "tasks" / f"{task.id}.md").exists()
+
+        # NOW commit the task -- HEAD has it, but the stale worktree above
+        # was already checked out before this commit and won't see it.
+        subprocess.run(["git", "-C", str(repo_dir), "add", ".project"], check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=a@b", "-c", "user.name=a",
+             "-C", str(repo_dir), "commit", "-q", "-m", "commit the task"],
+            check=True,
+        )
+
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code != 0, (
+            "reusing a stale worktree that predates the task's commit must "
+            "be rejected, not silently dispatched with isolation off"
+        )
+        assert "task_not_materialized" in r.output
+        assert not settings_path(stale_wt).exists()
+
+    def test_worktree_dispatch_materialization_check_handles_monorepo_subdirectory(
+        self, tmp_path, monkeypatch
+    ):
+        """A mono-repo-subdirectory project must never dispatch --worktree
+        with isolation silently off.
+
+        antigravity review, PR #55, established the original hazard: `git
+        cat-file -e HEAD:<path>` resolves <path> relative to the REPO ROOT,
+        not `-C`'s directory, so an unprefixed probe always concluded
+        ".project isn't tracked" and never blocked an uncommitted task.
+
+        Codex P1, PR #55 round 9, established that prefixing the probes is
+        not enough to make the layout work: `git worktree add` checks out the
+        repo root, so the session is registered against a directory whose
+        `.project/` is one level down and session-scoped resolution never
+        finds it. `--worktree` now refuses this layout outright, which
+        satisfies the original requirement by an earlier and more accurate
+        route -- the dispatch is rejected before anything is created, rather
+        than after the materialization check. The assertion that matters is
+        unchanged: it must not be let through."""
+        repo_root = tmp_path / "monorepo"
+        repo_root.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo_root)], check=True)
+        (repo_root / "README.md").write_text("root", encoding="utf-8")
+        subprocess.run(
+            ["git", "-c", "user.email=a@b", "-c", "user.name=a",
+             "-C", str(repo_root), "add", "README.md"], check=True,
+        )
+        subprocess.run(
+            ["git", "-c", "user.email=a@b", "-c", "user.name=a",
+             "-C", str(repo_root), "commit", "-q", "-m", "init"], check=True,
+        )
+
+        # The project lives in a SUBDIRECTORY of repo_root -- repo_path is
+        # NOT the git root.
+        project_dir = repo_root / "myproject"
+        project_meta = project_dir / ".project"
+        project_meta.mkdir(parents=True)
+        (project_meta / "settings.toml").write_text(
+            'id = "mono"\nname = "Mono"\nstatus = "active"\npriority = 3\n'
+            f'repo_path = "{project_dir.as_posix()}"\n',
+            encoding="utf-8",
+        )
+        tasks_dir = project_meta / "tasks"
+        tasks_dir.mkdir()
+        (tasks_dir / "done").mkdir()
+        (tasks_dir / "blocked").mkdir()
+
+        portfolio_root = tmp_path / "portfolio"
+        portfolio_root.mkdir()
+        (portfolio_root / "portfolio.toml").write_text(
+            f'portfolio_root = "{portfolio_root.as_posix()}"\n'
+            f'project_roots = ["{repo_root.as_posix()}"]\n'
+            '[defaults]\nstatus = "active"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CLAWPM_PORTFOLIO", str(portfolio_root))
+        config = load_portfolio_config(portfolio_root)
+
+        # Commit the .project/ SCAFFOLDING FIRST (before any task exists on
+        # disk to accidentally sweep in) so the subdirectory-relative "is
+        # .project tracked at all" probe has something real to find -- at
+        # the WRONG (unprefixed) path this would report false, silently
+        # skipping the whole check.
+        (tasks_dir / ".gitkeep").write_text("", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo_root), "add", "myproject/.project"],
+                        check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=a@b", "-c", "user.name=a",
+             "-C", str(repo_root), "commit", "-q", "-m", "seed .project scaffolding"],
+            check=True,
+        )
+
+        task = add_task(
+            config, "mono", title="Monorepo task",
+            predictions=Predictions(success_criteria=["C1"]),
+        )  # deliberately NOT committed
+
+        r = CliRunner().invoke(
+            main, ["-p", "mono", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code != 0, (
+            "an uncommitted task in a mono-repo subdirectory project must "
+            "still be blocked, not silently let through"
+        )
+        assert "monorepo_worktree_unsupported" in r.output
+        # Rejected before create_worktree, so a retry is not fighting a
+        # leftover checkout.
+        assert not (project_dir / ".clawpm-worktrees").exists()
 
 
 class TestSessionStartSidecar:
@@ -827,3 +1357,215 @@ class TestAutoTeardownOnDone:
             t["task_id"] == task.id for t in payload["dispatch_teardowns"]
         )
         assert not settings_path(repo_dir).exists()
+
+
+# ---------------------------------------------------------------------------
+# CLAWP-098 round-6 review (Codex, PR #55): end-to-end dispatch-gate coverage
+# ---------------------------------------------------------------------------
+
+
+def _commit_project(repo_dir: Path, message: str = "seed .project") -> None:
+    subprocess.run(["git", "-C", str(repo_dir), "add", ".project"], check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=a@b", "-c", "user.name=a",
+         "-C", str(repo_dir), "commit", "-q", "-m", message],
+        check=True,
+    )
+
+
+class TestDispatchRollsBackOnSessionRegistrationFailure:
+    """A failed sessions.jsonl append must not leave dispatch artifacts installed.
+
+    Before the fix the exception escaped after write_dispatch_settings had
+    already installed the managed settings and sidecar: the command reported
+    failure while leaving an ACTIVE Stop hook and dispatch-registry entry
+    with no session mapping, so an operator entering that worktree got
+    ID-based commands falling straight through to the main checkout — the
+    original CLAWP-098 corruption, re-armed by this feature's own failure
+    path.
+    """
+
+    def test_settings_are_removed_when_register_session_raises(
+        self, temp_portfolio_with_repo, monkeypatch
+    ):
+        config = temp_portfolio_with_repo["config"]
+        repo_dir = temp_portfolio_with_repo["repo_dir"]
+        task = add_task(config, "test", title="RollbackMe",
+                        predictions=Predictions(success_criteria=["C1"]))
+        _commit_project(repo_dir)
+
+        def _boom(*args, **kwargs):
+            raise OSError("simulated sessions.jsonl append failure")
+
+        monkeypatch.setattr("clawpm.sessions.register_session", _boom)
+
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code == 1, r.output
+        assert "session_registration_failed" in r.output
+
+        wt_path = repo_dir / ".clawpm-worktrees" / task.id
+        assert not settings_path(wt_path).exists(), (
+            "dispatch settings must be rolled back when session registration "
+            "fails — leaving them installed re-arms CLAWP-098's corruption"
+        )
+
+
+class TestDispatchGateFailsClosedOnProbeError:
+    def test_non_git_repo_path_aborts_rather_than_skipping_the_guards(
+        self, temp_portfolio_with_repo, monkeypatch, tmp_path
+    ):
+        """An operational git failure must abort, not read as 'untracked'.
+
+        The old `git cat-file -e` probe folded every nonzero exit into
+        "`.project` isn't tracked at HEAD", which skipped both
+        materialization guards entirely.
+        """
+        config = temp_portfolio_with_repo["config"]
+        task = add_task(config, "test", title="ProbeFail",
+                        predictions=Predictions(success_criteria=["C1"]))
+
+        from clawpm.dispatch import GitProbeError
+
+        def _boom(*args, **kwargs):
+            raise GitProbeError("simulated object-store failure")
+
+        monkeypatch.setattr("clawpm.dispatch.repo_prefix", _boom)
+
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code == 1, r.output
+        assert "git_probe_failed" in r.output
+
+
+class TestDispatchGateRejectsStaleRevision:
+    def test_uncommitted_progress_rename_is_refused(
+        self, temp_portfolio_with_repo
+    ):
+        """`tasks start` renames T.md -> T.progress.md. Until that is
+        committed, HEAD carries the stale open-state file, and dispatching
+        --worktree would check out that stale revision."""
+        config = temp_portfolio_with_repo["config"]
+        repo_dir = temp_portfolio_with_repo["repo_dir"]
+        task = add_task(config, "test", title="StaleRev",
+                        predictions=Predictions(success_criteria=["C1"]))
+        _commit_project(repo_dir)
+
+        # Move it to progress — an uncommitted rename in the main checkout.
+        change_task_state(config, "test", task.id, TaskState.PROGRESS)
+
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code == 1, r.output
+        assert "task_not_materialized" in r.output
+        assert "STALE" in r.output or "stale" in r.output
+
+    def test_committed_progress_rename_dispatches_cleanly(
+        self, temp_portfolio_with_repo
+    ):
+        """The same task, once committed, must still dispatch — the gate
+        must reject staleness, not every progress-state task."""
+        config = temp_portfolio_with_repo["config"]
+        repo_dir = temp_portfolio_with_repo["repo_dir"]
+        task = add_task(config, "test", title="FreshRev",
+                        predictions=Predictions(success_criteria=["C1"]))
+        change_task_state(config, "test", task.id, TaskState.PROGRESS)
+        _commit_project(repo_dir)
+
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code == 0, r.output
+        assert json.loads(r.output)["data"]["session_id"]
+
+
+class TestRollbackRestoresPriorSettings:
+    """Codex P2, PR #55 round 7: a failed RE-dispatch must not delete the
+    dispatch it was replacing.
+
+    `write_dispatch_settings` overwrites without a usable backup, so an
+    unconditional teardown-on-rollback turned a transient session-append
+    failure into the removal of a previously working Stop hook — and then
+    reported that nothing had been left installed.
+    """
+
+    def test_prior_dispatch_survives_a_failed_redispatch(
+        self, temp_portfolio_with_repo, monkeypatch
+    ):
+        config = temp_portfolio_with_repo["config"]
+        repo_dir = temp_portfolio_with_repo["repo_dir"]
+        task = add_task(config, "test", title="Redispatch",
+                        predictions=Predictions(success_criteria=["C1"]))
+        _commit_project(repo_dir)
+
+        # First dispatch succeeds and installs settings.
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code == 0, r.output
+        wt_path = Path(json.loads(r.output)["data"]["target_dir"])
+        original = settings_path(wt_path).read_bytes()
+
+        # Re-dispatch, with session registration failing this time.
+        def _boom(*args, **kwargs):
+            raise OSError("simulated sessions.jsonl append failure")
+
+        monkeypatch.setattr("clawpm.sessions.register_session", _boom)
+        r2 = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree",
+                   "--force"]
+        )
+        assert r2.exit_code == 1, r2.output
+        assert "session_registration_failed" in r2.output
+
+        assert settings_path(wt_path).exists(), (
+            "the previously working dispatch must not be deleted by a failed "
+            "re-dispatch"
+        )
+        assert settings_path(wt_path).read_bytes() == original, (
+            "and it must be restored byte-for-byte, not merely left present"
+        )
+        assert "restored" in r2.output
+
+
+class TestReusedWorktreeRevisionCheck:
+    """Codex P2, PR #55 round 7: the post-create check was existence-only, so
+    a reused worktree holding an OLDER revision of the same task passed and
+    was registered — the stale-revision dispatch the pre-create gate exists
+    to prevent, arriving by the one route that gate cannot see."""
+
+    def test_reused_worktree_with_stale_task_content_is_rejected(
+        self, temp_portfolio_with_repo
+    ):
+        config = temp_portfolio_with_repo["config"]
+        repo_dir = temp_portfolio_with_repo["repo_dir"]
+        task = add_task(config, "test", title="StaleWt",
+                        predictions=Predictions(success_criteria=["C1"]))
+        _commit_project(repo_dir)
+
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code == 0, r.output
+        wt_path = Path(json.loads(r.output)["data"]["target_dir"])
+        wt_task = wt_path / ".project" / "tasks" / f"{task.id}.md"
+        assert wt_task.exists()
+
+        # Simulate the reused checkout holding a different revision: the file
+        # exists (so an existence-only check passes) but its content differs
+        # from the revision the pre-create gate validated.
+        wt_task.write_text(
+            wt_task.read_text(encoding="utf-8") + "\nstale drift\n",
+            encoding="utf-8",
+        )
+
+        r2 = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree",
+                   "--force"]
+        )
+        assert r2.exit_code == 1, r2.output
+        assert "task_not_materialized" in r2.output
+        assert "DIFFERENT revision" in r2.output
