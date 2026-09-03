@@ -281,10 +281,14 @@ class TestConfirmCloseAutoGate:
 
 class TestWriteReadTeardown:
     def test_write_creates_file(self, tmp_path):
-        path = write_dispatch_settings(tmp_path, "TEST-001", "test")
-        assert path.exists()
-        data = json.loads(path.read_text(encoding="utf-8"))
+        written = write_dispatch_settings(tmp_path, "TEST-001", "test")
+        assert written.path.exists()
+        data = json.loads(written.path.read_text(encoding="utf-8"))
         assert data[CLAWPM_MARKER_KEY]["task_id"] == "TEST-001"
+        # The returned bytes are what is actually on disk — that equality is
+        # the whole point of returning them (Codex P2, PR #55 round 10).
+        assert written.settings_bytes == written.path.read_bytes()
+        assert written.sidecar_bytes is None  # no rubric rendered
 
     def test_read_marker_returns_block(self, tmp_path):
         write_dispatch_settings(tmp_path, "TEST-001", "test")

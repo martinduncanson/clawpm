@@ -29,6 +29,13 @@ Round 9 then reversed two of those:
    created, so a fallback applied to this task's own expired lease left two
    revisions in play. The sweep now runs first.
 
+Round 10 then finished finding 5:
+
+8. P2 — the ownership comparison the lock left in place still LEARNED
+   ownership by reading the file back after writing it, which the lock
+   cannot protect (its whole point is that an operator or editor is not a
+   dispatch). `write_dispatch_settings` now returns the bytes it wrote.
+
 Each test fails against the source it was written against.
 """
 
@@ -503,4 +510,80 @@ class TestLeaseSweepRunsBeforeTheTaskIsLoaded:
         assert order, "neither sweep nor get_task ran"
         assert order[0] == "sweep", (
             f"the lease sweep must run before the task is loaded, got {order}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 6. Round 10 — ownership must be derived, not read back
+# ---------------------------------------------------------------------------
+
+
+class TestOwnershipIsDerivedNotReadBack:
+    """Codex P2, PR #55 round 10.
+
+    Round 9's lock serialises other clawpm dispatches. It explicitly cannot
+    serialise an operator or editor writing `settings.local.json`, and the
+    round-8 ownership capture read the file back AFTER the write — so such a
+    writer landing in that window had their bytes recorded as ours, the
+    comparison passed, and the rollback overwrote their edit with the
+    pre-dispatch snapshot. The window is removed by taking the bytes from
+    the writer instead.
+    """
+
+    def test_write_dispatch_settings_returns_exactly_what_is_on_disk(
+        self, tmp_path
+    ):
+        from clawpm.dispatch import write_dispatch_settings
+
+        written = write_dispatch_settings(
+            tmp_path, "TEST-001", "test", rubric_markdown="## Criteria\n- one\n"
+        )
+        assert written.settings_bytes == written.path.read_bytes()
+        assert written.sidecar_bytes is not None
+        from clawpm.dispatch import session_start_payload_path
+
+        assert written.sidecar_bytes == session_start_payload_path(
+            tmp_path
+        ).read_bytes()
+
+    def test_written_bytes_have_no_newline_translation(self, tmp_path):
+        """Text-mode writes turn \n into \r\n on Windows, which would make
+        the returned bytes disagree with the file and break the comparison
+        outright. Bytes are written directly for that reason."""
+        from clawpm.dispatch import write_dispatch_settings
+
+        written = write_dispatch_settings(tmp_path, "TEST-001", "test")
+        assert b"\r\n" not in written.settings_bytes
+
+    def test_an_operator_edit_after_the_write_survives_the_rollback(
+        self, monorepo_free_portfolio, monkeypatch
+    ):
+        config = monorepo_free_portfolio["config"]
+        repo_dir = monorepo_free_portfolio["repo_dir"]
+        task = add_task(config, "test", title="OperatorEdit",
+                        predictions=Predictions(success_criteria=["C1"]))
+        _git(repo_dir, "add", ".project")
+        _git(repo_dir, "commit", "-q", "-m", "seed")
+
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code == 0, r.output
+        wt_path = Path(json.loads(r.output)["data"]["target_dir"])
+
+        edited = b'{"operator": "hand-edited this mid-dispatch"}'
+
+        def _edit_then_fail(*args, **kwargs):
+            # Not another dispatch — a writer the lock cannot serialise.
+            settings_path(wt_path).write_bytes(edited)
+            raise OSError("simulated sessions.jsonl append failure")
+
+        monkeypatch.setattr("clawpm.sessions.register_session", _edit_then_fail)
+        r2 = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree",
+                   "--force"]
+        )
+        assert r2.exit_code == 1, r2.output
+        assert settings_path(wt_path).read_bytes() == edited, (
+            "an edit made after our write is not ours to roll back over"
         )

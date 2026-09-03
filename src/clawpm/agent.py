@@ -288,13 +288,15 @@ def dispatch_agent(
     # crashes and leaves the subtask OPEN with no dispatch artifacts —
     # retries create duplicates.
     try:
+        # `.path`, not the whole tuple: write_dispatch_settings also returns
+        # the bytes it wrote, which only dispatch's rollback needs.
         settings_path = write_dispatch_settings(
             target_dir=target_dir,
             task_id=subtask_id,
             project_id=project_id,
             rubric_markdown=rubric_markdown,
             portfolio_root=config.portfolio_root,
-        )
+        ).path
     except (FileExistsError, ValueError, OSError) as exc:
         error_detail = str(exc)
         try:

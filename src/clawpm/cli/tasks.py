@@ -1863,7 +1863,7 @@ def tasks_dispatch(
             sys.exit(1)
 
         try:
-            path = write_dispatch_settings(
+            _written = write_dispatch_settings(
                 target_dir=resolved_dir,
                 task_id=task_id,
                 project_id=project_id,
@@ -1877,35 +1877,22 @@ def tasks_dispatch(
         except (FileExistsError, ValueError) as exc:
             output_error("dispatch_blocked", str(exc), fmt=fmt)
             sys.exit(1)
+        path = _written.path
 
-        # Record what THIS invocation wrote, so the rollback below can prove the
-        # file it is about to restore over is still ours (Codex P1, PR #55 round
-        # 8). Two dispatches targeting the same directory can both snapshot the
-        # same prior settings before either writes. If one then succeeds and the
-        # other's session registration fails, the failing one would restore its
-        # now-stale snapshot — or, with no prior settings, tear the file down —
-        # straight over the SUCCESSFUL dispatch's freshly installed hooks. That
-        # command reports success while its worktree is left with obsolete or
-        # missing settings, which is the corruption CLAWP-098 exists to prevent,
-        # arriving through the rollback path added to prevent it.
-        #
-        # Bytes, not a lock: the harm is confined to the rollback, and a
-        # comparison establishes exactly the fact the restore depends on — that
-        # nothing has replaced our file since we wrote it — without a lock file
-        # inside the operator's target directory or a critical section spanning
-        # the registry write. A read failure yields None, which reads as "can't
-        # prove it's ours" and skips the restore: the conservative direction,
-        # since leaving a live dispatch's settings alone is recoverable and
-        # destroying them is not.
-        _our_settings = None
-        _our_sidecar = None
-        try:
-            if _prior_settings_path.exists():
-                _our_settings = _prior_settings_path.read_bytes()
-            if _prior_sidecar_path.exists():
-                _our_sidecar = _prior_sidecar_path.read_bytes()
-        except OSError:
-            pass
+        # What THIS invocation wrote, taken from the writer rather than read
+        # back off disk (Codex P2, PR #55 round 10). The round-8 version read
+        # the file again after `write_dispatch_settings` returned, which has
+        # the same false-premise shape as the bug it was fixing: an operator
+        # or editor replacing the file in that window would have their bytes
+        # recorded as ours, the ownership comparison would pass, and the
+        # rollback would overwrite their edit with the pre-dispatch snapshot.
+        # The lock above serialises other clawpm dispatches and explicitly
+        # cannot serialise that writer, so the window had to be removed
+        # rather than narrowed. `write_dispatch_settings` writes bytes
+        # directly — no text-mode newline translation — so what it returns is
+        # exactly what is on disk.
+        _our_settings = _written.settings_bytes
+        _our_sidecar = _written.sidecar_bytes
 
         # CLAWP-098 (review finding): register the session AFTER settings are
         # written — same ordering rationale as the lease grant below — so a

@@ -47,7 +47,7 @@ import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 # Codex P1 fix: task_id and project_id flow unchanged into shell commands.
 # Reject anything outside the safe charset BEFORE interpolating, so an
@@ -410,10 +410,63 @@ def session_start_payload_path(target_dir: Path) -> Path:
     return target_dir / ".claude" / "clawpm-session-start.json"
 
 
+class WrittenDispatchSettings(NamedTuple):
+    """What :func:`write_dispatch_settings` put on disk.
+
+    ``path`` first, so existing tuple-unpacking and index-0 access read
+    naturally — but callers that only want the path should say ``.path``.
+
+    The byte fields exist so dispatch's rollback can tell whether the files
+    are still its own WITHOUT reading them back (Codex P2, PR #55 round 10):
+    a read-back adopts whatever is on disk at that moment, including an
+    operator's edit made a millisecond earlier, and the ownership comparison
+    then passes on a false premise. ``sidecar_bytes`` is ``None`` when no
+    rubric was rendered and therefore no sidecar written — which compares
+    correctly against "no sidecar on disk".
+    """
+
+    path: Path
+    settings_bytes: bytes
+    sidecar_bytes: Optional[bytes]
+
+
+def _write_exact(path: Path, text: str) -> bytes:
+    """Write *text* as UTF-8 with NO newline translation; return the bytes.
+
+    ``Path.write_text`` opens in text mode, so on Windows every ``\\n``
+    becomes ``\\r\\n`` and the bytes on disk are not the bytes the caller
+    rendered. Dispatch needs to know exactly what it put on disk in order to
+    tell later whether the file is still its own (Codex P2, PR #55 round 10),
+    and it cannot learn that by reading the file back — between the write and
+    the read, an operator or editor may have replaced it, and the read would
+    then adopt their bytes as ours.
+
+    Writing bytes directly makes the rendered form and the stored form the
+    same thing. It also makes these files byte-identical across platforms,
+    which suits artefacts the module docstring already expects to land in PR
+    diffs.
+    """
+    data = text.encode("utf-8")
+    path.write_bytes(data)
+    return data
+
+
 def write_session_start_sidecar(
     target_dir: Path, rubric_markdown: str
 ) -> Path:
     """Write the SessionStart additionalContext JSON to a sidecar file."""
+    path, _ = write_session_start_sidecar_bytes(target_dir, rubric_markdown)
+    return path
+
+
+def write_session_start_sidecar_bytes(
+    target_dir: Path, rubric_markdown: str
+) -> tuple[Path, bytes]:
+    """As :func:`write_session_start_sidecar`, also returning what was written.
+
+    Dispatch's rollback needs the exact bytes it put on disk; see
+    :func:`_write_exact`.
+    """
     payload = {
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
@@ -428,11 +481,9 @@ def write_session_start_sidecar(
     }
     path = session_start_payload_path(target_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False),
-        encoding="utf-8",
+    return path, _write_exact(
+        path, json.dumps(payload, indent=2, ensure_ascii=False)
     )
-    return path
 
 
 def write_dispatch_settings(
@@ -445,7 +496,7 @@ def write_dispatch_settings(
     confirm_close: bool = False,
     refute_votes: int = 1,
     lease_heartbeat: bool = False,
-) -> Path:
+) -> WrittenDispatchSettings:
     """Emit settings.local.json for the dispatched task.
 
     Returns the path written. Raises:
@@ -515,20 +566,22 @@ def write_dispatch_settings(
     )
     # Pretty-print so dispatch settings are review-friendly when they
     # land in PR diffs.
-    path.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
+    settings_bytes = _write_exact(
+        path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
     )
+    sidecar_bytes = None
     if rubric_markdown:
         # Side-car file holds the additionalContext JSON; the hook reads
         # it via `clawpm hook session-start`. See module docstring for
         # the cross-platform reasoning.
-        write_session_start_sidecar(target_dir, rubric_markdown)
+        _, sidecar_bytes = write_session_start_sidecar_bytes(
+            target_dir, rubric_markdown
+        )
     # Codex round-4: register the dispatch so on-done teardown can find
     # ALL target_dirs, not just the legacy repo_path + worktree pair.
     if portfolio_root is not None:
         register_dispatch(portfolio_root, task_id, project_id, target_dir)
-    return path
+    return WrittenDispatchSettings(path, settings_bytes, sidecar_bytes)
 
 
 def read_dispatch_marker(target_dir: Path) -> Optional[dict]:
