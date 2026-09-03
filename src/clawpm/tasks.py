@@ -643,6 +643,116 @@ def _write_rejection_frontmatter(
         raise
 
 
+def _write_resolution_frontmatter(file_path: Path, resolution: str) -> None:
+    """Rewrite the task file's YAML frontmatter to add resolution/resolved_at
+    before a ``kind: decision`` task is moved to ``done/`` (CLAWP-111).
+
+    Mirrors ``_write_rejection_frontmatter``: preserves all existing
+    frontmatter keys, only adds/overwrites ``resolution`` and ``resolved_at``.
+    """
+    with guard_fs_tamper(f"Task file '{file_path}'"):
+        text = file_path.read_text(encoding="utf-8")
+    fm, body = parse_frontmatter(text)
+    fm = require_mapping(fm, where=str(file_path))
+
+    fm["resolution"] = resolution
+    stamp_updated(fm)  # CLAWP-086 — resolving a decision is a mutation.
+    fm["resolved_at"] = fm["updated"]
+
+    new_text = (
+        "---\n"
+        + yaml.dump(fm, default_flow_style=False, allow_unicode=True)
+        + "---"
+        + body
+    )
+    tmp = file_path.with_suffix(".tmp")
+    try:
+        tmp.write_text(new_text, encoding="utf-8")
+        retry_transient(tmp.replace, file_path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _append_decision_to_parent(
+    parent_path: Path, child_id: str, child_title: str, resolution: str,
+) -> None:
+    """Append a one-line pointer under the parent's ``## Decisions so far``
+    section when a ``kind: decision`` child closes (CLAWP-111).
+
+    Creates the heading if absent. IDEMPOTENT (review fix): if a line for
+    ``child_id`` already exists under the heading — a retry after a partial
+    failure, or ``done --resolution`` simply re-run on an already-closed
+    decision — it is REPLACED in place (so a corrected resolution still
+    updates) rather than duplicated.
+
+    Lenient like ``_append_child_to_parent_frontmatter``: a vanished parent
+    is skipped rather than raising, so a missing parent file can never block
+    the child's own (already durable) completion. Narrowly so (review fix):
+    only the specific "parent no longer exists" case is swallowed — the same
+    scope ``_append_child_to_parent_frontmatter`` allows (its
+    ``ConcurrentModificationError``/``FrontmatterError`` catch), not every
+    ``OSError``. A genuine read failure (permissions, disk error) propagates
+    instead of being silently dropped (fail-open != fail-silent).
+    """
+    if not parent_path.exists():
+        return
+    try:
+        text = parent_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return  # vanished in the race between the exists() check and the read
+
+    first_line = next(
+        (ln for ln in resolution.strip().splitlines() if ln.strip()), ""
+    )
+    new_line = f"- [{child_title}]({child_id}): {first_line}"
+    heading = "## Decisions so far"
+    # Matches THIS child's existing line regardless of the title text it was
+    # written with (a task can be retitled between runs) — the (id) anchor is
+    # the stable identity.
+    child_line_re = re.compile(r"^-\s*\[.*?\]\(" + re.escape(child_id) + r"\):")
+
+    lines = text.split("\n")
+    h_idx = next((i for i, l in enumerate(lines) if l.strip() == heading), None)
+    if h_idx is not None:
+        section_end = len(lines)
+        for i in range(h_idx + 1, len(lines)):
+            if lines[i].startswith("## "):
+                section_end = i
+                break
+        existing_idx = next(
+            (i for i in range(h_idx + 1, section_end) if child_line_re.match(lines[i])),
+            None,
+        )
+        if existing_idx is not None:
+            lines[existing_idx] = new_line
+        else:
+            insert_idx = section_end
+            while insert_idx > h_idx + 1 and lines[insert_idx - 1].strip() == "":
+                insert_idx -= 1
+            lines.insert(insert_idx, new_line)
+        new_text = "\n".join(lines)
+    else:
+        sep = "" if text.endswith("\n") else "\n"
+        new_text = f"{text}{sep}\n{heading}\n\n{new_line}\n"
+
+    # CLAWP-086 — gaining a decision line mutates the parent, same as gaining
+    # a child (_child_append_text). Surgical splice (not a frontmatter
+    # reserialize) so the body edit above stays the only formatting change;
+    # a parent with no well-formed fence just skips the stamp.
+    _stamped = _set_updated_line(new_text, date.today().isoformat())
+    if _stamped is not None:
+        new_text = _stamped
+
+    tmp = parent_path.with_suffix(parent_path.suffix + ".tmp")
+    try:
+        tmp.write_text(new_text, encoding="utf-8")
+        retry_transient(tmp.replace, parent_path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 def change_task_state(
     config: PortfolioConfig,
     project_id: str,
@@ -652,6 +762,7 @@ def change_task_state(
     force: bool = False,
     rationale: str | None = None,
     supersedes: str | None = None,
+    resolution: str | None = None,
 ) -> Task | None:
     """Change a task's state by moving its file (or directory for parent tasks)."""
     tasks_dir = get_tasks_dir(config, project_id)
@@ -759,6 +870,35 @@ def change_task_state(
                     )
                 _write_rejection_frontmatter(_task_md, rationale.strip(), supersedes)  # type: ignore[arg-type]
 
+            # (d2) CLAWP-111 — DECISION: a kind=="decision" task requires a
+            #      non-empty resolution to complete. Written INSIDE the lock,
+            #      BEFORE the no-op return, so rerunning with a corrected
+            #      resolution still updates it. Backstop only — the primary
+            #      gate lives in services.tasks.transition (shared by
+            #      shortcuts.done and tasks_state); this defends direct callers.
+            _resolved_this_txn = False
+            if new_state == TaskState.DONE and task.kind == "decision":
+                if not resolution or not resolution.strip():
+                    raise ValueError(
+                        f"Task {task_id} is a decision (kind: decision) and "
+                        "requires a non-empty resolution to complete. "
+                        "Pass resolution='<text>' to change_task_state()."
+                    )
+                _task_md = task_dir / "_task.md"
+                if not _task_md.exists():
+                    raise FileNotFoundError(
+                        f"Task metadata '{_task_md}' no longer exists — "
+                        "it may have been moved by a concurrent session."
+                    )
+                _write_resolution_frontmatter(_task_md, resolution.strip())
+                _resolved_this_txn = True
+                if task.parent:
+                    _parent = get_task(config, project_id, task.parent)
+                    if _parent and _parent.file_path:
+                        _append_decision_to_parent(
+                            _parent.file_path, task_id, task.title, resolution.strip()
+                        )
+
             # (b) Already in correct location — skip the MOVE only; the gate (c)
             #     and metadata write (d) above have already run. Reload so the
             #     return reflects any frontmatter just written. Guard _task.md
@@ -776,19 +916,19 @@ def change_task_state(
                 #       transition keeps `_task.md` in place (no `.progress.md`
                 #       rename), so the move-path stamp below never runs. Stamp
                 #       here so `start` on a decomposed parent still bumps
-                #       `updated`. REJECTED already stamped in step (d).
-                if new_state != TaskState.REJECTED:
+                #       `updated`. REJECTED/DECISION already stamped above.
+                if new_state != TaskState.REJECTED and not _resolved_this_txn:
                     _stamp_updated_file(_task_md)
                 return retry_transient(Task.from_file, _task_md)
 
             # (e) Move (retry transient Windows sharing/access faults — CLAWP-051)
             retry_transient(shutil.move, str(task_dir), str(new_dir))
 
-            # (e.1) CLAWP-086 — stamp `updated` on the relocated file. REJECTED
-            #       already stamped via _write_rejection_frontmatter before the
-            #       move (whose divergent serializer we must not disturb), so
-            #       skip it here.
-            if new_state != TaskState.REJECTED:
+            # (e.1) CLAWP-086 — stamp `updated` on the relocated file. REJECTED/
+            #       DECISION already stamped via their own frontmatter writer
+            #       before the move (whose divergent serializer we must not
+            #       disturb), so skip it here.
+            if new_state != TaskState.REJECTED and not _resolved_this_txn:
                 _stamp_updated_file(new_dir / "_task.md")
 
             # (f) Reload and return INSIDE the lock (Finding 5). Retry the read
@@ -843,6 +983,26 @@ def change_task_state(
         if new_state == TaskState.REJECTED:
             _write_rejection_frontmatter(current_path, rationale.strip(), supersedes)  # type: ignore[arg-type]
 
+        # (d2) CLAWP-111 — DECISION: see the directory-task branch above for
+        #      full rationale. Backstop only — the primary gate lives in
+        #      services.tasks.transition.
+        _resolved_this_txn = False
+        if new_state == TaskState.DONE and task.kind == "decision":
+            if not resolution or not resolution.strip():
+                raise ValueError(
+                    f"Task {task_id} is a decision (kind: decision) and "
+                    "requires a non-empty resolution to complete. "
+                    "Pass resolution='<text>' to change_task_state()."
+                )
+            _write_resolution_frontmatter(current_path, resolution.strip())
+            _resolved_this_txn = True
+            if task.parent:
+                _parent = get_task(config, project_id, task.parent)
+                if _parent and _parent.file_path:
+                    _append_decision_to_parent(
+                        _parent.file_path, task_id, task.title, resolution.strip()
+                    )
+
         # (b) Already in correct location — skip the MOVE only; the gate (c) and
         #     metadata write (d) above have already run. Reload for a fresh view.
         if current_path.resolve() == new_path.resolve():
@@ -851,9 +1011,10 @@ def change_task_state(
         # (e) Move (retry transient Windows sharing/access faults — CLAWP-051)
         retry_transient(shutil.move, str(current_path), str(new_path))
 
-        # (e.1) CLAWP-086 — stamp `updated` on the relocated file. REJECTED
-        #       already stamped via _write_rejection_frontmatter before the move.
-        if new_state != TaskState.REJECTED:
+        # (e.1) CLAWP-086 — stamp `updated` on the relocated file. REJECTED/
+        #       DECISION already stamped via their own frontmatter writer
+        #       before the move.
+        if new_state != TaskState.REJECTED and not _resolved_this_txn:
             _stamp_updated_file(new_path)
 
         # (f) Reload and return INSIDE the lock (Finding 5). Retry the read too:
@@ -1336,6 +1497,7 @@ def add_task(
     out_of_scope: list[str] | None = None,
     stop_conditions: list[str] | None = None,
     delegability: str | None = None,
+    kind: str | None = None,
 ) -> Task | None:
     """Add a new task to a project."""
     tasks_dir = get_tasks_dir(config, project_id)
@@ -1468,6 +1630,10 @@ def add_task(
             frontmatter["stop_conditions"] = stop_conditions
         if delegability and delegability != "either":
             frontmatter["delegability"] = delegability
+        # CLAWP-111 — kind: omit at the "build" default so plain tasks keep
+        # emitting byte-identical frontmatter to before this field existed.
+        if kind and kind != "build":
+            frontmatter["kind"] = kind
 
         if predictions and not predictions.is_empty():
             pred_dict = predictions.to_dict()
@@ -1546,6 +1712,7 @@ def edit_task(
     out_of_scope: list[str] | None = None,
     stop_conditions: list[str] | None = None,
     delegability: str | None = None,
+    kind: str | None = None,
 ) -> Task | None:
     """Edit task metadata (frontmatter) and optionally title/body."""
     tasks_dir = get_tasks_dir(config, project_id)
@@ -1646,6 +1813,33 @@ def edit_task(
                 frontmatter["delegability"] = delegability
             else:
                 frontmatter.pop("delegability", None)
+        # CLAWP-111 — kind: REPLACE semantics (mirrors delegability); "build"
+        # (the default) pops the key so a reclassify-back-to-build task drops
+        # the key rather than persisting an explicit "build".
+        if kind is not None:
+            # Review fix — close-gate bypass: `edit` has no --resolution flag,
+            # so retroactively reclassifying an ALREADY-done, resolution-less
+            # task as kind: decision would leave it in a state the done gate
+            # (change_task_state) can never produce on its own (done without
+            # a resolution). Refuse rather than silently create that
+            # inconsistent combination; a task can still be reclassified
+            # BEFORE it's done, or AFTER if it already carries a resolution
+            # (e.g. corrected via a hand edit).
+            if (
+                kind == "decision"
+                and task.state == TaskState.DONE
+                and not frontmatter.get("resolution")
+            ):
+                raise ValueError(
+                    f"Task {task_id} is already done without a resolution. "
+                    "Reclassifying it as kind: decision now would bypass the "
+                    "done-requires-resolution gate. Reopen it first (or leave "
+                    "its kind as build)."
+                )
+            if kind != "build":
+                frontmatter["kind"] = kind
+            else:
+                frontmatter.pop("kind", None)
 
         # Update title in content (first # heading)
         if title is not None:
@@ -1931,6 +2125,7 @@ def add_subtask(
     stop_conditions: list[str] | None = None,
     delegability: str | None = None,
     tags: list[str] | None = None,
+    kind: str | None = None,
 ) -> Task | None:
     """Add a subtask to a parent task.
     
@@ -2024,6 +2219,10 @@ def add_subtask(
             frontmatter["stop_conditions"] = stop_conditions
         if delegability and delegability != "either":
             frontmatter["delegability"] = delegability
+        # CLAWP-111 — kind: omit at the "build" default (byte-identical to
+        # pre-111 subtask files).
+        if kind and kind != "build":
+            frontmatter["kind"] = kind
 
         # CLAWP-069 — subtasks may carry their own workstream tags (no
         # propagation from the parent; each task is tagged independently).
