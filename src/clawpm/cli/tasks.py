@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import subprocess
 import sys
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 import click
 
-from clawpm.concurrency import LockTimeout
+from clawpm.concurrency import LockTimeout, file_lock
 from clawpm.models import PortfolioConfig, Predictions, ProjectStatus, SURPRISE_TAXONOMY, SuccessCriterion, Task, TaskComplexity, TaskState, WorkLogAction
 from clawpm.output import OutputFormat, output_error, output_json, output_success, output_task_detail, output_tasks_list
 from clawpm.discovery import discover_projects, get_project
@@ -1199,6 +1202,50 @@ def tasks_emit_rubric(
             click.echo(_json_rub.dumps(payload, indent=2))
 
 
+@contextmanager
+def _dispatch_target_lock(portfolio_root: Path, target_dir: Path, fmt):
+    """Serialise dispatches that write to the same target directory.
+
+    The lock sentinel lives under ``<portfolio_root>/locks/`` keyed by a
+    digest of the normcased, resolved target path — never inside the target
+    itself, where it would appear as an untracked file in the operator's repo
+    (and, for ``--worktree``, in a checkout meant to be disposable).
+
+    Both failure modes exit the command rather than proceeding unserialised:
+    running the snapshot/write/register/rollback sequence without the lock is
+    exactly the race the lock exists to close, so degrading to "carry on
+    anyway" would reintroduce it silently — which is worse than a dispatch the
+    operator can simply re-run.
+    """
+    key = hashlib.sha256(
+        os.path.normcase(str(target_dir.resolve())).encode("utf-8")
+    ).hexdigest()[:16]
+    lock_path = portfolio_root / "locks" / f"dispatch-{key}.lock"
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        output_error(
+            "dispatch_blocked",
+            f"Could not create the dispatch lock directory {lock_path.parent} "
+            f"({type(exc).__name__}: {exc}). Refusing to dispatch "
+            f"unserialised: a concurrent dispatch to the same target could "
+            f"then clobber this one's settings.",
+            fmt=fmt,
+        )
+        sys.exit(1)
+    try:
+        with file_lock(lock_path):
+            yield
+    except LockTimeout as exc:
+        output_error(
+            "dispatch_blocked",
+            f"Another dispatch is writing to {target_dir} and did not finish "
+            f"in time ({exc}). Re-run once it completes.",
+            fmt=fmt,
+        )
+        sys.exit(1)
+
+
 _UNREADABLE = object()
 
 
@@ -1305,6 +1352,37 @@ def tasks_dispatch(
     config = require_portfolio(ctx)
     project_id, _source = require_project(ctx, project_id)
     task_id = expand_task_id(task_id, project_id)
+
+    # CLAWP-039: opportunistic lease sweep — one of the two no-daemon expiry
+    # detectors (the other is `clawpm doctor`). A holder that died is reaped
+    # here, on the next dispatch, instead of lingering. Run on EVERY dispatch,
+    # not only leased ones (Codex P2): a dead holder from an earlier lease must
+    # be reaped even if this dispatch isn't requesting one. Cheap — a no-op
+    # when leases.jsonl is absent.
+    #
+    # BEFORE the task is loaded (Codex P2, PR #55 round 9). The sweep applies a
+    # fallback policy to expired leases, which rewrites the canonical task —
+    # even an OPEN-to-OPEN fallback restamps `updated`. Sweeping after the task
+    # was read, its SHA validated and its worktree created meant re-dispatching
+    # a task whose own lease had just expired registered the pre-fallback
+    # revision while the canonical file already held a different one, and the
+    # post-create check (existence and SHA against the STALE validated value)
+    # could not see it. Sweeping first makes everything downstream read the
+    # post-fallback revision, so there is one revision in play rather than two.
+    from clawpm.leases import sweep as _lease_sweep
+    swept = []
+    sweep_error = None
+    try:
+        # Scope to the dispatched project (Codex P2): `dispatch --project A`
+        # must not reap project B's leased tasks. Portfolio-wide reaping is
+        # `clawpm doctor`'s job, not a side effect of an A-scoped dispatch.
+        swept = _lease_sweep(config, config.portfolio_root, project_id=project_id)
+    except Exception as exc:
+        # A sweep failure must not block the dispatch (the user's actual
+        # intent), but must not be silent either — else `leases_swept: 0`
+        # hides a broken janitor (Codex/silent-failure).
+        swept = []
+        sweep_error = f"{type(exc).__name__}: {exc}"
 
     task = get_task(config, project_id, task_id)
     if not task:
@@ -1453,6 +1531,41 @@ def tasks_dispatch(
                 fmt=fmt,
             )
             sys.exit(1)
+        if _repo_prefix:
+            # Fail CLOSED for a project that lives in a subdirectory of its
+            # repository (Codex P1, PR #55 round 9).
+            #
+            # Round 8 taught the materialization checks to look under the
+            # project prefix, which made a monorepo `--worktree` dispatch
+            # SUCCEED where it had previously aborted. That was worse, not
+            # better: `git worktree add` checks out the repo root, so the
+            # session is registered against a directory whose `.project/` is
+            # one level down, `_session_scoped_project_dir` looks only at
+            # `worktree_path/.project`, finds nothing, and every ID-based
+            # mutator in that checkout falls through to the MAIN one — the
+            # exact corruption CLAWP-098 exists to prevent, now arriving
+            # silently instead of as an error.
+            #
+            # Supporting this properly means deciding three things together:
+            # what the session record stores (the repo root, the project root,
+            # or both), where the agent's cwd should be, and where the dispatch
+            # settings live relative to each. That is a design surface of its
+            # own, and it is not what this PR is about. Until then, refuse
+            # clearly rather than register a mapping that cannot resolve.
+            output_error(
+                "monorepo_worktree_unsupported",
+                f"Project {project_id!r} lives at {_repo_prefix!r} inside its "
+                f"repository, and `--worktree` does not yet support that "
+                f"layout: `git worktree add` checks out the repository root, "
+                f"so the session would be registered against a directory whose "
+                f".project/ is not where session-scoped resolution looks — and "
+                f"ID-based commands run in that checkout would silently mutate "
+                f"the main one instead. Dispatch without --worktree, or run "
+                f"dispatch for a project whose repo_path is its repository "
+                f"root. Tracked separately.",
+                fmt=fmt,
+            )
+            sys.exit(1)
         if _head_has_project:
             from clawpm.tasks import _candidate_task_paths
             _rel_candidates = _candidate_task_paths(Path(".project/tasks"), task_id)
@@ -1586,17 +1699,12 @@ def tasks_dispatch(
                 fmt=fmt,
             )
             sys.exit(1)
-        # `git worktree add` checks out the REPOSITORY ROOT, so a project
-        # whose repo_path is a subdirectory (`packages/proj`) keeps its
-        # `.project/` under that same prefix inside the new checkout — not at
-        # its root (Codex P2, PR #55 round 8). `_repo_prefix` is git's
-        # `--show-prefix`: "" at the repo root, "packages/proj/" below it.
-        # Bound here rather than beside its first use, because BOTH
-        # materialization checks below need it and the second one runs
-        # precisely when the first was skipped.
-        _wt_project_root = (
-            resolved_dir / _repo_prefix if _repo_prefix else resolved_dir
-        )
+        # Unprefixed on purpose: the guard above refuses `--worktree` for any
+        # project whose repo_path is a subdirectory, so `_repo_prefix` is
+        # necessarily empty here and the worktree root IS the project root.
+        # Round 8 made these checks prefix-aware instead; round 9 showed that
+        # merely let a monorepo dispatch succeed with an unresolvable session
+        # mapping. See the `if _repo_prefix:` guard for the full reasoning.
         # CLAWP-098 (grok + Codex review, round 5 — independently caught by
         # both, third confirmation this exact shape is real): the HEAD
         # probe above proves the task is committed, but create_worktree is
@@ -1619,11 +1727,8 @@ def tasks_dispatch(
             # existence-only check and was registered — the stale-revision
             # dispatch the pre-create gate exists to prevent, arriving by
             # the one route that gate can't see.
-            # Prefixed via `_wt_project_root` (bound above): dropping the
-            # prefix here made every committed `--worktree` dispatch in a
-            # monorepo look unmaterialized and abort.
             _wt_path = next(
-                (p for p in _ctp(_wt_project_root / ".project" / "tasks", task_id)
+                (p for p in _ctp(resolved_dir / ".project" / "tasks", task_id)
                  if p.exists()),
                 None,
             )
@@ -1696,250 +1801,254 @@ def tasks_dispatch(
 
     refute_votes = max(1, refute_votes)
 
-    # CLAWP-039: opportunistic lease sweep before granting — this is one of the
-    # two no-daemon expiry detectors (the other is `clawpm doctor`). A holder
-    # that died is reaped here, on the next dispatch, instead of lingering.
-    # Run on EVERY dispatch, not only leased ones (Codex P2): a dead holder
-    # from an earlier lease must be reaped on the next dispatch even if this one
-    # isn't requesting a lease. Cheap — a no-op when leases.jsonl is absent.
-    from clawpm.leases import sweep as _lease_sweep
-    swept = []
-    sweep_error = None
-    try:
-        # Scope to the dispatched project (Codex P2): `dispatch --project A`
-        # must not reap project B's leased tasks. Portfolio-wide reaping is
-        # `clawpm doctor`'s job, not a side effect of an A-scoped dispatch.
-        swept = _lease_sweep(config, config.portfolio_root, project_id=project_id)
-    except Exception as exc:
-        # A sweep failure must not block the dispatch (the user's actual
-        # intent), but must not be silent either — else `leases_swept: 0`
-        # hides a broken janitor (Codex/silent-failure).
-        swept = []
-        sweep_error = f"{type(exc).__name__}: {exc}"
-
-    # Snapshot whatever dispatch state already exists at the target, so a
-    # rollback can RESTORE it rather than delete it (Codex P2, PR #55 round
-    # 7). `write_dispatch_settings` overwrites an existing settings file
-    # without a usable backup, so the earlier rollback — an unconditional
-    # teardown — turned a failed RE-dispatch into the removal of a
-    # previously working Stop hook, and then reported that nothing had been
-    # left installed. Bytes, not parsed JSON: restoring must reproduce the
-    # prior file exactly, including any operator formatting.
-    from clawpm.dispatch import session_start_payload_path, settings_path
-    _prior_settings_path = settings_path(resolved_dir)
-    _prior_sidecar_path = session_start_payload_path(resolved_dir)
-    _prior_settings = None
-    _prior_sidecar = None
-    try:
-        if _prior_settings_path.exists():
-            _prior_settings = _prior_settings_path.read_bytes()
-        if _prior_sidecar_path.exists():
-            _prior_sidecar = _prior_sidecar_path.read_bytes()
-    except OSError as exc:
-        # Couldn't snapshot. Say so now rather than discovering it only if a
-        # rollback is needed — proceeding would silently downgrade the
-        # rollback back to the destructive version this fixes.
-        output_error(
-            "dispatch_blocked",
-            f"Could not read the existing dispatch settings at {resolved_dir} "
-            f"({type(exc).__name__}: {exc}). Refusing to overwrite them, "
-            f"because a failure later in this command could then not restore "
-            f"them.",
-            fmt=fmt,
-        )
-        sys.exit(1)
-
-    try:
-        path = write_dispatch_settings(
-            target_dir=resolved_dir,
-            task_id=task_id,
-            project_id=project_id,
-            rubric_markdown=rubric,
-            force=force,
-            portfolio_root=config.portfolio_root,
-            confirm_close=confirm_close,
-            refute_votes=refute_votes,
-            lease_heartbeat=lease_ttl is not None,
-        )
-    except (FileExistsError, ValueError) as exc:
-        output_error("dispatch_blocked", str(exc), fmt=fmt)
-        sys.exit(1)
-
-    # Record what THIS invocation wrote, so the rollback below can prove the
-    # file it is about to restore over is still ours (Codex P1, PR #55 round
-    # 8). Two dispatches targeting the same directory can both snapshot the
-    # same prior settings before either writes. If one then succeeds and the
-    # other's session registration fails, the failing one would restore its
-    # now-stale snapshot — or, with no prior settings, tear the file down —
-    # straight over the SUCCESSFUL dispatch's freshly installed hooks. That
-    # command reports success while its worktree is left with obsolete or
-    # missing settings, which is the corruption CLAWP-098 exists to prevent,
-    # arriving through the rollback path added to prevent it.
+    # Serialize the whole snapshot -> write -> register -> rollback sequence
+    # against another dispatch targeting the same directory (Codex P1, PR #55
+    # rounds 8 and 9).
     #
-    # Bytes, not a lock: the harm is confined to the rollback, and a
-    # comparison establishes exactly the fact the restore depends on — that
-    # nothing has replaced our file since we wrote it — without a lock file
-    # inside the operator's target directory or a critical section spanning
-    # the registry write. A read failure yields None, which reads as "can't
-    # prove it's ours" and skips the restore: the conservative direction,
-    # since leaving a live dispatch's settings alone is recoverable and
-    # destroying them is not.
-    _our_settings = None
-    _our_sidecar = None
-    try:
-        if _prior_settings_path.exists():
-            _our_settings = _prior_settings_path.read_bytes()
-        if _prior_sidecar_path.exists():
-            _our_sidecar = _prior_sidecar_path.read_bytes()
-    except OSError:
-        pass
-
-    # CLAWP-098 (review finding): register the session AFTER settings are
-    # written — same ordering rationale as the lease grant below — so a
-    # write_dispatch_settings failure (dispatch_blocked, above) doesn't leave
-    # an orphaned session registered for a dispatch that never actually
-    # happened. Register a session-scoped pointer from a fresh session_id to
-    # the worktree's actual filesystem path: without this, an ID-based
-    # mutator command (tasks state/done/block) run with cwd inside this
-    # worktree resolves its project via the portfolio registry — which is
-    # cwd-independent — straight back to the MAIN checkout, and mutates its
-    # task file instead of the worktree's own. See sessions.py.
-    if worktree:
-        from clawpm.sessions import register_session
-        from clawpm.tasks import _candidate_task_paths
-        # Re-verify materialization here (cheap; already gated once, hard,
-        # right after create_worktree above when .project/ exists but this
-        # task doesn't — see that block's comment for the full reasoning).
-        # This second check only ever matters for the OTHER case: a project
-        # that doesn't git-track .project/ at all, where the early gate
-        # never ran and there is genuinely nothing here to register against
-        # — documented, pre-existing, unaffected-by-CLAWP-098 behavior, not
-        # an error. Checked with an EXPLICIT tasks_dir against resolved_dir,
-        # not via get_task(config, ...) — cwd here is wherever the OPERATOR
-        # invoked `tasks dispatch` from, essentially never inside the
-        # worktree it just created, so a cwd-based lookup would silently
-        # fall through to the OLD registry resolution and report a false
-        # "materialized" even when the worktree's own copy is missing.
-        # Prefixed, for the same monorepo reason as the post-create check
-        # above: the worktree holds the repo ROOT, so a project living at
-        # `packages/proj` keeps its `.project/` under that prefix. Codex
-        # flagged only the other site (P2, round 8); this one is the same
-        # defect, and dropping the prefix here would report every monorepo
-        # dispatch as unmaterialized and skip session registration —
-        # silently disabling CLAWP-098's isolation instead of aborting.
-        materialized = any(
-            p.exists()
-            for p in _candidate_task_paths(
-                _wt_project_root / ".project" / "tasks", task_id
+    # Round 8 closed this with a compare-before-restore guard; round 9 showed
+    # that is not sufficient, and the argument is correct. The bytes labelled
+    # "what this invocation wrote" are read back AFTER write_dispatch_settings
+    # returns, so a competing dispatch replacing the file in that window makes
+    # this command record the OTHER command's bytes as its own. The comparison
+    # then succeeds on a false premise and restores a stale snapshot over a
+    # dispatch that succeeded. Narrowing a race is not closing it, and no
+    # amount of re-reading makes a check-then-act atomic.
+    #
+    # The ownership comparison is KEPT inside the lock, for the writer this
+    # lock cannot see: an operator or editor touching settings.local.json
+    # mid-dispatch. The lock makes the comparison's premise true against other
+    # dispatches; the comparison keeps the rollback honest against everyone
+    # else.
+    #
+    # Keyed on the resolved target path, so dispatches to different directories
+    # never contend. The sentinel lives under the portfolio root rather than in
+    # the target: a lock file dropped in the target would show up as untracked
+    # in the operator's repo, and for --worktree it would land in a checkout
+    # whose whole point is to be disposable.
+    #
+    # The critical section is pure file and ledger I/O — every git probe runs
+    # earlier — so it is bounded. `register_session` locks sessions.jsonl, a
+    # different path, so there is no re-entry on this one.
+    with _dispatch_target_lock(config.portfolio_root, resolved_dir, fmt):
+        # Snapshot whatever dispatch state already exists at the target, so a
+        # rollback can RESTORE it rather than delete it (Codex P2, PR #55 round
+        # 7). `write_dispatch_settings` overwrites an existing settings file
+        # without a usable backup, so the earlier rollback — an unconditional
+        # teardown — turned a failed RE-dispatch into the removal of a
+        # previously working Stop hook, and then reported that nothing had been
+        # left installed. Bytes, not parsed JSON: restoring must reproduce the
+        # prior file exactly, including any operator formatting.
+        from clawpm.dispatch import session_start_payload_path, settings_path
+        _prior_settings_path = settings_path(resolved_dir)
+        _prior_sidecar_path = session_start_payload_path(resolved_dir)
+        _prior_settings = None
+        _prior_sidecar = None
+        try:
+            if _prior_settings_path.exists():
+                _prior_settings = _prior_settings_path.read_bytes()
+            if _prior_sidecar_path.exists():
+                _prior_sidecar = _prior_sidecar_path.read_bytes()
+        except OSError as exc:
+            # Couldn't snapshot. Say so now rather than discovering it only if a
+            # rollback is needed — proceeding would silently downgrade the
+            # rollback back to the destructive version this fixes.
+            output_error(
+                "dispatch_blocked",
+                f"Could not read the existing dispatch settings at {resolved_dir} "
+                f"({type(exc).__name__}: {exc}). Refusing to overwrite them, "
+                f"because a failure later in this command could then not restore "
+                f"them.",
+                fmt=fmt,
             )
-        )
-        if materialized:
-            session_id = str(uuid.uuid4())
-            try:
-                register_session(
-                    config.portfolio_root, session_id, task_id, project_id, resolved_dir
+            sys.exit(1)
+
+        try:
+            path = write_dispatch_settings(
+                target_dir=resolved_dir,
+                task_id=task_id,
+                project_id=project_id,
+                rubric_markdown=rubric,
+                force=force,
+                portfolio_root=config.portfolio_root,
+                confirm_close=confirm_close,
+                refute_votes=refute_votes,
+                lease_heartbeat=lease_ttl is not None,
+            )
+        except (FileExistsError, ValueError) as exc:
+            output_error("dispatch_blocked", str(exc), fmt=fmt)
+            sys.exit(1)
+
+        # Record what THIS invocation wrote, so the rollback below can prove the
+        # file it is about to restore over is still ours (Codex P1, PR #55 round
+        # 8). Two dispatches targeting the same directory can both snapshot the
+        # same prior settings before either writes. If one then succeeds and the
+        # other's session registration fails, the failing one would restore its
+        # now-stale snapshot — or, with no prior settings, tear the file down —
+        # straight over the SUCCESSFUL dispatch's freshly installed hooks. That
+        # command reports success while its worktree is left with obsolete or
+        # missing settings, which is the corruption CLAWP-098 exists to prevent,
+        # arriving through the rollback path added to prevent it.
+        #
+        # Bytes, not a lock: the harm is confined to the rollback, and a
+        # comparison establishes exactly the fact the restore depends on — that
+        # nothing has replaced our file since we wrote it — without a lock file
+        # inside the operator's target directory or a critical section spanning
+        # the registry write. A read failure yields None, which reads as "can't
+        # prove it's ours" and skips the restore: the conservative direction,
+        # since leaving a live dispatch's settings alone is recoverable and
+        # destroying them is not.
+        _our_settings = None
+        _our_sidecar = None
+        try:
+            if _prior_settings_path.exists():
+                _our_settings = _prior_settings_path.read_bytes()
+            if _prior_sidecar_path.exists():
+                _our_sidecar = _prior_sidecar_path.read_bytes()
+        except OSError:
+            pass
+
+        # CLAWP-098 (review finding): register the session AFTER settings are
+        # written — same ordering rationale as the lease grant below — so a
+        # write_dispatch_settings failure (dispatch_blocked, above) doesn't leave
+        # an orphaned session registered for a dispatch that never actually
+        # happened. Register a session-scoped pointer from a fresh session_id to
+        # the worktree's actual filesystem path: without this, an ID-based
+        # mutator command (tasks state/done/block) run with cwd inside this
+        # worktree resolves its project via the portfolio registry — which is
+        # cwd-independent — straight back to the MAIN checkout, and mutates its
+        # task file instead of the worktree's own. See sessions.py.
+        if worktree:
+            from clawpm.sessions import register_session
+            from clawpm.tasks import _candidate_task_paths
+            # Re-verify materialization here (cheap; already gated once, hard,
+            # right after create_worktree above when .project/ exists but this
+            # task doesn't — see that block's comment for the full reasoning).
+            # This second check only ever matters for the OTHER case: a project
+            # that doesn't git-track .project/ at all, where the early gate
+            # never ran and there is genuinely nothing here to register against
+            # — documented, pre-existing, unaffected-by-CLAWP-098 behavior, not
+            # an error. Checked with an EXPLICIT tasks_dir against resolved_dir,
+            # not via get_task(config, ...) — cwd here is wherever the OPERATOR
+            # invoked `tasks dispatch` from, essentially never inside the
+            # worktree it just created, so a cwd-based lookup would silently
+            # fall through to the OLD registry resolution and report a false
+            # "materialized" even when the worktree's own copy is missing.
+            # Unprefixed, like the post-create check above: `--worktree` is
+            # refused outright for a project in a repository subdirectory, so
+            # the worktree root is the project root here by construction.
+            materialized = any(
+                p.exists()
+                for p in _candidate_task_paths(
+                    resolved_dir / ".project" / "tasks", task_id
                 )
-            except Exception as exc:
-                # Make settings-install + session-registration transactional
-                # (Codex review, PR #55). Appending to sessions.jsonl can fail
-                # for reasons entirely outside this command — the file is
-                # read-only, its lock times out under a concurrent dispatch,
-                # the portfolio volume filled after the dispatch-registry
-                # append. Letting that escape reported failure while leaving
-                # an ACTIVE Stop hook and dispatch-registry entry installed
-                # with no session mapping: the worst of both states, because
-                # an operator who then entered the worktree got ID-based
-                # commands silently falling through to the main checkout —
-                # exactly CLAWP-098's original corruption, re-armed by the
-                # fix's own failure path. Roll the artifacts back so the
-                # dispatch fails clean and a retry starts from nothing.
-                session_id = None
-                teardown_error = None
-                # Only roll back while the file on disk is still the one THIS
-                # command wrote (Codex P1, PR #55 round 8). A concurrent
-                # dispatch to the same directory may have replaced it and
-                # succeeded; restoring our snapshot over it — or tearing it
-                # down, when we had no snapshot — would leave that command
-                # reporting success with obsolete or missing hooks. Compare
-                # the bytes we recorded after our own write; anything else on
-                # disk (different content, or nothing at all) means the
-                # artifacts are no longer ours to undo.
-                _still_ours = (
-                    _our_settings is not None
-                    and _read_bytes_or_none(_prior_settings_path) == _our_settings
-                    and _read_bytes_or_none(_prior_sidecar_path) == _our_sidecar
-                )
-                _restored = _still_ours and _prior_settings is not None
+            )
+            if materialized:
+                session_id = str(uuid.uuid4())
                 try:
-                    if not _still_ours:
-                        # Deliberately nothing: the artifacts on disk belong
-                        # to a concurrent dispatch now (see above). The
-                        # operator is told so in `_outcome` below.
-                        pass
-                    elif _prior_settings is not None:
-                        _prior_settings_path.parent.mkdir(
-                            parents=True, exist_ok=True
+                    register_session(
+                        config.portfolio_root, session_id, task_id, project_id, resolved_dir
+                    )
+                except Exception as exc:
+                    # Make settings-install + session-registration transactional
+                    # (Codex review, PR #55). Appending to sessions.jsonl can fail
+                    # for reasons entirely outside this command — the file is
+                    # read-only, its lock times out under a concurrent dispatch,
+                    # the portfolio volume filled after the dispatch-registry
+                    # append. Letting that escape reported failure while leaving
+                    # an ACTIVE Stop hook and dispatch-registry entry installed
+                    # with no session mapping: the worst of both states, because
+                    # an operator who then entered the worktree got ID-based
+                    # commands silently falling through to the main checkout —
+                    # exactly CLAWP-098's original corruption, re-armed by the
+                    # fix's own failure path. Roll the artifacts back so the
+                    # dispatch fails clean and a retry starts from nothing.
+                    session_id = None
+                    teardown_error = None
+                    # Only roll back while the file on disk is still the one THIS
+                    # command wrote (Codex P1, PR #55 round 8). A concurrent
+                    # dispatch to the same directory may have replaced it and
+                    # succeeded; restoring our snapshot over it — or tearing it
+                    # down, when we had no snapshot — would leave that command
+                    # reporting success with obsolete or missing hooks. Compare
+                    # the bytes we recorded after our own write; anything else on
+                    # disk (different content, or nothing at all) means the
+                    # artifacts are no longer ours to undo.
+                    _still_ours = (
+                        _our_settings is not None
+                        and _read_bytes_or_none(_prior_settings_path) == _our_settings
+                        and _read_bytes_or_none(_prior_sidecar_path) == _our_sidecar
+                    )
+                    _restored = _still_ours and _prior_settings is not None
+                    try:
+                        if not _still_ours:
+                            # Deliberately nothing: the artifacts on disk belong
+                            # to a concurrent dispatch now (see above). The
+                            # operator is told so in `_outcome` below.
+                            pass
+                        elif _prior_settings is not None:
+                            _prior_settings_path.parent.mkdir(
+                                parents=True, exist_ok=True
+                            )
+                            _prior_settings_path.write_bytes(_prior_settings)
+                            if _prior_sidecar is not None:
+                                _prior_sidecar_path.write_bytes(_prior_sidecar)
+                            elif _prior_sidecar_path.exists():
+                                _prior_sidecar_path.unlink()
+                        else:
+                            from clawpm.dispatch import teardown_dispatch_settings
+                            teardown_dispatch_settings(
+                                target_dir=resolved_dir,
+                                task_id=task_id,
+                                portfolio_root=config.portfolio_root,
+                                project_id=project_id,
+                            )
+                    except Exception as teardown_exc:
+                        # Rollback itself failed — report BOTH, since the operator
+                        # now has artifacts on disk that need manual attention
+                        # (fail-open WITH a marker, CLAWP-039/041 doctrine).
+                        teardown_error = f"{type(teardown_exc).__name__}: {teardown_exc}"
+                    if teardown_error:
+                        _outcome = (
+                            f"Rolling those settings back ALSO failed "
+                            f"({teardown_error}) — inspect "
+                            f"{_prior_settings_path} manually before retrying, or "
+                            f"commands run from that worktree will mutate the "
+                            f"main checkout."
                         )
-                        _prior_settings_path.write_bytes(_prior_settings)
-                        if _prior_sidecar is not None:
-                            _prior_sidecar_path.write_bytes(_prior_sidecar)
-                        elif _prior_sidecar_path.exists():
-                            _prior_sidecar_path.unlink()
+                    elif not _still_ours:
+                        _outcome = (
+                            f"The dispatch settings at {_prior_settings_path} are "
+                            f"no longer the ones this command wrote — another "
+                            f"dispatch has since replaced them — so they were "
+                            f"left ALONE rather than rolled back over a "
+                            f"concurrent dispatch that may have succeeded. No "
+                            f"session was registered for THIS command; fix the "
+                            f"portfolio state and re-run dispatch, and check "
+                            f"whether the other dispatch is the one you want."
+                        )
+                    elif _restored:
+                        _outcome = (
+                            "The dispatch settings that were in place before this "
+                            "command have been restored, so the previous dispatch "
+                            "is intact. Fix the portfolio state and re-run "
+                            "dispatch."
+                        )
                     else:
-                        from clawpm.dispatch import teardown_dispatch_settings
-                        teardown_dispatch_settings(
-                            target_dir=resolved_dir,
-                            task_id=task_id,
-                            portfolio_root=config.portfolio_root,
-                            project_id=project_id,
+                        _outcome = (
+                            "The dispatch settings have been rolled back; nothing "
+                            "was left installed. Fix the portfolio state and "
+                            "re-run dispatch."
                         )
-                except Exception as teardown_exc:
-                    # Rollback itself failed — report BOTH, since the operator
-                    # now has artifacts on disk that need manual attention
-                    # (fail-open WITH a marker, CLAWP-039/041 doctrine).
-                    teardown_error = f"{type(teardown_exc).__name__}: {teardown_exc}"
-                if teardown_error:
-                    _outcome = (
-                        f"Rolling those settings back ALSO failed "
-                        f"({teardown_error}) — inspect "
-                        f"{_prior_settings_path} manually before retrying, or "
-                        f"commands run from that worktree will mutate the "
-                        f"main checkout."
+                    output_error(
+                        "session_registration_failed",
+                        f"Dispatch settings were written to {resolved_dir} but "
+                        f"registering its session failed: {type(exc).__name__}: "
+                        f"{exc}. " + _outcome,
+                        fmt=fmt,
                     )
-                elif not _still_ours:
-                    _outcome = (
-                        f"The dispatch settings at {_prior_settings_path} are "
-                        f"no longer the ones this command wrote — another "
-                        f"dispatch has since replaced them — so they were "
-                        f"left ALONE rather than rolled back over a "
-                        f"concurrent dispatch that may have succeeded. No "
-                        f"session was registered for THIS command; fix the "
-                        f"portfolio state and re-run dispatch, and check "
-                        f"whether the other dispatch is the one you want."
-                    )
-                elif _restored:
-                    _outcome = (
-                        "The dispatch settings that were in place before this "
-                        "command have been restored, so the previous dispatch "
-                        "is intact. Fix the portfolio state and re-run "
-                        "dispatch."
-                    )
-                else:
-                    _outcome = (
-                        "The dispatch settings have been rolled back; nothing "
-                        "was left installed. Fix the portfolio state and "
-                        "re-run dispatch."
-                    )
-                output_error(
-                    "session_registration_failed",
-                    f"Dispatch settings were written to {resolved_dir} but "
-                    f"registering its session failed: {type(exc).__name__}: "
-                    f"{exc}. " + _outcome,
-                    fmt=fmt,
-                )
-                sys.exit(1)
-        else:
-            session_id = None
+                    sys.exit(1)
+            else:
+                session_id = None
 
     # Grant the lease AFTER settings are written (so a settings failure doesn't
     # leave a lease with no heartbeat source).

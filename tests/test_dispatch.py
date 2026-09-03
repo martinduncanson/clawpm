@@ -939,15 +939,23 @@ class TestWorktreeSessionScopedMutation:
     def test_worktree_dispatch_materialization_check_handles_monorepo_subdirectory(
         self, tmp_path, monkeypatch
     ):
-        """antigravity review, PR #55: `git cat-file -e HEAD:<path>` resolves
-        <path> relative to the REPO ROOT, not `-C`'s directory. A project
-        whose repo_path is a SUBDIRECTORY of a larger repo (mono-repo
-        layout) needs the probed paths prefixed with `git rev-parse
-        --show-prefix`, or the materialization check silently looks at the
-        wrong location, always concludes ".project isn't tracked", and
-        never blocks an uncommitted task -- resurfacing the original
-        CLAWP-098 corruption specifically for mono-repo-subdirectory
-        projects."""
+        """A mono-repo-subdirectory project must never dispatch --worktree
+        with isolation silently off.
+
+        antigravity review, PR #55, established the original hazard: `git
+        cat-file -e HEAD:<path>` resolves <path> relative to the REPO ROOT,
+        not `-C`'s directory, so an unprefixed probe always concluded
+        ".project isn't tracked" and never blocked an uncommitted task.
+
+        Codex P1, PR #55 round 9, established that prefixing the probes is
+        not enough to make the layout work: `git worktree add` checks out the
+        repo root, so the session is registered against a directory whose
+        `.project/` is one level down and session-scoped resolution never
+        finds it. `--worktree` now refuses this layout outright, which
+        satisfies the original requirement by an earlier and more accurate
+        route -- the dispatch is rejected before anything is created, rather
+        than after the materialization check. The assertion that matters is
+        unchanged: it must not be let through."""
         repo_root = tmp_path / "monorepo"
         repo_root.mkdir()
         subprocess.run(["git", "init", "-q", "-b", "main", str(repo_root)], check=True)
@@ -1013,7 +1021,10 @@ class TestWorktreeSessionScopedMutation:
             "an uncommitted task in a mono-repo subdirectory project must "
             "still be blocked, not silently let through"
         )
-        assert "task_not_materialized" in r.output
+        assert "monorepo_worktree_unsupported" in r.output
+        # Rejected before create_worktree, so a retry is not fighting a
+        # leftover checkout.
+        assert not (project_dir / ".clawpm-worktrees").exists()
 
 
 class TestSessionStartSidecar:

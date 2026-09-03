@@ -1,11 +1,10 @@
-"""CLAWP-098 round-8 review regressions (Codex, PR #55).
+"""CLAWP-098 round-8 and round-9 review regressions (Codex, PR #55).
 
-Four findings survived the round-8 decision to split moved-worktree
-rediscovery (and the session-scoped `_source_repo`) out of this PR:
+Round 8, after the decision to split moved-worktree rediscovery (and the
+session-scoped `_source_repo`) out of this PR:
 
 1. P1 — dispatch's rollback restored its snapshot over a CONCURRENT
-   dispatch's freshly written settings. Guarded by comparing the file on
-   disk against what this invocation itself wrote.
+   dispatch's freshly written settings.
 2. P2 — the post-create materialization check dropped the monorepo project
    prefix, so every committed `--worktree` dispatch for a project living in
    a subdirectory was rejected as unmaterialized. The second, pre-register
@@ -17,7 +16,20 @@ rediscovery (and the session-scoped `_source_repo`) out of this PR:
    `git worktree remove`, which leaves the `clawpm/<task>` branch behind at
    its old revision, so every retry rebuilt the same stale checkout.
 
-Each test fails against the pre-fix source.
+Round 9 then reversed two of those:
+
+5. P1 — finding 1's compare-before-restore narrowed the race without
+   closing it (the "what we wrote" read-back is itself unsynchronised), so
+   the sequence now runs under a target-scoped lock. The comparison stays,
+   for the writer a lock cannot see: an operator editing the file.
+6. P1 — finding 2's fix made monorepo `--worktree` dispatch SUCCEED with a
+   session mapping that cannot resolve, which is worse than the abort it
+   replaced. It now fails closed, and the layout is tracked separately.
+7. P2 — the lease sweep ran after the task was loaded and its worktree
+   created, so a fallback applied to this task's own expired lease left two
+   revisions in play. The sweep now runs first.
+
+Each test fails against the source it was written against.
 """
 
 from __future__ import annotations
@@ -214,22 +226,28 @@ def _portfolio(project_subdir: str | None):
         )
 
 
-class TestMonorepoWorktreeMaterialization:
-    """Codex P2, PR #55 round 8.
+class TestMonorepoWorktreeFailsClosed:
+    """Codex P2 round 8, then P1 round 9 — the second reversed the first.
 
-    `git worktree add` checks out the repository ROOT, so a project at
-    `packages/proj` keeps its `.project/` under that prefix inside the new
-    checkout. Both materialization checks looked for it at the worktree
-    root, so every committed `--worktree` dispatch for such a project was
-    rejected as unmaterialized.
+    Round 8 taught the materialization checks to look under the project
+    prefix, so a monorepo `--worktree` dispatch stopped aborting and started
+    succeeding. Round 9 showed that was the worse outcome: `git worktree
+    add` checks out the repository ROOT, so the session gets registered
+    against a directory whose `.project/` is one level down,
+    `_session_scoped_project_dir` looks only at `worktree_path/.project`,
+    and every ID-based mutator in that checkout falls through to the MAIN
+    one — CLAWP-098's own corruption, arriving silently.
+
+    Until the session record can carry the project prefix, refusing is the
+    honest answer: it is the same outcome the pre-round-8 code produced,
+    with a message that says why.
     """
 
-    def test_dispatch_succeeds_for_a_project_in_a_subdirectory(
+    def test_dispatch_refuses_a_project_in_a_repository_subdirectory(
         self, monorepo_portfolio
     ):
         config = monorepo_portfolio["config"]
         repo_dir = monorepo_portfolio["repo_dir"]
-        project_root = monorepo_portfolio["project_root"]
         task = add_task(config, "test", title="Monorepo",
                         predictions=Predictions(success_criteria=["C1"]))
         _git(repo_dir, "add", ".")
@@ -238,18 +256,32 @@ class TestMonorepoWorktreeMaterialization:
         r = CliRunner().invoke(
             main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
         )
-        assert r.exit_code == 0, r.output
-        data = json.loads(r.output)["data"]
-        assert data["session_id"], (
-            "a committed task in a monorepo project must register a session; "
-            "dropping the project prefix reports it as unmaterialized and "
-            "silently skips CLAWP-098's isolation"
+        assert r.exit_code == 1, r.output
+        assert "monorepo_worktree_unsupported" in r.output
+        # And it must refuse BEFORE creating anything, so a retry after the
+        # layout changes is not fighting a leftover checkout.
+        assert not (repo_dir / ".clawpm-worktrees").exists(), (
+            "the guard must run before create_worktree"
         )
-        # The task really is under the prefix, not at the worktree root.
-        wt = Path(data["target_dir"])
-        prefix = project_root.relative_to(repo_dir).as_posix()
-        assert (wt / prefix / ".project" / "tasks" / f"{task.id}.md").exists()
-        assert not (wt / ".project" / "tasks" / f"{task.id}.md").exists()
+
+    def test_dispatch_without_worktree_still_works_in_a_monorepo(
+        self, monorepo_portfolio, tmp_path
+    ):
+        """The refusal is scoped to --worktree, not to monorepo projects."""
+        config = monorepo_portfolio["config"]
+        repo_dir = monorepo_portfolio["repo_dir"]
+        task = add_task(config, "test", title="MonorepoInPlace",
+                        predictions=Predictions(success_criteria=["C1"]))
+        _git(repo_dir, "add", ".")
+        _git(repo_dir, "commit", "-q", "-m", "seed")
+
+        target = tmp_path / "in-place"
+        target.mkdir()
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id,
+                   "--target-dir", str(target)]
+        )
+        assert r.exit_code == 0, r.output
 
 
 # ---------------------------------------------------------------------------
@@ -356,4 +388,119 @@ class TestStaleWorktreeRecoveryAdvice:
         assert f"git branch -D clawpm/{task.id}" in r2.output, (
             "removing the worktree alone leaves the stale branch, so every "
             "retry recreates the same checkout — the advice has to say so"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 5. Round 9 — the rollback race needs a lock, not a comparison
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchTargetLock:
+    """Codex P1, PR #55 round 9.
+
+    Round 8's compare-before-restore reads back "what we wrote" AFTER
+    `write_dispatch_settings` returns, so a competing dispatch replacing the
+    file in that window makes this command record the OTHER command's bytes
+    as its own — the comparison then succeeds on a false premise. Only
+    serialising the whole sequence closes it.
+    """
+
+    def test_dispatch_takes_a_target_scoped_lock(
+        self, monorepo_free_portfolio, monkeypatch
+    ):
+        from clawpm.cli import tasks as tasks_cli
+
+        config = monorepo_free_portfolio["config"]
+        repo_dir = monorepo_free_portfolio["repo_dir"]
+        task = add_task(config, "test", title="Locked",
+                        predictions=Predictions(success_criteria=["C1"]))
+        _git(repo_dir, "add", ".project")
+        _git(repo_dir, "commit", "-q", "-m", "seed")
+
+        held: list = []
+        real_lock = tasks_cli.file_lock
+
+        def _record(lock_path, *a, **k):
+            held.append(Path(lock_path))
+            return real_lock(lock_path, *a, **k)
+
+        monkeypatch.setattr(tasks_cli, "file_lock", _record)
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code == 0, r.output
+
+        target = Path(json.loads(r.output)["data"]["target_dir"])
+        dispatch_locks = [p for p in held if p.name.startswith("dispatch-")]
+        assert dispatch_locks, f"no target-scoped lock acquired: {held}"
+        # Under the portfolio root, never inside the target directory: a
+        # sentinel in the target shows up as untracked in the operator's repo.
+        for lock in dispatch_locks:
+            assert lock.parent == monorepo_free_portfolio["root"] / "locks", lock
+            assert target.resolve() not in lock.parents, lock
+
+    def test_lock_is_keyed_on_the_target_so_different_targets_dont_contend(
+        self, monorepo_free_portfolio, tmp_path
+    ):
+        from clawpm.cli.tasks import _dispatch_target_lock
+
+        root = monorepo_free_portfolio["root"]
+        a, b = tmp_path / "a", tmp_path / "b"
+        a.mkdir()
+        b.mkdir()
+
+        # Both acquire concurrently; a shared lock would deadlock or time out.
+        with _dispatch_target_lock(root, a, "json"):
+            with _dispatch_target_lock(root, b, "json"):
+                pass
+
+        # And the same target maps to the same sentinel across calls.
+        seen = []
+        for _ in range(2):
+            with _dispatch_target_lock(root, a, "json"):
+                seen.append(sorted(p.name for p in (root / "locks").glob("*.lock")))
+        assert seen[0] == seen[1], seen
+
+
+class TestLeaseSweepRunsBeforeTheTaskIsLoaded:
+    """Codex P2, PR #55 round 9.
+
+    The sweep applies a fallback policy to expired leases, which rewrites
+    the canonical task — even an OPEN-to-OPEN fallback restamps `updated`.
+    Sweeping after the task was read and its SHA validated meant registering
+    a pre-fallback revision while the canonical file held another.
+    """
+
+    def test_sweep_precedes_task_load(self, monorepo_free_portfolio, monkeypatch):
+        from clawpm.cli import tasks as tasks_cli
+
+        config = monorepo_free_portfolio["config"]
+        repo_dir = monorepo_free_portfolio["repo_dir"]
+        task = add_task(config, "test", title="SweepOrder",
+                        predictions=Predictions(success_criteria=["C1"]))
+        _git(repo_dir, "add", ".project")
+        _git(repo_dir, "commit", "-q", "-m", "seed")
+
+        order: list[str] = []
+        real_get_task = tasks_cli.get_task
+
+        def _sweep(*a, **k):
+            order.append("sweep")
+            return []
+
+        def _get_task(*a, **k):
+            order.append("get_task")
+            return real_get_task(*a, **k)
+
+        monkeypatch.setattr("clawpm.leases.sweep", _sweep)
+        monkeypatch.setattr(tasks_cli, "get_task", _get_task)
+
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code == 0, r.output
+        assert order, "neither sweep nor get_task ran"
+        assert order[0] == "sweep", (
+            f"the lease sweep must run before the task is loaded, got {order}"
         )
