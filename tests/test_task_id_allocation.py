@@ -319,7 +319,7 @@ class TestPrefixUniqueness:
 
         tasks_a = _make_portfolio(tmp_path, monkeypatch, "code-")
         _add_project(tmp_path, "sib-one", task_prefix="CODE")
-        digest = hashlib.sha256(b"code-").hexdigest()[:6].upper()
+        digest = hashlib.sha256(b"code-").hexdigest()[:32].upper()
         _add_project(tmp_path, "sib-two", task_prefix=f"CODE{digest}")
 
         config = load_portfolio_config(tmp_path)

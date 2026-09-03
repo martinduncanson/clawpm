@@ -1405,8 +1405,20 @@ def assign_task_prefix(
     # len(full) are claimed, which needs siblings with explicit prefixes
     # engineered to exhaust them. An ugly prefix in that corner is a fair
     # trade for never minting a duplicate ID.
+    # 128 bits, not 24 (Codex P1, PR #57 round 5). A six-hex truncation is
+    # deterministic but NOT injective, and that is the property this arm
+    # actually needs: Codex produced a real collision by brute force —
+    # "code.--..--_" and "code--_._-_-_" both digest to 3384EB (verified
+    # locally), so two task-less projects could each see CODE3384EB as free
+    # and both mint CODE3384EB-000. 24 bits is trivially searchable; 128 is
+    # not, by anyone. This is injective to a cryptographic bound rather than
+    # provably injective — provable injectivity here means coordinating
+    # selection with the task-file write, which is CLAWP-116.
+    #
+    # Width is bounded by the task-id charset cap (64): stem + 32 hex + the
+    # "-NNN" suffix stays well inside it.
     stem = _strip_trailing_non_alnum(full)
-    digest = hashlib.sha256(project_id.encode("utf-8")).hexdigest()[:6].upper()
+    digest = hashlib.sha256(project_id.encode("utf-8")).hexdigest()[:32].upper()
     candidate = f"{stem}{digest}"
     if candidate not in used:
         return candidate
