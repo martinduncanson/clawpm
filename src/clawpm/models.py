@@ -551,6 +551,14 @@ class Task:
     # all-projects list path so each row carries its owning project id and two
     # same-numeric-id tasks in different projects are never conflated.
     project_id: str | None = None
+    # CLAWP-111-002 — a root task can be a "map": destination (the target
+    # state, free text) and not_yet_specified (the "fog" list — open
+    # questions/areas the map doesn't cover yet). Fog entries graduate into
+    # child tasks via ``tasks add --parent <root> --graduates "<text>"`` or are
+    # edited directly via ``tasks fog <root> --add/--drop``. Both omit from
+    # frontmatter when absent/empty — no diff on existing fixtures.
+    destination: str | None = None
+    not_yet_specified: list[str] = field(default_factory=list)
 
     @property
     def is_parent(self) -> bool:
@@ -717,6 +725,22 @@ class Task:
             else None
         )
 
+        # CLAWP-111-002 — destination (free text) and not_yet_specified (the
+        # fog list). Same lenient coercion shape as out_of_scope/stop_conditions
+        # above: absent or wrong-typed frontmatter degrades to the empty default
+        # rather than raising.
+        destination_raw = frontmatter.get("destination")
+        destination: str | None = (
+            destination_raw
+            if isinstance(destination_raw, str) and destination_raw.strip()
+            else None
+        )
+        nys_raw = frontmatter.get("not_yet_specified")
+        not_yet_specified: list[str] = (
+            [s for s in nys_raw if isinstance(s, str)]
+            if isinstance(nys_raw, list) else []
+        )
+
         return cls(
             id=frontmatter.get("id", path.stem.replace(".progress", "")),
             title=title,
@@ -744,6 +768,8 @@ class Task:
             stop_conditions=stop_conditions,
             delegability=delegability,
             baseline_ref=baseline_ref,
+            destination=destination,
+            not_yet_specified=not_yet_specified,
         )
 
     @property
@@ -801,6 +827,9 @@ class Task:
             "delegability": self.delegability,
             # CLAWP-055 — baseline ref (opaque; None for legacy tasks)
             "baseline_ref": self.baseline_ref,
+            # CLAWP-111-002 — root-map fields (see field comments above)
+            "destination": self.destination,
+            "not_yet_specified": self.not_yet_specified,
         }
         # CLAWP-084 — cross-project scope. Emitted ONLY when set (the
         # all-projects view sets it); single-project output stays byte-identical
