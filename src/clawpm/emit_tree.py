@@ -580,7 +580,15 @@ def _build_predictions_block(
     if sc:
         pred_dict["success_criteria"] = [c.to_yaml() for c in sc]
     cleaned = {k: v for k, v in pred_dict.items() if v is not None and v != []}
-    return cleaned or None
+    if not cleaned:
+        return None
+    # CLAWP-112-001 — emit-tree is a first-write site like `tasks add`; mint
+    # prediction_id here so it lands in the frontmatter this function builds
+    # (the post-promotion registration event reads it back off the emitted
+    # Task, so it must already be on disk by then).
+    if not cleaned.get("prediction_id"):
+        cleaned["prediction_id"] = uuid.uuid4().hex
+    return cleaned
 
 
 def _render_task_content(
@@ -1169,6 +1177,32 @@ def emit_tree(
     except Exception:
         # Work-log failure never blocks the result
         pass
+
+    # CLAWP-112-001 — register each emitted task's predictions snapshot.
+    # Reads back off the promoted (on-disk) Task objects rather than the
+    # staging-time LeafSpec/root predictions, so the registered snapshot is
+    # exactly what actually landed — including the prediction_id minted into
+    # the frontmatter by _build_predictions_block during staging. Best-effort,
+    # like the work-log append above: the tree is already durably promoted,
+    # so a registration failure must not turn a successful emit into a
+    # reported failure.
+    for _emitted_task in emitted_tasks:
+        if _emitted_task.predictions.is_empty():
+            continue
+        try:
+            from .reflect import write_prediction_event
+            write_prediction_event(
+                config.portfolio_root,
+                event="prediction_registered",
+                task_id=_emitted_task.id,
+                project_id=project_id,
+                prediction_id=_emitted_task.predictions.prediction_id,
+                predictions=_emitted_task.predictions.to_dict(),
+                filled_by=_emitted_task.predictions.filled_by,
+                baseline_ref=_emitted_task.baseline_ref,
+            )
+        except Exception:
+            pass
 
     # Build result — emitted_tasks was populated by _collect_emitted_tasks
     # (new-root path) or by individual file reads (attach_to path).
