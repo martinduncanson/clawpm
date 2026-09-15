@@ -47,7 +47,7 @@ import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 # Codex P1 fix: task_id and project_id flow unchanged into shell commands.
 # Reject anything outside the safe charset BEFORE interpolating, so an
@@ -410,10 +410,63 @@ def session_start_payload_path(target_dir: Path) -> Path:
     return target_dir / ".claude" / "clawpm-session-start.json"
 
 
+class WrittenDispatchSettings(NamedTuple):
+    """What :func:`write_dispatch_settings` put on disk.
+
+    ``path`` first, so existing tuple-unpacking and index-0 access read
+    naturally — but callers that only want the path should say ``.path``.
+
+    The byte fields exist so dispatch's rollback can tell whether the files
+    are still its own WITHOUT reading them back (Codex P2, PR #55 round 10):
+    a read-back adopts whatever is on disk at that moment, including an
+    operator's edit made a millisecond earlier, and the ownership comparison
+    then passes on a false premise. ``sidecar_bytes`` is ``None`` when no
+    rubric was rendered and therefore no sidecar written — which compares
+    correctly against "no sidecar on disk".
+    """
+
+    path: Path
+    settings_bytes: bytes
+    sidecar_bytes: Optional[bytes]
+
+
+def _write_exact(path: Path, text: str) -> bytes:
+    """Write *text* as UTF-8 with NO newline translation; return the bytes.
+
+    ``Path.write_text`` opens in text mode, so on Windows every ``\\n``
+    becomes ``\\r\\n`` and the bytes on disk are not the bytes the caller
+    rendered. Dispatch needs to know exactly what it put on disk in order to
+    tell later whether the file is still its own (Codex P2, PR #55 round 10),
+    and it cannot learn that by reading the file back — between the write and
+    the read, an operator or editor may have replaced it, and the read would
+    then adopt their bytes as ours.
+
+    Writing bytes directly makes the rendered form and the stored form the
+    same thing. It also makes these files byte-identical across platforms,
+    which suits artefacts the module docstring already expects to land in PR
+    diffs.
+    """
+    data = text.encode("utf-8")
+    path.write_bytes(data)
+    return data
+
+
 def write_session_start_sidecar(
     target_dir: Path, rubric_markdown: str
 ) -> Path:
     """Write the SessionStart additionalContext JSON to a sidecar file."""
+    path, _ = write_session_start_sidecar_bytes(target_dir, rubric_markdown)
+    return path
+
+
+def write_session_start_sidecar_bytes(
+    target_dir: Path, rubric_markdown: str
+) -> tuple[Path, bytes]:
+    """As :func:`write_session_start_sidecar`, also returning what was written.
+
+    Dispatch's rollback needs the exact bytes it put on disk; see
+    :func:`_write_exact`.
+    """
     payload = {
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
@@ -428,11 +481,9 @@ def write_session_start_sidecar(
     }
     path = session_start_payload_path(target_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False),
-        encoding="utf-8",
+    return path, _write_exact(
+        path, json.dumps(payload, indent=2, ensure_ascii=False)
     )
-    return path
 
 
 def write_dispatch_settings(
@@ -445,7 +496,7 @@ def write_dispatch_settings(
     confirm_close: bool = False,
     refute_votes: int = 1,
     lease_heartbeat: bool = False,
-) -> Path:
+) -> WrittenDispatchSettings:
     """Emit settings.local.json for the dispatched task.
 
     Returns the path written. Raises:
@@ -515,20 +566,22 @@ def write_dispatch_settings(
     )
     # Pretty-print so dispatch settings are review-friendly when they
     # land in PR diffs.
-    path.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
+    settings_bytes = _write_exact(
+        path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
     )
+    sidecar_bytes = None
     if rubric_markdown:
         # Side-car file holds the additionalContext JSON; the hook reads
         # it via `clawpm hook session-start`. See module docstring for
         # the cross-platform reasoning.
-        write_session_start_sidecar(target_dir, rubric_markdown)
+        _, sidecar_bytes = write_session_start_sidecar_bytes(
+            target_dir, rubric_markdown
+        )
     # Codex round-4: register the dispatch so on-done teardown can find
     # ALL target_dirs, not just the legacy repo_path + worktree pair.
     if portfolio_root is not None:
         register_dispatch(portfolio_root, task_id, project_id, target_dir)
-    return path
+    return WrittenDispatchSettings(path, settings_bytes, sidecar_bytes)
 
 
 def read_dispatch_marker(target_dir: Path) -> Optional[dict]:
@@ -540,7 +593,19 @@ def read_dispatch_marker(target_dir: Path) -> Optional[dict]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return None
-    return data.get(CLAWPM_MARKER_KEY)
+    # Shape guards (Codex P2, PR #55 round 7). A settings file whose top
+    # level is valid JSON but not an object (a bare list/string/number) made
+    # `data.get` raise AttributeError, and a truthy non-object marker value
+    # pushed the same failure onto every caller of `marker.get`. The path
+    # into this function is `.claude/settings.local.json` — a file the
+    # OPERATOR edits, and one any editor or unrelated tool may have written
+    # — so a malformed shape is an ordinary condition, not a corrupted
+    # invariant. Teardown must report "no clawpm marker here" and leave the
+    # file alone, which is exactly what returning None does.
+    if not isinstance(data, dict):
+        return None
+    marker = data.get(CLAWPM_MARKER_KEY)
+    return marker if isinstance(marker, dict) else None
 
 
 def teardown_dispatch_settings(
@@ -569,6 +634,19 @@ def teardown_dispatch_settings(
 
     No exception is raised in the not-removed paths — the caller reads
     the bool to decide what to surface.
+
+    CLAWP-098: this function does NOT release the task's session-scoped
+    worktree pointer (see sessions.py). An earlier version did, and Codex
+    review (PR #55) caught the resulting regression: dispatch-settings
+    teardown and worktree lifetime are NOT the same thing. A bulk
+    ``tasks state A B done`` run with cwd inside A's worktree tears down A's
+    settings mid-loop; if that also released A's session, task B — processed
+    next in the SAME invocation, same cwd — would find no active session and
+    silently fall through to the portfolio registry (main checkout) for the
+    rest of the command. Session liveness is instead purely a function of
+    whether the worktree directory still exists on disk (see
+    ``sessions.active_sessions``) — correct without any explicit release,
+    and immune to this ordering hazard.
     """
     path = settings_path(target_dir)
     sidecar = session_start_payload_path(target_dir)
@@ -616,6 +694,161 @@ def teardown_dispatch_settings(
                 project_id=resolved_project,
             )
     return True
+
+
+class GitProbeError(RuntimeError):
+    """A git tree probe failed for an OPERATIONAL reason, not because the
+    probed path is absent.
+
+    CLAWP-098 (Codex review, PR #55): the materialization gate previously
+    probed with ``git cat-file -e`` and read *any* nonzero exit as "this
+    path isn't in HEAD". ``cat-file -e`` only reports object existence and
+    cannot distinguish a missing path from a broken object database, an
+    unreadable HEAD, or git missing from PATH — so a transient repository
+    fault silently set ``_head_has_project`` false, skipped BOTH
+    materialization guards, and could register a stale reused checkout as
+    an isolated worktree. That is precisely the fail-open this gate exists
+    to close, reached through the gate's own probe.
+
+    Probes therefore raise this instead of folding the failure into a bool,
+    and the caller aborts the dispatch rather than treating an operational
+    error as the supported untracked-``.project`` case.
+    """
+
+
+def repo_prefix(repo_path: Path) -> str:
+    """Path from the repo root down to *repo_path* (empty when it IS the root).
+
+    Raises :class:`GitProbeError` rather than silently returning ``""`` on
+    failure — an empty prefix is indistinguishable from the legitimate
+    repo-root case, so swallowing the error would make every subsequent
+    probe address the wrong location in a mono-repo layout while looking
+    like it succeeded.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "rev-parse", "--show-prefix"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except OSError as exc:
+        raise GitProbeError(
+            f"could not run git rev-parse --show-prefix in {repo_path}: {exc}"
+        ) from exc
+    if result.returncode != 0:
+        raise GitProbeError(
+            f"git rev-parse --show-prefix in {repo_path} failed "
+            f"(exit {result.returncode}): "
+            f"{(result.stderr or '').strip() or '<no stderr>'}"
+        )
+    return result.stdout.strip()
+
+
+def head_object_sha(repo_path: Path, rel_path: str) -> Optional[str]:
+    """SHA of ``HEAD:<rel_path>``, or ``None`` when that path is not in HEAD.
+
+    Raises :class:`GitProbeError` when the probe itself fails.
+
+    ``git rev-parse --verify --quiet`` is used rather than ``cat-file -e``
+    precisely because it separates the two outcomes the gate must never
+    conflate: a path that cleanly does not resolve exits 1 with EMPTY
+    stderr, while an operational fault (corrupt or unavailable object
+    store, unreadable HEAD, not a repository) exits nonzero WITH a
+    diagnostic on stderr. It also returns the object id, which the caller
+    needs in order to compare a committed blob against the working tree.
+
+    ``rel_path`` resolves relative to the REPO ROOT, not ``-C``'s
+    directory, so callers must already have applied :func:`repo_prefix`
+    for a project whose repo_path is a subdirectory of a larger repo.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "rev-parse", "--verify", "--quiet",
+             f"HEAD:{rel_path}"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except OSError as exc:
+        # git missing from PATH, repo_path unreadable, process limits — an
+        # operational failure by definition, never "the path is absent".
+        raise GitProbeError(
+            f"could not run git rev-parse in {repo_path}: {exc}"
+        ) from exc
+    if result.returncode == 0:
+        return result.stdout.strip() or None
+    stderr = (result.stderr or "").strip()
+    if result.returncode == 1 and not stderr:
+        # Exit 1 with empty stderr means "this object name did not resolve" —
+        # but that covers BOTH "the path isn't in the tree" and "HEAD itself
+        # doesn't resolve", because --quiet suppresses the diagnostic for any
+        # invalid object name, not just a missing path (Codex P2, PR #55
+        # round 7, verified against git 2.43.0: `HEAD:nope` and `HEAD:f` are
+        # indistinguishable once HEAD points at a nonexistent ref). Reading
+        # that as a clean miss is the same fail-open this helper replaced
+        # `git cat-file -e` to close — an unborn or broken HEAD would set
+        # _head_has_project false and skip the materialization guards.
+        #
+        # So validate HEAD independently before believing the miss. Only on
+        # the miss path, so the common hit costs nothing extra.
+        if _head_resolves(repo_path):
+            return None
+        raise GitProbeError(
+            f"HEAD does not resolve in {repo_path} (unborn branch, detached "
+            f"at a missing object, or a corrupt ref), so HEAD:{rel_path} "
+            f"cannot be probed"
+        )
+    raise GitProbeError(
+        f"git rev-parse HEAD:{rel_path} in {repo_path} failed "
+        f"(exit {result.returncode}): {stderr or '<no stderr>'}"
+    )
+
+
+def _head_resolves(repo_path: Path) -> bool:
+    """Whether ``HEAD`` names a real commit in *repo_path*.
+
+    Deliberately narrow: this only ever runs to disambiguate an exit-1
+    non-resolution in :func:`head_object_sha`, so it answers one question and
+    treats any failure to answer as "no". Its caller turns that into a
+    ``GitProbeError``, which is the fail-closed outcome either way — an
+    unresolvable HEAD and an unanswerable probe both mean the materialization
+    guards must not be skipped.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "rev-parse", "--verify", "--quiet",
+             "HEAD^{commit}"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except OSError:
+        return False
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def working_tree_blob_sha(path: Path) -> Optional[str]:
+    """SHA git WOULD record for *path*'s current contents, or ``None`` if absent.
+
+    Lets the materialization gate tell "this task is committed" from "a
+    task with this id is committed, but the revision dispatch just loaded
+    differs from it" — the distinction that stops a worktree being checked
+    out at a stale task revision (Codex review, PR #55). Raises
+    :class:`GitProbeError` on an operational failure, same contract as
+    :func:`head_object_sha`.
+    """
+    if not path.exists():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "hash-object", "--", str(path)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except OSError as exc:
+        raise GitProbeError(
+            f"could not run git hash-object for {path}: {exc}"
+        ) from exc
+    if result.returncode != 0:
+        raise GitProbeError(
+            f"git hash-object {path} failed (exit {result.returncode}): "
+            f"{(result.stderr or '').strip() or '<no stderr>'}"
+        )
+    return result.stdout.strip() or None
 
 
 def create_worktree(repo_path: Path, task_id: str) -> Path:
