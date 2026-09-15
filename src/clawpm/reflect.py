@@ -660,6 +660,7 @@ def write_reflection_event(
     process_lesson: str | None = None,
     surprise_taxonomy: list[str] | None = None,
     agent_profile: str | None = None,
+    kind: str | None = None,
 ) -> Path:
     """Compute deltas and append one JSON line to ~/clawpm/reflections/<task-id>.jsonl.
 
@@ -671,6 +672,10 @@ def write_reflection_event(
     - ``surprise_taxonomy``: multi-pick tags from the fixed vocabulary in
       ``SURPRISE_TAXONOMY`` (models.py).  Validated before calling this function
       — pass an empty list rather than None when no surprise is provided.
+
+    CLAWP-111 — ``kind``: the closing task's ``Task.kind``. Recorded only
+    when it's not the ("build") default, so existing reflection events and
+    consumers keep their current shape.
     """
     deltas = _compute_deltas(predictions, actuals)
 
@@ -688,6 +693,8 @@ def write_reflection_event(
         "process_lesson": process_lesson,
         "surprise_taxonomy": surprise_taxonomy if surprise_taxonomy is not None else [],
     }
+    if kind and kind != "build":
+        record["kind"] = kind
 
     ref_dir = _reflections_dir(portfolio_root)
     ref_file = ref_dir / f"{task_id}.jsonl"

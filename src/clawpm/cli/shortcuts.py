@@ -45,10 +45,13 @@ def quick_add(ctx: click.Context, project_id: str | None, title: str, priority: 
 @click.option("--meta-reflect", "meta_reflect", default=None, help="What could have been anticipated that wasn't, and why?")
 @click.option("--process-lesson", "process_lesson", default=None, help="What update to your prediction PROCESS would have caught this?")
 @click.option("--surprise", "surprise_tags", multiple=True, help="Surprise taxonomy tag (repeatable): unknown_unknown, scope_drift, dependency, tooling_friction, complexity_misread, assumption_broke, external_blocker")
+# CLAWP-111 — decision-kind tasks: required to complete a kind: decision task.
+@click.option("--resolution", "resolution", default=None,
+              help="Required to complete (done) a kind: decision task: the decision's outcome.")
 @click.pass_context
-def quick_done(ctx: click.Context, project_id: str | None, task_ids: tuple[str, ...], note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...]) -> None:
+def quick_done(ctx: click.Context, project_id: str | None, task_ids: tuple[str, ...], note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...], resolution: str | None = None) -> None:
     """Mark one or many tasks as done (alias for 'tasks state <ids...> done')."""
-    ctx.invoke(tasks_state, project_id=project_id, task_ids=task_ids, new_state="done", note=note, force=force, reflect_note=reflect_note, meta_reflect=meta_reflect, process_lesson=process_lesson, surprise_tags=surprise_tags)
+    ctx.invoke(tasks_state, project_id=project_id, task_ids=task_ids, new_state="done", note=note, force=force, reflect_note=reflect_note, meta_reflect=meta_reflect, process_lesson=process_lesson, surprise_tags=surprise_tags, resolution=resolution)
 
 
 @main.command("start")
