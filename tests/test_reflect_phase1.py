@@ -291,7 +291,7 @@ class TestActualsComputation:
         entries = [
             self._make_log_entry("test", task.id, WorkLogAction.START, ts=start_ts),
         ]
-        actuals = _compute_actuals(task.id, None, entries)
+        actuals = _compute_actuals(task.id, entries)
         # Should be approximately 30 minutes (allow ±2 min slop)
         assert actuals.duration_min is not None
         assert 28 <= actuals.duration_min <= 32
@@ -304,7 +304,7 @@ class TestActualsComputation:
         entries = [
             self._make_log_entry("test", task.id, WorkLogAction.PROGRESS),
         ]
-        actuals = _compute_actuals(task.id, None, entries)
+        actuals = _compute_actuals(task.id, entries)
         assert actuals.duration_min is None
 
     def test_files_touched_deduped(self, temp_portfolio):
@@ -318,18 +318,30 @@ class TestActualsComputation:
             self._make_log_entry("test", task.id, WorkLogAction.DONE,
                                  files=["src/b.py", "src/c.py"]),
         ]
-        actuals = _compute_actuals(task.id, None, entries)
+        actuals = _compute_actuals(task.id, entries)
         # src/b.py appears twice but should be deduped
         assert actuals.files_touched == sorted(["src/a.py", "src/b.py", "src/c.py"])
         assert actuals.files_changed == 3
 
-    def test_complexity_taken_from_task_field(self, temp_portfolio):
+    def test_complexity_null_without_actual_complexity(self, temp_portfolio):
+        """CLAWP-112-002: complexity is NEVER inferred from the task's own
+        (predicted) complexity field — only from an explicit actual_complexity."""
         config = temp_portfolio["config"]
         task = add_task(config, "test", "Complexity test", complexity=TaskComplexity.L)
         assert task is not None
 
-        actuals = _compute_actuals(task.id, TaskComplexity.L, [])
-        assert actuals.complexity == TaskComplexity.L
+        actuals = _compute_actuals(task.id, [])
+        assert actuals.complexity is None
+
+    def test_complexity_set_from_actual_complexity_param(self, temp_portfolio):
+        """CLAWP-112-002: actuals.complexity reflects the INDEPENDENTLY
+        supplied actual_complexity, not the task's (predicted) complexity."""
+        config = temp_portfolio["config"]
+        task = add_task(config, "test", "Complexity test", complexity=TaskComplexity.L)
+        assert task is not None
+
+        actuals = _compute_actuals(task.id, [], actual_complexity=TaskComplexity.M)
+        assert actuals.complexity == TaskComplexity.M
 
 
 # ---------------------------------------------------------------------------
@@ -571,6 +583,133 @@ class TestTasksStateDoneWritesReflection:
         record = json.loads(ref_file.read_text().strip().splitlines()[-1])
         assert record["note"] == "unexpected complexity"
         assert "DB schema gap" in record["meta_reflection"]
+
+
+# ---------------------------------------------------------------------------
+# 7b. --actual-complexity (CLAWP-112-002): honest actuals.complexity
+# ---------------------------------------------------------------------------
+
+
+class TestActualComplexityCLI:
+    def test_done_without_actual_complexity_leaves_complexity_null(self, temp_portfolio):
+        """WHEN done runs WITHOUT --actual-complexity THEN actuals.complexity
+        is null and deltas.complexity_match is null — never a passthrough of
+        the prediction."""
+        config = temp_portfolio["config"]
+        portfolio_root = temp_portfolio["root"]
+
+        predictions = Predictions(duration_min=60, complexity=TaskComplexity.M)
+        task = add_task(
+            config, "test", "No actual-complexity", complexity=TaskComplexity.M,
+            predictions=predictions,
+        )
+        assert task is not None
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main, ["tasks", "state", task.id, "done", "--project", "test"],
+        )
+        assert result.exit_code == 0, result.output
+
+        ref_file = portfolio_root / "reflections" / f"{task.id}.jsonl"
+        record = json.loads(ref_file.read_text().strip().splitlines()[-1])
+        assert record["actuals"]["complexity"] is None
+        assert record["deltas"]["complexity_match"] is None
+
+    def test_done_with_actual_complexity_compares_to_supplied(self, temp_portfolio):
+        """WHEN done runs WITH --actual-complexity THEN complexity_match
+        compares the PREDICTION to the SUPPLIED value, not to itself."""
+        config = temp_portfolio["config"]
+        portfolio_root = temp_portfolio["root"]
+
+        predictions = Predictions(duration_min=60, complexity=TaskComplexity.M)
+        task = add_task(
+            config, "test", "Mismatched actual-complexity", complexity=TaskComplexity.M,
+            predictions=predictions,
+        )
+        assert task is not None
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "tasks", "state", task.id, "done",
+                "--actual-complexity", "l",
+                "--project", "test",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+        ref_file = portfolio_root / "reflections" / f"{task.id}.jsonl"
+        record = json.loads(ref_file.read_text().strip().splitlines()[-1])
+        assert record["actuals"]["complexity"] == "l"
+        assert record["deltas"]["complexity_predicted"] == "m"
+        assert record["deltas"]["complexity_actual"] == "l"
+        assert record["deltas"]["complexity_match"] is False
+
+    def test_done_with_matching_actual_complexity(self, temp_portfolio):
+        config = temp_portfolio["config"]
+        portfolio_root = temp_portfolio["root"]
+
+        predictions = Predictions(duration_min=60, complexity=TaskComplexity.M)
+        task = add_task(
+            config, "test", "Matched actual-complexity", complexity=TaskComplexity.M,
+            predictions=predictions,
+        )
+        assert task is not None
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "tasks", "state", task.id, "done",
+                "--actual-complexity", "m",
+                "--project", "test",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+        ref_file = portfolio_root / "reflections" / f"{task.id}.jsonl"
+        record = json.loads(ref_file.read_text().strip().splitlines()[-1])
+        assert record["actuals"]["complexity"] == "m"
+        assert record["deltas"]["complexity_match"] is True
+
+    def test_done_shortcut_actual_complexity(self, temp_portfolio):
+        """The 'clawpm done' shortcut (cli/shortcuts.py) threads
+        --actual-complexity through to the same reflection event."""
+        config = temp_portfolio["config"]
+        portfolio_root = temp_portfolio["root"]
+
+        predictions = Predictions(duration_min=60, complexity=TaskComplexity.S)
+        task = add_task(
+            config, "test", "Shortcut actual-complexity", complexity=TaskComplexity.S,
+            predictions=predictions,
+        )
+        assert task is not None
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["done", task.id, "--actual-complexity", "xl", "--project", "test"],
+        )
+        assert result.exit_code == 0, result.output
+
+        ref_file = portfolio_root / "reflections" / f"{task.id}.jsonl"
+        record = json.loads(ref_file.read_text().strip().splitlines()[-1])
+        assert record["actuals"]["complexity"] == "xl"
+        assert record["deltas"]["complexity_match"] is False
+
+    def test_invalid_actual_complexity_rejected_by_cli(self, temp_portfolio):
+        config = temp_portfolio["config"]
+        task = add_task(config, "test", "Bad actual-complexity")
+        assert task is not None
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["tasks", "state", task.id, "done", "--actual-complexity", "huge", "--project", "test"],
+        )
+        assert result.exit_code != 0
 
 
 # ---------------------------------------------------------------------------

@@ -457,6 +457,9 @@ class Actuals:
     """
 
     duration_min: int | None = None
+    # CLAWP-112-002 — honest actuals: complexity is null unless independently
+    # supplied via `clawpm done --actual-complexity`. Never a passthrough of
+    # the task's (predicted) complexity — see _compute_actuals.
     complexity: TaskComplexity | None = None
     files_changed: int | None = None
     files_touched: list[str] = field(default_factory=list)
@@ -464,6 +467,11 @@ class Actuals:
     # event. Populated by _compute_actuals from iteration_event lines in
     # the reflection JSONL. None = no iterations were captured.
     iterations: int | None = None
+    # CLAWP-112-002 — sum of min(gap_to_next, 60) minutes over consecutive
+    # work_log entries for the task, plus a flat 15-minute wrap-up credit for
+    # the final entry; clamped to duration_min when both are known. None when
+    # the task has no work_log entries. See _compute_actuals / _compute_active_min.
+    active_min: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -472,6 +480,7 @@ class Actuals:
             "files_changed": self.files_changed,
             "files_touched": self.files_touched,
             "iterations": self.iterations,
+            "active_min": self.active_min,
         }
 
 

@@ -1,0 +1,1077 @@
+[
+  {
+    "task_id": "SBD-003",
+    "actual_duration_min": 14439,
+    "work_log_entries": [
+      {
+        "ts": "2026-08-14T12:08:53.819177+00:00",
+        "task": "SBD-003",
+        "action": "start"
+      },
+      {
+        "ts": "2026-08-14T19:30:16.416364+00:00",
+        "task": "SBD-003",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-08-14T20:42:14.911500+00:00",
+        "task": "SBD-003",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-08-14T23:42:27+03:00",
+        "task": "SBD-003",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-08-14T21:07:56.598908+00:00",
+        "task": "SBD-003",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-08-15T00:08:02+03:00",
+        "task": "SBD-003",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-08-14T21:34:17.946317+00:00",
+        "task": "SBD-003",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-08-15T00:34:27+03:00",
+        "task": "SBD-003",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-08-15T02:30:16.205049+00:00",
+        "task": "SBD-003",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-08-24T07:35:57.346757+00:00",
+        "task": "SBD-003",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-08-24T08:09:48.392812+00:00",
+        "task": "SBD-003",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-08-24T09:07:27.509524+00:00",
+        "task": "SBD-003",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-08-24T09:09:23.263292+00:00",
+        "task": "SBD-003",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-08-24T09:57:05.987621+00:00",
+        "task": "SBD-003",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-08-14T17:36:54+03:00",
+        "task": "SBD-003",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-08-24T12:09:12+03:00",
+        "task": "SBD-003",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-08-24T12:57:18+03:00",
+        "task": "SBD-003",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-08-24T10:50:13.835003+00:00",
+        "task": "SBD-003",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-08-24T11:12:54.577562+00:00",
+        "task": "SBD-003",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-08-24T14:13:10+03:00",
+        "task": "SBD-003",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-08-24T11:27:41.418348+00:00",
+        "task": "SBD-003",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-08-24T14:27:41+03:00",
+        "task": "SBD-003",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-08-24T11:44:44.974691+00:00",
+        "task": "SBD-003",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-08-24T14:44:45+03:00",
+        "task": "SBD-003",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-08-24T11:58:12.874519+00:00",
+        "task": "SBD-003",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-08-24T14:58:12+03:00",
+        "task": "SBD-003",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-08-24T12:18:22.327337+00:00",
+        "task": "SBD-003",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-08-24T15:18:22+03:00",
+        "task": "SBD-003",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-08-24T12:31:34.796073+00:00",
+        "task": "SBD-003",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-08-24T15:31:52+03:00",
+        "task": "SBD-003",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-08-24T12:44:48.004289+00:00",
+        "task": "SBD-003",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-08-24T15:45:01+03:00",
+        "task": "SBD-003",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-08-24T12:48:03.306330+00:00",
+        "task": "SBD-003",
+        "action": "done"
+      },
+      {
+        "ts": "2026-08-24T05:47:24-07:00",
+        "task": "SBD-003",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-08-24T15:48:22+03:00",
+        "task": "SBD-003",
+        "action": "commit"
+      }
+    ]
+  },
+  {
+    "task_id": "AOS-000",
+    "actual_duration_min": 255,
+    "work_log_entries": [
+      {
+        "ts": "2026-07-07T11:18:42.748749+00:00",
+        "task": "AOS-000",
+        "action": "start"
+      },
+      {
+        "ts": "2026-07-07T14:32:06+03:00",
+        "task": "AOS-000",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-07-07T15:33:58.087083+00:00",
+        "task": "AOS-000",
+        "action": "done"
+      },
+      {
+        "ts": "2026-07-07T13:43:25+03:00",
+        "task": "AOS-000",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-07-07T14:57:00+03:00",
+        "task": "AOS-000",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-07-07T15:07:18+03:00",
+        "task": "AOS-000",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-07-07T15:17:38+03:00",
+        "task": "AOS-000",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-07-07T15:25:22+03:00",
+        "task": "AOS-000",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-07-07T15:36:47+03:00",
+        "task": "AOS-000",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-07-07T15:45:37+03:00",
+        "task": "AOS-000",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-07-07T16:08:45+03:00",
+        "task": "AOS-000",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-07-07T16:25:21+03:00",
+        "task": "AOS-000",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-07-07T16:37:13+03:00",
+        "task": "AOS-000",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-07-07T16:50:02+03:00",
+        "task": "AOS-000",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-07-07T17:02:41+03:00",
+        "task": "AOS-000",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-07-07T17:06:20+03:00",
+        "task": "AOS-000",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-07-07T17:14:53+03:00",
+        "task": "AOS-000",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-07-07T17:33:58+03:00",
+        "task": "AOS-000",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-07-07T17:48:06+03:00",
+        "task": "AOS-000",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-07-07T17:59:05+03:00",
+        "task": "AOS-000",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-07-07T18:12:33+03:00",
+        "task": "AOS-000",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-07-07T18:31:44+03:00",
+        "task": "AOS-000",
+        "action": "commit"
+      }
+    ]
+  },
+  {
+    "task_id": "ARB-P-000",
+    "actual_duration_min": 20726,
+    "work_log_entries": [
+      {
+        "ts": "2026-04-26T20:06:39.880724+00:00",
+        "task": "ARB-P-000",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-05-25T19:06:47.291363+00:00",
+        "task": "ARB-P-000",
+        "action": "start"
+      },
+      {
+        "ts": "2026-05-26T00:08:38.470728+00:00",
+        "task": "ARB-P-000",
+        "action": "start"
+      },
+      {
+        "ts": "2026-05-28T06:23:20.070903+00:00",
+        "task": "ARB-P-000",
+        "action": "start"
+      },
+      {
+        "ts": "2026-05-28T06:29:51.002143+00:00",
+        "task": "ARB-P-000",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-05-28T07:10:47.177340+00:00",
+        "task": "ARB-P-000",
+        "action": "start"
+      },
+      {
+        "ts": "2026-05-28T07:23:07.065435+00:00",
+        "task": "ARB-P-000",
+        "action": "done"
+      },
+      {
+        "ts": "2026-05-28T14:30:44.000385+00:00",
+        "task": "ARB-P-000",
+        "action": "start"
+      },
+      {
+        "ts": "2026-05-31T20:00:28.746461+00:00",
+        "task": "ARB-P-000",
+        "action": "start"
+      },
+      {
+        "ts": "2026-05-31T20:10:06.892644+00:00",
+        "task": "ARB-P-000",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-05-31T20:10:29.773032+00:00",
+        "task": "ARB-P-000",
+        "action": "done"
+      },
+      {
+        "ts": "2026-06-02T14:12:53.550553+00:00",
+        "task": "ARB-P-000",
+        "action": "done"
+      },
+      {
+        "ts": "2026-06-02T20:15:41.454984+00:00",
+        "task": "ARB-P-000",
+        "action": "done"
+      },
+      {
+        "ts": "2026-06-09T04:33:28.193407+00:00",
+        "task": "ARB-P-000",
+        "action": "done"
+      }
+    ]
+  },
+  {
+    "task_id": "CLAWP-041",
+    "actual_duration_min": 568,
+    "work_log_entries": [
+      {
+        "ts": "2026-06-01T17:48:43.890229+00:00",
+        "task": "CLAWP-041",
+        "action": "start"
+      },
+      {
+        "ts": "2026-05-27T09:33:36+03:00",
+        "task": "CLAWP-041",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-05-27T15:43:34+03:00",
+        "task": "CLAWP-041",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-05-27T15:47:23+03:00",
+        "task": "CLAWP-041",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-05-27T16:39:45+03:00",
+        "task": "CLAWP-041",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-06-01T19:47:29+03:00",
+        "task": "CLAWP-041",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-06-01T21:18:07+03:00",
+        "task": "CLAWP-041",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-06-01T21:25:43+03:00",
+        "task": "CLAWP-041",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-06-01T21:39:24+03:00",
+        "task": "CLAWP-041",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-06-01T21:50:59+03:00",
+        "task": "CLAWP-041",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-06-01T22:07:15+03:00",
+        "task": "CLAWP-041",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-06-01T19:12:24.476062+00:00",
+        "task": "CLAWP-041",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-06-02T03:16:52.217013+00:00",
+        "task": "CLAWP-041",
+        "action": "done"
+      }
+    ]
+  },
+  {
+    "task_id": "AICQ-W9",
+    "actual_duration_min": 23,
+    "work_log_entries": [
+      {
+        "ts": "2026-05-26T06:56:39.794115+00:00",
+        "task": "AICQ-W9",
+        "action": "start"
+      },
+      {
+        "ts": "2026-05-26T09:33:50+03:00",
+        "task": "AICQ-W9",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-05-26T07:35:42+01:00",
+        "task": "AICQ-W9",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-05-26T09:36:01+03:00",
+        "task": "AICQ-W9",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-05-26T09:42:05+03:00",
+        "task": "AICQ-W9",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-05-26T07:44:32+01:00",
+        "task": "AICQ-W9",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-05-26T09:44:58+03:00",
+        "task": "AICQ-W9",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-05-26T09:45:32+03:00",
+        "task": "AICQ-W9",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-05-26T09:49:44+03:00",
+        "task": "AICQ-W9",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-05-26T07:54:50+01:00",
+        "task": "AICQ-W9",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-05-26T09:55:21+03:00",
+        "task": "AICQ-W9",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-05-26T07:20:22.211649+00:00",
+        "task": "AICQ-W9",
+        "action": "done"
+      }
+    ]
+  },
+  {
+    "task_id": "AICQ-W0",
+    "actual_duration_min": 31,
+    "work_log_entries": [
+      {
+        "ts": "2026-05-26T04:56:47.255281+00:00",
+        "task": "AICQ-W0",
+        "action": "start"
+      },
+      {
+        "ts": "2026-05-26T07:43:31+03:00",
+        "task": "AICQ-W0",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-05-26T07:46:53+03:00",
+        "task": "AICQ-W0",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-05-26T07:55:33+03:00",
+        "task": "AICQ-W0",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-05-26T08:21:40+03:00",
+        "task": "AICQ-W0",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-05-26T08:21:56+03:00",
+        "task": "AICQ-W0",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-05-26T08:22:15+03:00",
+        "task": "AICQ-W0",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-05-26T08:22:32+03:00",
+        "task": "AICQ-W0",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-05-26T08:22:45+03:00",
+        "task": "AICQ-W0",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-05-26T05:28:12.706709+00:00",
+        "task": "AICQ-W0",
+        "action": "done"
+      }
+    ]
+  },
+  {
+    "task_id": "ARB-P-137",
+    "actual_duration_min": 87407,
+    "work_log_entries": [
+      {
+        "ts": "2026-05-28T14:20:27.788632+00:00",
+        "task": "ARB-P-137",
+        "action": "start"
+      },
+      {
+        "ts": "2026-05-28T14:26:03.775675+00:00",
+        "task": "ARB-P-137",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-06-01T07:04:25.935598+00:00",
+        "task": "ARB-P-137",
+        "action": "start"
+      },
+      {
+        "ts": "2026-06-01T07:26:43.214730+00:00",
+        "task": "ARB-P-137",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-06-01T09:36:25.163265+00:00",
+        "task": "ARB-P-137",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-06-01T09:36:39.447036+00:00",
+        "task": "ARB-P-137",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-06-01T10:38:32.299802+00:00",
+        "task": "ARB-P-137",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-06-01T19:58:14.170338+00:00",
+        "task": "ARB-P-137",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-06-01T21:34:38.543844+00:00",
+        "task": "ARB-P-137",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-07-28T07:08:03.871050+00:00",
+        "task": "ARB-P-137",
+        "action": "done"
+      }
+    ]
+  },
+  {
+    "task_id": "ARB-P-076",
+    "actual_duration_min": 489,
+    "work_log_entries": [
+      {
+        "ts": "2026-05-18T06:48:33.224891+00:00",
+        "task": "ARB-P-076",
+        "action": "start"
+      },
+      {
+        "ts": "2026-05-18T06:54:38.144847+00:00",
+        "task": "ARB-P-076",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-05-18T07:51:19.245998+00:00",
+        "task": "ARB-P-076",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-05-18T08:02:26.903835+00:00",
+        "task": "ARB-P-076",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-05-18T14:05:50.819411+00:00",
+        "task": "ARB-P-076",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-05-18T14:23:02.237921+00:00",
+        "task": "ARB-P-076",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-05-18T14:46:37.730616+00:00",
+        "task": "ARB-P-076",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-05-18T14:52:52.909546+00:00",
+        "task": "ARB-P-076",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-05-18T14:58:18.975693+00:00",
+        "task": "ARB-P-076",
+        "action": "done"
+      }
+    ]
+  },
+  {
+    "task_id": "ARB-P-130",
+    "actual_duration_min": 87899,
+    "work_log_entries": [
+      {
+        "ts": "2026-05-28T06:08:32.249989+00:00",
+        "task": "ARB-P-130",
+        "action": "start"
+      },
+      {
+        "ts": "2026-06-01T08:57:55.326500+00:00",
+        "task": "ARB-P-130",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-06-01T09:12:29.297609+00:00",
+        "task": "ARB-P-130",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-06-01T09:12:47.071088+00:00",
+        "task": "ARB-P-130",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-06-01T09:13:23.369059+00:00",
+        "task": "ARB-P-130",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-06-01T09:13:38.208528+00:00",
+        "task": "ARB-P-130",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-06-01T12:51:20.300484+00:00",
+        "task": "ARB-P-130",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-06-01T19:54:21.918963+00:00",
+        "task": "ARB-P-130",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-07-28T07:08:04.537054+00:00",
+        "task": "ARB-P-130",
+        "action": "done"
+      }
+    ]
+  },
+  {
+    "task_id": "ARB-P-135",
+    "actual_duration_min": 117172,
+    "work_log_entries": [
+      {
+        "ts": "2026-06-01T03:39:06.158303+00:00",
+        "task": "ARB-P-135",
+        "action": "start"
+      },
+      {
+        "ts": "2026-06-01T03:43:47.571041+00:00",
+        "task": "ARB-P-135",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-06-01T05:55:47.320369+00:00",
+        "task": "ARB-P-135",
+        "action": "note"
+      },
+      {
+        "ts": "2026-06-01T20:03:10.341067+00:00",
+        "task": "ARB-P-135",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-07-28T07:07:43.828955+00:00",
+        "task": "ARB-P-135",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-08-21T09:52:20.300096+00:00",
+        "task": "ARB-P-135",
+        "action": "note"
+      },
+      {
+        "ts": "2026-08-21T09:52:31.445446+00:00",
+        "task": "ARB-P-135",
+        "action": "note"
+      },
+      {
+        "ts": "2026-08-21T12:31:12.380636+00:00",
+        "task": "ARB-P-135",
+        "action": "done"
+      },
+      {
+        "ts": "2026-08-21T12:31:13.258351+00:00",
+        "task": "ARB-P-135",
+        "action": "done"
+      }
+    ]
+  },
+  {
+    "task_id": "ARB-P-143",
+    "actual_duration_min": 47,
+    "work_log_entries": [
+      {
+        "ts": "2026-05-31T18:01:15.253764+00:00",
+        "task": "ARB-P-143",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-06-01T07:34:20.220286+00:00",
+        "task": "ARB-P-143",
+        "action": "start"
+      },
+      {
+        "ts": "2026-06-01T08:21:40.871202+00:00",
+        "task": "ARB-P-143",
+        "action": "done"
+      },
+      {
+        "ts": "2026-06-01T08:21:45.128337+00:00",
+        "task": "ARB-P-143",
+        "action": "done"
+      },
+      {
+        "ts": "2026-06-01T12:44:16.006609+00:00",
+        "task": "ARB-P-143",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-06-01T20:03:38.507202+00:00",
+        "task": "ARB-P-143",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-06-01T20:10:30.514063+00:00",
+        "task": "ARB-P-143",
+        "action": "progress"
+      }
+    ]
+  },
+  {
+    "task_id": "AGENT-037",
+    "actual_duration_min": 6132,
+    "work_log_entries": [
+      {
+        "ts": "2026-06-10T11:58:55+03:00",
+        "task": "AGENT-037",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-06-17T10:37:56+03:00",
+        "task": "AGENT-037",
+        "action": "commit"
+      },
+      {
+        "ts": "2026-06-22T03:06:14.274745+00:00",
+        "task": "AGENT-037",
+        "action": "start"
+      },
+      {
+        "ts": "2026-06-26T09:18:23.292636+00:00",
+        "task": "AGENT-037",
+        "action": "done"
+      }
+    ]
+  },
+  {
+    "task_id": "ACCOU-012-001",
+    "actual_duration_min": 5,
+    "work_log_entries": [
+      {
+        "ts": "2026-07-30T09:12:34.915854+00:00",
+        "task": "ACCOU-012-001",
+        "action": "start"
+      },
+      {
+        "ts": "2026-07-30T09:18:19.076239+00:00",
+        "task": "ACCOU-012-001",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-07-30T09:18:19.491632+00:00",
+        "task": "ACCOU-012-001",
+        "action": "done"
+      }
+    ]
+  },
+  {
+    "task_id": "ARB-P-045",
+    "actual_duration_min": 4,
+    "work_log_entries": [
+      {
+        "ts": "2026-05-28T14:14:06.056157+00:00",
+        "task": "ARB-P-045",
+        "action": "start"
+      },
+      {
+        "ts": "2026-05-28T14:18:22.124004+00:00",
+        "task": "ARB-P-045",
+        "action": "done"
+      },
+      {
+        "ts": "2026-05-28T14:18:51.406854+00:00",
+        "task": "ARB-P-045",
+        "action": "done"
+      }
+    ]
+  },
+  {
+    "task_id": "CLAWP-056",
+    "actual_duration_min": 40,
+    "work_log_entries": [
+      {
+        "ts": "2026-06-12T09:24:46.792797+00:00",
+        "task": "CLAWP-056",
+        "action": "start"
+      },
+      {
+        "ts": "2026-06-12T10:05:06.712780+00:00",
+        "task": "CLAWP-056",
+        "action": "done"
+      },
+      {
+        "ts": "2026-06-15T08:33:28+03:00",
+        "task": "CLAWP-056",
+        "action": "commit"
+      }
+    ]
+  },
+  {
+    "task_id": "SBD-001-003",
+    "actual_duration_min": 8,
+    "work_log_entries": [
+      {
+        "ts": "2026-08-11T14:36:06.884858+00:00",
+        "task": "SBD-001-003",
+        "action": "start"
+      },
+      {
+        "ts": "2026-08-11T14:44:58.619544+00:00",
+        "task": "SBD-001-003",
+        "action": "progress"
+      },
+      {
+        "ts": "2026-08-11T14:44:59.106782+00:00",
+        "task": "SBD-001-003",
+        "action": "done"
+      }
+    ]
+  },
+  {
+    "task_id": "TSA-018",
+    "actual_duration_min": 12,
+    "work_log_entries": [
+      {
+        "ts": "2026-06-29T04:05:41.695901+00:00",
+        "task": "TSA-018",
+        "action": "start"
+      },
+      {
+        "ts": "2026-06-29T04:18:40.912911+00:00",
+        "task": "TSA-018",
+        "action": "done"
+      },
+      {
+        "ts": "2026-06-29T07:19:16+03:00",
+        "task": "TSA-018",
+        "action": "commit"
+      }
+    ]
+  },
+  {
+    "task_id": "ARB-P-021",
+    "actual_duration_min": 10,
+    "work_log_entries": [
+      {
+        "ts": "2026-05-26T11:29:55.943342+00:00",
+        "task": "ARB-P-021",
+        "action": "start"
+      },
+      {
+        "ts": "2026-05-26T11:39:58.342764+00:00",
+        "task": "ARB-P-021",
+        "action": "done"
+      }
+    ]
+  },
+  {
+    "task_id": "BEACO-041",
+    "actual_duration_min": 41235,
+    "work_log_entries": [
+      {
+        "ts": "2026-04-14T18:44:57.438315+00:00",
+        "task": "BEACO-041",
+        "action": "start"
+      },
+      {
+        "ts": "2026-05-13T10:00:15.411293+00:00",
+        "task": "BEACO-041",
+        "action": "done"
+      }
+    ]
+  },
+  {
+    "task_id": "CLAWP-054",
+    "actual_duration_min": 38,
+    "work_log_entries": [
+      {
+        "ts": "2026-06-12T05:54:58.789160+00:00",
+        "task": "CLAWP-054",
+        "action": "start"
+      },
+      {
+        "ts": "2026-06-12T06:33:26.866838+00:00",
+        "task": "CLAWP-054",
+        "action": "done"
+      }
+    ]
+  },
+  {
+    "task_id": "OPENW-000-006",
+    "actual_duration_min": 42306,
+    "work_log_entries": [
+      {
+        "ts": "2026-04-09T06:15:12.195995+00:00",
+        "task": "OPENW-000-006",
+        "action": "start"
+      },
+      {
+        "ts": "2026-05-08T15:21:25.491730+00:00",
+        "task": "OPENW-000-006",
+        "action": "done"
+      }
+    ]
+  },
+  {
+    "task_id": "POLYM-001",
+    "actual_duration_min": 187,
+    "work_log_entries": [
+      {
+        "ts": "2026-05-13T13:00:19.781011+00:00",
+        "task": "POLYM-001",
+        "action": "start"
+      },
+      {
+        "ts": "2026-05-13T16:07:25.409079+00:00",
+        "task": "POLYM-001",
+        "action": "done"
+      }
+    ]
+  },
+  {
+    "task_id": "SIRVO-000",
+    "actual_duration_min": 5,
+    "work_log_entries": [
+      {
+        "ts": "2026-05-11T14:42:54.864835+00:00",
+        "task": "SIRVO-000",
+        "action": "start"
+      },
+      {
+        "ts": "2026-05-11T14:48:33.226231+00:00",
+        "task": "SIRVO-000",
+        "action": "done"
+      }
+    ]
+  },
+  {
+    "task_id": "SIRVO-140",
+    "actual_duration_min": 9,
+    "work_log_entries": [
+      {
+        "ts": "2026-08-25T06:35:53.487225+00:00",
+        "task": "SIRVO-140",
+        "action": "start"
+      },
+      {
+        "ts": "2026-08-25T06:45:40.974425+00:00",
+        "task": "SIRVO-140",
+        "action": "done"
+      }
+    ]
+  },
+  {
+    "task_id": "TSA-001-002",
+    "actual_duration_min": 8,
+    "work_log_entries": [
+      {
+        "ts": "2026-06-17T15:46:39.368129+00:00",
+        "task": "TSA-001-002",
+        "action": "start"
+      },
+      {
+        "ts": "2026-06-17T15:54:43.760503+00:00",
+        "task": "TSA-001-002",
+        "action": "done"
+      }
+    ]
+  }
+]

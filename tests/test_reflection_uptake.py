@@ -242,7 +242,7 @@ class TestSubtaskDurationIsolation:
             self._make_entry("test", parent.id, WorkLogAction.START, ts=parent_start),
         ]
 
-        actuals = _compute_actuals(subtask.id, None, entries)
+        actuals = _compute_actuals(subtask.id, entries)
         assert actuals.duration_min is None, (
             f"Expected None but got {actuals.duration_min!r} — "
             "subtask should not inherit parent's start event"
@@ -268,7 +268,7 @@ class TestSubtaskDurationIsolation:
             self._make_entry("test", subtask.id, WorkLogAction.START, ts=sub_start),
         ]
 
-        actuals = _compute_actuals(subtask.id, None, entries)
+        actuals = _compute_actuals(subtask.id, entries)
         assert actuals.duration_min is not None
         # Should be ~30 min, not ~300 min
         assert 28 <= actuals.duration_min <= 35, (
@@ -295,7 +295,7 @@ class TestSubtaskDurationIsolation:
             self._make_entry("test", subtask.id, WorkLogAction.START, ts=sub_start),
         ]
 
-        parent_actuals = _compute_actuals(parent.id, None, entries)
+        parent_actuals = _compute_actuals(parent.id, entries)
         assert parent_actuals.duration_min is not None
         # ~60 min, not ~5 min
         assert 58 <= parent_actuals.duration_min <= 65
