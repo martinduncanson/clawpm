@@ -24,7 +24,7 @@ predictions:
   - SKILL.md / dispatch output documents the interim hand-edit-and-git-mv workaround
     if the full fix is deferred
 priority: 2
-updated: '2026-07-10'
+updated: '2026-09-02'
 ---
 
 # Worktree-dispatched ID-mutator commands silently corrupt the MAIN checkout's task file (portfolio-registry resolution bypasses cwd)

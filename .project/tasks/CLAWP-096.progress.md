@@ -14,7 +14,7 @@ predictions:
   - 2h30m parses to 150 minutes
   - hyphenated project ids derive single-dash alnum prefixes
 priority: 3
-updated: '2026-07-05'
+updated: '2026-09-02'
 ---
 # CLI ergonomics: glob-safe --predict-scope, combined duration units, prefix derivation for hyphenated project ids
 
