@@ -369,3 +369,37 @@ class TestDoctorCollisionCheck:
         assert not any(
             c["prefix"] == minted and len(c["projects"]) > 1 for c in cols
         ), cols
+
+    def test_doctor_surfaces_allocator_refusal_instead_of_swallowing_it(
+        self, tmp_path, monkeypatch
+    ):
+        """CLAWP-119 fallout (antigravity/grok-4.5/grok-4.6, PR #57).
+
+        doctor's cross-project collision check used to catch a bare
+        ``except Exception`` around the allocator call and fall back to the
+        naive placeholder with no trace anywhere -- a diagnostic command
+        silently hiding a real, actionable refusal is exactly the failure
+        mode `expired_lease_findings` next to it already guards against.
+        Same scenario as
+        ``test_explicit_sibling_prefixes_exhaust_the_candidates_and_raise``
+        (two explicit sibling prefixes exhaust every id-derived candidate),
+        but exercised through `doctor` rather than `assign_task_prefix`
+        directly, to prove the CLI-facing surface actually reports it.
+        """
+        _make_portfolio(tmp_path, monkeypatch, "abcde-f")
+        _add_project(tmp_path, "sib-one", task_prefix="ABCDE")
+        _add_project(tmp_path, "sib-two", task_prefix="ABCDE-F")
+
+        res = CliRunner().invoke(main, ["--format", "json", "doctor"])
+        assert res.exit_code == 0, res.output
+        data = json.loads(res.output)
+        assert any(
+            i["scope"] == "prefix" and "abcde-f" in i["message"]
+            for i in data.get("issues", [])
+        ), data.get("issues")
+        # It still appears in the map (naive fallback), so the check doesn't
+        # silently drop the project rather than vanishing from the check.
+        cols = self._prefix_collisions(res.output)
+        assert any(
+            c["prefix"] == "ABCDE" and "abcde-f" in c["projects"] for c in cols
+        ), cols

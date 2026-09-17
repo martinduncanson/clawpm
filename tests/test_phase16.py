@@ -484,15 +484,24 @@ class TestDoctorChecks:
         assert "alpha-extra" in alpha_collision["projects"]
 
     def test_taskless_siblings_are_not_a_collision(self, temp_portfolio):
-        """Codex P2, PR #57 round 6.
+        """Codex P2, PR #57 round 6; revised for CLAWP-119 fallout (PR #57).
 
         This test previously asserted the opposite, on the premise that two
         task-less `alpha*` projects both mint the naive base ALPHA. They do
         not: the base is only the allocator's first candidate, and each sees
         the other's reservation and extends — verified here by asking the
-        allocator rather than by asserting a remembered value ('alpha' has no
-        6th character to extend into, so it takes the digest fallback, while
-        'alpha-extra' becomes ALPHA-E).
+        allocator rather than by asserting a remembered value.
+
+        `alpha` has no 6th character to extend into, so a NAIVE-GUESS
+        reservation from `alpha-extra` (which does have room) must not block
+        it — `alpha-extra` can always step around instead. Pre-CLAWP-119 the
+        synthesised digest fallback papered over this same case by construction;
+        CLAWP-119 removed that fallback and, until this fix, `_portfolio_prefixes`
+        treated every task-less sibling's guess as a hard reservation
+        regardless of whether that sibling could move — manufacturing an
+        unconditional raise for `alpha` and breaking every other test in this
+        file that mints a first task for it (antigravity/grok-4.5/grok-4.6,
+        PR #57).
 
         Reporting ALPHA as a collision failed `doctor --strict` in CI and told
         the operator to rename a project over a namespace nothing mints.
@@ -508,8 +517,7 @@ class TestDoctorChecks:
             )
             for pid in ("alpha", "alpha-extra")
         }
-        assert len(set(minted.values())) == 2, minted
-        assert "ALPHA" not in set(minted.values()), minted
+        assert minted == {"alpha": "ALPHA", "alpha-extra": "ALPHA-E"}, minted
 
         runner = CliRunner()
         result = runner.invoke(main, ["doctor"])

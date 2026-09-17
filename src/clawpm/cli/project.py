@@ -792,13 +792,19 @@ def project_doctor(
                     if getattr(proj, "project_dir", None) else Path("."),
                     config,
                 )
-            except Exception:
+            except ValueError as _prefix_exc:
                 # The allocator refuses when every id-derived candidate is
-                # claimed by an explicit sibling prefix. That is itself a real
-                # condition, but doctor's job here is to report collisions,
-                # not to fail on one — fall back to the naive base so the
-                # project still appears in the map rather than vanishing
-                # from the check entirely.
+                # claimed by an explicit sibling prefix (CLAWP-119: no
+                # synthesised fallback). That is a real, actionable condition
+                # for the operator, not a doctor blind spot to paper over --
+                # surface it as an issue rather than silently swallowing it,
+                # then fall back to the naive base so the project still
+                # appears in the map rather than vanishing from the check
+                # entirely (antigravity/grok-4.5/grok-4.6, PR #57).
+                issues.append({
+                    "level": "warning", "scope": "prefix",
+                    "message": f"{proj.id}: {_prefix_exc}",
+                })
                 prefix = _naive_prefix(proj.id)
         prefix_map.setdefault(prefix, []).append(proj.id)
     prefix_collisions = [

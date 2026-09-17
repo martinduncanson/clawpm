@@ -1317,14 +1317,36 @@ def _naive_prefix_placeholder(project_id: str) -> str:
 def _portfolio_prefixes(config, exclude_id: str) -> set[str]:
     """Prefixes already claimed by OTHER projects (resolved, or the naive
     first-mint placeholder for the task-less ones, so a new project can't
-    grab a prefix another would derive)."""
+    grab a prefix another would derive).
+
+    A task-less sibling's naive placeholder is only a PREDICTION of its own
+    first candidate, not a pin -- if that sibling still has a 6th+ character
+    to extend into, it can always move out of the way, so its guess must not
+    manufacture an unavoidable collision for a project that has no room to
+    extend at all (CLAWP-119 fallout, PR #57: this previously made minting
+    `alpha` alongside a task-less `alpha-extra` raise unconditionally, since
+    `alpha`'s own 5-char id equals its base with nothing to extend into,
+    breaking every caller that mints a first task for it regardless of
+    whether the two projects ever actually collide). A sibling's RESOLVED
+    prefix (explicit `task_prefix`, or inferred from tasks it already
+    minted) is a real claim regardless and is always included.
+    """
     from .discovery import discover_projects
 
+    exclude_can_extend = len(exclude_id.upper()) > 5
     used: set[str] = set()
     for p in discover_projects(config):
         if p.id == exclude_id:
             continue
-        used.add(resolve_existing_prefix(p) or _naive_prefix_placeholder(p.id))
+        resolved = resolve_existing_prefix(p)
+        if resolved is not None:
+            used.add(resolved)
+            continue
+        if not exclude_can_extend and len(p.id.upper()) > 5:
+            # We have no room to move; a flexible sibling's mere guess must
+            # not block our only candidate -- it can step around us instead.
+            continue
+        used.add(_naive_prefix_placeholder(p.id))
     return used
 
 
