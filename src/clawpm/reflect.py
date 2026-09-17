@@ -44,8 +44,11 @@ def parse_duration(value: "str | int | None") -> "int | None":
         # Lazy import so this module (imported by the click-free service layer's
         # transition() via write_reflection_event / _compute_actuals) does not
         # pull click into the MCP import chain — click.BadParameter is only
-        # meaningful at the CLI boundary, and parse_duration is only ever called
-        # from CLI command handlers (CLAWP-077 Codex review).
+        # meaningful at the CLI boundary (CLAWP-077 Codex review). This function
+        # is ALSO called from mcp_server.py's _build_predictions (CLAWP-068),
+        # a non-CLI caller — that call site catches BadParameter and re-raises
+        # it as ValueError, so any new caller outside a click command must do
+        # the same rather than assuming ValueError alone is enough.
         import click
         raise click.BadParameter(
             f"Bad duration: {value!r}. Use 90, 90m, 2h, 1d, or 1w."

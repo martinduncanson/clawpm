@@ -21,6 +21,16 @@ web = [
     "fastapi>=0.100.0",
     "uvicorn[standard]>=0.23.0",
 ]
+# MCP stdio server (CLAWP-068). The `clawpm mcp` command degrades gracefully
+# with a "pip install 'clawpm[mcp]'" hint when this extra isn't present.
+# <2: mcp 2.x renamed FastMCP -> MCPServer and moved
+# create_connected_server_and_client_session (CI caught this — team-lead
+# diagnosis, confirmed against the actual CI failure log). Bump the floor
+# alongside a real migration of mcp_server.py + test_mcp_server.py to the 2.x
+# API, not by widening this bound alone.
+mcp = [
+    "mcp>=1.5.0,<2",
+]
 # Mirrors [dependency-groups].dev below so `pip install -e ".[dev]"` (CI, plain
 # pip) works alongside `uv sync` (which reads the PEP 735 group). Keep in sync.
 dev = [
@@ -29,6 +39,7 @@ dev = [
     "fastapi>=0.100.0",
     "uvicorn[standard]>=0.23.0",
     "httpx>=0.24.0",
+    "mcp>=1.5.0,<2",
 ]
 
 [project.urls]
@@ -53,6 +64,7 @@ dev = [
     "fastapi>=0.100.0",
     "uvicorn[standard]>=0.23.0",
     "httpx>=0.24.0",
+    "mcp>=1.5.0,<2",
 ]
 
 [tool.pytest.ini_options]
