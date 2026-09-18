@@ -468,3 +468,20 @@ class TestDoctorCollisionCheck:
         # The command must complete and still report on the OTHER project.
         cols = self._prefix_collisions(res.output)
         assert not any("locked-sib" in c["projects"] for c in cols), cols
+        # grok-4.5, PR #57 round: the assertion above is satisfied by
+        # locked-sib's own resolve turn (`_resolve_prefix(locked-sib)` at
+        # project.py:786, which correctly names itself) REGARDLESS of
+        # whether the sibling-scan attribution fix below exists -- it
+        # doesn't actually exercise the fix. Isolate the sibling-scan path
+        # specifically: no issue may misattribute the failure to `victim`
+        # (the taskless project whose OWN mint triggered the scan), and the
+        # PortfolioPrefixScanError wording must appear for the real sibling.
+        assert not any(
+            i["scope"] == "prefix" and i["message"].startswith("victim:")
+            for i in data.get("issues", [])
+        ), data.get("issues")
+        assert any(
+            i["scope"] == "prefix"
+            and "could not evaluate prefix collisions for sibling 'locked-sib'" in i["message"]
+            for i in data.get("issues", [])
+        ), data.get("issues")
