@@ -385,6 +385,17 @@ class TestDoctorCollisionCheck:
         (two explicit sibling prefixes exhaust every id-derived candidate),
         but exercised through `doctor` rather than `assign_task_prefix`
         directly, to prove the CLI-facing surface actually reports it.
+
+        CLAWP-120 PRE-REVIEW (this round): the naive-placeholder fallback
+        this test originally pinned was itself a false-collision bug --
+        identical in shape to the one fixed above for the resolved-prefix
+        path, since a ValueError refusal means the naive base is NECESSARILY
+        claimed by whichever sibling caused the refusal (here: sib-one's
+        explicit ABCDE). Reporting that as a `prefix_collisions` entry tells
+        the operator sib-one needs renaming too, when only abcde-f does.
+        `prefix_map` has no reader besides `prefix_collisions`, so nothing
+        is lost by NOT keying the refused project into it -- the issues[]
+        entry alone is the actionable surface.
         """
         _make_portfolio(tmp_path, monkeypatch, "abcde-f")
         _add_project(tmp_path, "sib-one", task_prefix="ABCDE")
@@ -397,9 +408,63 @@ class TestDoctorCollisionCheck:
             i["scope"] == "prefix" and "abcde-f" in i["message"]
             for i in data.get("issues", [])
         ), data.get("issues")
-        # It still appears in the map (naive fallback), so the check doesn't
-        # silently drop the project rather than vanishing from the check.
+        # It must NOT appear in the collision map: there is no real prefix
+        # to key it under, and the naive-base fallback manufactures a
+        # collision against sib-one's perfectly valid ABCDE.
         cols = self._prefix_collisions(res.output)
-        assert any(
-            c["prefix"] == "ABCDE" and "abcde-f" in c["projects"] for c in cols
+        assert not any("abcde-f" in c["projects"] for c in cols), cols
+        # sib-one/sib-two's own explicit prefixes must still resolve clean.
+        assert not any(
+            c["prefix"] in ("ABCDE", "ABCDE-F") for c in cols
         ), cols
+
+    def test_doctor_surfaces_unreadable_sibling_task_dir_instead_of_aborting(
+        self, tmp_path, monkeypatch
+    ):
+        """CLAWP-120 PRE-REVIEW: the allocator's own exception-handling arm in
+        doctor's collision check only caught ``ValueError`` (CLAWP-119
+        refusal). But `assign_task_prefix` -> `_portfolio_prefixes` ->
+        `resolve_existing_prefix` -> `_infer_prefix_from_tasks` does a raw
+        ``Path.iterdir()`` with no exception handling at all -- an unreadable
+        directory (Windows AV lock, a concurrent clawpm session, a broken
+        symlink) raised `OSError` straight out of `project_doctor`, aborting
+        `doctor` for the ENTIRE portfolio over one project's transient scan
+        failure. Mirrors the lease-scanning block a few lines below, which
+        already declares its blind spots (`except Exception` -> issues[]
+        warning) rather than crashing the whole command.
+
+        Patches `resolve_existing_prefix` itself (not the filesystem) so this
+        exercises ONLY the collision-check block this round actually
+        touches -- `project_doctor` has an unrelated, pre-existing unguarded
+        `Path.iterdir()` in `list_tasks` (:508, `_scan_task_files`) that
+        would swallow a filesystem-level OSError before ever reaching this
+        code, which is a real but separately-tracked gap (CLAWP-094:
+        "harden fail-open error handling ... discovery/context/research/
+        doctor"), not part of this fix's scope.
+        """
+        import clawpm.tasks as _tasks_mod
+
+        _make_portfolio(tmp_path, monkeypatch, "victim")
+        _add_project(tmp_path, "locked-sib")
+        real_resolve = _tasks_mod.resolve_existing_prefix
+
+        def _raising_resolve(settings):
+            if getattr(settings, "id", None) == "locked-sib":
+                raise OSError(13, "Permission denied", "locked-sib/.project/tasks")
+            return real_resolve(settings)
+
+        monkeypatch.setattr(_tasks_mod, "resolve_existing_prefix", _raising_resolve)
+
+        res = CliRunner().invoke(main, ["--format", "json", "doctor"])
+        assert res.exit_code == 0, res.output
+        data = json.loads(res.output)
+        # errno 13 auto-promotes OSError to PermissionError (a subclass), so
+        # check the actual raised type rather than the literal base class name.
+        assert any(
+            i["scope"] == "prefix" and "locked-sib" in i["message"]
+            and "PermissionError" in i["message"]
+            for i in data.get("issues", [])
+        ), data.get("issues")
+        # The command must complete and still report on the OTHER project.
+        cols = self._prefix_collisions(res.output)
+        assert not any("locked-sib" in c["projects"] for c in cols), cols

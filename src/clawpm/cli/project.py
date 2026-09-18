@@ -776,36 +776,55 @@ def project_doctor(
     #
     # `assign_task_prefix` is a pure function of the project id and the other
     # projects' prefixes, so iteration order does not affect the result.
-    from clawpm.tasks import _naive_prefix_placeholder as _naive_prefix
     from clawpm.tasks import assign_task_prefix as _assign_prefix
     from clawpm.tasks import resolve_existing_prefix as _resolve_prefix
 
     prefix_map: dict[str, list[str]] = {}
     all_projects = discover_projects(config)
     for proj in all_projects:
-        prefix = _resolve_prefix(proj)
-        if prefix is None:
-            try:
+        try:
+            prefix = _resolve_prefix(proj)
+            if prefix is None:
                 prefix = _assign_prefix(
                     proj.id,
                     (proj.project_dir / ".project" / "tasks")
                     if getattr(proj, "project_dir", None) else Path("."),
                     config,
                 )
-            except ValueError as _prefix_exc:
-                # The allocator refuses when every id-derived candidate is
-                # claimed by an explicit sibling prefix (CLAWP-119: no
-                # synthesised fallback). That is a real, actionable condition
-                # for the operator, not a doctor blind spot to paper over --
-                # surface it as an issue rather than silently swallowing it,
-                # then fall back to the naive base so the project still
-                # appears in the map rather than vanishing from the check
-                # entirely (antigravity/grok-4.5/grok-4.6, PR #57).
-                issues.append({
-                    "level": "warning", "scope": "prefix",
-                    "message": f"{proj.id}: {_prefix_exc}",
-                })
-                prefix = _naive_prefix(proj.id)
+        except (ValueError, OSError) as _prefix_exc:
+            # ValueError: the allocator refuses when every id-derived
+            # candidate is claimed by an explicit sibling prefix (CLAWP-119:
+            # no synthesised fallback). OSError: a task dir couldn't be
+            # scanned (locked/unreadable -- Windows AV, a concurrent clawpm
+            # session, a broken symlink) -- reachable both from resolving
+            # THIS project's own prefix (`_resolve_prefix` above) and from
+            # `_assign_prefix` scanning every SIBLING's tasks dir
+            # internally, so both calls share this one guard. Mirrors the
+            # lease-scanning block below, which already declares its blind
+            # spots rather than implying "clean" on a failed check. Both
+            # are real, actionable conditions -- surface as an issue rather
+            # than silently swallowing them.
+            #
+            # Do NOT fall back to the naive base here (round-6 fix,
+            # reverted): there is no real prefix in either case, and
+            # inserting one into prefix_map reproduces exactly the
+            # false-collision bug fixed above for the resolved-prefix path
+            # -- a ValueError refusal means the naive base is necessarily
+            # claimed by whichever sibling caused the refusal, so keying
+            # this project under it manufactures a collision entry between
+            # a project that will NEVER mint that prefix and a sibling
+            # whose prefix is perfectly valid. `prefix_map` has no reader
+            # besides `prefix_collisions` (see module docstring context),
+            # so nothing needs this project to "still appear in the map" --
+            # the issues[] entry above is the only actionable surface, and
+            # skipping the map entry here doesn't drop it from the check.
+            issues.append({
+                "level": "warning", "scope": "prefix",
+                "message": f"{proj.id}: {type(_prefix_exc).__name__}: {_prefix_exc}"
+                if isinstance(_prefix_exc, OSError)
+                else f"{proj.id}: {_prefix_exc}",
+            })
+            continue
         prefix_map.setdefault(prefix, []).append(proj.id)
     prefix_collisions = [
         {"prefix": pfx, "projects": pids}
