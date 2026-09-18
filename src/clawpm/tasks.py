@@ -1314,6 +1314,31 @@ def _naive_prefix_placeholder(project_id: str) -> str:
     return _strip_trailing_non_alnum(base)
 
 
+class PortfolioPrefixScanError(OSError):
+    """A sibling's tasks directory couldn't be scanned while collecting
+    portfolio prefixes.
+
+    Raised by ``_portfolio_prefixes`` (not ``resolve_existing_prefix``
+    itself, whose own-project callers still want a bare ``OSError``) so a
+    caller iterating a DIFFERENT project can tell "my own resolve failed"
+    apart from "a sibling's scan failed" and attribute the issue to the
+    sibling that actually failed (``sibling_id``), not to whichever
+    project's minting/resolution happened to trigger the portfolio scan
+    (Codex P2 + grok-4.5 + antigravity, PR #57 round: one locked sibling
+    directory was previously blamed on every OTHER taskless project
+    processed afterward).
+    """
+
+    def __init__(self, sibling_id: str, original: OSError):
+        self.sibling_id = sibling_id
+        self.original = original
+        message = (
+            f"could not evaluate prefix collisions for sibling '{sibling_id}': "
+            f"{type(original).__name__}: {original}"
+        )
+        super().__init__(message)
+
+
 def _portfolio_prefixes(config, exclude_id: str) -> set[str]:
     """Prefixes already claimed by OTHER projects (resolved, or the naive
     first-mint placeholder for the task-less ones, so a new project can't
@@ -1330,6 +1355,13 @@ def _portfolio_prefixes(config, exclude_id: str) -> set[str]:
     whether the two projects ever actually collide). A sibling's RESOLVED
     prefix (explicit `task_prefix`, or inferred from tasks it already
     minted) is a real claim regardless and is always included.
+
+    Raises:
+        PortfolioPrefixScanError: a sibling's own tasks directory couldn't
+            be scanned (locked/unreadable). Distinguished from a bare
+            ``OSError`` so callers can attribute the failure to the sibling
+            (``sibling_id``) rather than to the project whose resolve/mint
+            triggered this scan.
     """
     from .discovery import discover_projects
 
@@ -1338,7 +1370,10 @@ def _portfolio_prefixes(config, exclude_id: str) -> set[str]:
     for p in discover_projects(config):
         if p.id == exclude_id:
             continue
-        resolved = resolve_existing_prefix(p)
+        try:
+            resolved = resolve_existing_prefix(p)
+        except OSError as exc:
+            raise PortfolioPrefixScanError(p.id, exc) from exc
         if resolved is not None:
             used.add(resolved)
             continue

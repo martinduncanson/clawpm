@@ -778,6 +778,7 @@ def project_doctor(
     # projects' prefixes, so iteration order does not affect the result.
     from clawpm.tasks import assign_task_prefix as _assign_prefix
     from clawpm.tasks import resolve_existing_prefix as _resolve_prefix
+    from clawpm.tasks import PortfolioPrefixScanError as _PrefixScanError
 
     prefix_map: dict[str, list[str]] = {}
     all_projects = discover_projects(config)
@@ -818,11 +819,26 @@ def project_doctor(
             # so nothing needs this project to "still appear in the map" --
             # the issues[] entry above is the only actionable surface, and
             # skipping the map entry here doesn't drop it from the check.
+            #
+            # Attribution (Codex P2 + grok-4.5 + antigravity, PR #57): an
+            # OSError raised while `_assign_prefix` scans a SIBLING's tasks
+            # dir is NOT about `proj` -- `proj` may be perfectly healthy and
+            # simply happened to be the taskless project whose mint
+            # triggered the portfolio scan that touched the broken sibling.
+            # `_portfolio_prefixes` wraps that case as
+            # `PortfolioPrefixScanError` (carrying the sibling's own id), so
+            # only the plain-`OSError` case below -- proj's OWN resolve,
+            # where `proj.id` really is the failing project -- gets the
+            # `{proj.id}: ...` prefix.
+            if isinstance(_prefix_exc, _PrefixScanError):
+                message = str(_prefix_exc)
+            elif isinstance(_prefix_exc, OSError):
+                message = f"{proj.id}: {type(_prefix_exc).__name__}: {_prefix_exc}"
+            else:
+                message = f"{proj.id}: {_prefix_exc}"
             issues.append({
                 "level": "warning", "scope": "prefix",
-                "message": f"{proj.id}: {type(_prefix_exc).__name__}: {_prefix_exc}"
-                if isinstance(_prefix_exc, OSError)
-                else f"{proj.id}: {_prefix_exc}",
+                "message": message,
             })
             continue
         prefix_map.setdefault(prefix, []).append(proj.id)
