@@ -443,3 +443,49 @@ class TestEditFileOptions:
         assert result.exit_code == 0, result.output
         data = json.loads(result.output)
         assert data["data"].get("out_of_scope") == patterns
+
+
+# ---------------------------------------------------------------------------
+# 7. CLAWP-096: plain --scope/--predict-scope pass a glob pattern through
+#    VERBATIM once argv reaches Python. This is the only layer clawpm's own
+#    code can be held accountable for -- CliRunner.invoke() constructs argv
+#    programmatically, bypassing the OS/launcher-level CRT wildcard expansion
+#    documented at the top of this file, so it isolates clawpm's own parsing
+#    from the upstream, un-fixable-in-application-code expansion bug. That
+#    upstream bug is exactly what --scope-file (above) exists to route
+#    around; these tests confirm there's no SECOND, clawpm-owned mangling
+#    layer stacked on top of it.
+# ---------------------------------------------------------------------------
+
+
+class TestPlainScopeVerbatimAtPythonLayer:
+    def test_scope_glob_pattern_stored_verbatim(self, temp_portfolio):
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "tasks", "add",
+                "--title", "Plain scope glob test",
+                "--scope", "scripts/**",
+                "--project", "test",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["data"]["scope"] == ["scripts/**"]
+
+    def test_predict_scope_glob_pattern_stored_verbatim(self, temp_portfolio):
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "tasks", "add",
+                "--title", "Plain predict-scope glob test",
+                "--predict-scope", "scripts/**",
+                "--project", "test",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        preds = data["data"].get("predictions", {})
+        assert preds.get("files_scope") == ["scripts/**"]
