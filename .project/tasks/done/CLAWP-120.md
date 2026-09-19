@@ -7,7 +7,7 @@ predictions:
   duration_min: 90
   filled_by: agent
 priority: 2
-updated: '2026-09-17'
+updated: '2026-09-19'
 ---
 # Fix CLAWP-119 digest-fallback-removal fallout: doctor swallows allocator refusal + 2 broken tests + portfolio_prefixes over-eager
 
