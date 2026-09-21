@@ -295,6 +295,7 @@ def _dispatch_agent(
     # before re-raising AgentDispatchError. Otherwise the command
     # crashes and leaves the subtask OPEN with no dispatch artifacts —
     # retries create duplicates.
+    _rollback_note = ""
     try:
         # `.path`, not the whole tuple: write_dispatch_settings also returns
         # the bytes it wrote, which only dispatch's rollback needs.
@@ -305,34 +306,40 @@ def _dispatch_agent(
         # write and the subagent starting — which would then run without its
         # Stop / progress hooks.
         with dispatch_target_lock(config.portfolio_root, target_dir):
-            settings_path = write_dispatch_settings(
-                target_dir=target_dir,
-                task_id=subtask_id,
-                project_id=project_id,
-                rubric_markdown=rubric_markdown,
-                portfolio_root=config.portfolio_root,
-            ).path
-    except (FileExistsError, ValueError, OSError, PartialDispatchWrite) as exc:
-        error_detail = str(exc)
-        if isinstance(exc, PartialDispatchWrite):
-            # settings.local.json landed (Stop hook LIVE) before the writer
-            # failed: take it back down rather than leave the nested
-            # worktree armed with a hook for a subtask that is about to be
-            # BLOCKED (CLAWP-098, PR #55 round 13 PRE-REVIEW). Best-effort —
-            # the primary error below is what the caller must see.
             try:
-                teardown_dispatch_settings(
-                    target_dir,
+                settings_path = write_dispatch_settings(
+                    target_dir=target_dir,
                     task_id=subtask_id,
-                    portfolio_root=config.portfolio_root,
                     project_id=project_id,
-                    remove_sidecar=exc.written.sidecar_written,
-                )
-            except Exception as teardown_exc:
-                error_detail += (
-                    f" (rolling the partial dispatch back ALSO failed: "
-                    f"{type(teardown_exc).__name__}: {teardown_exc})"
-                )
+                    rubric_markdown=rubric_markdown,
+                    portfolio_root=config.portfolio_root,
+                ).path
+            except PartialDispatchWrite as partial:
+                # settings.local.json landed (Stop hook LIVE) before the
+                # writer failed: take it back down rather than leave the
+                # nested worktree armed with a hook for a subtask that is
+                # about to be BLOCKED (PR #55 round 13 PRE-REVIEW). Done
+                # INSIDE this critical section (Codex P1, round 15): after
+                # releasing the lock, another same-task dispatch could
+                # install ITS settings, and a marker-only teardown would then
+                # remove them. Best-effort — the primary error is what the
+                # caller must see. (Reentrant: teardown re-takes the lock.)
+                try:
+                    teardown_dispatch_settings(
+                        target_dir,
+                        task_id=subtask_id,
+                        portfolio_root=config.portfolio_root,
+                        project_id=project_id,
+                        remove_sidecar=partial.written.sidecar_written,
+                    )
+                except Exception as teardown_exc:
+                    _rollback_note = (
+                        f" (rolling the partial dispatch back ALSO failed: "
+                        f"{type(teardown_exc).__name__}: {teardown_exc})"
+                    )
+                raise
+    except (FileExistsError, ValueError, OSError, PartialDispatchWrite) as exc:
+        error_detail = str(exc) + _rollback_note
         try:
             change_task_state(
                 config, project_id, subtask_id, TaskState.BLOCKED,

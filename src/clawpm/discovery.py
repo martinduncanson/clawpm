@@ -10,7 +10,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .models import PortfolioConfig, ProjectSettings, ProjectStatus
-from .sessions import _suppress_session_resolution, find_session_for_cwd, stat_is_dir
+from .sessions import (
+    _suppress_session_resolution,
+    find_session_for_cwd,
+    scope_cwd,
+    stat_is_dir,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -399,7 +404,7 @@ def _session_scoped_repo_path(config: PortfolioConfig, project_id: str) -> Path 
     if not portfolio_root:
         return None
     try:
-        cwd = Path.cwd()
+        cwd = scope_cwd()
     except OSError as exc:
         logger.error("Failed to determine cwd: %s. Session-scoped repo "
                      "resolution skipped for this call.", exc)
@@ -469,7 +474,7 @@ def _session_scoped_project_dir(config: PortfolioConfig, project_id: str) -> Pat
     if not portfolio_root:
         return None
     try:
-        cwd = Path.cwd()
+        cwd = scope_cwd()
     except OSError as exc:
         # antigravity review, PR #55 (round 4): Path.cwd() itself failing
         # (the process's cwd deleted out from under it — rare, but the

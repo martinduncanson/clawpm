@@ -123,6 +123,36 @@ def suppress_session_resolution():
     finally:
         _suppress_session_resolution.reset(token)
 
+# CLAWP-098 (Codex P1, PR #55 round 15): a command that will RUN somewhere
+# other than its own cwd — `tasks dispatch --target-dir X` — must resolve its
+# task in the scope of THAT place, because the process it launches there will.
+# `resolve_scope_from(X)` makes session lookup use X instead of the process
+# cwd for the duration of the block: X inside a registered worktree resolves
+# that worktree's store; X inside none resolves the canonical store. Distinct
+# from `suppress_session_resolution`, which can only ever mean "canonical".
+_scope_cwd_override: "contextvars.ContextVar[Optional[Path]]" = contextvars.ContextVar(
+    "clawpm_scope_cwd_override", default=None
+)
+
+
+@contextlib.contextmanager
+def resolve_scope_from(path: Path):
+    """Resolve sessions as if the process cwd were *path* (see above)."""
+    token = _scope_cwd_override.set(Path(path))
+    try:
+        yield
+    finally:
+        _scope_cwd_override.reset(token)
+
+
+def scope_cwd() -> Path:
+    """The directory session-scoped resolution keys on: the active
+    :func:`resolve_scope_from` override if any, else the process cwd.
+    Raises ``OSError`` exactly like ``Path.cwd()``."""
+    override = _scope_cwd_override.get()
+    return override if override is not None else Path.cwd()
+
+
 _REGISTERED = "registered"
 _RELEASED = "released"
 
@@ -151,6 +181,24 @@ def stat_is_dir(path: Path) -> bool:
     before falling open.
     """
     return stat.S_ISDIR(os.stat(path).st_mode)
+
+
+def stat_exists(path: Path) -> bool:
+    """Whether *path* exists, WITHOUT swallowing a stat fault.
+
+    ``Path.exists()`` catches ``OSError`` (all of it on some Python versions,
+    a subset on others) and answers ``False``, so a permission failure or an
+    unavailable volume reads as "absent". For the gates that decide whether
+    isolation is armed, or whether an existing file may be overwritten,
+    "absent" and "could not tell" are different answers with different safe
+    reactions (CLAWP-098, Codex rounds 14-15). Missing / not-a-directory is
+    ``False``; any other ``OSError`` propagates.
+    """
+    try:
+        os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return True
 
 
 @dataclass

@@ -437,6 +437,67 @@ class TestCustomTargetDispatchResolvesWhereItsHooksWill:
         assert r.exit_code == 0, r.output
         assert settings_path(outside).exists()
 
+    def test_target_in_a_different_registered_worktree_uses_its_store(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        """Codex P1, round 15: binding resolution to 'no session' is not
+        enough — a target inside ANOTHER registered worktree launches hooks
+        that resolve THAT worktree's store."""
+        wt2 = _registered_worktree(
+            git_portfolio, tmp_path, monkeypatch, _OWN_SETTINGS, name="wt2"
+        )
+        task = add_task(  # lands in wt2's store (cwd is wt2)
+            git_portfolio["config"], "test", "in wt2 only",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+        assert task is not None
+        assert (wt2 / ".project" / "tasks" / f"{task.id}.md").exists()
+        # Caller is now a DIFFERENT registered worktree.
+        _registered_worktree(
+            git_portfolio, tmp_path, monkeypatch, _OWN_SETTINGS, name="wt1"
+        )
+        target = wt2 / "subdir"
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id,
+                   "--target-dir", str(target)],
+        )
+        assert r.exit_code == 0, r.output
+        assert settings_path(target).exists()
+
+    def test_scope_override_is_reset_after_the_command(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        from clawpm.sessions import scope_cwd
+
+        _registered_worktree(git_portfolio, tmp_path, monkeypatch, _OWN_SETTINGS)
+        task = add_task(
+            git_portfolio["config"], "test", "t",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+        assert task is not None
+        CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id,
+                   "--target-dir", str(tmp_path / "elsewhere")],
+        )
+        assert scope_cwd() == Path.cwd()
+
+    def test_relative_target_is_resolved_against_cwd(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        """`--target-dir .` from inside a registered worktree is inside it;
+        the session lookup resolves the path, it does not compare it raw."""
+        wt = _registered_worktree(git_portfolio, tmp_path, monkeypatch, _OWN_SETTINGS)
+        task = add_task(
+            git_portfolio["config"], "test", "worktree-only",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+        assert task is not None
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--target-dir", "."],
+        )
+        assert r.exit_code == 0, r.output
+        assert settings_path(wt).exists()
+
     def test_target_inside_the_worktree_keeps_the_session_scope(
         self, git_portfolio, tmp_path, monkeypatch
     ):
@@ -453,6 +514,102 @@ class TestCustomTargetDispatchResolvesWhereItsHooksWill:
         )
         assert r.exit_code == 0, r.output
         assert settings_path(inside).exists()
+
+
+# ---------------------------------------------------------------------------
+# P2 (round 15): progress-hook / commit logging diff the session checkout
+# ---------------------------------------------------------------------------
+
+
+class TestWorkLogDiffsTheSessionCheckout:
+    def _capture_git_cwd(self, monkeypatch):
+        seen: list = []
+        real_run = subprocess.run
+
+        def _run(cmd, *a, **k):
+            # `subprocess` is one shared module, so only intercept the git
+            # calls this command makes; anything else runs for real.
+            if k.get("cwd") is not None and cmd[:1] == ["git"]:
+                seen.append(Path(k["cwd"]))
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return real_run(cmd, *a, **k)
+
+        monkeypatch.setattr("clawpm.cli.log.subprocess.run", _run)
+        return seen
+
+    def test_log_add_diffs_the_registered_worktree(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        wt = _registered_worktree(git_portfolio, tmp_path, monkeypatch, _OWN_SETTINGS)
+        seen = self._capture_git_cwd(monkeypatch)
+        r = CliRunner().invoke(
+            main, ["-p", "test", "log", "add", "--action", "progress",
+                   "--summary", "subagent-tool-use"],
+        )
+        assert r.exit_code == 0, r.output
+        assert seen and seen[0].resolve() == wt.resolve(), seen
+
+    def test_log_commit_reads_the_registered_worktree(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        wt = _registered_worktree(git_portfolio, tmp_path, monkeypatch, _OWN_SETTINGS)
+        seen = self._capture_git_cwd(monkeypatch)
+        CliRunner().invoke(main, ["-p", "test", "log", "commit", "--dry-run"])
+        assert seen and seen[0].resolve() == wt.resolve(), seen
+
+
+# ---------------------------------------------------------------------------
+# P1 (round 15): a stat fault at the final materialization gate fails the
+# dispatch and rolls back instead of skipping registration
+# ---------------------------------------------------------------------------
+
+
+class TestMaterializationStatFaultFailsClosed:
+    def test_stat_exists_distinguishes_absent_from_a_fault(self, tmp_path, monkeypatch):
+        from clawpm.cli.tasks import _stat_exists
+
+        assert _stat_exists(tmp_path) is True
+        assert _stat_exists(tmp_path / "nope") is False
+
+        def _boom(path, *a, **k):
+            raise PermissionError("simulated EACCES")
+
+        monkeypatch.setattr("clawpm.sessions.os.stat", _boom)
+        with pytest.raises(PermissionError):
+            _stat_exists(tmp_path)
+
+    def test_final_check_fault_rolls_back_and_registers_nothing(
+        self, git_portfolio, monkeypatch
+    ):
+        from clawpm.sessions import active_sessions
+
+        task = add_task(
+            git_portfolio["config"], "test", "t",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+        _git(git_portfolio["repo"], "add", ".project")
+        _git(git_portfolio["repo"], "commit", "-q", "-m", "seed")
+
+        real = __import__("clawpm.cli.tasks", fromlist=["_stat_exists"])._stat_exists
+        wt_root = git_portfolio["repo"] / ".clawpm-worktrees" / task.id
+
+        def _fault_once_hooks_are_live(path):
+            p = Path(path)
+            armed = (wt_root / ".claude" / "settings.local.json").exists()
+            if armed and (wt_root == p or wt_root in p.parents):
+                raise PermissionError("simulated transient stat fault")
+            return real(path)
+
+        monkeypatch.setattr("clawpm.cli.tasks._stat_exists", _fault_once_hooks_are_live)
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code == 1, r.output
+        assert "dispatch_blocked" in r.output
+        assert not (wt_root / ".claude" / "settings.local.json").exists(), (
+            "hooks left live with no session mapping"
+        )
+        assert active_sessions(git_portfolio["root"]) == []
 
 
 # ---------------------------------------------------------------------------
@@ -719,6 +876,49 @@ class TestWriterFailureIsRolledBack:
             init_codegraph=False,
         )
         assert [t for _, t in held] == [Path(result["target_dir"])], held
+
+    def test_dispatch_agent_cleans_up_inside_the_same_critical_section(
+        self, git_portfolio, monkeypatch
+    ):
+        """Codex P1, round 15: releasing the lock before the cleanup lets a
+        same-task dispatch install its settings in the gap, which a
+        marker-only teardown would then delete."""
+        import clawpm.agent as agmod
+        from contextlib import contextmanager
+
+        events: list[str] = []
+        real_lock = agmod.dispatch_target_lock
+        real_td = agmod.teardown_dispatch_settings
+
+        @contextmanager
+        def _lock(portfolio_root, target_dir):
+            events.append("enter")
+            try:
+                with real_lock(portfolio_root, target_dir):
+                    yield
+            finally:
+                events.append("exit")
+
+        def _td(*a, **k):
+            events.append("teardown")
+            return real_td(*a, **k)
+
+        def _boom(*a, **k):
+            raise OSError("simulated disk full")
+
+        monkeypatch.setattr(agmod, "dispatch_target_lock", _lock)
+        monkeypatch.setattr(agmod, "teardown_dispatch_settings", _td)
+        monkeypatch.setattr("clawpm.dispatch.register_dispatch", _boom)
+        with pytest.raises(agmod.AgentDispatchError):
+            agmod.dispatch_agent(
+                config=git_portfolio["config"],
+                project_id="test",
+                prompt="Do a thing",
+                success_criteria=["c1"],
+                judge_invoker=lambda prompt: '{"ok": true, "reason": "done"}',
+                init_codegraph=False,
+            )
+        assert events == ["enter", "teardown", "exit"], events
 
     def test_dispatch_agent_takes_a_partial_write_back_down(
         self, git_portfolio, monkeypatch

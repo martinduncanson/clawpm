@@ -18,6 +18,7 @@ from clawpm.worklog import add_entry, filter_files_changed, read_entries
 from clawpm.context import expand_task_id
 from clawpm.cli.base import main, _mutation_errors, get_format, require_portfolio, require_project, _read_patterns_file, _FALLBACK_POLICIES
 from clawpm.services.tasks import transition_isolated
+from clawpm.sessions import stat_exists as _stat_exists
 
 # ============================================================================
 # Tasks commands
@@ -1270,7 +1271,9 @@ def _read_bytes_or_none(path: Path):
     clobber the comparison exists to prevent.
     """
     try:
-        return path.read_bytes() if path.exists() else None
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
     except OSError:
         return _UNREADABLE
 
@@ -1351,29 +1354,19 @@ def tasks_dispatch(
     on a single .claude/settings.local.json.
     """
     # A dispatch resolves its task in the scope of the place it will RUN
-    # (CLAWP-098, Codex P1 on PR #55 round 14). In place, that is cwd's own
-    # session (if any). For an explicit `--target-dir` OUTSIDE every
-    # registered worktree, the launched process has no session, so its
-    # ID-based hooks resolve the CANONICAL store — the task (and rubric) must
-    # therefore be read from there too, not from the caller's own worktree,
-    # or the hooks report "task not found" / mutate a divergent copy.
-    # (`--worktree` is unchanged: see the source-repo comment in the body.)
-    _canonical_only = False
+    # (CLAWP-098, Codex P1 on PR #55 rounds 14-15). In place, that is cwd's
+    # own session (if any). For an explicit `--target-dir` the launched
+    # process runs THERE, so its ID-based hooks resolve whatever session
+    # contains that directory — the target's own worktree, or the canonical
+    # store when it is inside none — and the task (and rubric) must be read
+    # from that same store, not from the caller's, or the hooks report "task
+    # not found" / mutate a divergent copy. `resolve_scope_from` makes every
+    # session lookup below key on the target. (`--worktree` is unchanged: see
+    # the source-repo comment in the body.)
     if target_dir is not None and not worktree:
-        from clawpm.sessions import find_session_for_cwd
+        from clawpm.sessions import resolve_scope_from
 
-        _config = require_portfolio(ctx)
-        _pid, _ = require_project(ctx, project_id)
-        _canonical_only = (
-            find_session_for_cwd(
-                _config.portfolio_root, Path(target_dir), project_id=_pid
-            )
-            is None
-        )
-    if _canonical_only:
-        from clawpm.sessions import suppress_session_resolution
-
-        _scope = suppress_session_resolution()
+        _scope = resolve_scope_from(Path(target_dir).resolve())
     else:
         _scope = nullcontext()
     with _scope:
@@ -1654,7 +1647,19 @@ def _tasks_dispatch_impl(
             _live_candidates = _candidate_task_paths(
                 _source_repo / ".project" / "tasks", task_id
             )
-            _live_path = next((p for p in _live_candidates if p.exists()), None)
+            try:
+                _live_path = next(
+                    (p for p in _live_candidates if _stat_exists(p)), None
+                )
+            except OSError as exc:
+                output_error(
+                    "git_probe_failed",
+                    f"Could not check for task {task_id!r} in {_source_repo}: "
+                    f"{type(exc).__name__}: {exc}. Refusing to dispatch "
+                    f"--worktree rather than assume it is absent.",
+                    fmt=fmt,
+                )
+                sys.exit(1)
             # The blob this gate approves. Carried to the post-create check
             # so the worktree can be verified to hold THIS revision, not
             # merely some file for this id.
@@ -1798,11 +1803,21 @@ def _tasks_dispatch_impl(
             # existence-only check and was registered — the stale-revision
             # dispatch the pre-create gate exists to prevent, arriving by
             # the one route that gate can't see.
-            _wt_path = next(
-                (p for p in _ctp(resolved_dir / ".project" / "tasks", task_id)
-                 if p.exists()),
-                None,
-            )
+            try:
+                _wt_path = next(
+                    (p for p in _ctp(resolved_dir / ".project" / "tasks", task_id)
+                     if _stat_exists(p)),
+                    None,
+                )
+            except OSError as exc:
+                output_error(
+                    "git_probe_failed",
+                    f"Could not check for the task file in the worktree at "
+                    f"{resolved_dir}: {type(exc).__name__}: {exc}. Refusing "
+                    f"to register it rather than assume the task is absent.",
+                    fmt=fmt,
+                )
+                sys.exit(1)
             _wt_sha = None
             if _wt_path is not None:
                 try:
@@ -1917,9 +1932,12 @@ def _tasks_dispatch_impl(
         _prior_settings = None
         _prior_sidecar = None
         try:
-            if _prior_settings_path.exists():
+            # `_stat_exists` so a stat FAULT reaches the handler below instead
+            # of reading as "no prior dispatch" (which would make a later
+            # rollback delete instead of restore).
+            if _stat_exists(_prior_settings_path):
                 _prior_settings = _prior_settings_path.read_bytes()
-            if _prior_sidecar_path.exists():
+            if _stat_exists(_prior_sidecar_path):
                 _prior_sidecar = _prior_sidecar_path.read_bytes()
         except OSError as exc:
             # Couldn't snapshot. Say so now rather than discovering it only if a
@@ -2159,12 +2177,32 @@ def _tasks_dispatch_impl(
             # Unprefixed, like the post-create check above: `--worktree` is
             # refused outright for a project in a repository subdirectory, so
             # the worktree root is the project root here by construction.
-            materialized = any(
-                p.exists()
-                for p in _candidate_task_paths(
-                    resolved_dir / ".project" / "tasks", task_id
+            #
+            # `_stat_exists`, not `Path.exists()` (Codex P1, PR #55 round 15):
+            # exists() reports a transient stat fault as False, which would
+            # skip session registration below while the command went on to
+            # report a successful dispatch with LIVE hooks and no session
+            # mapping — the exact fall-through-to-canonical corruption this
+            # gate exists to prevent. A fault fails the dispatch and rolls
+            # the just-installed settings back.
+            try:
+                materialized = any(
+                    _stat_exists(p)
+                    for p in _candidate_task_paths(
+                        resolved_dir / ".project" / "tasks", task_id
+                    )
                 )
-            )
+            except OSError as exc:
+                _outcome = _roll_back_dispatch()
+                output_error(
+                    "dispatch_blocked",
+                    f"Dispatch settings were written to {resolved_dir} but "
+                    f"the task file's presence there could not be verified "
+                    f"({type(exc).__name__}: {exc}), so no session could be "
+                    f"registered safely. " + _outcome,
+                    fmt=fmt,
+                )
+                sys.exit(1)
             if materialized:
                 session_id = str(uuid.uuid4())
                 try:
@@ -2275,12 +2313,12 @@ def tasks_teardown_dispatch(
         task_id = expand_task_id(task_id, project_id)
 
     resolved_dir = Path(target_dir) if target_dir else Path.cwd()
-    marker = read_dispatch_marker(resolved_dir)
 
     # Teardown now takes the per-target dispatch lock (round 13), so it can
     # wait on a dispatch in progress; surface a contended lock (or a lock
     # directory that can't be created) as a structured error, not a traceback.
     try:
+        marker = read_dispatch_marker(resolved_dir)
         removed = teardown_dispatch_settings(
             resolved_dir,
             task_id=task_id,

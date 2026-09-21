@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import NamedTuple, Optional
 
 from .concurrency import file_lock, retry_transient
+from .sessions import stat_exists
 
 # Codex P1 fix: task_id and project_id flow unchanged into shell commands.
 # Reject anything outside the safe charset BEFORE interpolating, so an
@@ -592,7 +593,10 @@ def write_dispatch_settings(
     path = settings_path(target_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    if path.exists():
+    # stat_exists, not Path.exists(): a stat FAULT reading as "no existing
+    # file" would skip the operator-config / other-dispatch guard below and
+    # overwrite a file we could not even inspect (CLAWP-098, PR #55 round 15).
+    if stat_exists(path):
         try:
             existing = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
@@ -630,7 +634,7 @@ def write_dispatch_settings(
                 "+ replace."
             )
 
-        if force and path.exists():
+        if force and stat_exists(path):
             shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
 
     # The lease holder is a shell-safe TOKEN of the resolved target dir — the
@@ -683,7 +687,7 @@ def write_dispatch_settings(
 def read_dispatch_marker(target_dir: Path) -> Optional[dict]:
     """Return the clawpm dispatch marker block from settings.local.json, or None."""
     path = settings_path(target_dir)
-    if not path.exists():
+    if not stat_exists(path):
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -797,19 +801,20 @@ def _teardown_dispatch_settings_locked(
     """
     path = settings_path(target_dir)
     sidecar = session_start_payload_path(target_dir)
-    if not path.exists():
+    # stat_exists: a stat FAULT must surface (callers report teardown errors),
+    # not read as "nothing to tear down" and leave live hooks behind.
+    if not stat_exists(path):
         # Sidecar without settings is an orphan from a partial earlier
         # failure; clean it up so doctor doesn't surface it forever.
-        if sidecar.exists():
-            sidecar.unlink()
+        sidecar.unlink(missing_ok=True)
         return False
     marker = read_dispatch_marker(target_dir)
     if marker is None:
         if not force:
             return False
         path.unlink()
-        if remove_sidecar and sidecar.exists():
-            sidecar.unlink()
+        if remove_sidecar:
+            sidecar.unlink(missing_ok=True)
         return True
     if task_id is not None and marker.get("task_id") != task_id:
         return False
@@ -825,8 +830,8 @@ def _teardown_dispatch_settings_locked(
     ):
         return False
     path.unlink()
-    if remove_sidecar and sidecar.exists():
-        sidecar.unlink()
+    if remove_sidecar:
+        sidecar.unlink(missing_ok=True)
     # Codex round-4: append a torn_down event to the registry so
     # active_dispatch_dirs reflects reality. Pass project_id from the
     # marker (round-5 P1: cross-project isolation requires it).
