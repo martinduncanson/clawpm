@@ -1531,6 +1531,66 @@ class TestRollbackRestoresPriorSettings:
         assert "restored" in r2.output
 
 
+class TestRollbackWithSidecarNeverTouched:
+    """Codex P2, PR #55 round 11 (cli/tasks.py:1966): a re-dispatch that
+    never renders a rubric (``--no-session-context``) against a target that
+    already carries an EARLIER dispatch's sidecar must not let that
+    untouched sidecar poison the rollback ownership check.
+
+    Pre-fix, ``_written.sidecar_bytes`` is ``None`` whenever this invocation
+    doesn't write a sidecar — indistinguishable from "wrote nothing and
+    expect nothing on disk". Comparing that against the OLD sidecar's still-
+    present bytes read "untouched" as "a concurrent dispatch replaced it",
+    which refused to restore the prior (genuinely still-ours) settings and
+    left the just-written, now-orphaned settings installed instead.
+    """
+
+    def test_prior_dispatch_with_sidecar_survives_a_failed_no_session_context_redispatch(
+        self, temp_portfolio_with_repo, monkeypatch
+    ):
+        from clawpm.dispatch import session_start_payload_path
+
+        config = temp_portfolio_with_repo["config"]
+        repo_dir = temp_portfolio_with_repo["repo_dir"]
+        task = add_task(config, "test", title="RedispatchSidecar",
+                        predictions=Predictions(success_criteria=["C1"]))
+        _commit_project(repo_dir)
+
+        # First dispatch renders a rubric -> writes the sidecar.
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
+        )
+        assert r.exit_code == 0, r.output
+        wt_path = Path(json.loads(r.output)["data"]["target_dir"])
+        original_settings = settings_path(wt_path).read_bytes()
+        sidecar = session_start_payload_path(wt_path)
+        assert sidecar.exists()
+        original_sidecar = sidecar.read_bytes()
+
+        # Re-dispatch WITHOUT rendering a rubric — this invocation never
+        # writes the sidecar — with session registration failing.
+        def _boom(*args, **kwargs):
+            raise OSError("simulated sessions.jsonl append failure")
+
+        monkeypatch.setattr("clawpm.sessions.register_session", _boom)
+        r2 = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree",
+                   "--force", "--no-session-context"]
+        )
+        assert r2.exit_code == 1, r2.output
+        assert "session_registration_failed" in r2.output
+
+        assert settings_path(wt_path).read_bytes() == original_settings, (
+            "the previously working dispatch's settings must be restored "
+            "byte-for-byte, not left as this failed invocation's new write"
+        )
+        assert sidecar.read_bytes() == original_sidecar, (
+            "the sidecar this invocation never touched must be left exactly "
+            "as it was"
+        )
+        assert "restored" in r2.output, r2.output
+
+
 class TestReusedWorktreeRevisionCheck:
     """Codex P2, PR #55 round 7: the post-create check was existence-only, so
     a reused worktree holding an OLDER revision of the same task passed and

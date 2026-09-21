@@ -190,3 +190,92 @@ class TestDoctorCollisionCheck:
         cols = self._prefix_collisions(res.output)
         assert cols is not None, res.output
         assert not any(c["prefix"] == "ARB-P" and len(c["projects"]) > 1 for c in cols), cols
+
+
+# ---------------------------------------------------------------------------
+# CLAWP-098 predecessor (Codex P2, PR #55 round 11, discovery.py:259): a
+# registered worktree's own committed task_prefix must be honoured, not the
+# canonical checkout's. `get_tasks_dir` already redirects the task STORE
+# into the worktree; `add_task` separately resolved settings via the
+# cwd-independent `get_project(...)`, so a worktree whose own settings.toml
+# set a different task_prefix still minted IDs under the canonical
+# checkout's prefix, risking a collision when the branch merges.
+# ---------------------------------------------------------------------------
+
+
+class TestSessionScopedTaskPrefix:
+    def test_worktree_own_task_prefix_is_used_when_session_active(
+        self, isolated_portfolio, tmp_path, monkeypatch
+    ):
+        from clawpm.sessions import register_session
+        from clawpm.tasks import add_task
+
+        # Worktree carries its OWN .project/ with a task_prefix the
+        # canonical checkout does not set.
+        wt = tmp_path / "wt"
+        wt_tasks = wt / ".project" / "tasks"
+        for sub in ("done", "blocked"):
+            (wt_tasks / sub).mkdir(parents=True)
+        (wt / ".project" / "settings.toml").write_text(
+            'id = "test"\nname = "Test"\nstatus = "active"\npriority = 3\n'
+            'task_prefix = "WTPFX"\n',
+            encoding="utf-8",
+        )
+
+        register_session(
+            isolated_portfolio.root, "sess-1", "SEED",
+            isolated_portfolio.project_id, wt,
+        )
+        monkeypatch.chdir(wt)
+
+        task = add_task(
+            isolated_portfolio.config, isolated_portfolio.project_id,
+            "from worktree",
+        )
+        assert task is not None
+        # Canonical checkout has no explicit task_prefix, so the pre-fix
+        # cwd-independent lookup derived "TEST" from the project id instead.
+        assert task.id.startswith("WTPFX-"), task.id
+        # And it must have landed in the worktree's own task store.
+        assert (wt_tasks / f"{task.id}.md").exists()
+
+    def test_worktree_settings_with_foreign_id_is_ignored(
+        self, isolated_portfolio, tmp_path, monkeypatch
+    ):
+        """`ProjectSettings.load` does no id validation, unlike the
+        registry's `get_project` (which only ever returns settings whose
+        `id == project_id`). A worktree registered for THIS project but
+        whose committed settings.toml carries a DIFFERENT project's id
+        must not have that foreign task_prefix used as an explicit
+        override — that would bypass assign_task_prefix's portfolio-wide
+        collision check entirely (the cross-project prefix-collision
+        class CLAWP-048 already exists to prevent, reopened via a new
+        route)."""
+        from clawpm.sessions import register_session
+        from clawpm.tasks import add_task
+
+        wt = tmp_path / "wt"
+        wt_tasks = wt / ".project" / "tasks"
+        for sub in ("done", "blocked"):
+            (wt_tasks / sub).mkdir(parents=True)
+        # Registered for "test", but its OWN settings.toml claims a
+        # different project id and prefix.
+        (wt / ".project" / "settings.toml").write_text(
+            'id = "other-project"\nname = "Other"\nstatus = "active"\n'
+            'priority = 3\ntask_prefix = "FOREIGN"\n',
+            encoding="utf-8",
+        )
+
+        register_session(
+            isolated_portfolio.root, "sess-1", "SEED",
+            isolated_portfolio.project_id, wt,
+        )
+        monkeypatch.chdir(wt)
+
+        task = add_task(
+            isolated_portfolio.config, isolated_portfolio.project_id,
+            "from worktree with foreign id",
+        )
+        assert task is not None
+        assert not task.id.startswith("FOREIGN-"), task.id
+        assert task.id.startswith("TEST-"), task.id

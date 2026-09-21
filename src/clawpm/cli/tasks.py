@@ -1893,6 +1893,7 @@ def tasks_dispatch(
         # exactly what is on disk.
         _our_settings = _written.settings_bytes
         _our_sidecar = _written.sidecar_bytes
+        _sidecar_touched = _written.sidecar_written
 
         # CLAWP-098 (review finding): register the session AFTER settings are
         # written — same ordering rationale as the lease grant below — so a
@@ -1960,10 +1961,27 @@ def tasks_dispatch(
                     # the bytes we recorded after our own write; anything else on
                     # disk (different content, or nothing at all) means the
                     # artifacts are no longer ours to undo.
+                    #
+                    # The sidecar term is gated on `_sidecar_touched` (Codex P2,
+                    # PR #55 round 11): with `--no-session-context` against a
+                    # target that already carries a rubric sidecar from an
+                    # EARLIER dispatch, this invocation never writes the
+                    # sidecar, so `_our_sidecar` is None while the untouched
+                    # file on disk still holds that earlier sidecar's bytes.
+                    # Comparing those unconditionally reads "we didn't touch
+                    # it" as "someone else raced us", which poisoned
+                    # `_still_ours` and refused a legitimate settings restore
+                    # (leaving stale post-registration-failure settings
+                    # installed instead of the working prior dispatch). A
+                    # sidecar we never wrote is never ours to compare or
+                    # restore.
                     _still_ours = (
                         _our_settings is not None
                         and _read_bytes_or_none(_prior_settings_path) == _our_settings
-                        and _read_bytes_or_none(_prior_sidecar_path) == _our_sidecar
+                        and (
+                            not _sidecar_touched
+                            or _read_bytes_or_none(_prior_sidecar_path) == _our_sidecar
+                        )
                     )
                     _restored = _still_ours and _prior_settings is not None
                     try:
@@ -1977,10 +1995,11 @@ def tasks_dispatch(
                                 parents=True, exist_ok=True
                             )
                             _prior_settings_path.write_bytes(_prior_settings)
-                            if _prior_sidecar is not None:
-                                _prior_sidecar_path.write_bytes(_prior_sidecar)
-                            elif _prior_sidecar_path.exists():
-                                _prior_sidecar_path.unlink()
+                            if _sidecar_touched:
+                                if _prior_sidecar is not None:
+                                    _prior_sidecar_path.write_bytes(_prior_sidecar)
+                                elif _prior_sidecar_path.exists():
+                                    _prior_sidecar_path.unlink()
                         else:
                             from clawpm.dispatch import teardown_dispatch_settings
                             teardown_dispatch_settings(

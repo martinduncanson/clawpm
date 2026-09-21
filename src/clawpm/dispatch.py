@@ -420,14 +420,19 @@ class WrittenDispatchSettings(NamedTuple):
     are still its own WITHOUT reading them back (Codex P2, PR #55 round 10):
     a read-back adopts whatever is on disk at that moment, including an
     operator's edit made a millisecond earlier, and the ownership comparison
-    then passes on a false premise. ``sidecar_bytes`` is ``None`` when no
-    rubric was rendered and therefore no sidecar written — which compares
-    correctly against "no sidecar on disk".
+    then passes on a false premise. ``sidecar_bytes`` is ``None`` both when no
+    rubric was rendered (nothing to compare) AND when a rubric was reused
+    from an existing target that already carried one (CLAWP-121 predecessor,
+    PR #55 round 11) — those two are NOT the same claim about what's on disk,
+    which is why ``sidecar_written`` exists: ``sidecar_bytes`` alone cannot
+    tell "we wrote nothing, expect nothing" apart from "we wrote nothing,
+    something else's sidecar is still there".
     """
 
     path: Path
     settings_bytes: bytes
     sidecar_bytes: Optional[bytes]
+    sidecar_written: bool
 
 
 def _write_exact(path: Path, text: str) -> bytes:
@@ -570,6 +575,7 @@ def write_dispatch_settings(
         path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
     )
     sidecar_bytes = None
+    sidecar_written = False
     if rubric_markdown:
         # Side-car file holds the additionalContext JSON; the hook reads
         # it via `clawpm hook session-start`. See module docstring for
@@ -577,11 +583,14 @@ def write_dispatch_settings(
         _, sidecar_bytes = write_session_start_sidecar_bytes(
             target_dir, rubric_markdown
         )
+        sidecar_written = True
     # Codex round-4: register the dispatch so on-done teardown can find
     # ALL target_dirs, not just the legacy repo_path + worktree pair.
     if portfolio_root is not None:
         register_dispatch(portfolio_root, task_id, project_id, target_dir)
-    return WrittenDispatchSettings(path, settings_bytes, sidecar_bytes)
+    return WrittenDispatchSettings(
+        path, settings_bytes, sidecar_bytes, sidecar_written
+    )
 
 
 def read_dispatch_marker(target_dir: Path) -> Optional[dict]:
