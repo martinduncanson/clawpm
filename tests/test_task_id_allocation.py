@@ -534,7 +534,7 @@ class TestSessionScopedTaskPrefix:
         # And it must have landed in the worktree's own task store.
         assert (wt_tasks / f"{task.id}.md").exists()
 
-    def test_worktree_settings_with_foreign_id_is_ignored(
+    def test_worktree_settings_with_foreign_id_fails_closed(
         self, isolated_portfolio, tmp_path, monkeypatch
     ):
         """`ProjectSettings.load` does no id validation, unlike the
@@ -545,7 +545,9 @@ class TestSessionScopedTaskPrefix:
         override — that would bypass assign_task_prefix's portfolio-wide
         collision check entirely (the cross-project prefix-collision
         class CLAWP-048 already exists to prevent, reopened via a new
-        route)."""
+        route). Rounds 11-12 silently fell back to the canonical settings;
+        by operator decision (2026-09-21) it now FAILS CLOSED, loudly."""
+        from clawpm.discovery import ScopedSettingsMismatchError
         from clawpm.sessions import register_session
         from clawpm.tasks import add_task
 
@@ -567,10 +569,9 @@ class TestSessionScopedTaskPrefix:
         )
         monkeypatch.chdir(wt)
 
-        task = add_task(
-            isolated_portfolio.config, isolated_portfolio.project_id,
-            "from worktree with foreign id",
-        )
-        assert task is not None
-        assert not task.id.startswith("FOREIGN-"), task.id
-        assert task.id.startswith("TEST-"), task.id
+        with pytest.raises(ScopedSettingsMismatchError, match="other-project"):
+            add_task(
+                isolated_portfolio.config, isolated_portfolio.project_id,
+                "from worktree with foreign id",
+            )
+        assert not list(wt_tasks.glob("*.md"))

@@ -298,6 +298,80 @@ def get_repo_path(config: PortfolioConfig, project_id: str) -> Path | None:
     return project.repo_path if project else None
 
 
+class ScopedSettingsMismatchError(ValueError):
+    """A registered worktree's own ``settings.toml`` names a different project.
+
+    Subclasses ``ValueError`` so the CLI mutation wrappers
+    (``_mutation_errors``, ``cli/agent.py``) map it to a structured error
+    instead of a traceback.
+    """
+
+
+def get_scoped_project_settings(
+    config: PortfolioConfig, project_id: str
+) -> ProjectSettings | None:
+    """Project settings from the SAME checkout the task store resolves to.
+
+    This is the settings-side twin of :func:`get_project_dir` /
+    :func:`get_repo_path` (CLAWP-098, PR #55 rounds 11-13). The scope
+    invariant those two enforce is that everything one operation touches — the
+    task store, the git checkout, and the settings that decide ID prefixes —
+    comes from ONE checkout. ``get_project`` is cwd-independent, so any caller
+    that took the task store from ``get_tasks_dir`` but its settings from
+    ``get_project`` read the CANONICAL checkout's ``settings.toml`` while
+    writing into a worktree, and minted IDs under the wrong ``task_prefix``.
+    Both ``add_task`` and ``emit-tree``'s root-ID prediction now go through
+    here so they cannot disagree.
+
+    - No registered session for cwd (every ordinary invocation), or inside
+      ``suppress_session_resolution()``: identical to ``get_project``.
+    - Session matched but its worktree has no ``settings.toml``: silently
+      ``get_project`` — that is the ordinary case (a worktree with nothing of
+      its own to say), not a degrade.
+    - Session matched but its ``settings.toml`` is unreadable / malformed
+      (``OSError``, ``ValueError`` — which includes ``tomllib.TOMLDecodeError``
+      — or ``KeyError``): LOGS and falls back to ``get_project`` — fail-open
+      WITH a marker (CLAWP-039/041). Any other exception is a bug and
+      propagates.
+    - Session matched and the worktree's settings name a DIFFERENT project id:
+      raises :class:`ScopedSettingsMismatchError`. This is fail-CLOSED on
+      purpose (operator decision, 2026-09-21): the session was matched by the
+      registry record's project id, so a settings file claiming another id
+      means the worktree's identity is inconsistent. Falling back to the
+      canonical settings would keep working but silently mint IDs from a
+      checkout the operation is not writing into.
+    """
+    session_dir = _session_scoped_project_dir(config, project_id)
+    if session_dir is None:
+        return get_project(config, project_id)
+    settings_file = session_dir / "settings.toml"
+    try:
+        exists = settings_file.exists()
+    except OSError:
+        exists = False
+    if not exists:
+        return get_project(config, project_id)
+    try:
+        scoped = ProjectSettings.load(settings_file)
+    except (OSError, ValueError, KeyError) as exc:
+        logger.warning(
+            "Failed to load session-scoped settings.toml at %s: %s. Falling "
+            "back to the registry lookup — a worktree-specific task_prefix, "
+            "if any, will be ignored for this operation.",
+            settings_file, exc,
+        )
+        return get_project(config, project_id)
+    if scoped.id != project_id:
+        raise ScopedSettingsMismatchError(
+            f"The worktree at {session_dir.parent} is registered for project "
+            f"{project_id!r}, but its {settings_file} declares project id "
+            f"{scoped.id!r}. Refusing to continue rather than fall back to "
+            f"the main checkout's settings — fix the worktree's settings.toml "
+            f"(or re-dispatch the task) so the two agree."
+        )
+    return scoped
+
+
 def _session_scoped_repo_path(config: PortfolioConfig, project_id: str) -> Path | None:
     """Worktree root of the session registered for cwd, or ``None``.
 

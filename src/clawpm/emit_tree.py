@@ -691,14 +691,19 @@ def _predict_parent_id(
 
     # New root — predict the next ID add_task would generate
     from .tasks import get_tasks_dir, assign_task_prefix
-    from .discovery import get_project
+    from .discovery import get_scoped_project_settings
     import re
 
     tasks_dir = get_tasks_dir(config, project_id)
     if not tasks_dir:
         raise EmitValidationError(f"Cannot locate tasks directory for project {project_id!r}")
 
-    _settings = get_project(config, project_id)
+    # Session-scoped like `tasks_dir` above and `add_task`'s own prefix
+    # resolution (CLAWP-098, Codex P2 on PR #55 round 13): the cwd-independent
+    # `get_project` would read the CANONICAL settings.toml and give the whole
+    # emitted tree the wrong prefix while it lands in a worktree. A foreign
+    # project id in the worktree's settings raises (a ValueError subclass).
+    _settings = get_scoped_project_settings(config, project_id)
     prefix = assign_task_prefix(
         project_id,
         tasks_dir,

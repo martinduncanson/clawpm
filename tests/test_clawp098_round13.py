@@ -1,0 +1,622 @@
+"""CLAWP-098 round-13 review regressions (Codex + antigravity, PR #55).
+
+One structural invariant covers findings 1-5 (see the PR reply): an
+operation's artifacts — task store, settings, dispatch hooks, sessions — are
+RESOLVED from, WRITTEN into, and TORN DOWN under a single scope; a
+half-installed dispatch is never left behind.
+
+- P1 dispatch_agent from a registered worktree wrote the subtask into the
+  caller's worktree while its (unregistered) nested worktree's hooks resolve
+  canonically -> the hook could never find the task.
+- P1 only `tasks dispatch` held the per-target lock; every teardown path
+  could unlink a fresh dispatch's settings.
+- P2 the dispatch drift gate diffed the canonical checkout while the task was
+  loaded from the session checkout.
+- P2 emit-tree's root-ID prefix came from the canonical settings.toml.
+- P1 a failure INSIDE write_dispatch_settings (after settings.local.json
+  landed) escaped before rollback, leaving armed hooks and no session.
+
+Plus the operator decision (2026-09-21): a foreign project id in a registered
+worktree's settings.toml FAILS CLOSED, and the missing regression test for the
+malformed-TOML fallback narrowed to (OSError, ValueError, KeyError).
+
+Each test fails against the source it was written against.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import subprocess
+import threading
+from pathlib import Path
+
+import pytest
+from click.testing import CliRunner
+
+from clawpm.cli import main
+from clawpm.concurrency import LockTimeout
+from clawpm.discovery import (
+    ScopedSettingsMismatchError,
+    get_scoped_project_settings,
+    load_portfolio_config,
+)
+from clawpm.dispatch import (
+    PartialDispatchWrite,
+    dispatch_lock_path,
+    settings_path,
+    session_start_payload_path,
+    teardown_dispatch_settings,
+    write_dispatch_settings,
+)
+from clawpm.models import Predictions, ProjectSettings
+from clawpm.sessions import register_session
+from clawpm.tasks import add_task
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-c", "user.email=a@b", "-c", "user.name=a", "-C", str(repo), *args],
+        check=True, capture_output=True, text=True,
+    )
+
+
+@pytest.fixture
+def git_portfolio(tmp_path, monkeypatch):
+    """A portfolio whose single project 'test' lives at the root of a real git repo."""
+    root = tmp_path / "portfolio"
+    root.mkdir()
+    repo = root / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    (repo / "README.md").write_text("hi", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-q", "-m", "init")
+
+    (root / "portfolio.toml").write_text(
+        f'portfolio_root = "{root.as_posix()}"\n'
+        f'project_roots = ["{root.as_posix()}"]\n'
+        "[defaults]\n"
+        'status = "active"\n',
+        encoding="utf-8",
+    )
+    meta = repo / ".project"
+    meta.mkdir()
+    (meta / "settings.toml").write_text(
+        'id = "test"\nname = "Test"\nstatus = "active"\npriority = 3\n'
+        f'repo_path = "{repo.as_posix()}"\n',
+        encoding="utf-8",
+    )
+    tasks = meta / "tasks"
+    for sub in ("", "done", "blocked"):
+        (tasks / sub).mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.delenv("CLAWPM_PROJECT_ROOTS", raising=False)
+    monkeypatch.delenv("CLAWPM_WORKSPACE", raising=False)
+    monkeypatch.setenv("CLAWPM_PORTFOLIO", str(root))
+    yield {
+        "root": root,
+        "repo": repo,
+        "tasks_dir": tasks,
+        "config": load_portfolio_config(root),
+    }
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "prune"],
+        check=False, capture_output=True,
+    )
+
+
+def _emit_doc():
+    from clawpm.emit_tree import parse_emit_document
+
+    return parse_emit_document({
+        "schema_version": 1,
+        "root": {"title": "root"},
+        "leaves": [{
+            "ref": "L1",
+            "parent_ref": None,
+            "title": "Leaf one",
+            "leaf_key": "round13-L1",
+            "success_criteria": [{
+                "criterion": "Tests pass",
+                "gradeable_signal": "pytest exit 0",
+                "comparator": "eq:0",
+            }],
+            "delegability": "agent",
+        }],
+    })
+
+
+def _registered_worktree(fx, tmp_path, monkeypatch, settings_text, name="wt"):
+    """A directory with its own .project/ registered as a session, cwd inside it."""
+    wt = tmp_path / name
+    tasks = wt / ".project" / "tasks"
+    for sub in ("", "done", "blocked"):
+        (tasks / sub).mkdir(parents=True, exist_ok=True)
+    (wt / ".project" / "settings.toml").write_text(settings_text, encoding="utf-8")
+    register_session(fx["root"], f"sess-{name}", "SEED", "test", wt)
+    monkeypatch.chdir(wt)
+    return wt
+
+
+_OWN_SETTINGS = (
+    'id = "test"\nname = "Test"\nstatus = "active"\npriority = 3\n'
+    'task_prefix = "WTPFX"\n'
+)
+_FOREIGN_SETTINGS = (
+    'id = "other-project"\nname = "Other"\nstatus = "active"\npriority = 3\n'
+    'task_prefix = "FOREIGN"\n'
+)
+
+
+# ---------------------------------------------------------------------------
+# Operator decision: foreign project id FAILS CLOSED
+# ---------------------------------------------------------------------------
+
+
+class TestForeignProjectIdFailsClosed:
+    def test_add_task_raises_and_writes_nothing(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        wt = _registered_worktree(
+            git_portfolio, tmp_path, monkeypatch, _FOREIGN_SETTINGS
+        )
+        with pytest.raises(ScopedSettingsMismatchError) as ei:
+            add_task(git_portfolio["config"], "test", "from a confused worktree")
+        assert isinstance(ei.value, ValueError)  # CLI mutation wrappers map it
+        msg = str(ei.value)
+        assert "'test'" in msg and "'other-project'" in msg
+        assert not list((wt / ".project" / "tasks").glob("*.md"))
+        # ... and nothing was silently minted in the canonical store either.
+        assert not list(git_portfolio["tasks_dir"].glob("*.md"))
+
+    def test_cli_add_reports_a_structured_error(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        _registered_worktree(
+            git_portfolio, tmp_path, monkeypatch, _FOREIGN_SETTINGS
+        )
+        r = CliRunner().invoke(main, ["-p", "test", "tasks", "add", "-t", "x"])
+        assert r.exit_code == 1, r.output
+        assert "add_failed" in r.output
+        assert "other-project" in r.output
+
+    def test_emit_tree_root_prediction_raises_too(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        from clawpm.emit_tree import _predict_parent_id
+
+        _registered_worktree(
+            git_portfolio, tmp_path, monkeypatch, _FOREIGN_SETTINGS
+        )
+        doc = _emit_doc()
+        with pytest.raises(ScopedSettingsMismatchError):
+            _predict_parent_id(doc, git_portfolio["config"], "test")
+
+    def test_ordinary_checkout_is_unaffected(self, git_portfolio, monkeypatch):
+        """The guard is only about a REGISTERED worktree; outside one the
+        resolver is exactly `get_project` (cwd-independent)."""
+        monkeypatch.chdir(git_portfolio["repo"])
+        got = get_scoped_project_settings(git_portfolio["config"], "test")
+        assert got is not None and got.id == "test"
+
+
+# ---------------------------------------------------------------------------
+# Malformed-TOML fallback: the missing regression test (narrowed except)
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedScopedSettingsFallback:
+    def test_malformed_toml_logs_and_falls_back_to_the_registry(
+        self, git_portfolio, tmp_path, monkeypatch, caplog
+    ):
+        wt = _registered_worktree(
+            git_portfolio, tmp_path, monkeypatch, "this is = [not valid toml"
+        )
+        with caplog.at_level(logging.WARNING, logger="clawpm.discovery"):
+            task = add_task(git_portfolio["config"], "test", "degraded prefix")
+        assert task is not None
+        # Fallback = canonical settings (no explicit prefix) -> derived "TEST".
+        assert task.id.startswith("TEST-"), task.id
+        # The task still lands in the worktree's own store.
+        assert (wt / ".project" / "tasks" / f"{task.id}.md").exists()
+        # Fail-open WITH a marker (CLAWP-039/041): the degrade is logged.
+        assert any(
+            "Failed to load session-scoped settings.toml" in rec.getMessage()
+            for rec in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+
+    @pytest.mark.parametrize("exc", [OSError("EACCES"), ValueError("bad"), KeyError("k")])
+    def test_the_three_narrowed_exceptions_fall_back(
+        self, git_portfolio, tmp_path, monkeypatch, caplog, exc
+    ):
+        wt = _registered_worktree(
+            git_portfolio, tmp_path, monkeypatch, _OWN_SETTINGS
+        )
+        wt_settings = wt / ".project" / "settings.toml"
+        real = ProjectSettings.load
+
+        def _load(cls, path):
+            if Path(path) == wt_settings:
+                raise exc
+            return real(path)
+
+        monkeypatch.setattr(ProjectSettings, "load", classmethod(_load))
+        with caplog.at_level(logging.WARNING, logger="clawpm.discovery"):
+            got = get_scoped_project_settings(git_portfolio["config"], "test")
+        assert got is not None and got.task_prefix != "WTPFX"
+        assert any("session-scoped settings.toml" in r.getMessage() for r in caplog.records)
+
+    def test_a_genuine_bug_is_not_swallowed(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        """The except was NARROWED on purpose: a programming error must surface,
+        not masquerade as a bad settings file."""
+        wt = _registered_worktree(
+            git_portfolio, tmp_path, monkeypatch, _OWN_SETTINGS
+        )
+        wt_settings = wt / ".project" / "settings.toml"
+        real = ProjectSettings.load
+
+        def _load(cls, path):
+            if Path(path) == wt_settings:
+                raise RuntimeError("a bug, not a bad file")
+            return real(path)
+
+        monkeypatch.setattr(ProjectSettings, "load", classmethod(_load))
+        with pytest.raises(RuntimeError, match="a bug"):
+            get_scoped_project_settings(git_portfolio["config"], "test")
+
+
+# ---------------------------------------------------------------------------
+# P2: emit-tree prefix is scoped with its task store
+# ---------------------------------------------------------------------------
+
+
+class TestEmitTreePrefixIsSessionScoped:
+    def test_root_id_uses_the_worktrees_task_prefix(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        from clawpm.emit_tree import _predict_parent_id
+
+        _registered_worktree(git_portfolio, tmp_path, monkeypatch, _OWN_SETTINGS)
+        doc = _emit_doc()
+        pid = _predict_parent_id(doc, git_portfolio["config"], "test")
+        assert pid.startswith("WTPFX-"), pid
+
+
+# ---------------------------------------------------------------------------
+# P2: dispatch drift gate diffs the checkout the task was loaded from
+# ---------------------------------------------------------------------------
+
+
+class TestDriftGateUsesTheSessionCheckout:
+    def test_in_place_dispatch_from_a_worktree_checks_that_worktree(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        wt = _registered_worktree(git_portfolio, tmp_path, monkeypatch, _OWN_SETTINGS)
+        task = add_task(
+            git_portfolio["config"], "test", "in-place",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+        assert task is not None
+
+        seen: list = []
+
+        def _record(repo_path, scope, baseline_ref):
+            seen.append(Path(repo_path) if repo_path else None)
+            return {"status": "skipped", "skip_class": "expected"}
+
+        monkeypatch.setattr("clawpm.baseline.detect_scope_drift", _record)
+        r = CliRunner().invoke(main, ["-p", "test", "tasks", "dispatch", task.id])
+        assert r.exit_code == 0, r.output
+        assert seen, "drift gate did not run"
+        assert seen[0].resolve() == wt.resolve(), (
+            f"drift gate diffed {seen[0]} but the task was loaded from {wt}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# P1: dispatch_agent from a registered worktree stays in the canonical store
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchAgentFromAWorktreeIsCanonical:
+    def test_subtask_is_created_where_the_unregistered_worktrees_hooks_look(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        from clawpm.agent import dispatch_agent
+        from clawpm.sessions import active_sessions
+
+        wt = _registered_worktree(git_portfolio, tmp_path, monkeypatch, _OWN_SETTINGS)
+        result = dispatch_agent(
+            config=git_portfolio["config"],
+            project_id="test",
+            prompt="Do a thing",
+            success_criteria=["c1"],
+            judge_invoker=lambda prompt: '{"ok": true, "reason": "done"}',
+            init_codegraph=False,
+        )
+        sid = result["subtask_id"]
+        canonical = list(git_portfolio["tasks_dir"].rglob(f"{sid}*.md"))
+        in_caller = list((wt / ".project" / "tasks").rglob(f"{sid}*.md"))
+        assert canonical, (
+            "the nested worktree is unregistered, so its Stop hook resolves "
+            "the canonical store; the subtask must live there"
+        )
+        assert not in_caller, f"subtask leaked into the caller's worktree: {in_caller}"
+        # And the prefix came from the canonical settings, not the caller's.
+        assert not sid.startswith("WTPFX-"), sid
+        # The nested worktree stays unregistered (unchanged contract).
+        assert all(s.session_id == "sess-wt" for s in active_sessions(git_portfolio["root"]))
+
+
+# ---------------------------------------------------------------------------
+# P1: every teardown takes the same per-target lock as dispatch
+# ---------------------------------------------------------------------------
+
+
+class TestTeardownTakesTheTargetLock:
+    def _install(self, root, target):
+        target.mkdir(parents=True, exist_ok=True)
+        write_dispatch_settings(
+            target, "T-1", "test", rubric_markdown="rubric", portfolio_root=root
+        )
+
+    def test_teardown_acquires_the_dispatch_sentinel(self, tmp_path, monkeypatch):
+        import clawpm.dispatch as dmod
+
+        root, target = tmp_path / "root", tmp_path / "target"
+        root.mkdir()
+        self._install(root, target)
+        held: list[Path] = []
+        real = dmod.file_lock
+
+        def _record(lock_path, *a, **k):
+            held.append(Path(lock_path))
+            return real(lock_path, *a, **k)
+
+        monkeypatch.setattr(dmod, "file_lock", _record)
+        assert teardown_dispatch_settings(
+            target, task_id="T-1", portfolio_root=root, project_id="test"
+        )
+        assert held == [dispatch_lock_path(root, target)]
+
+    def test_teardown_waits_out_a_dispatch_in_progress(self, tmp_path, monkeypatch):
+        """A teardown from ANOTHER actor cannot unlink settings while a
+        dispatch holds the target — the lock `tasks dispatch` takes is the
+        very sentinel teardown contends on."""
+        import clawpm.dispatch as dmod
+        from clawpm.cli.tasks import _dispatch_target_lock
+
+        root, target = tmp_path / "root", tmp_path / "target"
+        root.mkdir()
+        self._install(root, target)
+
+        real = dmod.file_lock
+        monkeypatch.setattr(
+            dmod, "file_lock", lambda p, *a, **k: real(p, timeout=0.3)
+        )
+        outcome: dict = {}
+
+        def _other_actor():
+            try:
+                outcome["removed"] = teardown_dispatch_settings(
+                    target, task_id="T-1", portfolio_root=root, project_id="test"
+                )
+            except BaseException as exc:  # noqa: BLE001 - recorded for the assert
+                outcome["exc"] = exc
+
+        with _dispatch_target_lock(root, target, "json"):
+            t = threading.Thread(target=_other_actor)
+            t.start()
+            t.join(30)
+        assert isinstance(outcome.get("exc"), LockTimeout), outcome
+        assert settings_path(target).exists(), "teardown ran without the lock"
+
+    def test_teardown_cli_reports_a_contended_lock_structurally(
+        self, tmp_path, monkeypatch
+    ):
+        import clawpm.dispatch as dmod
+        from clawpm.cli.tasks import _dispatch_target_lock
+
+        root, target = tmp_path / "root", tmp_path / "target"
+        root.mkdir()
+        (root / "portfolio.toml").write_text(
+            f'portfolio_root = "{root.as_posix()}"\nproject_roots = []\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CLAWPM_PORTFOLIO", str(root))
+        self._install(root, target)
+        real = dmod.file_lock
+        monkeypatch.setattr(
+            dmod, "file_lock", lambda p, *a, **k: real(p, timeout=0.3)
+        )
+        outcome: dict = {}
+
+        def _run_cli():
+            outcome["r"] = CliRunner().invoke(
+                main, ["tasks", "teardown-dispatch", "--target-dir", str(target)]
+            )
+
+        with _dispatch_target_lock(root, target, "json"):
+            t = threading.Thread(target=_run_cli)
+            t.start()
+            t.join(30)
+        r = outcome["r"]
+        assert r.exit_code == 1, r.output
+        assert "dispatch_blocked" in r.output
+        assert settings_path(target).exists()
+
+    def test_teardown_nests_inside_dispatch_rollback(self, tmp_path):
+        """Dispatch's own rollback calls teardown from inside the lock; the
+        lock is reentrant per thread, so that must not self-deadlock."""
+        from clawpm.cli.tasks import _dispatch_target_lock
+
+        root, target = tmp_path / "root", tmp_path / "target"
+        root.mkdir()
+        self._install(root, target)
+        with _dispatch_target_lock(root, target, "json"):
+            assert teardown_dispatch_settings(
+                target, task_id="T-1", portfolio_root=root, project_id="test"
+            )
+        assert not settings_path(target).exists()
+
+
+# ---------------------------------------------------------------------------
+# P1: a failure inside the writer rolls back instead of escaping armed
+# ---------------------------------------------------------------------------
+
+
+class TestWriterFailureIsRolledBack:
+    def test_writer_reports_what_landed_when_it_fails_afterwards(
+        self, tmp_path, monkeypatch
+    ):
+        root, target = tmp_path / "root", tmp_path / "target"
+        root.mkdir()
+        target.mkdir()
+
+        def _boom(*a, **k):
+            raise OSError("simulated disk full appending dispatches.jsonl")
+
+        monkeypatch.setattr("clawpm.dispatch.register_dispatch", _boom)
+        with pytest.raises(PartialDispatchWrite) as ei:
+            write_dispatch_settings(
+                target, "T-1", "test", rubric_markdown="rubric", portfolio_root=root
+            )
+        w = ei.value.written
+        assert isinstance(ei.value.cause, OSError)
+        assert w.settings_bytes == settings_path(target).read_bytes()
+        assert w.sidecar_written is True
+        assert w.sidecar_bytes == session_start_payload_path(target).read_bytes()
+
+    def test_a_failed_sidecar_write_is_reported_as_not_written(
+        self, tmp_path, monkeypatch
+    ):
+        target = tmp_path / "target"
+        target.mkdir()
+
+        def _boom(*a, **k):
+            raise OSError("simulated sidecar failure")
+
+        monkeypatch.setattr("clawpm.dispatch.write_session_start_sidecar_bytes", _boom)
+        with pytest.raises(PartialDispatchWrite) as ei:
+            write_dispatch_settings(target, "T-1", "test", rubric_markdown="rubric")
+        assert ei.value.written.sidecar_written is False
+        assert not session_start_payload_path(target).exists()
+
+    def test_cli_leaves_nothing_armed_after_a_writer_failure(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        task = add_task(
+            git_portfolio["config"], "test", "t",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+        target = tmp_path / "target"
+
+        def _boom(*a, **k):
+            raise OSError("simulated disk full")
+
+        monkeypatch.setattr("clawpm.dispatch.register_dispatch", _boom)
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id,
+                   "--target-dir", str(target)],
+        )
+        assert r.exit_code == 1, r.output
+        assert "dispatch_write_failed" in r.output
+        assert not settings_path(target).exists(), "hooks left armed"
+        assert not session_start_payload_path(target).exists()
+
+    def test_registry_failure_during_rollback_is_not_reported_as_armed(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        """Disk-full breaks BOTH the dispatch append and the follow-up
+        `torn_down` append. The hooks are gone by then, so the operator must
+        not be told the settings still need manual attention."""
+        task = add_task(
+            git_portfolio["config"], "test", "t",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+        target = tmp_path / "target"
+
+        def _boom(*a, **k):
+            raise OSError("simulated disk full")
+
+        monkeypatch.setattr("clawpm.dispatch.register_dispatch", _boom)
+        monkeypatch.setattr("clawpm.dispatch.register_teardown", _boom)
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id,
+                   "--target-dir", str(target)],
+        )
+        assert r.exit_code == 1, r.output
+        assert not settings_path(target).exists()
+        assert "were removed, but recording" in r.output
+        assert "inspect" not in r.output
+
+    def test_dispatch_agent_takes_a_partial_write_back_down(
+        self, git_portfolio, monkeypatch
+    ):
+        from clawpm.agent import AgentDispatchError, dispatch_agent
+
+        def _boom(*a, **k):
+            raise OSError("simulated disk full")
+
+        monkeypatch.setattr("clawpm.dispatch.register_dispatch", _boom)
+        with pytest.raises(AgentDispatchError, match="write_dispatch_settings"):
+            dispatch_agent(
+                config=git_portfolio["config"],
+                project_id="test",
+                prompt="Do a thing",
+                success_criteria=["c1"],
+                judge_invoker=lambda prompt: '{"ok": true, "reason": "done"}',
+                init_codegraph=False,
+            )
+        armed = list(
+            (git_portfolio["repo"] / ".clawpm-worktrees").glob(
+                "*/.claude/settings.local.json"
+            )
+        )
+        assert not armed, f"nested worktree left armed: {armed}"
+
+    def test_cli_restores_the_prior_dispatch_after_a_writer_failure(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        task = add_task(
+            git_portfolio["config"], "test", "t",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+        target = tmp_path / "target"
+        args = ["-p", "test", "tasks", "dispatch", task.id, "--target-dir", str(target)]
+        r1 = CliRunner().invoke(main, args + ["--no-confirm-close"])
+        assert r1.exit_code == 0, r1.output
+        first = settings_path(target).read_bytes()
+        first_sidecar = session_start_payload_path(target).read_bytes()
+
+        def _boom(*a, **k):
+            raise OSError("simulated disk full")
+
+        monkeypatch.setattr("clawpm.dispatch.register_dispatch", _boom)
+        r2 = CliRunner().invoke(main, args + ["--confirm-close"])
+        assert r2.exit_code == 1, r2.output
+        assert "dispatch_write_failed" in r2.output
+        assert settings_path(target).read_bytes() == first
+        assert session_start_payload_path(target).read_bytes() == first_sidecar
+
+    def test_the_settings_write_is_atomic(self, tmp_path, monkeypatch):
+        """`PartialDispatchWrite` treats the settings file as all-or-nothing;
+        that only holds if a failed write leaves the previous bytes alone."""
+        import clawpm.dispatch as dmod
+
+        target = tmp_path / "target"
+        target.mkdir()
+        write_dispatch_settings(target, "T-1", "test")
+        before = settings_path(target).read_bytes()
+
+        def _boom(*a, **k):
+            raise OSError("simulated failure at the rename")
+
+        monkeypatch.setattr(dmod.os, "replace", _boom)
+        with pytest.raises(OSError):
+            write_dispatch_settings(target, "T-1", "test", confirm_close=True)
+        assert settings_path(target).read_bytes() == before
+        assert not list((target / ".claude").glob("*.tmp")), "temp file leaked"

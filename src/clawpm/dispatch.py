@@ -40,6 +40,7 @@ Design tradeoffs:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -48,6 +49,8 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple, Optional
+
+from .concurrency import file_lock, retry_transient
 
 # Codex P1 fix: task_id and project_id flow unchanged into shell commands.
 # Reject anything outside the safe charset BEFORE interpolating, so an
@@ -435,8 +438,56 @@ class WrittenDispatchSettings(NamedTuple):
     sidecar_written: bool
 
 
+class PartialDispatchWrite(Exception):
+    """:func:`write_dispatch_settings` failed AFTER settings.local.json landed.
+
+    The settings file is the first artifact and the one that arms the hooks,
+    so a failure later in the writer (sidecar, ``dispatches.jsonl``) leaves a
+    live Stop hook behind. ``written`` records exactly what did land, so the
+    caller can run the same ownership-checked rollback it uses for every other
+    post-write failure (CLAWP-098, Codex P1 on PR #55 round 13) instead of
+    exiting with hooks active and no session mapping. Failures BEFORE the
+    settings file lands (``FileExistsError``, ``ValueError``, an ``OSError``
+    while writing it — the write is atomic, see :func:`_write_exact`) leave
+    nothing behind and propagate unchanged.
+    """
+
+    def __init__(self, cause: BaseException, written: "WrittenDispatchSettings"):
+        super().__init__(f"{type(cause).__name__}: {cause}")
+        self.cause = cause
+        self.written = written
+
+
+def dispatch_lock_path(portfolio_root: Path, target_dir: Path) -> Path:
+    """Sentinel path serialising every writer/teardown of *target_dir*'s dispatch.
+
+    Lives under ``<portfolio_root>/locks/`` keyed by a digest of the normcased,
+    resolved target — never inside the target itself, where it would show up as
+    an untracked file in the operator's repo (and, for ``--worktree``, in a
+    checkout meant to be disposable).
+    """
+    key = hashlib.sha256(
+        os.path.normcase(str(target_dir.resolve())).encode("utf-8")
+    ).hexdigest()[:16]
+    return portfolio_root / "locks" / f"dispatch-{key}.lock"
+
+
 def _write_exact(path: Path, text: str) -> bytes:
     """Write *text* as UTF-8 with NO newline translation; return the bytes.
+
+    The write is ATOMIC (temp file + ``os.replace``): a failure part-way
+    (disk full, permissions) leaves the previous file untouched instead of a
+    truncated one, so "the write raised" always means "nothing new is on
+    disk" — which is what lets :class:`PartialDispatchWrite` treat the
+    settings file as all-or-nothing.
+
+    Trade-off: ``os.replace`` swaps in a fresh regular file, so on Windows a
+    re-dispatch over a settings file another process holds open (a live
+    Claude session in that directory) can now fail with ``PermissionError``
+    after a short transient retry, where an in-place ``write_bytes`` used to
+    succeed — and it no longer preserves a symlink or custom ACL on the
+    target. Failing loudly (``dispatch_blocked``, nothing installed) is the
+    deliberate side of that trade.
 
     ``Path.write_text`` opens in text mode, so on Windows every ``\\n``
     becomes ``\\r\\n`` and the bytes on disk are not the bytes the caller
@@ -452,7 +503,16 @@ def _write_exact(path: Path, text: str) -> bytes:
     diffs.
     """
     data = text.encode("utf-8")
-    path.write_bytes(data)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_bytes(data)
+        retry_transient(os.replace, tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
     return data
 
 
@@ -576,18 +636,28 @@ def write_dispatch_settings(
     )
     sidecar_bytes = None
     sidecar_written = False
-    if rubric_markdown:
-        # Side-car file holds the additionalContext JSON; the hook reads
-        # it via `clawpm hook session-start`. See module docstring for
-        # the cross-platform reasoning.
-        _, sidecar_bytes = write_session_start_sidecar_bytes(
-            target_dir, rubric_markdown
-        )
-        sidecar_written = True
-    # Codex round-4: register the dispatch so on-done teardown can find
-    # ALL target_dirs, not just the legacy repo_path + worktree pair.
-    if portfolio_root is not None:
-        register_dispatch(portfolio_root, task_id, project_id, target_dir)
+    try:
+        if rubric_markdown:
+            # Side-car file holds the additionalContext JSON; the hook reads
+            # it via `clawpm hook session-start`. See module docstring for
+            # the cross-platform reasoning.
+            _, sidecar_bytes = write_session_start_sidecar_bytes(
+                target_dir, rubric_markdown
+            )
+            sidecar_written = True
+        # Codex round-4: register the dispatch so on-done teardown can find
+        # ALL target_dirs, not just the legacy repo_path + worktree pair.
+        if portfolio_root is not None:
+            register_dispatch(portfolio_root, task_id, project_id, target_dir)
+    except Exception as exc:
+        # Settings are live but the writer did not finish: hand the caller
+        # exactly what landed so it can roll back (see PartialDispatchWrite).
+        raise PartialDispatchWrite(
+            exc,
+            WrittenDispatchSettings(
+                path, settings_bytes, sidecar_bytes, sidecar_written
+            ),
+        ) from exc
     return WrittenDispatchSettings(
         path, settings_bytes, sidecar_bytes, sidecar_written
     )
@@ -618,6 +688,48 @@ def read_dispatch_marker(target_dir: Path) -> Optional[dict]:
 
 
 def teardown_dispatch_settings(
+    target_dir: Path,
+    task_id: Optional[str] = None,
+    force: bool = False,
+    portfolio_root: Optional[Path] = None,
+    project_id: Optional[str] = None,
+    remove_sidecar: bool = True,
+) -> bool:
+    """Remove a clawpm-managed dispatch settings file, under the target lock.
+
+    Every teardown path — explicit ``teardown-dispatch``, completion
+    auto-teardown, lease-fallback teardown, dispatch's own rollback — funnels
+    through here, and (when ``portfolio_root`` is given) takes the SAME
+    per-target sentinel ``tasks dispatch`` holds across its
+    snapshot/write/register/rollback sequence (CLAWP-098, Codex P1 on PR #55
+    round 13). Before this, only dispatch took the lock, so an old dispatch
+    finishing while the same target was being re-dispatched could unlink the
+    new dispatch's freshly written settings between write and registration —
+    the command then reported success with no working hooks. The lock is
+    reentrant per thread, so dispatch's rollback (already inside it) nests
+    safely. A contended lock raises ``LockTimeout``; every caller of this
+    function already treats a teardown exception as reportable, not fatal.
+
+    Without ``portfolio_root`` there is no sentinel location, so the body runs
+    unserialised (library/test use only).
+
+    See :func:`_teardown_dispatch_settings_locked` for the behaviour matrix.
+    """
+    if portfolio_root is None:
+        return _teardown_dispatch_settings_locked(
+            target_dir, task_id, force, portfolio_root, project_id,
+            remove_sidecar,
+        )
+    lock_path = dispatch_lock_path(portfolio_root, target_dir)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock(lock_path):
+        return _teardown_dispatch_settings_locked(
+            target_dir, task_id, force, portfolio_root, project_id,
+            remove_sidecar,
+        )
+
+
+def _teardown_dispatch_settings_locked(
     target_dir: Path,
     task_id: Optional[str] = None,
     force: bool = False,

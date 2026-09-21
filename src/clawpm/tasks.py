@@ -1532,62 +1532,19 @@ def add_task(
             # the naive id.upper()[:5], which collides across near-name-twin ids.
             #
             # Session-scoped, like the task store and baseline_ref above
-            # (CLAWP-098 predecessor, PR #55 round 11). `tasks_dir` was
-            # already redirected into a registered worktree by
-            # `get_tasks_dir`; loading settings via the cwd-independent
-            # `get_project(...)` instead read the CANONICAL checkout's
-            # settings.toml, so a worktree whose committed settings.toml
-            # carries a different `task_prefix` had its new task minted
-            # against the wrong prefix — violating that worktree's own
-            # configuration and risking a collision when the branch merges.
-            # `tasks_dir.parent` is the `.project/` directory `get_tasks_dir`
-            # actually resolved to, so reading settings.toml alongside it is
-            # the same scoped checkout the task store itself came from.
-            from .discovery import get_project
-            from .models import ProjectSettings
+            # (CLAWP-098, PR #55 rounds 11-13). `tasks_dir` was already
+            # redirected into a registered worktree by `get_tasks_dir`, so the
+            # settings that pick the prefix must come from that same checkout
+            # — the cwd-independent `get_project(...)` reads the CANONICAL
+            # one. The shared resolver (also used by emit-tree's root-ID
+            # prediction) logs a malformed worktree settings.toml and falls
+            # back; on a foreign project id it raises
+            # ScopedSettingsMismatchError (a ValueError), failing closed
+            # rather than minting IDs from a checkout this write isn't going
+            # into.
+            from .discovery import get_scoped_project_settings
 
-            _settings_path = tasks_dir.parent / "settings.toml"
-            try:
-                _settings = (
-                    ProjectSettings.load(_settings_path)
-                    if _settings_path.exists() else None
-                )
-            except (OSError, ValueError, KeyError) as exc:
-                # Malformed/unreadable scoped settings.toml: fall through
-                # to the registry lookup below rather than failing task
-                # creation over a prefix-resolution detail — but LOG it
-                # (CLAWP-039/041 fail-open-WITH-a-marker doctrine; matches
-                # `get_project`'s own `logger.warning` on this identical
-                # load failure, discovery.py). Silently falling back here
-                # would reinstate the exact bug this fix closes: the
-                # registry lookup reads the CANONICAL checkout's settings,
-                # so an operator whose worktree settings.toml went bad
-                # would see tasks silently minted under the wrong prefix
-                # with no signal anything degraded. `tomllib.TOMLDecodeError`
-                # is a `ValueError` subclass, so it's covered here too.
-                logger.warning(
-                    "Failed to load session-scoped settings.toml at %s: %s. "
-                    "Falling back to the registry lookup for task_prefix "
-                    "resolution — a worktree-specific task_prefix, if any, "
-                    "will be ignored for this task.",
-                    _settings_path, exc,
-                )
-                _settings = None
-            if _settings is not None and _settings.id != project_id:
-                # `ProjectSettings.load` does no id validation, unlike
-                # `get_project` (which only ever returns settings whose
-                # `id == project_id`). The worktree session is matched by
-                # the session record's project_id, not by the settings
-                # file's own `id` field, so a worktree whose committed
-                # settings.toml carries a renamed/foreign id would
-                # otherwise supply THAT project's task_prefix as an
-                # explicit override — bypassing assign_task_prefix's
-                # portfolio-wide collision check entirely (the same
-                # cross-project prefix-collision class CLAWP-048 exists
-                # to prevent). Treat a mismatch like a load failure.
-                _settings = None
-            if _settings is None:
-                _settings = get_project(config, project_id)
+            _settings = get_scoped_project_settings(config, project_id)
             prefix = assign_task_prefix(
                 project_id,
                 tasks_dir,

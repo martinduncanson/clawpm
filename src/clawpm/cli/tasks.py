@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import hashlib
 import json
-import os
 import subprocess
 import sys
 import uuid
@@ -1217,10 +1215,12 @@ def _dispatch_target_lock(portfolio_root: Path, target_dir: Path, fmt):
     anyway" would reintroduce it silently — which is worse than a dispatch the
     operator can simply re-run.
     """
-    key = hashlib.sha256(
-        os.path.normcase(str(target_dir.resolve())).encode("utf-8")
-    ).hexdigest()[:16]
-    lock_path = portfolio_root / "locks" / f"dispatch-{key}.lock"
+    from clawpm.dispatch import dispatch_lock_path
+
+    # Same sentinel `teardown_dispatch_settings` takes, so a teardown of this
+    # target (completion, lease fallback, explicit) can never interleave with
+    # this command's write -> register window.
+    lock_path = dispatch_lock_path(portfolio_root, target_dir)
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -1244,6 +1244,15 @@ def _dispatch_target_lock(portfolio_root: Path, target_dir: Path, fmt):
             fmt=fmt,
         )
         sys.exit(1)
+
+
+def _settings_still_present(path: Path) -> bool:
+    """Whether *path* exists; an unreadable answer counts as present (the safe
+    reading — it keeps the "inspect manually" advice)."""
+    try:
+        return path.exists()
+    except OSError:
+        return True
 
 
 _UNREADABLE = object()
@@ -1409,8 +1418,22 @@ def tasks_dispatch(
     # EXPECTED-class skips (no scope, no baseline, ts: marker, non-git) stay silent.
     if not confirm_stale:
         from clawpm.baseline import detect_scope_drift
-        _proj_for_drift = get_project(config, project_id)
-        _repo_for_drift = getattr(_proj_for_drift, "repo_path", None) if _proj_for_drift else None
+        # The drift gate must diff in the checkout the TASK was loaded from
+        # (CLAWP-098, Codex P2 on PR #55 round 13). `get_task` above is
+        # session-scoped, so an in-place dispatch from a registered worktree
+        # reads that worktree's task and baseline; diffing the canonical
+        # checkout instead reported "clean" for a worktree branch whose
+        # in-scope files had changed. `--worktree` keeps the canonical repo:
+        # that is where `create_worktree` will branch from, so it is the tree
+        # the new worktree will actually contain.
+        if worktree:
+            _proj_for_drift = get_project(config, project_id)
+            _repo_for_drift = (
+                getattr(_proj_for_drift, "repo_path", None) if _proj_for_drift else None
+            )
+        else:
+            from clawpm.discovery import get_repo_path as _get_repo_path_for_drift
+            _repo_for_drift = _get_repo_path_for_drift(config, project_id)
         _drift_result = detect_scope_drift(
             repo_path=_repo_for_drift,
             scope=getattr(task, "scope", []),
@@ -1838,7 +1861,9 @@ def tasks_dispatch(
         # previously working Stop hook, and then reported that nothing had been
         # left installed. Bytes, not parsed JSON: restoring must reproduce the
         # prior file exactly, including any operator formatting.
-        from clawpm.dispatch import session_start_payload_path, settings_path
+        from clawpm.dispatch import (
+            PartialDispatchWrite, session_start_payload_path, settings_path,
+        )
         _prior_settings_path = settings_path(resolved_dir)
         _prior_sidecar_path = session_start_payload_path(resolved_dir)
         _prior_settings = None
@@ -1862,6 +1887,7 @@ def tasks_dispatch(
             )
             sys.exit(1)
 
+        _partial_write = None
         try:
             _written = write_dispatch_settings(
                 target_dir=resolved_dir,
@@ -1876,6 +1902,27 @@ def tasks_dispatch(
             )
         except (FileExistsError, ValueError) as exc:
             output_error("dispatch_blocked", str(exc), fmt=fmt)
+            sys.exit(1)
+        except PartialDispatchWrite as exc:
+            # The settings file landed (hooks are LIVE) but the writer failed
+            # afterwards — sidecar, or the dispatches.jsonl append (disk full,
+            # permissions). Codex P1, PR #55 round 13: this used to escape
+            # uncaught, exiting before session registration OR rollback and
+            # leaving armed hooks with no session mapping, so ID-based
+            # commands in that worktree fell through to the main checkout.
+            # Adopt what the writer says it wrote and take the same
+            # ownership-checked rollback as a registration failure below.
+            _written = exc.written
+            _partial_write = exc
+        except OSError as exc:
+            # Failed before anything new landed (the settings write is
+            # atomic), so there is nothing to roll back.
+            output_error(
+                "dispatch_blocked",
+                f"Could not write the dispatch settings at {resolved_dir} "
+                f"({type(exc).__name__}: {exc}). Nothing was installed.",
+                fmt=fmt,
+            )
             sys.exit(1)
         path = _written.path
 
@@ -1894,6 +1941,141 @@ def tasks_dispatch(
         _our_settings = _written.settings_bytes
         _our_sidecar = _written.sidecar_bytes
         _sidecar_touched = _written.sidecar_written
+
+        def _roll_back_dispatch() -> str:
+            """Undo what THIS invocation installed; return the operator-facing
+            outcome sentence. Shared by every post-write failure path (a
+            writer that failed part-way, a session registration that failed)
+            so they cannot drift apart — the recurring shape of the round
+            5-13 findings was one failure path getting the ownership-checked
+            rollback and its sibling not getting it."""
+            teardown_error = None
+            # Only roll back while the file on disk is still the one THIS
+            # command wrote (Codex P1, PR #55 round 8). A concurrent
+            # dispatch to the same directory may have replaced it and
+            # succeeded; restoring our snapshot over it — or tearing it
+            # down, when we had no snapshot — would leave that command
+            # reporting success with obsolete or missing hooks. Compare
+            # the bytes we recorded after our own write; anything else on
+            # disk (different content, or nothing at all) means the
+            # artifacts are no longer ours to undo.
+            #
+            # The sidecar term is gated on `_sidecar_touched` (Codex P2,
+            # PR #55 round 11): with `--no-session-context` against a
+            # target that already carries a rubric sidecar from an
+            # EARLIER dispatch, this invocation never writes the
+            # sidecar, so `_our_sidecar` is None while the untouched
+            # file on disk still holds that earlier sidecar's bytes.
+            # Comparing those unconditionally reads "we didn't touch
+            # it" as "someone else raced us", which poisoned
+            # `_still_ours` and refused a legitimate settings restore
+            # (leaving stale post-registration-failure settings
+            # installed instead of the working prior dispatch). A
+            # sidecar we never wrote is never ours to compare or
+            # restore.
+            _still_ours = (
+                _our_settings is not None
+                and _read_bytes_or_none(_prior_settings_path) == _our_settings
+                and (
+                    not _sidecar_touched
+                    or _read_bytes_or_none(_prior_sidecar_path) == _our_sidecar
+                )
+            )
+            _restored = _still_ours and _prior_settings is not None
+            try:
+                if not _still_ours:
+                    # Deliberately nothing: the artifacts on disk belong
+                    # to a concurrent dispatch now (see above). The
+                    # operator is told so in the outcome below.
+                    pass
+                elif _prior_settings is not None:
+                    _prior_settings_path.parent.mkdir(
+                        parents=True, exist_ok=True
+                    )
+                    _prior_settings_path.write_bytes(_prior_settings)
+                    if _sidecar_touched:
+                        if _prior_sidecar is not None:
+                            _prior_sidecar_path.write_bytes(_prior_sidecar)
+                        elif _prior_sidecar_path.exists():
+                            _prior_sidecar_path.unlink()
+                else:
+                    from clawpm.dispatch import teardown_dispatch_settings
+                    # remove_sidecar=_sidecar_touched (PR #55
+                    # PRE-REVIEW + antigravity, round 12): this
+                    # invocation never wrote the sidecar when
+                    # `_sidecar_touched` is False, so an earlier,
+                    # unrelated dispatch's sidecar at this target
+                    # isn't ours to delete.
+                    teardown_dispatch_settings(
+                        target_dir=resolved_dir,
+                        task_id=task_id,
+                        portfolio_root=config.portfolio_root,
+                        project_id=project_id,
+                        remove_sidecar=_sidecar_touched,
+                    )
+            except Exception as teardown_exc:
+                # Rollback itself failed — report BOTH, since the operator
+                # now has artifacts on disk that need manual attention
+                # (fail-open WITH a marker, CLAWP-039/041 doctrine).
+                teardown_error = f"{type(teardown_exc).__name__}: {teardown_exc}"
+            if teardown_error and not _settings_still_present(
+                _prior_settings_path
+            ):
+                # The hooks ARE gone; only the follow-up bookkeeping (the
+                # `torn_down` append to dispatches.jsonl — likely failing for
+                # the same reason the dispatch did) raised. Don't tell the
+                # operator the settings need manual attention when they don't.
+                return (
+                    f"The dispatch settings were removed, but recording that "
+                    f"in the dispatch registry failed ({teardown_error}); the "
+                    f"registry may still list this target as dispatched until "
+                    f"the underlying fault is fixed. Re-run dispatch once it is."
+                )
+            if teardown_error:
+                return (
+                    f"Rolling those settings back ALSO failed "
+                    f"({teardown_error}) — inspect "
+                    f"{_prior_settings_path} manually before retrying, or "
+                    f"commands run from that worktree will mutate the "
+                    f"main checkout."
+                )
+            if not _still_ours:
+                return (
+                    f"The dispatch settings at {_prior_settings_path} are "
+                    f"no longer the ones this command wrote — another "
+                    f"dispatch has since replaced them — so they were "
+                    f"left ALONE rather than rolled back over a "
+                    f"concurrent dispatch that may have succeeded. No "
+                    f"session was registered for THIS command; fix the "
+                    f"portfolio state and re-run dispatch, and check "
+                    f"whether the other dispatch is the one you want."
+                )
+            if _restored:
+                return (
+                    "The dispatch settings that were in place before this "
+                    "command have been restored, so the previous dispatch "
+                    "is intact. Fix the portfolio state and re-run "
+                    "dispatch."
+                )
+            return (
+                "The dispatch settings have been rolled back; nothing "
+                "was left installed. Fix the portfolio state and "
+                "re-run dispatch."
+            )
+
+        if _partial_write is not None:
+            # See the `except PartialDispatchWrite` above: settings landed,
+            # the writer then failed. No session was registered, so nothing
+            # may be left armed.
+            _outcome = _roll_back_dispatch()
+            output_error(
+                "dispatch_write_failed",
+                f"Dispatch settings were written to {resolved_dir} but the "
+                f"dispatch could not be completed: {_partial_write}. "
+                + _outcome,
+                fmt=fmt,
+            )
+            sys.exit(1)
 
         # CLAWP-098 (review finding): register the session AFTER settings are
         # written — same ordering rationale as the lease grant below — so a
@@ -1951,107 +2133,7 @@ def tasks_dispatch(
                     # fix's own failure path. Roll the artifacts back so the
                     # dispatch fails clean and a retry starts from nothing.
                     session_id = None
-                    teardown_error = None
-                    # Only roll back while the file on disk is still the one THIS
-                    # command wrote (Codex P1, PR #55 round 8). A concurrent
-                    # dispatch to the same directory may have replaced it and
-                    # succeeded; restoring our snapshot over it — or tearing it
-                    # down, when we had no snapshot — would leave that command
-                    # reporting success with obsolete or missing hooks. Compare
-                    # the bytes we recorded after our own write; anything else on
-                    # disk (different content, or nothing at all) means the
-                    # artifacts are no longer ours to undo.
-                    #
-                    # The sidecar term is gated on `_sidecar_touched` (Codex P2,
-                    # PR #55 round 11): with `--no-session-context` against a
-                    # target that already carries a rubric sidecar from an
-                    # EARLIER dispatch, this invocation never writes the
-                    # sidecar, so `_our_sidecar` is None while the untouched
-                    # file on disk still holds that earlier sidecar's bytes.
-                    # Comparing those unconditionally reads "we didn't touch
-                    # it" as "someone else raced us", which poisoned
-                    # `_still_ours` and refused a legitimate settings restore
-                    # (leaving stale post-registration-failure settings
-                    # installed instead of the working prior dispatch). A
-                    # sidecar we never wrote is never ours to compare or
-                    # restore.
-                    _still_ours = (
-                        _our_settings is not None
-                        and _read_bytes_or_none(_prior_settings_path) == _our_settings
-                        and (
-                            not _sidecar_touched
-                            or _read_bytes_or_none(_prior_sidecar_path) == _our_sidecar
-                        )
-                    )
-                    _restored = _still_ours and _prior_settings is not None
-                    try:
-                        if not _still_ours:
-                            # Deliberately nothing: the artifacts on disk belong
-                            # to a concurrent dispatch now (see above). The
-                            # operator is told so in `_outcome` below.
-                            pass
-                        elif _prior_settings is not None:
-                            _prior_settings_path.parent.mkdir(
-                                parents=True, exist_ok=True
-                            )
-                            _prior_settings_path.write_bytes(_prior_settings)
-                            if _sidecar_touched:
-                                if _prior_sidecar is not None:
-                                    _prior_sidecar_path.write_bytes(_prior_sidecar)
-                                elif _prior_sidecar_path.exists():
-                                    _prior_sidecar_path.unlink()
-                        else:
-                            from clawpm.dispatch import teardown_dispatch_settings
-                            # remove_sidecar=_sidecar_touched (PR #55
-                            # PRE-REVIEW + antigravity, round 12): this
-                            # invocation never wrote the sidecar when
-                            # `_sidecar_touched` is False, so an earlier,
-                            # unrelated dispatch's sidecar at this target
-                            # isn't ours to delete.
-                            teardown_dispatch_settings(
-                                target_dir=resolved_dir,
-                                task_id=task_id,
-                                portfolio_root=config.portfolio_root,
-                                project_id=project_id,
-                                remove_sidecar=_sidecar_touched,
-                            )
-                    except Exception as teardown_exc:
-                        # Rollback itself failed — report BOTH, since the operator
-                        # now has artifacts on disk that need manual attention
-                        # (fail-open WITH a marker, CLAWP-039/041 doctrine).
-                        teardown_error = f"{type(teardown_exc).__name__}: {teardown_exc}"
-                    if teardown_error:
-                        _outcome = (
-                            f"Rolling those settings back ALSO failed "
-                            f"({teardown_error}) — inspect "
-                            f"{_prior_settings_path} manually before retrying, or "
-                            f"commands run from that worktree will mutate the "
-                            f"main checkout."
-                        )
-                    elif not _still_ours:
-                        _outcome = (
-                            f"The dispatch settings at {_prior_settings_path} are "
-                            f"no longer the ones this command wrote — another "
-                            f"dispatch has since replaced them — so they were "
-                            f"left ALONE rather than rolled back over a "
-                            f"concurrent dispatch that may have succeeded. No "
-                            f"session was registered for THIS command; fix the "
-                            f"portfolio state and re-run dispatch, and check "
-                            f"whether the other dispatch is the one you want."
-                        )
-                    elif _restored:
-                        _outcome = (
-                            "The dispatch settings that were in place before this "
-                            "command have been restored, so the previous dispatch "
-                            "is intact. Fix the portfolio state and re-run "
-                            "dispatch."
-                        )
-                    else:
-                        _outcome = (
-                            "The dispatch settings have been rolled back; nothing "
-                            "was left installed. Fix the portfolio state and "
-                            "re-run dispatch."
-                        )
+                    _outcome = _roll_back_dispatch()
                     output_error(
                         "session_registration_failed",
                         f"Dispatch settings were written to {resolved_dir} but "
@@ -2142,13 +2224,33 @@ def tasks_teardown_dispatch(
     resolved_dir = Path(target_dir) if target_dir else Path.cwd()
     marker = read_dispatch_marker(resolved_dir)
 
-    removed = teardown_dispatch_settings(
-        resolved_dir,
-        task_id=task_id,
-        force=force,
-        portfolio_root=config.portfolio_root,
-        project_id=project_id,
-    )
+    # Teardown now takes the per-target dispatch lock (round 13), so it can
+    # wait on a dispatch in progress; surface a contended lock (or a lock
+    # directory that can't be created) as a structured error, not a traceback.
+    try:
+        removed = teardown_dispatch_settings(
+            resolved_dir,
+            task_id=task_id,
+            force=force,
+            portfolio_root=config.portfolio_root,
+            project_id=project_id,
+        )
+    except LockTimeout as exc:
+        output_error(
+            "dispatch_blocked",
+            f"A dispatch is writing to {resolved_dir} and did not finish in "
+            f"time ({exc}). Re-run once it completes.",
+            fmt=fmt,
+        )
+        sys.exit(1)
+    except OSError as exc:
+        output_error(
+            "teardown_failed",
+            f"Could not tear down the dispatch at {resolved_dir} "
+            f"({type(exc).__name__}: {exc}).",
+            fmt=fmt,
+        )
+        sys.exit(1)
 
     output_success(
         "Dispatch torn down" if removed else "Nothing to tear down",
