@@ -764,13 +764,19 @@ def emit_tree(
     from .tasks import get_tasks_dir, add_task, split_task, get_task
     from .tasks import _append_child_to_parent_frontmatter
     from .baseline import resolve_baseline_ref
-    from .discovery import get_repo_path
+    from .discovery import get_repo_path, get_scoped_project_settings
     from .worklog import add_entry
     from .models import WorkLogAction
 
     tasks_dir = get_tasks_dir(config, project_id)
     if not tasks_dir:
         raise EmitValidationError(f"No tasks directory for project {project_id!r}")
+
+    # Identity guard for the scoped store the tree is minted into, applied to
+    # EVERY emit — `attach_to` roots included, which return before
+    # `_predict_parent_id` would otherwise resolve settings (CLAWP-098, PR #55
+    # round 14). Fail closed (ValueError) on a worktree naming another project.
+    get_scoped_project_settings(config, project_id)
 
     # -----------------------------------------------------------------------
     # Phase 2 — Gate barrier (all read-only)

@@ -4,7 +4,7 @@ import json
 import subprocess
 import sys
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import click
@@ -1350,6 +1350,54 @@ def tasks_dispatch(
     so multiple subagents can be dispatched in parallel without colliding
     on a single .claude/settings.local.json.
     """
+    # A dispatch resolves its task in the scope of the place it will RUN
+    # (CLAWP-098, Codex P1 on PR #55 round 14). In place, that is cwd's own
+    # session (if any). For an explicit `--target-dir` OUTSIDE every
+    # registered worktree, the launched process has no session, so its
+    # ID-based hooks resolve the CANONICAL store — the task (and rubric) must
+    # therefore be read from there too, not from the caller's own worktree,
+    # or the hooks report "task not found" / mutate a divergent copy.
+    # (`--worktree` is unchanged: see the source-repo comment in the body.)
+    _canonical_only = False
+    if target_dir is not None and not worktree:
+        from clawpm.sessions import find_session_for_cwd
+
+        _config = require_portfolio(ctx)
+        _pid, _ = require_project(ctx, project_id)
+        _canonical_only = (
+            find_session_for_cwd(
+                _config.portfolio_root, Path(target_dir), project_id=_pid
+            )
+            is None
+        )
+    if _canonical_only:
+        from clawpm.sessions import suppress_session_resolution
+
+        _scope = suppress_session_resolution()
+    else:
+        _scope = nullcontext()
+    with _scope:
+        _tasks_dispatch_impl(
+            ctx, project_id, task_id, target_dir, worktree, no_session_context,
+            force, confirm_close, refute_votes, lease_ttl, fallback_policy,
+            confirm_stale,
+        )
+
+
+def _tasks_dispatch_impl(
+    ctx: click.Context,
+    project_id: str | None,
+    task_id: str,
+    target_dir: str | None,
+    worktree: bool,
+    no_session_context: bool,
+    force: bool,
+    confirm_close: bool | None,
+    refute_votes: int,
+    lease_ttl: int | None,
+    fallback_policy: str,
+    confirm_stale: bool,
+) -> None:
     from clawpm.dispatch import (
         create_worktree,
         settings_path,
@@ -2000,6 +2048,11 @@ def tasks_dispatch(
                             _prior_sidecar_path.unlink()
                 else:
                     from clawpm.dispatch import teardown_dispatch_settings
+                    # We are already inside `_dispatch_target_lock`; the
+                    # teardown re-acquires the same sentinel. That is safe:
+                    # `file_lock` is reentrant per thread (CLAWP-066), pinned
+                    # by test_teardown_nests_inside_dispatch_rollback.
+                    #
                     # remove_sidecar=_sidecar_touched (PR #55
                     # PRE-REVIEW + antigravity, round 12): this
                     # invocation never wrote the sidecar when

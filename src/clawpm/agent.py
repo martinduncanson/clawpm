@@ -60,6 +60,7 @@ from .discovery import get_project
 from .dispatch import (
     PartialDispatchWrite,
     create_worktree,
+    dispatch_target_lock,
     teardown_dispatch_settings,
     write_dispatch_settings,
 )
@@ -297,13 +298,20 @@ def _dispatch_agent(
     try:
         # `.path`, not the whole tuple: write_dispatch_settings also returns
         # the bytes it wrote, which only dispatch's rollback needs.
-        settings_path = write_dispatch_settings(
-            target_dir=target_dir,
-            task_id=subtask_id,
-            project_id=project_id,
-            rubric_markdown=rubric_markdown,
-            portfolio_root=config.portfolio_root,
-        ).path
+        #
+        # Under the per-target dispatch lock (Codex P2, PR #55 round 14):
+        # teardown takes it, so every writer must too, or a concurrent
+        # teardown of this target could unlink the settings between this
+        # write and the subagent starting — which would then run without its
+        # Stop / progress hooks.
+        with dispatch_target_lock(config.portfolio_root, target_dir):
+            settings_path = write_dispatch_settings(
+                target_dir=target_dir,
+                task_id=subtask_id,
+                project_id=project_id,
+                rubric_markdown=rubric_markdown,
+                portfolio_root=config.portfolio_root,
+            ).path
     except (FileExistsError, ValueError, OSError, PartialDispatchWrite) as exc:
         error_detail = str(exc)
         if isinstance(exc, PartialDispatchWrite):

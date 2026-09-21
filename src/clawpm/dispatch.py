@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import contextmanager
 import os
 import re
 import shutil
@@ -472,6 +473,22 @@ def dispatch_lock_path(portfolio_root: Path, target_dir: Path) -> Path:
     return portfolio_root / "locks" / f"dispatch-{key}.lock"
 
 
+@contextmanager
+def dispatch_target_lock(portfolio_root: Path, target_dir: Path):
+    """Hold the per-target dispatch lock (see :func:`dispatch_lock_path`).
+
+    EVERY production writer of a target's dispatch artifacts — ``tasks
+    dispatch``, ``dispatch_agent`` — and every teardown must go through this
+    (or the CLI's equivalent), so none can interleave with another
+    (CLAWP-098, Codex P1/P2 on PR #55 rounds 13-14). Reentrant per thread.
+    ``LockTimeout`` and ``OSError`` (lock directory) propagate.
+    """
+    lock_path = dispatch_lock_path(portfolio_root, target_dir)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock(lock_path):
+        yield
+
+
 def _write_exact(path: Path, text: str) -> bytes:
     """Write *text* as UTF-8 with NO newline translation; return the bytes.
 
@@ -720,9 +737,7 @@ def teardown_dispatch_settings(
             target_dir, task_id, force, portfolio_root, project_id,
             remove_sidecar,
         )
-    lock_path = dispatch_lock_path(portfolio_root, target_dir)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with file_lock(lock_path):
+    with dispatch_target_lock(portfolio_root, target_dir):
         return _teardown_dispatch_settings_locked(
             target_dir, task_id, force, portfolio_root, project_id,
             remove_sidecar,

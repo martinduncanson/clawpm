@@ -327,7 +327,8 @@ def get_scoped_project_settings(
       ``suppress_session_resolution()``: identical to ``get_project``.
     - Session matched but its worktree has no ``settings.toml``: silently
       ``get_project`` — that is the ordinary case (a worktree with nothing of
-      its own to say), not a degrade.
+      its own to say), not a degrade. A stat FAULT on it (permissions, an
+      unavailable volume) is a degrade and is logged at ERROR.
     - Session matched but its ``settings.toml`` is unreadable / malformed
       (``OSError``, ``ValueError`` — which includes ``tomllib.TOMLDecodeError``
       — or ``KeyError``): LOGS and falls back to ``get_project`` — fail-open
@@ -345,11 +346,22 @@ def get_scoped_project_settings(
     if session_dir is None:
         return get_project(config, project_id)
     settings_file = session_dir / "settings.toml"
+    # os.stat, not Path.exists() (Codex P2, PR #55 round 14): exists() catches
+    # OSError and answers False, so a permission fault or unavailable volume
+    # read as "this worktree has no settings.toml" and fell back to the
+    # canonical prefix with no signal. FileNotFoundError is the ordinary
+    # "nothing of its own to say"; any other fault degrades WITH a marker.
     try:
-        exists = settings_file.exists()
-    except OSError:
-        exists = False
-    if not exists:
+        os.stat(settings_file)
+    except FileNotFoundError:
+        return get_project(config, project_id)
+    except OSError as exc:
+        logger.error(
+            "Failed to stat session-scoped settings.toml at %s: %s. Falling "
+            "back to the registry lookup — a worktree-specific task_prefix, "
+            "if any, will be ignored for this operation.",
+            settings_file, exc,
+        )
         return get_project(config, project_id)
     try:
         scoped = ProjectSettings.load(settings_file)

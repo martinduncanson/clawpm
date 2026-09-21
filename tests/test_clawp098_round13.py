@@ -193,6 +193,47 @@ class TestForeignProjectIdFailsClosed:
         with pytest.raises(ScopedSettingsMismatchError):
             _predict_parent_id(doc, git_portfolio["config"], "test")
 
+    # Round 14 (Codex P2): the guard is not confined to the auto-ID branch.
+
+    def test_explicit_id_add_is_guarded_too(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        wt = _registered_worktree(
+            git_portfolio, tmp_path, monkeypatch, _FOREIGN_SETTINGS
+        )
+        with pytest.raises(ScopedSettingsMismatchError):
+            add_task(git_portfolio["config"], "test", "explicit", task_id="TEST-900")
+        assert not list((wt / ".project" / "tasks").glob("*.md"))
+
+    def test_add_subtask_is_guarded_too(self, git_portfolio, tmp_path, monkeypatch):
+        from clawpm.tasks import add_subtask
+
+        _registered_worktree(git_portfolio, tmp_path, monkeypatch, _FOREIGN_SETTINGS)
+        with pytest.raises(ScopedSettingsMismatchError):
+            add_subtask(git_portfolio["config"], "test", "TEST-001", "child")
+
+    def test_emit_tree_attach_to_is_guarded_too(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        from clawpm.emit_tree import emit_tree, parse_emit_document
+
+        _registered_worktree(git_portfolio, tmp_path, monkeypatch, _FOREIGN_SETTINGS)
+        doc = parse_emit_document({
+            "schema_version": 1,
+            "root": {"attach_to": "TEST-001"},
+            "leaves": [{
+                "ref": "L1", "parent_ref": None, "title": "Leaf one",
+                "leaf_key": "round14-L1",
+                "success_criteria": [{
+                    "criterion": "Tests pass", "gradeable_signal": "pytest exit 0",
+                    "comparator": "eq:0",
+                }],
+                "delegability": "agent",
+            }],
+        })
+        with pytest.raises(ScopedSettingsMismatchError):
+            emit_tree(git_portfolio["config"], "test", doc)
+
     def test_ordinary_checkout_is_unaffected(self, git_portfolio, monkeypatch):
         """The guard is only about a REGISTERED worktree; outside one the
         resolver is exactly `get_project` (cwd-independent)."""
@@ -246,6 +287,42 @@ class TestMalformedScopedSettingsFallback:
             got = get_scoped_project_settings(git_portfolio["config"], "test")
         assert got is not None and got.task_prefix != "WTPFX"
         assert any("session-scoped settings.toml" in r.getMessage() for r in caplog.records)
+
+    def test_a_stat_fault_is_logged_not_read_as_no_settings(
+        self, git_portfolio, tmp_path, monkeypatch, caplog
+    ):
+        """Codex P2, round 14: `Path.exists()` turns a permission fault into
+        False, so an unreadable settings.toml read as "no settings of its own"
+        with no signal. The fault must be distinguished from a missing file."""
+        import os as _os
+
+        wt = _registered_worktree(git_portfolio, tmp_path, monkeypatch, _OWN_SETTINGS)
+        wt_settings = wt / ".project" / "settings.toml"
+        real_stat = _os.stat
+
+        def _stat(path, *a, **k):
+            if Path(path) == wt_settings:
+                raise PermissionError("simulated EACCES")
+            return real_stat(path, *a, **k)
+
+        monkeypatch.setattr("clawpm.discovery.os.stat", _stat)
+        with caplog.at_level(logging.ERROR, logger="clawpm.discovery"):
+            got = get_scoped_project_settings(git_portfolio["config"], "test")
+        assert got is not None and got.task_prefix != "WTPFX"
+        assert any(
+            "Failed to stat session-scoped settings.toml" in r.getMessage()
+            for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]
+
+    def test_a_missing_settings_file_falls_back_silently(
+        self, git_portfolio, tmp_path, monkeypatch, caplog
+    ):
+        wt = _registered_worktree(git_portfolio, tmp_path, monkeypatch, _OWN_SETTINGS)
+        (wt / ".project" / "settings.toml").unlink()
+        with caplog.at_level(logging.WARNING, logger="clawpm.discovery"):
+            got = get_scoped_project_settings(git_portfolio["config"], "test")
+        assert got is not None and got.id == "test"
+        assert not caplog.records
 
     def test_a_genuine_bug_is_not_swallowed(
         self, git_portfolio, tmp_path, monkeypatch
@@ -314,6 +391,68 @@ class TestDriftGateUsesTheSessionCheckout:
         assert seen[0].resolve() == wt.resolve(), (
             f"drift gate diffed {seen[0]} but the task was loaded from {wt}"
         )
+
+
+class TestCustomTargetDispatchResolvesWhereItsHooksWill:
+    """Codex P1, round 14: `--target-dir` outside every registered worktree
+    launches a process with no session, so its hooks resolve the CANONICAL
+    store. The task must be read from there, not from the caller's worktree."""
+
+    def test_outside_target_reads_the_canonical_store(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        _registered_worktree(git_portfolio, tmp_path, monkeypatch, _OWN_SETTINGS)
+        # Exists ONLY in the caller's worktree store.
+        task = add_task(
+            git_portfolio["config"], "test", "worktree-only",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+        assert task is not None
+        outside = tmp_path / "elsewhere"
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id,
+                   "--target-dir", str(outside)],
+        )
+        assert r.exit_code == 1, r.output
+        assert "task_not_found" in r.output
+        assert not settings_path(outside).exists()
+
+    def test_outside_target_dispatches_a_canonical_task(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        from clawpm.sessions import suppress_session_resolution
+
+        _registered_worktree(git_portfolio, tmp_path, monkeypatch, _OWN_SETTINGS)
+        with suppress_session_resolution():
+            canonical = add_task(
+                git_portfolio["config"], "test", "canonical",
+                predictions=Predictions(success_criteria=["C1"]),
+            )
+        assert canonical is not None
+        outside = tmp_path / "elsewhere"
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", canonical.id,
+                   "--target-dir", str(outside)],
+        )
+        assert r.exit_code == 0, r.output
+        assert settings_path(outside).exists()
+
+    def test_target_inside_the_worktree_keeps_the_session_scope(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        wt = _registered_worktree(git_portfolio, tmp_path, monkeypatch, _OWN_SETTINGS)
+        task = add_task(
+            git_portfolio["config"], "test", "worktree-only",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+        assert task is not None
+        inside = wt / "subdir"
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id,
+                   "--target-dir", str(inside)],
+        )
+        assert r.exit_code == 0, r.output
+        assert settings_path(inside).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +691,34 @@ class TestWriterFailureIsRolledBack:
         assert not settings_path(target).exists()
         assert "were removed, but recording" in r.output
         assert "inspect" not in r.output
+
+    def test_dispatch_agent_writes_under_the_target_lock(
+        self, git_portfolio, monkeypatch
+    ):
+        """Codex P2, round 14: teardown takes the per-target lock, so the
+        second production writer must too."""
+        import clawpm.agent as agmod
+        from contextlib import contextmanager
+
+        held: list[tuple] = []
+        real = agmod.dispatch_target_lock
+
+        @contextmanager
+        def _record(portfolio_root, target_dir):
+            held.append((Path(portfolio_root), Path(target_dir)))
+            with real(portfolio_root, target_dir):
+                yield
+
+        monkeypatch.setattr(agmod, "dispatch_target_lock", _record)
+        result = agmod.dispatch_agent(
+            config=git_portfolio["config"],
+            project_id="test",
+            prompt="Do a thing",
+            success_criteria=["c1"],
+            judge_invoker=lambda prompt: '{"ok": true, "reason": "done"}',
+            init_codegraph=False,
+        )
+        assert [t for _, t in held] == [Path(result["target_dir"])], held
 
     def test_dispatch_agent_takes_a_partial_write_back_down(
         self, git_portfolio, monkeypatch
