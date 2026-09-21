@@ -1251,7 +1251,7 @@ def _settings_still_present(path: Path) -> bool:
     """Whether *path* exists; an unreadable answer counts as present (the safe
     reading — it keeps the "inspect manually" advice)."""
     try:
-        return path.exists()
+        return _stat_exists(path)
     except OSError:
         return True
 

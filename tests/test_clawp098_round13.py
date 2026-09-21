@@ -849,6 +849,19 @@ class TestWriterFailureIsRolledBack:
         assert "were removed, but recording" in r.output
         assert "inspect" not in r.output
 
+    def test_a_stat_fault_during_rollback_is_reported_as_still_present(
+        self, tmp_path, monkeypatch
+    ):
+        """Codex P2, round 16: `Path.exists()` swallowed the fault and the
+        operator was told the hooks were gone when nobody could tell."""
+        from clawpm.cli.tasks import _settings_still_present
+
+        def _boom(path, *a, **k):
+            raise PermissionError("simulated EACCES")
+
+        monkeypatch.setattr("clawpm.sessions.os.stat", _boom)
+        assert _settings_still_present(tmp_path / "settings.local.json") is True
+
     def test_dispatch_agent_writes_under_the_target_lock(
         self, git_portfolio, monkeypatch
     ):
