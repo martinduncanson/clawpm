@@ -15,7 +15,7 @@ predictions:
   - Written merge plan with adopt/adapt/skip verdict per mechanic and seeded follow-up
     tasks
 priority: 5
-updated: '2026-07-14'
+updated: '2026-09-02'
 ---
 # Fable session: clawpm vs wayfinder/openspec/feature-dev/osmani agent-skills - merge plan
 

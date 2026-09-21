@@ -582,10 +582,24 @@ class Task:
             state = TaskState.OPEN
 
         # Parse frontmatter (lenient: any malformation -> {} + full text as
-        # content, matching the pre-CLAWP-079 hand-rolled behaviour).
+        # content, matching the pre-CLAWP-079 hand-rolled behaviour). This
+        # DELIBERATELY includes CLAWP-091's "not_a_mapping" reason too, even
+        # though it's a stronger corruption signal than the other three: the
+        # sole caller of Task.from_file that acts on a single resolved task
+        # (get_task) already wraps it in a broad `except Exception: continue`
+        # and reports "not found" on ANY failure, so raising here instead
+        # would just get re-swallowed one frame up with a WORSE outcome for
+        # the entry points this task exists to fix — get_task() feeding
+        # edit_task/change_task_state would see the raise, report the task
+        # as not-found, and never reach edit_task's OWN re-parse (which is
+        # what raises the friendly, file-naming error). Read-path visibility
+        # for a corrupt-but-listed file is a real, separate concern (a
+        # get_task()-level fix distinguishing "this exact path is malformed"
+        # from "try the next candidate path" across every one of its ~10
+        # call sites) — out of scope for this task; tracked as a follow-up.
         frontmatter: dict[str, Any]
         try:
-            frontmatter, body = split_frontmatter(text)
+            frontmatter, body = split_frontmatter(text, where=str(path))
             content = body.strip()
         except FrontmatterError:
             frontmatter = {}
@@ -981,10 +995,13 @@ class Research:
         text = path.read_text(encoding="utf-8")
 
         # Parse frontmatter (lenient: any malformation -> {} + full text as
-        # content, matching the pre-CLAWP-079 hand-rolled behaviour).
+        # content, matching the pre-CLAWP-079 hand-rolled behaviour). Includes
+        # CLAWP-091's "not_a_mapping" reason too — see Task.from_file's
+        # identical guard above for why raising here would be worse, not
+        # better, for the mutation-site entry points this task targets.
         frontmatter: dict[str, Any]
         try:
-            frontmatter, body = split_frontmatter(text)
+            frontmatter, body = split_frontmatter(text, where=str(path))
             content = body.strip()
         except FrontmatterError:
             frontmatter = {}

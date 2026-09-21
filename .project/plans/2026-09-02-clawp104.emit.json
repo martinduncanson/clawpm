@@ -1,0 +1,261 @@
+{
+  "schema_version": 1,
+  "project": "clawpm",
+  "root": {
+    "title": "Calibration layer: miss categories, real metrics, pre-registered predictions, honest actuals (calibration-metrics-spec 2026-09-02)",
+    "predictions": {
+      "complexity": "l",
+      "confidence": 3,
+      "approach": "Implement docs/design/calibration-metrics-spec.md sections 2.1-2.6 as five leaves: ledger + prediction_id (M1), honest actuals (M2), miss_category (M3), metrics in reflect summarize + scorecard (M4), nudges (M5), docs (M6). Pre-auth lanes are spec-only (2.7) and have no leaf. Sonnet executors, tests pin formulas against synthetic corpora.",
+      "pre_mortem": "The formulas get implemented against wall-clock duration because active_min lands late; sequence M2 in group 1 so M4 can prefer it. Second risk: confidence proves to be noise against held - that is a valid finding, not a failure; report it, don't tune the map to hide it.",
+      "filled_by": "agent"
+    }
+  },
+  "prd": {
+    "title": "PRD: clawpm calibration metrics and miss-category taxonomy (CLAWP-104 audit)",
+    "type": "decision",
+    "tags": ["prd", "calibration", "reflection", "clawp-104"],
+    "body_markdown": "## Objective\n`clawpm reflect summarize` reports a real calibration scorecard (Brier, calibration curve, overconfidence, log-MAE, bias, learning velocity, miss-category distribution, closure) computed deterministically from the reflection JSONL, with formulas defined once in docs/design/calibration-metrics-spec.md and shared with the gbrain bridge.\n\n## Why\nCLAWP-104 audit. Measured 2026-09-02: 395 non-voided task_done events, 226 usable duration pairs, median actual/predicted 0.13 with a wall-clock tail to 977x, confidence 1-5 showing zero discrimination on duration, complexity_match tautological (100%), no pre-registration record, no closure rate. The existing summarize reports only duration ratios.\n\n## Constraints\n- Pure arithmetic over JSONL; no model calls; offline (gbrain unreachable).\n- Forward-only ledger changes; no rewrite of historical events; no backfill of miss_category.\n- Every metric cell gates on n>=20 and returns insufficient_data below it.\n- Probability map and resolution rules live only in the spec; code cites the section.\n\n## Out of scope\n- Pre-authorisation lanes implementation (spec section 2.7 only).\n- gbrain bridge and takes backfill (cognition-layer COGNI-007 / COGNI-002).\n- Weekly operator surface cadence (weekly-memory-review integration) - a later leaf once scorecard exists.\n\n## Success definition\nSpec section 4 criteria 1-5 hold on the real portfolio and on synthetic fixtures.\n\n## Chosen approach\nSpec sections 2.1-2.6.\n\n## Open questions\n- If confidence shows no discrimination against held after M4 lands, propose retiring or redefining the field (research entry, not a leaf).\n\n## Traceability\nGround: reflect.py, models.py, cli/reflect.py, cli/tasks.py read at fork/main 06a32b7; corpus probed with a disposable script (numbers in spec section 1); gbrain formulas read from garrytan/gbrain src/core/ops/takes.ts. UNGROUNDED-GRAPH effort tags.\n"
+  },
+  "leaves": [
+    {
+      "ref": "M1",
+      "parent_ref": null,
+      "leaf_key": "calibration::two-line-ledger-prediction-id",
+      "title": "Predictions are pre-registered: prediction_id + prediction_registered/prediction_revised events, closure computable",
+      "success_criteria": [
+        {
+          "criterion": "WHEN predictions are first written by tasks add, tasks predict, or emit-tree THEN predictions.prediction_id (uuid4 hex) is stored in frontmatter and a prediction_registered event with the snapshot, registered_at, filled_by, baseline_ref is appended to the task's reflection JSONL",
+          "gradeable_signal": "tests per write site asserting frontmatter and JSONL line",
+          "comparator": "eq:pass"
+        },
+        {
+          "criterion": "WHEN tasks edit changes any predictions field THEN a prediction_revised event with the full new snapshot is appended and unrelated prediction fields are preserved (CLAWP-108 fixed or covered by a failing-then-passing test)",
+          "gradeable_signal": "edit round-trip test",
+          "comparator": "eq:pass"
+        },
+        {
+          "criterion": "WHEN task_done or task_blocked events are written THEN they carry prediction_id; legacy events without it are read as legacy: true registered at created",
+          "gradeable_signal": "reader tests on mixed fixtures",
+          "comparator": "eq:pass"
+        },
+        {
+          "criterion": "WHEN a synthetic corpus has 10 registered and 6 resolved non-voided predictions THEN closure reads 0.6 with open_predictions 4",
+          "gradeable_signal": "unit test on the closure function (consumed by M4)",
+          "comparator": "eq:0.6"
+        }
+      ],
+      "scope": ["src/clawpm/models.py", "src/clawpm/reflect.py", "src/clawpm/tasks.py", "src/clawpm/services/tasks.py", "src/clawpm/cli/tasks.py", "src/clawpm/emit_tree.py", "tests/"],
+      "out_of_scope": ["scoring (M4)", "rewriting historical JSONL"],
+      "stop_conditions": [
+        "If the concurrency lock (append_jsonl_line) cannot be used from the tasks add path without a circular import, STOP and report; do not write unlocked."
+      ],
+      "delegability": "agent",
+      "predictions": {
+        "duration_min": 150,
+        "complexity": "m",
+        "confidence": 3,
+        "approach": "Mint id in Predictions post-init when absent (persisted on first save); one helper write_prediction_event(event, ...) in reflect.py used by all three write sites; done/blocked events read prediction_id from the task. UNGROUNDED-GRAPH effort.",
+        "pre_mortem": "Three write sites means one gets missed (likely emit-tree); the per-site tests are the guard.",
+        "filled_by": "agent"
+      },
+      "parallel_group": 1
+    },
+    {
+      "ref": "M2",
+      "parent_ref": null,
+      "leaf_key": "calibration::honest-actuals",
+      "title": "Actuals are honest: active_min from work_log gaps; actuals.complexity only from --actual-complexity",
+      "success_criteria": [
+        {
+          "criterion": "WHEN a task has work_log entries THEN actuals.active_min = sum of min(gap_to_next, 60) over consecutive entries plus 15 for the last, and active_min <= duration_min on every real corpus event",
+          "gradeable_signal": "unit test with a hand-built log; property check over ~/clawpm/reflections replayed from a fixture copy",
+          "comparator": "eq:pass"
+        },
+        {
+          "criterion": "WHEN done runs without --actual-complexity THEN actuals.complexity is null and deltas.complexity_match is null; WHEN given THEN complexity_match compares prediction to the supplied value",
+          "gradeable_signal": "CLI tests both branches; test_reflect_phase1 updated to the new contract",
+          "comparator": "eq:pass"
+        },
+        {
+          "criterion": "reflect summarize and find_reference_tasks read active_min when present and fall back to duration_min, reporting which was used",
+          "gradeable_signal": "summarize output field duration_source in {active,wallclock}",
+          "comparator": "eq:pass"
+        }
+      ],
+      "scope": ["src/clawpm/reflect.py", "src/clawpm/models.py", "src/clawpm/cli/tasks.py", "src/clawpm/cli/shortcuts.py", "tests/"],
+      "out_of_scope": ["changing the work_log schema", "re-deriving actuals for historical events"],
+      "stop_conditions": [
+        "If the 60-minute gap cap has to be configurable to make tests meaningful, STOP: it is a constant in the spec; propose a spec change instead."
+      ],
+      "delegability": "agent",
+      "predictions": {
+        "duration_min": 90,
+        "complexity": "s",
+        "confidence": 4,
+        "approach": "Extend _compute_actuals with the gap sum; add Actuals.active_min; remove task_complexity passthrough; new --actual-complexity option threaded to the transition. UNGROUNDED-GRAPH effort.",
+        "pre_mortem": "Removing the complexity passthrough breaks tests that asserted the tautology; update them, don't keep the tautology.",
+        "filled_by": "agent"
+      },
+      "parallel_group": 1
+    },
+    {
+      "ref": "M3",
+      "parent_ref": null,
+      "leaf_key": "calibration::miss-category",
+      "title": "Misses get a root cause: --miss-category on done, validated six-value taxonomy, nudge on unclassified miss",
+      "success_criteria": [
+        {
+          "criterion": "WHEN done --miss-category <c> runs THEN task_done carries miss_category=c for c in {wrong_signal, wrong_weight, missed_variable, operator_override, noise, structural}; any other value is rejected with bad_miss_category and nothing is written",
+          "gradeable_signal": "CLI tests valid/invalid",
+          "comparator": "eq:pass"
+        },
+        {
+          "criterion": "WHEN the derived held outcome is incorrect and no --miss-category was given THEN done prints a one-line nudge listing the six values and still closes the task; WHEN held is correct or unresolvable THEN no nudge",
+          "gradeable_signal": "output tests for the three branches",
+          "comparator": "eq:pass"
+        },
+        {
+          "criterion": "surprise_taxonomy behaviour is unchanged and both fields may be set on the same event",
+          "gradeable_signal": "existing test_reflection_phase1_5 green plus a combined test",
+          "comparator": "eq:pass"
+        }
+      ],
+      "scope": ["src/clawpm/models.py", "src/clawpm/reflect.py", "src/clawpm/cli/tasks.py", "src/clawpm/cli/shortcuts.py", "tests/"],
+      "out_of_scope": ["backfill", "repeat-rule computation (M4)", "replacing surprise_taxonomy"],
+      "stop_conditions": [
+        "If computing held at done-time requires the full metrics module from M4, STOP and implement only the per-axis resolution function from spec 2.1 here (M4 imports it)."
+      ],
+      "delegability": "agent",
+      "predictions": {
+        "duration_min": 90,
+        "complexity": "s",
+        "confidence": 4,
+        "approach": "MISS_CATEGORIES frozenset next to SURPRISE_TAXONOMY; resolve_axes(predictions, actuals, deltas) -> per-axis + held per spec 2.1, living in reflect.py so M4 reuses it; nudge via click.echo to stderr in text mode, a warnings field in JSON mode. UNGROUNDED-GRAPH effort.",
+        "pre_mortem": "The nudge becomes a blocking prompt; agent closes must stay non-interactive.",
+        "filled_by": "agent"
+      },
+      "parallel_group": 2
+    },
+    {
+      "ref": "M4",
+      "parent_ref": null,
+      "leaf_key": "calibration::metrics-summarize-scorecard",
+      "title": "reflect summarize reports the calibration block (spec 2.3) and reflect scorecard renders it in five lines",
+      "success_criteria": [
+        {
+          "criterion": "WHEN reflect summarize runs THEN JSON contains calibration with brier, calibration_curve, overconfidence_ratio, mae_log, bias{factor,direction}, bucket_bias_factor, learning_velocity{90d,365d}, miss_category_distribution, metareflection_due, closure{rate,open_predictions,void_rate}; every cell has n and either values or insufficient_data: true when n<20",
+          "gradeable_signal": "schema test on a synthetic corpus; run on the real portfolio exits 0",
+          "comparator": "eq:pass"
+        },
+        {
+          "criterion": "WHEN the synthetic corpus has hand-computed expected values (documented in the test) THEN brier, mae_log, bias.factor, overconfidence_ratio and closure match to 4 decimal places using the confidence->p map from spec 2.2",
+          "gradeable_signal": "golden-value unit tests",
+          "comparator": "eq:pass"
+        },
+        {
+          "criterion": "WHEN the same miss_category appears >=3 times in the trailing 30 days within one project THEN metareflection_due lists {project_id, miss_category, count}; 2 occurrences or a 31-day spread do not",
+          "gradeable_signal": "boundary tests",
+          "comparator": "eq:pass"
+        },
+        {
+          "criterion": "WHEN reflect scorecard runs THEN it prints exactly five lines: closure, bias factor, Brier+n, overconfidence headline, top miss category / metareflection due; --json returns the calibration block",
+          "gradeable_signal": "output test",
+          "comparator": "eq:5"
+        },
+        {
+          "criterion": "kind:decision events are excluded from the duration axis by default and included with --include-decisions",
+          "gradeable_signal": "flag test",
+          "comparator": "eq:pass"
+        }
+      ],
+      "scope": ["src/clawpm/reflect.py", "src/clawpm/cli/reflect.py", "tests/"],
+      "out_of_scope": ["hook nudges (M5)", "gbrain writes", "30-day learning velocity (spec excludes it)"],
+      "stop_conditions": [
+        "If M1, M2 or M3 have not merged, STOP: this leaf consumes prediction_id/closure, active_min and resolve_axes.",
+        "If any formula needs a definition not in spec 2.3, STOP and propose the spec change rather than inventing it in code."
+      ],
+      "delegability": "agent",
+      "predictions": {
+        "duration_min": 180,
+        "complexity": "m",
+        "confidence": 3,
+        "approach": "New module clawpm/calibration.py (pure functions over event lists) called from summarize_calibration; scorecard command in cli/reflect.py; synthetic corpus builder in tests with documented expected numbers. UNGROUNDED-GRAPH effort.",
+        "pre_mortem": "Learning velocity gets implemented on 30-day windows because it is natural; the spec forbids it at current volume.",
+        "filled_by": "agent"
+      },
+      "parallel_group": 3
+    },
+    {
+      "ref": "M5",
+      "parent_ref": null,
+      "leaf_key": "calibration::nudges-closure-alarm",
+      "title": "Calibration signals reach the agent: Stop-hook and done output surface metareflection_due and a closure alarm below 0.6",
+      "success_criteria": [
+        {
+          "criterion": "WHEN the current project has a metareflection_due entry THEN clawpm hook eval-stop output and clawpm done text output include one line naming the category and count; WHEN none THEN no line",
+          "gradeable_signal": "hook and CLI output tests",
+          "comparator": "eq:pass"
+        },
+        {
+          "criterion": "WHEN rolling-30-day closure < 0.6 for the portfolio THEN reflect summarize and scorecard include an alarm string; the threshold is a named constant cited to spec 2.3",
+          "gradeable_signal": "boundary test at 0.59/0.60",
+          "comparator": "eq:pass"
+        },
+        {
+          "criterion": "Nudges never change exit codes or block a transition",
+          "gradeable_signal": "exit-code assertions in the same tests",
+          "comparator": "eq:pass"
+        }
+      ],
+      "scope": ["src/clawpm/cli/hook.py", "src/clawpm/cli/shortcuts.py", "src/clawpm/cli/tasks.py", "src/clawpm/reflect.py", "tests/"],
+      "out_of_scope": ["weekly cadence integration", "auto-applying anything"],
+      "stop_conditions": [
+        "If computing metareflection_due inside the Stop hook exceeds ~200ms on the real portfolio, STOP and cache it in the summarize output file instead of recomputing per stop."
+      ],
+      "delegability": "agent",
+      "predictions": {
+        "duration_min": 75,
+        "complexity": "s",
+        "confidence": 4,
+        "approach": "Reuse M4 functions; hook path already fail-open. UNGROUNDED-GRAPH effort.",
+        "pre_mortem": "Hook latency; measure before wiring.",
+        "filled_by": "agent"
+      },
+      "parallel_group": 4
+    },
+    {
+      "ref": "M6",
+      "parent_ref": null,
+      "leaf_key": "calibration::docs-cross-links",
+      "title": "The calibration layer is documented: SKILL.md reflection section, CLAUDE.md task discipline, COGNI-007 cross-reference",
+      "success_criteria": [
+        {
+          "criterion": "skills/clawpm/SKILL.md reflection section documents --miss-category (with the six meanings and the noise-is-valid rule), --actual-complexity, --resolution, reflect scorecard, and links docs/design/calibration-metrics-spec.md",
+          "gradeable_signal": "section present; every flag named exists in the CLI (--help grep)",
+          "comparator": "eq:present"
+        },
+        {
+          "criterion": "cognition-layer COGNI-007 task notes reference the spec sections 2.1-2.3 and 2.8 as the shared definitions for the gbrain bridge",
+          "gradeable_signal": "note appended via clawpm log or tasks edit on COGNI-007 in F:/Git/cognition-layer",
+          "comparator": "eq:present"
+        }
+      ],
+      "scope": ["skills/clawpm/SKILL.md", "CLAUDE.md", "docs/design/calibration-metrics-spec.md"],
+      "out_of_scope": ["code"],
+      "stop_conditions": [
+        "If M3/M4 flags differ from the spec names, STOP and reconcile the spec first; docs follow the CLI."
+      ],
+      "delegability": "agent",
+      "predictions": {
+        "duration_min": 45,
+        "complexity": "s",
+        "confidence": 4,
+        "approach": "Docs pass after M4/M5 merge.",
+        "pre_mortem": "Written before the CLI settles and drifts; sequence last.",
+        "filled_by": "agent"
+      },
+      "parallel_group": 4
+    }
+  ]
+}

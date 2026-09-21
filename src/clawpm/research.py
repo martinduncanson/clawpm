@@ -237,9 +237,21 @@ def link_research_session(
     # Read current content
     text = item.file_path.read_text(encoding="utf-8")
 
-    # Parse and update frontmatter — skip (return None) on any malformation.
+    # Parse and update frontmatter — skip (return None) on any malformation,
+    # including "not_a_mapping". Tried distinguishing not_a_mapping to raise
+    # here (antigravity review, CLAWP-091), then reverted: it's unreachable.
+    # get_research() above resolves items by comparing the FRONTMATTER's own
+    # `id` field to research_id (research filenames are date-prefixed, not
+    # the research_id itself — unlike tasks, where get_task() locates by
+    # filename and corrupted frontmatter doesn't block the lookup). Once a
+    # research item's frontmatter is corrupted into a non-mapping, its `id`
+    # is unrecoverable, so get_research() can never match it and this
+    # function's own `if not item: return None` fires first — the guard
+    # below would be dead code. Fixing this needs a different, filename-
+    # aware lookup in get_research() (a structurally separate problem from
+    # CLAWP-091's mutation-site guard, and out of scope here).
     try:
-        frontmatter, body = split_frontmatter(text)
+        frontmatter, body = split_frontmatter(text, where=str(item.file_path))
     except FrontmatterError:
         return None
 

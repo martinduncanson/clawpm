@@ -15,7 +15,7 @@ predictions:
   unknowns: Whether existing reflection JSONLs have enough resolved predictions to
     compute meaningful baselines
 priority: 5
-updated: '2026-07-31'
+updated: '2026-09-02'
 ---
 # Audit self-improvement spec (Q-agent) for clawpm calibration implementation
 

@@ -23,6 +23,7 @@ from .concurrency import (
 from .frontmatter import (
     FrontmatterError,
     parse_frontmatter,
+    require_mapping,
     split_frontmatter,
     stamp_updated,
 )
@@ -503,6 +504,21 @@ def _set_updated_line(text: str, stamp: str) -> str | None:
             break
     if close_idx is None:
         return None  # unterminated fence
+    # CLAWP-091 — this function bypasses frontmatter.py entirely (surgical
+    # line-splice, not a YAML round-trip), so it was never guarded against
+    # non-mapping frontmatter. Splicing an `updated:` line into a block that
+    # parses to a list/scalar would silently downgrade an already-malformed
+    # file from cleanly-recoverable (a clear FrontmatterError elsewhere) into
+    # genuinely UNPARSEABLE YAML. Refuse the same way an unterminated fence
+    # already does. Real YAML syntax errors are left untouched exactly as
+    # before this fix — that's a pre-existing, out-of-scope case, not the
+    # "parses fine but isn't a mapping" case this task guards against.
+    try:
+        _parsed = yaml.safe_load("\n".join(lines[1:close_idx]))
+    except yaml.YAMLError:
+        _parsed = None
+    if _parsed is not None and not isinstance(_parsed, dict):
+        return None
     new_line = f"updated: '{stamp}'"
     for i in range(1, close_idx):
         if _UPDATED_LINE_RE.match(lines[i]):
@@ -601,7 +617,12 @@ def _write_rejection_frontmatter(
     # Lenient parse: unparseable YAML drops to fm={} while keeping the raw body,
     # so the rewrite replaces the bad frontmatter rather than doubling it. An
     # absent/unterminated fence keeps body=text and synthesises a fence below.
+    # parse_frontmatter never raises, so a non-mapping document (bare YAML
+    # scalar/list) would otherwise pass straight through and TypeError at the
+    # first `fm[key] = ...` below; require_mapping turns that into a clear,
+    # file-naming FrontmatterError instead (CLAWP-091).
     fm, body = parse_frontmatter(text)
+    fm = require_mapping(fm, where=str(file_path))
 
     fm["rationale"] = rationale
     if supersedes:
@@ -1263,16 +1284,107 @@ def resolve_existing_prefix(settings) -> str | None:
     return None
 
 
+def _strip_trailing_non_alnum(prefix: str) -> str:
+    """Drop trailing non-alphanumeric characters from a derived prefix slice.
+
+    A fixed-length slice of an uppercased project id can land exactly on a
+    separator — ``"code-quorum".upper()[:5]`` is ``"CODE-"``, hyphen last.
+    Left alone, the later ``f"{prefix}-{num:03d}"`` join doubles the
+    separator (``"CODE-" + "-000"`` -> ``"CODE--000"``, CLAWP-096). Only the
+    trailing run is trimmed — an internal separator like ``"ARB-P"``
+    (``"arb-prd".upper()[:5]``) is untouched by design (CLAWP-047). Never
+    strips down to empty: an all-punctuation slice is returned unchanged
+    rather than nulled out.
+    """
+    stripped = prefix.rstrip("-_.")
+    return stripped or prefix
+
+
+def _naive_prefix_placeholder(project_id: str) -> str:
+    """The prefix a task-less project would derive on its first mint.
+
+    Mirrors ``assign_task_prefix``'s own ``base`` candidate exactly
+    (``id.upper()[:5]`` + the CLAWP-096 trailing-separator strip). Used as
+    the ``_portfolio_prefixes`` collision-set placeholder for a sibling
+    project that has no explicit ``task_prefix`` and no tasks minted yet —
+    if this placeholder disagreed with what ``assign_task_prefix`` actually
+    derives, two still-task-less siblings whose slices land on the same
+    boundary (e.g. two "code-*" projects, both -> "CODE") could each fail to
+    see the other as a collision and independently mint the same prefix.
+    """
+    full = project_id.upper()
+    base = full[:5] if len(full) >= 5 else full
+    return _strip_trailing_non_alnum(base)
+
+
+class PortfolioPrefixScanError(OSError):
+    """A sibling's tasks directory couldn't be scanned while collecting
+    portfolio prefixes.
+
+    Raised by ``_portfolio_prefixes`` (not ``resolve_existing_prefix``
+    itself, whose own-project callers still want a bare ``OSError``) so a
+    caller iterating a DIFFERENT project can tell "my own resolve failed"
+    apart from "a sibling's scan failed" and attribute the issue to the
+    sibling that actually failed (``sibling_id``), not to whichever
+    project's minting/resolution happened to trigger the portfolio scan
+    (Codex P2 + grok-4.5 + antigravity, PR #57 round: one locked sibling
+    directory was previously blamed on every OTHER taskless project
+    processed afterward).
+    """
+
+    def __init__(self, sibling_id: str, original: OSError):
+        self.sibling_id = sibling_id
+        self.original = original
+        message = (
+            f"could not evaluate prefix collisions for sibling '{sibling_id}': "
+            f"{type(original).__name__}: {original}"
+        )
+        super().__init__(message)
+
+
 def _portfolio_prefixes(config, exclude_id: str) -> set[str]:
-    """Prefixes already claimed by OTHER projects (resolved, or ``[:5]`` for the
-    task-less ones, so a new project can't grab a prefix another would derive)."""
+    """Prefixes already claimed by OTHER projects (resolved, or the naive
+    first-mint placeholder for the task-less ones, so a new project can't
+    grab a prefix another would derive).
+
+    A task-less sibling's naive placeholder is only a PREDICTION of its own
+    first candidate, not a pin -- if that sibling still has a 6th+ character
+    to extend into, it can always move out of the way, so its guess must not
+    manufacture an unavoidable collision for a project that has no room to
+    extend at all (CLAWP-119 fallout, PR #57: this previously made minting
+    `alpha` alongside a task-less `alpha-extra` raise unconditionally, since
+    `alpha`'s own 5-char id equals its base with nothing to extend into,
+    breaking every caller that mints a first task for it regardless of
+    whether the two projects ever actually collide). A sibling's RESOLVED
+    prefix (explicit `task_prefix`, or inferred from tasks it already
+    minted) is a real claim regardless and is always included.
+
+    Raises:
+        PortfolioPrefixScanError: a sibling's own tasks directory couldn't
+            be scanned (locked/unreadable). Distinguished from a bare
+            ``OSError`` so callers can attribute the failure to the sibling
+            (``sibling_id``) rather than to the project whose resolve/mint
+            triggered this scan.
+    """
     from .discovery import discover_projects
 
+    exclude_can_extend = len(exclude_id.upper()) > 5
     used: set[str] = set()
     for p in discover_projects(config):
         if p.id == exclude_id:
             continue
-        used.add(resolve_existing_prefix(p) or p.id.upper()[:5])
+        try:
+            resolved = resolve_existing_prefix(p)
+        except OSError as exc:
+            raise PortfolioPrefixScanError(p.id, exc) from exc
+        if resolved is not None:
+            used.add(resolved)
+            continue
+        if not exclude_can_extend and len(p.id.upper()) > 5:
+            # We have no room to move; a flexible sibling's mere guess must
+            # not block our only candidate -- it can step around us instead.
+            continue
+        used.add(_naive_prefix_placeholder(p.id))
     return used
 
 
@@ -1284,6 +1396,27 @@ def assign_task_prefix(
     explicit ``task_prefix`` -> inferred-from-existing (stability) -> shortest
     collision-free extension of ``id.upper()[:5]``. A new project that would
     collide on ``[:5]`` gets the shortest longer prefix no other project uses.
+    The base candidate is derived via ``_naive_prefix_placeholder`` (CLAWP-096)
+    so a slice boundary landing on a hyphen never produces a doubled separator
+    once ``-{num:03d}`` is appended, and so this function's own candidate
+    always agrees with what ``_portfolio_prefixes`` assumes OTHER task-less
+    projects would derive. Extension-loop candidates beyond the base are
+    stripped the same way -- no arm of this function can emit a trailing
+    separator.
+
+    EVERY arm is a pure function of ``project_id`` and the portfolio's other
+    prefixes; none depends on a scanned counter. That is what makes concurrent
+    first mints safe without a lock: two different projects cannot converge on
+    the same candidate, so there is nothing to serialise (Codex P1, PR #57 --
+    see the last-resort comment for why a lock would not have fixed it).
+    There is no synthesised last resort at all (CLAWP-119): when every
+    id-derived candidate is claimed this raises rather than inventing one.
+
+    Raises:
+        ValueError: if every id-derived candidate is already claimed. Only
+            reachable when sibling projects set explicit ``task_prefix``
+            values that exhaust them; the remedy is an explicit
+            ``task_prefix`` on this project, which the message names.
     """
     if explicit_prefix:
         return explicit_prefix.upper()
@@ -1292,13 +1425,44 @@ def assign_task_prefix(
         return inferred
     full = project_id.upper()
     used = _portfolio_prefixes(config, project_id)
-    base = full[:5] if len(full) >= 5 else full
+    base = _naive_prefix_placeholder(project_id)
     if base and base not in used:
         return base
     for n in range(6, len(full) + 1):
-        if full[:n] not in used:
-            return full[:n]
-    return full  # ids are portfolio-unique, so the full id can't collide
+        candidate = _strip_trailing_non_alnum(full[:n])
+        if candidate not in used:
+            return candidate
+    # ids are portfolio-unique, so the id-derived candidates above can't
+    # collide with another project's OWN id-derived prefix. But `used` also
+    # holds EXPLICIT `task_prefix` values -- arbitrary strings a sibling can
+    # set independent of its own id -- so every candidate above can still be
+    # claimed (Codex P1, PR #57: siblings with explicit prefixes "ABCDE" and
+    # "ABCDE-F" exhaust every stripped candidate through n=len(full)).
+    #
+    # There is no synthesised last resort: this fails loudly and tells the
+    # operator to set an explicit `task_prefix`.
+    #
+    # A generated fallback was tried across PR #57 rounds 4-9 (a digest of the
+    # project id, stem-truncated to fit dispatch's 64-character id cap) and
+    # split back out to CLAWP-119. It was correct in isolation and wrong in
+    # aggregate: it produced a review finding in five consecutive rounds, and
+    # its length budget cannot be made correct by tuning. `emit_tree` mints
+    # child ids as `f"{parent_id}-{ordinal:03d}"` recursively with no depth
+    # cap, so ANY fixed suffix reserve is a wall at some depth -- a 52-char
+    # generated prefix passes the cap at depth 3 and fails it at depth 4.
+    # Bounding it properly means enforcing the cap where ids are MINTED, which
+    # is a change to the task-id system, not to this PR's CLI ergonomics.
+    #
+    # Failing here costs little: this arm is reached only when the base AND
+    # every extension through len(full) are claimed, which needs siblings with
+    # explicit prefixes engineered to exhaust them. An actionable error in that
+    # corner beats a synthesised prefix the rest of the tool cannot use.
+    raise ValueError(
+        f"Cannot derive a collision-free task prefix for project "
+        f"{project_id!r}: every id-derived candidate through {full!r} is "
+        f"claimed by another project. "
+        f"Set an explicit `task_prefix` in this project's settings.toml."
+    )
 
 
 def add_task(
@@ -1613,11 +1777,12 @@ def edit_task(
 
         # Parse frontmatter and content. An absent fence falls through with
         # frontmatter={}, content=text (a fence is synthesised on rebuild). An
-        # unterminated or unparseable fence is refused rather than rebuilt into
-        # a double-frontmatter, metadata-wiped file (Codex / Grok review).
+        # unterminated, unparseable, or non-mapping fence is refused rather
+        # than rebuilt into a double-frontmatter, metadata-wiped file (Codex /
+        # Grok review; not_a_mapping added CLAWP-091).
         frontmatter: dict
         try:
-            frontmatter, content = split_frontmatter(text)
+            frontmatter, content = split_frontmatter(text, where=str(task.file_path))
         except FrontmatterError as exc:
             if exc.reason == "absent":
                 frontmatter, content = {}, text
@@ -1625,6 +1790,11 @@ def edit_task(
                 raise ValueError(
                     f"Task {task_id} has an unterminated frontmatter fence; "
                     "refusing to edit (would corrupt the file)."
+                ) from None
+            elif exc.reason == "not_a_mapping":
+                raise ValueError(
+                    f"Task {task_id} frontmatter is not a YAML mapping; "
+                    f"refusing to edit (would corrupt the file): {exc}"
                 ) from None
             else:
                 cause = exc.__cause__ or exc
@@ -1801,7 +1971,7 @@ def _child_append_text(parent_path: Path, child_id: str) -> str | None:
     - :class:`ConcurrentModificationError` if the parent ``_task.md`` vanished
       (an external delete/move under the lock).
     - :class:`FrontmatterError` (a ``ValueError``) if its frontmatter is
-      absent / unterminated / unparseable.
+      absent / unterminated / unparseable / not a mapping (CLAWP-091).
     """
     if parent_path.name != "_task.md":
         return None  # not a directory-task parent — genuine no-op
@@ -1812,7 +1982,7 @@ def _child_append_text(parent_path: Path, child_id: str) -> str | None:
         )
     with guard_fs_tamper(f"Parent task '{parent_path}'"):
         text = parent_path.read_text(encoding="utf-8")
-    fm, raw_body = split_frontmatter(text)  # raises FrontmatterError on malformation
+    fm, raw_body = split_frontmatter(text, where=str(parent_path))  # raises FrontmatterError on malformation
     children = fm.get("children")
     if not isinstance(children, list):
         children = []

@@ -58,6 +58,12 @@ class TestTaskIdRegex:
     def test_no_match(self, text):
         assert TASK_ID_RE.findall(text) == []
 
+    def test_digest_arm_does_not_widen_the_generic_cap(self):
+        """The precise arm must not become a blanket length increase — a long
+        uppercase token in ordinary log text is not a task ID, and matches
+        here become TaskMentions with no validation against the task store."""
+        assert TASK_ID_RE.findall("ABCDEFGHIJKLMNOPQR-1") == []
+
 
 # ---------------------------------------------------------------------------
 # Unit: find_log_files

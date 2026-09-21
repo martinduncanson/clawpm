@@ -124,9 +124,16 @@ class Mission:
     @classmethod
     def from_file(cls, path: Path) -> "Mission":
         text = path.read_text(encoding="utf-8")
+        # Lenient: any malformation (including CLAWP-091's "not_a_mapping")
+        # -> {} + full text as content. See models.Task.from_file's identical
+        # guard for why: every current caller (list_missions, get_mission)
+        # already wraps this in a broad except and skips/returns None on ANY
+        # exception, so raising here would just get re-swallowed one frame up
+        # — with a WORSE outcome for add_mission_mini_goal's own re-parse
+        # (which is what actually raises the friendly, mission-naming error).
         frontmatter: dict[str, Any]
         try:
-            frontmatter, body = split_frontmatter(text)
+            frontmatter, body = split_frontmatter(text, where=str(path))
             content = body.strip()
         except FrontmatterError:
             frontmatter = {}
@@ -409,12 +416,18 @@ def add_mission_mini_goal(
         with guard_fs_tamper(f"Task {task_id}"):
             text = task.file_path.read_text(encoding="utf-8")
         try:
-            fm, body = split_frontmatter(text)
+            fm, body = split_frontmatter(text, where=str(task.file_path))
         except FrontmatterError as exc:
             if exc.reason == "absent":
                 raise ValueError(f"Task {task_id} has no frontmatter") from None
             if exc.reason == "unterminated":
                 raise ValueError(f"Task {task_id} frontmatter malformed") from None
+            if exc.reason == "not_a_mapping":
+                # CLAWP-091 — parseable but not a mapping; distinct from the
+                # "unparseable" wording below, which would be misleading here.
+                raise ValueError(
+                    f"Task {task_id} frontmatter is not a YAML mapping: {exc}"
+                ) from None
             cause = exc.__cause__ or exc
             raise ValueError(
                 f"Task {task_id} frontmatter unparseable: {cause}"
@@ -503,7 +516,7 @@ def _render_mission(mission: Mission) -> str:
     with guard_fs_tamper(f"Mission {mission.id}"):
         text = mission.file_path.read_text(encoding="utf-8")
     try:
-        fm, body = split_frontmatter(text)
+        fm, body = split_frontmatter(text, where=str(mission.file_path))
     except FrontmatterError as exc:
         if exc.reason == "absent":
             raise ValueError("Mission file has no frontmatter") from None
