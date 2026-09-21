@@ -2002,11 +2002,18 @@ def tasks_dispatch(
                                     _prior_sidecar_path.unlink()
                         else:
                             from clawpm.dispatch import teardown_dispatch_settings
+                            # remove_sidecar=_sidecar_touched (PR #55
+                            # PRE-REVIEW + antigravity, round 12): this
+                            # invocation never wrote the sidecar when
+                            # `_sidecar_touched` is False, so an earlier,
+                            # unrelated dispatch's sidecar at this target
+                            # isn't ours to delete.
                             teardown_dispatch_settings(
                                 target_dir=resolved_dir,
                                 task_id=task_id,
                                 portfolio_root=config.portfolio_root,
                                 project_id=project_id,
+                                remove_sidecar=_sidecar_touched,
                             )
                     except Exception as teardown_exc:
                         # Rollback itself failed — report BOTH, since the operator

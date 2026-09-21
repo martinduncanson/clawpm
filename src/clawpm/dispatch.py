@@ -623,6 +623,7 @@ def teardown_dispatch_settings(
     force: bool = False,
     portfolio_root: Optional[Path] = None,
     project_id: Optional[str] = None,
+    remove_sidecar: bool = True,
 ) -> bool:
     """Remove a clawpm-managed dispatch settings file (and sidecar).
 
@@ -639,7 +640,17 @@ def teardown_dispatch_settings(
         False; the dispatch belongs to a different project (Codex
         round-7 fix — cross-project isolation also enforced here).
       - Marker present, matches (or filter not given): removes
-        settings.local.json AND the SessionStart sidecar if present.
+        settings.local.json AND, if ``remove_sidecar`` (default True),
+        the SessionStart sidecar if present.
+
+    ``remove_sidecar=False`` (PR #55 PRE-REVIEW + antigravity, round 12):
+    a caller whose OWN invocation never wrote the sidecar — e.g. a
+    ``--no-session-context`` rollback where ``_sidecar_touched`` is False
+    — must not delete a sidecar left by an unrelated earlier dispatch to
+    the same target; that file isn't this invocation's to remove. The
+    pre-existing orphan cleanup above (settings already gone, sidecar
+    still present) is unaffected — that path always removes the orphan
+    regardless of this flag, since nothing else can still be using it.
 
     No exception is raised in the not-removed paths — the caller reads
     the bool to decide what to surface.
@@ -670,7 +681,7 @@ def teardown_dispatch_settings(
         if not force:
             return False
         path.unlink()
-        if sidecar.exists():
+        if remove_sidecar and sidecar.exists():
             sidecar.unlink()
         return True
     if task_id is not None and marker.get("task_id") != task_id:
@@ -687,7 +698,7 @@ def teardown_dispatch_settings(
     ):
         return False
     path.unlink()
-    if sidecar.exists():
+    if remove_sidecar and sidecar.exists():
         sidecar.unlink()
     # Codex round-4: append a torn_down event to the registry so
     # active_dispatch_dirs reflects reality. Pass project_id from the

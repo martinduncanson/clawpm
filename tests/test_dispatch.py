@@ -349,6 +349,40 @@ class TestWriteReadTeardown:
         assert removed is True
         assert not settings_path(tmp_path).exists()
 
+    def test_teardown_with_remove_sidecar_false_leaves_sidecar(self, tmp_path):
+        """PR #55 PRE-REVIEW + antigravity, round 12: an invocation whose
+        own dispatch never wrote the sidecar (_sidecar_touched False) must
+        be able to tear down settings.local.json without deleting a
+        sidecar left by an unrelated earlier dispatch at the same target
+        — that file isn't this invocation's to remove."""
+        from clawpm.dispatch import session_start_payload_path
+
+        write_dispatch_settings(tmp_path, "TEST-001", "test")
+        sidecar = session_start_payload_path(tmp_path)
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(json.dumps({"hookSpecificOutput": {}}), encoding="utf-8")
+
+        removed = teardown_dispatch_settings(
+            tmp_path, task_id="TEST-001", remove_sidecar=False
+        )
+        assert removed is True
+        assert not settings_path(tmp_path).exists()
+        assert sidecar.exists()
+
+    def test_teardown_default_still_removes_sidecar(self, tmp_path):
+        """The pre-existing default (remove_sidecar=True) is unchanged for
+        every other call site that doesn't pass the new flag."""
+        from clawpm.dispatch import session_start_payload_path
+
+        write_dispatch_settings(tmp_path, "TEST-001", "test")
+        sidecar = session_start_payload_path(tmp_path)
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(json.dumps({"hookSpecificOutput": {}}), encoding="utf-8")
+
+        removed = teardown_dispatch_settings(tmp_path, task_id="TEST-001")
+        assert removed is True
+        assert not sidecar.exists()
+
 
 # ---------------------------------------------------------------------------
 # Write safety: refuses to clobber
