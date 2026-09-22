@@ -691,14 +691,19 @@ def _predict_parent_id(
 
     # New root — predict the next ID add_task would generate
     from .tasks import get_tasks_dir, assign_task_prefix
-    from .discovery import get_project
+    from .discovery import get_scoped_project_settings
     import re
 
     tasks_dir = get_tasks_dir(config, project_id)
     if not tasks_dir:
         raise EmitValidationError(f"Cannot locate tasks directory for project {project_id!r}")
 
-    _settings = get_project(config, project_id)
+    # Session-scoped like `tasks_dir` above and `add_task`'s own prefix
+    # resolution (CLAWP-098, Codex P2 on PR #55 round 13): the cwd-independent
+    # `get_project` would read the CANONICAL settings.toml and give the whole
+    # emitted tree the wrong prefix while it lands in a worktree. A foreign
+    # project id in the worktree's settings raises (a ValueError subclass).
+    _settings = get_scoped_project_settings(config, project_id)
     prefix = assign_task_prefix(
         project_id,
         tasks_dir,
@@ -759,7 +764,7 @@ def emit_tree(
     from .tasks import get_tasks_dir, add_task, split_task, get_task
     from .tasks import _append_child_to_parent_frontmatter
     from .baseline import resolve_baseline_ref
-    from .discovery import get_project
+    from .discovery import get_repo_path, get_scoped_project_settings
     from .worklog import add_entry
     from .models import WorkLogAction
 
@@ -767,13 +772,26 @@ def emit_tree(
     if not tasks_dir:
         raise EmitValidationError(f"No tasks directory for project {project_id!r}")
 
+    # Identity guard for the scoped store the tree is minted into, applied to
+    # EVERY emit — `attach_to` roots included, which return before
+    # `_predict_parent_id` would otherwise resolve settings (CLAWP-098, PR #55
+    # round 14). Fail closed (ValueError) on a worktree naming another project.
+    get_scoped_project_settings(config, project_id)
+
     # -----------------------------------------------------------------------
     # Phase 2 — Gate barrier (all read-only)
     # -----------------------------------------------------------------------
 
     # Resolve baseline once for the whole tree (planning baseline).
-    _settings = get_project(config, project_id)
-    _repo_path = getattr(_settings, "repo_path", None) if _settings else None
+    #
+    # Session-scoped, exactly as `add_task` resolves it (CLAWP-098, Codex P2
+    # on PR #55 round 8). `get_tasks_dir` above already redirects into a
+    # registered worktree, so taking the baseline from the cwd-independent
+    # `get_project(...).repo_path` stamped EVERY emitted task with the main
+    # checkout's HEAD while writing them into a worktree on a different
+    # commit — the same scope-drift error the single-task path fixed, just
+    # multiplied across a whole tree.
+    _repo_path = get_repo_path(config, project_id)
     baseline_ref = resolve_baseline_ref(_repo_path)
 
     # Predict parent/root task ID (before writing anything)

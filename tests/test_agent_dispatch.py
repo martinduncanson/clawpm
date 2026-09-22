@@ -179,6 +179,42 @@ class TestHappyPath:
 
 
 # ---------------------------------------------------------------------------
+# CLAWP-098: session registration
+# ---------------------------------------------------------------------------
+
+
+class TestSessionRegistration:
+    def test_dispatch_does_not_register_a_session_for_its_worktree(
+        self, temp_portfolio_with_repo
+    ):
+        """`clawpm agent dispatch` deliberately does NOT register a
+        CLAWP-098 session for its worktree (Codex review, PR #55): the new
+        subtask is created in the caller's checkout (uncommitted) and
+        `create_worktree` checks out committed HEAD immediately after, so
+        the subtask file never lands in the worktree. Registering a session
+        anyway would redirect the worktree's own eval-stop Stop-hook to look
+        for the task there, find nothing, and block termination forever.
+        This documents that exclusion so it isn't silently "fixed" back in
+        without also materializing the task file into the worktree."""
+        from clawpm.sessions import active_sessions
+
+        config = temp_portfolio_with_repo["config"]
+        portfolio_root = temp_portfolio_with_repo["root"]
+        stub = _make_stub_invoker('{"ok": true, "reason": "done"}')
+
+        result = dispatch_agent(
+            config=config,
+            project_id="test",
+            prompt="Do a thing",
+            success_criteria=["c1"],
+            judge_invoker=stub,
+        )
+
+        assert Path(result["settings_path"]).exists()
+        assert active_sessions(portfolio_root) == []
+
+
+# ---------------------------------------------------------------------------
 # 2. ok=false → BLOCKED
 # ---------------------------------------------------------------------------
 

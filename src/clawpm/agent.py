@@ -50,13 +50,20 @@ Design tradeoffs:
 
 from __future__ import annotations
 
+import functools
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
 from .discovery import get_project
-from .dispatch import create_worktree, write_dispatch_settings
+from .dispatch import (
+    PartialDispatchWrite,
+    create_worktree,
+    dispatch_target_lock,
+    teardown_dispatch_settings,
+    write_dispatch_settings,
+)
 from .judges.stop_condition import (
     JudgeVerdict,
     evaluate_stop_condition,
@@ -70,6 +77,7 @@ from .models import (
 )
 from .reflect import write_iteration_event, write_reflection_event
 from .rubric import render_rubric_markdown
+from .sessions import suppress_session_resolution
 from .tasks import add_task, change_task_state
 
 
@@ -155,7 +163,7 @@ def _write_transcript(target_dir: Path, transcript: str) -> Path:
     return path
 
 
-def dispatch_agent(
+def _dispatch_agent(
     config,
     project_id: str,
     prompt: str,
@@ -287,16 +295,51 @@ def dispatch_agent(
     # before re-raising AgentDispatchError. Otherwise the command
     # crashes and leaves the subtask OPEN with no dispatch artifacts —
     # retries create duplicates.
+    _rollback_note = ""
     try:
-        settings_path = write_dispatch_settings(
-            target_dir=target_dir,
-            task_id=subtask_id,
-            project_id=project_id,
-            rubric_markdown=rubric_markdown,
-            portfolio_root=config.portfolio_root,
-        )
-    except (FileExistsError, ValueError, OSError) as exc:
-        error_detail = str(exc)
+        # `.path`, not the whole tuple: write_dispatch_settings also returns
+        # the bytes it wrote, which only dispatch's rollback needs.
+        #
+        # Under the per-target dispatch lock (Codex P2, PR #55 round 14):
+        # teardown takes it, so every writer must too, or a concurrent
+        # teardown of this target could unlink the settings between this
+        # write and the subagent starting — which would then run without its
+        # Stop / progress hooks.
+        with dispatch_target_lock(config.portfolio_root, target_dir):
+            try:
+                settings_path = write_dispatch_settings(
+                    target_dir=target_dir,
+                    task_id=subtask_id,
+                    project_id=project_id,
+                    rubric_markdown=rubric_markdown,
+                    portfolio_root=config.portfolio_root,
+                ).path
+            except PartialDispatchWrite as partial:
+                # settings.local.json landed (Stop hook LIVE) before the
+                # writer failed: take it back down rather than leave the
+                # nested worktree armed with a hook for a subtask that is
+                # about to be BLOCKED (PR #55 round 13 PRE-REVIEW). Done
+                # INSIDE this critical section (Codex P1, round 15): after
+                # releasing the lock, another same-task dispatch could
+                # install ITS settings, and a marker-only teardown would then
+                # remove them. Best-effort — the primary error is what the
+                # caller must see. (Reentrant: teardown re-takes the lock.)
+                try:
+                    teardown_dispatch_settings(
+                        target_dir,
+                        task_id=subtask_id,
+                        portfolio_root=config.portfolio_root,
+                        project_id=project_id,
+                        remove_sidecar=partial.written.sidecar_written,
+                    )
+                except Exception as teardown_exc:
+                    _rollback_note = (
+                        f" (rolling the partial dispatch back ALSO failed: "
+                        f"{type(teardown_exc).__name__}: {teardown_exc})"
+                    )
+                raise
+    except (FileExistsError, ValueError, OSError, PartialDispatchWrite) as exc:
+        error_detail = str(exc) + _rollback_note
         try:
             change_task_state(
                 config, project_id, subtask_id, TaskState.BLOCKED,
@@ -309,6 +352,23 @@ def dispatch_agent(
         raise AgentDispatchError(
             f"write_dispatch_settings failed: {error_detail}"
         ) from exc
+
+    # CLAWP-098 scope note (Codex review, PR #55): this command deliberately
+    # does NOT register a session for its worktree, unlike `tasks dispatch
+    # --worktree`. Step 2 (create_worktree) checks out committed HEAD, so the
+    # new subtask file — written uncommitted by step 1 — never lands in
+    # target_dir. Registering a session anyway would redirect the worktree's
+    # own Stop-hook (`eval-stop`, wired below) to look up the task inside
+    # target_dir's .project/tasks/, find nothing, and block termination
+    # forever ("task not found"). The hook instead falls through to the
+    # portfolio registry (the main checkout), which is where the task must
+    # therefore live: `dispatch_agent` below pins this whole function to
+    # registry (canonical) resolution, so the subtask is created — and later
+    # transitioned — there even when the caller runs from a registered
+    # worktree (round 13 P1: the session-scoped `add_task` used to put it in
+    # the CALLER's worktree, where the unregistered nested worktree's hooks
+    # could never find it). Materializing the file into the worktree and
+    # registering a session is the proper fix — left as follow-up work.
 
     # 4. Invoke the subagent. Tests pass `judge_invoker`; the CLI passes
     # `judge_cmd_override` or falls through to CLAWPM_JUDGE_CMD /
@@ -448,4 +508,20 @@ def dispatch_agent(
             "+00:00", "Z"
         ),
     }
+
+
+@functools.wraps(_dispatch_agent)
+def dispatch_agent(*args, **kwargs) -> dict:
+    """See :func:`_dispatch_agent` (the documented body).
+
+    Runs the whole dispatch with session-scoped resolution suppressed
+    (CLAWP-098, Codex P1 on PR #55 round 13). The nested worktree this
+    creates is deliberately unregistered, so its hooks resolve the task from
+    the portfolio registry — the canonical checkout. Every task read/write in
+    this function (the new subtask, its state transitions) therefore has to
+    use that same canonical store, regardless of whether the CALLER happens to
+    be sitting inside some other registered worktree.
+    """
+    with suppress_session_resolution():
+        return _dispatch_agent(*args, **kwargs)
 

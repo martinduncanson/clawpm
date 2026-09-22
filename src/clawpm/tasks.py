@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -9,6 +10,8 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 from .concurrency import (
     ConcurrentModificationError,
@@ -1498,11 +1501,32 @@ def add_task(
     # CLAWP-055 — resolve baseline_ref BEFORE entering the lock: this may
     # invoke a git subprocess, which must not be held inside a critical section.
     from .baseline import resolve_baseline_ref
-    from .discovery import get_project as _get_project_for_baseline
+    from .discovery import get_repo_path as _get_repo_path_for_baseline
 
-    _proj_settings = _get_project_for_baseline(config, project_id)
-    _repo_path = getattr(_proj_settings, "repo_path", None) if _proj_settings else None
+    # Session-scoped, like the task store itself (CLAWP-098, Codex P2 on
+    # PR #55). `get_tasks_dir` above already redirects into a registered
+    # worktree, so resolving the baseline from the cwd-independent
+    # `get_project(...).repo_path` stamped a task created in that worktree
+    # against the MAIN checkout's HEAD. When the two sit on different
+    # commits the baseline is simply wrong, and every later scope-drift
+    # decision inherits the error. Git metadata has to come from whichever
+    # checkout the task store was redirected to.
+    _repo_path = _get_repo_path_for_baseline(config, project_id)
     _baseline_ref = resolve_baseline_ref(_repo_path)
+
+    # Session-scoped settings, resolved for EVERY create — explicit `--id`
+    # included (CLAWP-098, PR #55 rounds 11-14). `tasks_dir` was already
+    # redirected into a registered worktree by `get_tasks_dir`, so the
+    # settings that pick a prefix must come from that same checkout (the
+    # cwd-independent `get_project(...)` reads the CANONICAL one). Resolving
+    # it outside the auto-ID branch is what makes the identity guard cover an
+    # explicit-ID create too: a worktree whose settings.toml names another
+    # project raises ScopedSettingsMismatchError (a ValueError) here, failing
+    # closed, instead of the write landing in the mismatched checkout. Shared
+    # with emit-tree and add_subtask, which also mint IDs into a store.
+    from .discovery import get_scoped_project_settings
+
+    _settings = get_scoped_project_settings(config, project_id)
 
     # CLAWP-051 — per-project file lock serialises ID allocation (scan→write)
     # and explicit-ID creates so two concurrent sessions in the same project
@@ -1520,9 +1544,9 @@ def add_task(
             # CLAWP-048: resolve a portfolio-unique prefix (explicit task_prefix ->
             # inferred from existing tasks -> collision-free derivation) instead of
             # the naive id.upper()[:5], which collides across near-name-twin ids.
-            from .discovery import get_project
-
-            _settings = get_project(config, project_id)
+            #
+            # `_settings` was resolved (session-scoped) before the lock; see
+            # the comment there.
             prefix = assign_task_prefix(
                 project_id,
                 tasks_dir,
@@ -2083,7 +2107,15 @@ def add_subtask(
     tasks_dir = get_tasks_dir(config, project_id)
     if not tasks_dir:
         return None
-    
+
+    # Identity guard for the scoped store this subtask is minted into (CLAWP-098,
+    # PR #55 round 14): same fail-closed check as `add_task` — a registered
+    # worktree whose settings.toml names another project raises
+    # ScopedSettingsMismatchError instead of taking new IDs.
+    from .discovery import get_scoped_project_settings
+
+    get_scoped_project_settings(config, project_id)
+
     # CLAWP-051 Finding 6 — wrap the ENTIRE parent-resolution + allocate-and-create
     # in file_lock so concurrent sessions decomposing the same parent can't mint
     # the same subtask ID, clobber each other, OR read a half-written parent.

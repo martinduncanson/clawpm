@@ -10,6 +10,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .models import PortfolioConfig, ProjectSettings, ProjectStatus
+from .sessions import (
+    _suppress_session_resolution,
+    find_session_for_cwd,
+    scope_cwd,
+    stat_is_dir,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -238,15 +244,314 @@ def get_project_dir(config: PortfolioConfig, project_id: str) -> Path | None:
     """Get the .project directory for a project.
 
     Returns the ``.project/`` directory path (not the repo root) when found,
-    or ``None`` if the project cannot be located via the portfolio registry.
+    or ``None`` if the project cannot be located.
+
+    CLAWP-098: before consulting the portfolio registry, checks whether cwd
+    is inside a worktree that ``tasks dispatch --worktree`` registered a
+    session for (see ``sessions.find_session_for_cwd``). Without this, an
+    ID-based mutator run from inside a dispatched worktree would resolve
+    straight through to the MAIN checkout's ``.project/`` (the registry
+    lookup is 100% cwd-independent) and corrupt its task file instead of the
+    worktree's own. When cwd matches no active session — true for every
+    normal single-checkout invocation — this is a no-op and falls straight
+    through to the registry lookup exactly as before.
 
     Use :func:`find_project_dir_fallback` if you need a best-effort lookup
     that also checks the CWD walk when the registry lookup fails.
     """
+    session_dir = _session_scoped_project_dir(config, project_id)
+    if session_dir is not None:
+        return session_dir
+
     project = get_project(config, project_id)
     if project and project.project_dir:
         return project.project_dir / ".project"
     return None
+
+
+def is_task_store_canonical(config: PortfolioConfig, project_id: str) -> bool:
+    """Whether ``get_project_dir`` would resolve *project_id* to the
+    CANONICAL checkout for the currently active scope (ambient cwd, or a
+    :func:`sessions.resolve_scope_from` override) rather than to a
+    registered worktree's own store.
+
+    Used to refuse a feature that cannot see a worktree-scoped task (CLAWP-098,
+    Codex P1 on PR #55 round 16): ``leases.apply_fallback`` runs the ENTIRE
+    sweep under ``suppress_session_resolution()`` on purpose, because it
+    processes whichever task's lease expired — one the operator did not name
+    in the current command — and must never inherit the caller's own worktree
+    for an unrelated task (see that function's docstring). A lease granted for
+    a task that lives in a worktree is therefore a lease the sweep can never
+    correctly act on: it would read (and mutate) the canonical copy, treating
+    the worktree-only task as missing. Simpler to refuse the lease than to
+    plumb scope through the lease registry and every sweep call site.
+
+    ``True`` for every ordinary single-checkout invocation (the overwhelming
+    majority) — this is a no-op there, mirroring ``get_project_dir``'s own
+    contract.
+    """
+    return _session_scoped_project_dir(config, project_id) is None
+
+
+def get_repo_path(config: PortfolioConfig, project_id: str) -> Path | None:
+    """The checkout to run git in for *project_id* — session-scoped.
+
+    CLAWP-098 (Codex review, PR #55): ``get_project_dir`` already redirects
+    an ID-based mutator running inside a dispatched worktree to that
+    worktree's own ``.project/``, but every SECONDARY step that shells out
+    to git kept using ``get_project(...).repo_path``, which is
+    cwd-independent and therefore always the MAIN checkout. The concrete
+    symptom is the work-log's ``files_changed`` enrichment on
+    ``tasks state/start/done/block``: run from a dispatched worktree, it
+    recorded the main checkout's ``git diff`` — omitting every file the
+    agent actually touched, and attributing whatever unrelated edits
+    happened to be sitting in main to this task instead.
+
+    Resolution is keyed on the active SESSION rather than on
+    :func:`_session_scoped_project_dir`, which additionally requires the
+    worktree to carry its own ``.project/``. That extra gate exists to stop
+    a WRITER forking a new task store into a worktree that never had one —
+    a hazard that simply does not apply to reading a diff. So when cwd sits
+    in a registered worktree, git runs there whether or not the project
+    git-tracks ``.project/``; a worktree without one still holds the work
+    being described.
+
+    Returns ``None`` when the project cannot be located at all, matching
+    ``get_project_dir``'s contract. Never raises: every failure inside
+    session resolution falls through to the registry answer.
+    """
+    session_root = _session_scoped_repo_path(config, project_id)
+    if session_root is not None:
+        return session_root
+    project = get_project(config, project_id)
+    return project.repo_path if project else None
+
+
+class ScopedSettingsMismatchError(ValueError):
+    """A registered worktree's own ``settings.toml`` names a different project.
+
+    Subclasses ``ValueError`` so the CLI mutation wrappers
+    (``_mutation_errors``, ``cli/agent.py``) map it to a structured error
+    instead of a traceback.
+    """
+
+
+def get_scoped_project_settings(
+    config: PortfolioConfig, project_id: str
+) -> ProjectSettings | None:
+    """Project settings from the SAME checkout the task store resolves to.
+
+    This is the settings-side twin of :func:`get_project_dir` /
+    :func:`get_repo_path` (CLAWP-098, PR #55 rounds 11-13). The scope
+    invariant those two enforce is that everything one operation touches — the
+    task store, the git checkout, and the settings that decide ID prefixes —
+    comes from ONE checkout. ``get_project`` is cwd-independent, so any caller
+    that took the task store from ``get_tasks_dir`` but its settings from
+    ``get_project`` read the CANONICAL checkout's ``settings.toml`` while
+    writing into a worktree, and minted IDs under the wrong ``task_prefix``.
+    Both ``add_task`` and ``emit-tree``'s root-ID prediction now go through
+    here so they cannot disagree.
+
+    - No registered session for cwd (every ordinary invocation), or inside
+      ``suppress_session_resolution()``: identical to ``get_project``.
+    - Session matched but its worktree has no ``settings.toml``: silently
+      ``get_project`` — that is the ordinary case (a worktree with nothing of
+      its own to say), not a degrade. A stat FAULT on it (permissions, an
+      unavailable volume) is a degrade and is logged at ERROR.
+    - Session matched but its ``settings.toml`` is unreadable / malformed
+      (``OSError``, ``ValueError`` — which includes ``tomllib.TOMLDecodeError``
+      — or ``KeyError``): LOGS and falls back to ``get_project`` — fail-open
+      WITH a marker (CLAWP-039/041). Any other exception is a bug and
+      propagates.
+    - Session matched and the worktree's settings name a DIFFERENT project id:
+      raises :class:`ScopedSettingsMismatchError`. This is fail-CLOSED on
+      purpose (operator decision, 2026-09-21): the session was matched by the
+      registry record's project id, so a settings file claiming another id
+      means the worktree's identity is inconsistent. Falling back to the
+      canonical settings would keep working but silently mint IDs from a
+      checkout the operation is not writing into.
+    """
+    session_dir = _session_scoped_project_dir(config, project_id)
+    if session_dir is None:
+        return get_project(config, project_id)
+    settings_file = session_dir / "settings.toml"
+    # os.stat, not Path.exists() (Codex P2, PR #55 round 14): exists() catches
+    # OSError and answers False, so a permission fault or unavailable volume
+    # read as "this worktree has no settings.toml" and fell back to the
+    # canonical prefix with no signal. FileNotFoundError is the ordinary
+    # "nothing of its own to say"; any other fault degrades WITH a marker.
+    try:
+        os.stat(settings_file)
+    except FileNotFoundError:
+        return get_project(config, project_id)
+    except OSError as exc:
+        logger.error(
+            "Failed to stat session-scoped settings.toml at %s: %s. Falling "
+            "back to the registry lookup — a worktree-specific task_prefix, "
+            "if any, will be ignored for this operation.",
+            settings_file, exc,
+        )
+        return get_project(config, project_id)
+    try:
+        scoped = ProjectSettings.load(settings_file)
+    except (OSError, ValueError, KeyError) as exc:
+        logger.warning(
+            "Failed to load session-scoped settings.toml at %s: %s. Falling "
+            "back to the registry lookup — a worktree-specific task_prefix, "
+            "if any, will be ignored for this operation.",
+            settings_file, exc,
+        )
+        return get_project(config, project_id)
+    if scoped.id != project_id:
+        raise ScopedSettingsMismatchError(
+            f"The worktree at {session_dir.parent} is registered for project "
+            f"{project_id!r}, but its {settings_file} declares project id "
+            f"{scoped.id!r}. Refusing to continue rather than fall back to "
+            f"the main checkout's settings — fix the worktree's settings.toml "
+            f"(or re-dispatch the task) so the two agree."
+        )
+    return scoped
+
+
+def _session_scoped_repo_path(config: PortfolioConfig, project_id: str) -> Path | None:
+    """Worktree root of the session registered for cwd, or ``None``.
+
+    Same suppression and fail-open contract as
+    :func:`_session_scoped_project_dir` — in particular it returns ``None``
+    inside a ``sessions.suppress_session_resolution()`` block, so the
+    portfolio-wide lease-fallback sweep never inherits the caller's
+    worktree for a task the operator did not name.
+    """
+    if _suppress_session_resolution.get():
+        return None
+    portfolio_root = getattr(config, "portfolio_root", None)
+    if not portfolio_root:
+        return None
+    try:
+        cwd = scope_cwd()
+    except OSError as exc:
+        logger.error("Failed to determine cwd: %s. Session-scoped repo "
+                     "resolution skipped for this call.", exc)
+        return None
+    session = find_session_for_cwd(portfolio_root, cwd, project_id=project_id)
+    if session is None:
+        return None
+    try:
+        root = session.worktree_path.resolve()
+    except OSError as exc:
+        logger.error(
+            "Failed to resolve session worktree %s: %s. Falling through to "
+            "the portfolio registry (main-checkout) repo_path for this call.",
+            session.worktree_path, exc,
+        )
+        return None
+    try:
+        if not stat_is_dir(root):
+            return None
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        logger.error(
+            "Failed to stat session worktree %s: %s. Falling through to the "
+            "portfolio registry (main-checkout) repo_path for this call.",
+            root, exc,
+        )
+        return None
+    return root
+
+
+def _session_scoped_project_dir(config: PortfolioConfig, project_id: str) -> Path | None:
+    """Return the ``.project/`` dir of the worktree registered for cwd, if any.
+
+    Returns ``None`` (never raises) when there is no portfolio root, no cwd,
+    no active session whose registered worktree contains cwd, OR — critically
+    — the session matched but its worktree has no ``.project/`` of its own
+    (review finding, CLAWP-098): a worktree only inherits ``.project/`` when
+    the project git-tracks it (CLAWP-075's convention; this repo does, most
+    don't). Redirecting unconditionally would silently arm every WRITER that
+    calls this (``add_task``, ``add_research``, ``save_constitution``, ...)
+    to ``mkdir(parents=True, exist_ok=True)`` a brand-new, untracked task
+    store inside the worktree for a project that doesn't carry one — exactly
+    the "ledger forks per worktree" failure this module's own docstring
+    warns against, and silent since those callers never see a `None` to
+    trigger their existing not-found handling. Gating on existence keeps
+    this a pure REDIRECT of an already-present tree, never a fork point: a
+    worktree with no ``.project/`` falls through to the registry lookup
+    exactly like before this fix (which may itself resolve to the main
+    checkout — unavoidable, since there's nothing worktree-local to point
+    at; this is the write-corruption case ``get_project_dir``'s caller must
+    still guard against some other way, unchanged from pre-CLAWP-098).
+
+    Also returns ``None`` — unconditionally, before even checking cwd —
+    inside a ``sessions.suppress_session_resolution()`` block (Codex round-3
+    P1, PR #55): portfolio-wide background housekeeping that resolves a task
+    the operator did NOT explicitly name in the current command (the
+    lease-fallback sweep opportunistically run by ``tasks dispatch``/
+    ``doctor``) must never inherit the caller's own worktree just because it
+    happens to share cwd and project_id — see that function's docstring.
+
+    The caller treats ``None`` as "fall through to the registry lookup".
+    """
+    if _suppress_session_resolution.get():
+        return None
+    portfolio_root = getattr(config, "portfolio_root", None)
+    if not portfolio_root:
+        return None
+    try:
+        cwd = scope_cwd()
+    except OSError as exc:
+        # antigravity review, PR #55 (round 4): Path.cwd() itself failing
+        # (the process's cwd deleted out from under it — rare, but the
+        # existing fail-open-needs-a-marker doctrine applies regardless of
+        # how rare) must fall open the same as every other miss, but not
+        # silently — logged at ERROR to match the severity of every other
+        # fail-open branch in this module and sessions.py.
+        logger.error("Failed to determine cwd: %s. Session-scoped "
+                      "resolution skipped for this call.", exc)
+        return None
+    session = find_session_for_cwd(portfolio_root, cwd, project_id=project_id)
+    if session is None:
+        return None
+    try:
+        # OSError here (antigravity review, PR #55) — a TOCTOU race against
+        # `git worktree remove`, a permission error, an unmounted drive —
+        # must fall open to the registry lookup like every other "no
+        # session" case, not crash the caller. The docstring promises
+        # "never raises"; before this guard, resolve() could break that
+        # promise for exactly the class of caller (tasks list/next/reflect)
+        # that must never hard-fail on a rare filesystem hiccup.
+        candidate = session.worktree_path.resolve() / ".project"
+    except OSError as exc:
+        logger.error(
+            "Failed to resolve session worktree %s: %s. Falling through to "
+            "the portfolio registry (main-checkout) lookup for this call.",
+            session.worktree_path, exc,
+        )
+        return None
+    try:
+        # stat_is_dir, not candidate.is_dir() (Codex review, PR #55):
+        # Path.is_dir() catches OSError internally and just returns False,
+        # which made this a silent "not there" for a genuine permission/
+        # unmounted-drive fault too — the ERROR log below never fired.
+        if not stat_is_dir(candidate):
+            return None
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        # grok review, PR #55: log at the same ERROR severity as
+        # sessions._replay's fail-open path — this is the same class of
+        # "silently regress to main-checkout resolution" degrade, just
+        # triggered by a filesystem fault on the WORKTREE side instead of
+        # the registry file. A logged-but-fall-open here beats both a hard
+        # crash (breaks read-only callers) and a silent one (CLAWP-039/041
+        # fail-open-needs-a-marker doctrine).
+        logger.error(
+            "Failed to stat session worktree %s: %s. Falling through to "
+            "the portfolio registry (main-checkout) lookup for this call.",
+            candidate, exc,
+        )
+        return None
+    return candidate
 
 
 def _read_project_id_from_settings(settings_file: Path) -> str | None:

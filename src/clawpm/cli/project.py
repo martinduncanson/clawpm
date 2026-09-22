@@ -263,6 +263,46 @@ def project_doctor(
     - Code-vs-tracking drift (commits authored after the last work_log entry)
     - Missing clawpm-requirement marker in repo agent docs (CLAUDE.md/AGENTS.md/README.md)
     """
+    # Whole detect+apply body runs canonically (CLAWP-098, Codex P1 on PR #55
+    # round 16): `projects_to_check` is built from `discover_projects`/
+    # `get_project` — both cwd-independent, always the CANONICAL checkout —
+    # but the body's task lookups (`list_tasks`, and `doctor_apply`'s
+    # `cascade_unblock_dependents`) go through the session-scoped
+    # `get_tasks_dir` chokepoint. Run from inside a registered worktree, that
+    # mismatch let doctor combine the canonical project's blocked-task list
+    # with the WORKTREE's dependency state, then mutate the worktree copy
+    # while reporting the canonical issue remediated. Doctor is portfolio-wide
+    # housekeeping — like `leases.apply_fallback` — never scoped to whatever
+    # worktree happens to be cwd; suppress for the whole body, the same
+    # pattern that function already uses.
+    from clawpm.sessions import suppress_session_resolution
+
+    with suppress_session_resolution():
+        _project_doctor_impl(
+            ctx, project_id, strict, commits_drift_threshold, check_codex,
+            apply_mode, assume_yes, dry_run, no_apply_drift, no_apply_cascade,
+            no_apply_stale_blocked, no_apply_half_rename, check_encoding,
+        )
+
+
+def _project_doctor_impl(
+    ctx: click.Context,
+    project_id: str | None,
+    strict: bool = False,
+    commits_drift_threshold: int = 5,
+    check_codex: bool = False,
+    apply_mode: bool = False,
+    assume_yes: bool = False,
+    dry_run: bool = False,
+    no_apply_drift: bool = False,
+    no_apply_cascade: bool = False,
+    no_apply_stale_blocked: bool = False,
+    no_apply_half_rename: bool = False,
+    check_encoding: bool = False,
+) -> None:
+    """The actual doctor body — split out of :func:`project_doctor` purely so
+    it can run inside ``suppress_session_resolution()`` without re-indenting
+    several hundred lines. Not meant to be called directly."""
     import json as _json_doc
     from datetime import date, datetime, timezone, timedelta
 
