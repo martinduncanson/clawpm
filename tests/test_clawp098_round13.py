@@ -975,6 +975,31 @@ class TestWriterFailureIsRolledBack:
         assert r.exit_code == 1, r.output
         assert "lease_unsupported_scope" in r.output
 
+    def test_lease_grant_cli_refuses_a_task_that_only_exists_in_a_worktree(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        """grok review, round 17: guard #1 (ambient scope) is a no-op from an
+        ordinary canonical cwd — it says nothing about whether the NAMED task
+        actually exists canonically. A worktree-only id would otherwise grant
+        a lease `apply_fallback` can never find, silently retiring it on the
+        first sweep with no fallback ever applied."""
+        wt = _registered_worktree(git_portfolio, tmp_path, monkeypatch, _OWN_SETTINGS)
+        task = add_task(  # lands in wt's own store (cwd is wt)
+            git_portfolio["config"], "test", "worktree-only-for-lease",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+        assert task is not None
+        # Caller is now an ORDINARY canonical cwd — guard #1 alone would pass.
+        monkeypatch.chdir(git_portfolio["repo"])
+        r = CliRunner().invoke(
+            main, ["-p", "test", "lease", "grant", "--task", task.id, "--ttl", "60"],
+        )
+        assert r.exit_code == 1, r.output
+        assert "lease_unsupported_scope" in r.output
+        from clawpm.leases import active_leases
+
+        assert active_leases(git_portfolio["root"]) == []
+
     def test_dispatch_agent_writes_under_the_target_lock(
         self, git_portfolio, monkeypatch
     ):

@@ -40,17 +40,22 @@ def lease_grant(ctx, project_id, task_id, ttl, fallback_policy, holder_id, targe
     """Grant a lease on a dispatched task."""
     from clawpm.discovery import is_task_store_canonical
     from clawpm.leases import FallbackPolicy, grant_lease
+    from clawpm.sessions import suppress_session_resolution
+    from clawpm.tasks import get_task
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
     project_id, _ = require_project(ctx, project_id)
     task_id = expand_task_id(task_id, project_id)
 
-    # Same guard as `tasks dispatch --lease-ttl` (CLAWP-098, Codex P1 on
-    # PR #55 round 16): `leases.apply_fallback` runs its whole sweep under
-    # `suppress_session_resolution()` on purpose, so a lease on a task that
-    # lives in a registered worktree's own store can never be correctly
-    # reaped — the sweep would act on the canonical copy instead.
+    # Two DIFFERENT gaps, both closed here (CLAWP-098, Codex P1 on PR #55
+    # rounds 16-17): `leases.apply_fallback` runs its whole sweep under
+    # `suppress_session_resolution()` on purpose, so a lease can only ever be
+    # correctly reaped for a task that lives in the CANONICAL store.
+    #
+    # 1. Ambient-scope guard (round 16): cwd itself is inside a registered
+    #    worktree, so THIS command's own task lookups would be redirected
+    #    there even for a task that also exists canonically.
     if not is_task_store_canonical(config, project_id):
         output_error(
             "lease_unsupported_scope",
@@ -59,6 +64,32 @@ def lease_grant(ctx, project_id, task_id, ttl, fallback_policy, holder_id, targe
             f"supported there: crash-safety sweeps always act on the "
             f"canonical store, so a lease on a worktree-scoped task could "
             f"never be correctly reaped.",
+            fmt=fmt,
+        )
+        sys.exit(1)
+
+    # 2. Canonical-existence guard (round 17, grok review): unlike `tasks
+    #    dispatch --lease-ttl` — which already loaded the task under this
+    #    same active scope before granting, so guard #1 alone is a faithful
+    #    proxy — this command never loads the task at all; it just writes a
+    #    ledger event. From an ordinary (non-worktree) cwd, guard #1 passes
+    #    unconditionally, so a `--task <worktree-only-id>` naming a task that
+    #    exists ONLY inside some OTHER registered worktree would grant a
+    #    lease `apply_fallback` can never find (suppressed `get_task` returns
+    #    None), silently retiring it on the very first sweep with no
+    #    fallback ever applied — a lease that looks granted but can never
+    #    function. Verify existence in the canonical store explicitly.
+    with suppress_session_resolution():
+        canonical_task = get_task(config, project_id, task_id)
+    if canonical_task is None:
+        output_error(
+            "lease_unsupported_scope",
+            f"Task {task_id!r} does not exist in the canonical checkout for "
+            f"project {project_id!r}. Crash-safety sweeps always act on the "
+            f"canonical store, so a lease granted for a task that only "
+            f"exists in a worktree's own store could never be correctly "
+            f"reaped — it would be silently retired on the first sweep with "
+            f"no fallback ever applied.",
             fmt=fmt,
         )
         sys.exit(1)
