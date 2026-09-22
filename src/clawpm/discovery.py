@@ -269,6 +269,30 @@ def get_project_dir(config: PortfolioConfig, project_id: str) -> Path | None:
     return None
 
 
+def is_task_store_canonical(config: PortfolioConfig, project_id: str) -> bool:
+    """Whether ``get_project_dir`` would resolve *project_id* to the
+    CANONICAL checkout for the currently active scope (ambient cwd, or a
+    :func:`sessions.resolve_scope_from` override) rather than to a
+    registered worktree's own store.
+
+    Used to refuse a feature that cannot see a worktree-scoped task (CLAWP-098,
+    Codex P1 on PR #55 round 16): ``leases.apply_fallback`` runs the ENTIRE
+    sweep under ``suppress_session_resolution()`` on purpose, because it
+    processes whichever task's lease expired — one the operator did not name
+    in the current command — and must never inherit the caller's own worktree
+    for an unrelated task (see that function's docstring). A lease granted for
+    a task that lives in a worktree is therefore a lease the sweep can never
+    correctly act on: it would read (and mutate) the canonical copy, treating
+    the worktree-only task as missing. Simpler to refuse the lease than to
+    plumb scope through the lease registry and every sweep call site.
+
+    ``True`` for every ordinary single-checkout invocation (the overwhelming
+    majority) — this is a no-op there, mirroring ``get_project_dir``'s own
+    contract.
+    """
+    return _session_scoped_project_dir(config, project_id) is None
+
+
 def get_repo_path(config: PortfolioConfig, project_id: str) -> Path | None:
     """The checkout to run git in for *project_id* — session-scoped.
 

@@ -38,12 +38,31 @@ def lease_group() -> None:
 @click.pass_context
 def lease_grant(ctx, project_id, task_id, ttl, fallback_policy, holder_id, target_dir):
     """Grant a lease on a dispatched task."""
+    from clawpm.discovery import is_task_store_canonical
     from clawpm.leases import FallbackPolicy, grant_lease
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
     project_id, _ = require_project(ctx, project_id)
     task_id = expand_task_id(task_id, project_id)
+
+    # Same guard as `tasks dispatch --lease-ttl` (CLAWP-098, Codex P1 on
+    # PR #55 round 16): `leases.apply_fallback` runs its whole sweep under
+    # `suppress_session_resolution()` on purpose, so a lease on a task that
+    # lives in a registered worktree's own store can never be correctly
+    # reaped — the sweep would act on the canonical copy instead.
+    if not is_task_store_canonical(config, project_id):
+        output_error(
+            "lease_unsupported_scope",
+            f"Task {task_id!r} resolves from a registered worktree's own "
+            f"task store, not the canonical checkout. Leases are not "
+            f"supported there: crash-safety sweeps always act on the "
+            f"canonical store, so a lease on a worktree-scoped task could "
+            f"never be correctly reaped.",
+            fmt=fmt,
+        )
+        sys.exit(1)
+
     # Store an ABSOLUTE target dir (Codex P2) so a later sweep from a different
     # CWD tears down the right path — matching what `tasks dispatch` does.
     if target_dir:

@@ -12,7 +12,7 @@ import click
 from clawpm.concurrency import LockTimeout, file_lock
 from clawpm.models import PortfolioConfig, Predictions, ProjectStatus, SURPRISE_TAXONOMY, SuccessCriterion, Task, TaskComplexity, TaskState, WorkLogAction
 from clawpm.output import OutputFormat, output_error, output_json, output_success, output_task_detail, output_tasks_list
-from clawpm.discovery import discover_projects, get_project
+from clawpm.discovery import discover_projects, get_project, is_task_store_canonical
 from clawpm.tasks import add_subtask, add_task, archive_done_tasks, change_task_state, distinct_tags, edit_task, get_task, list_tasks, split_task
 from clawpm.worklog import add_entry, filter_files_changed, read_entries
 from clawpm.context import expand_task_id
@@ -1510,6 +1510,31 @@ def _tasks_dispatch_impl(
     if lease_ttl is not None and lease_ttl <= 0:
         output_error("lease_grant_failed",
                      f"--lease-ttl must be positive, got {lease_ttl}", fmt=fmt)
+        sys.exit(1)
+
+    # Refuse a lease for a task that does not live in the CANONICAL store
+    # (Codex P1, PR #55 round 16). `leases.apply_fallback` runs its entire
+    # sweep under `suppress_session_resolution()` — deliberately, since a
+    # sweep processes whichever task's lease expired, not one the operator
+    # named in the current command, and must never inherit the caller's own
+    # worktree for an unrelated task. So a lease granted for a task that
+    # lives in a registered worktree's own store is a lease the sweep can
+    # never correctly act on: it would read/mutate the canonical copy,
+    # treating the worktree-only task as missing, and silently leave the
+    # dispatch's live hooks untorn-down. Refuse up front rather than plumb
+    # scope through the lease registry and every sweep call site — the
+    # operator can dispatch without --lease-ttl for a worktree-scoped task.
+    if lease_ttl is not None and not is_task_store_canonical(config, project_id):
+        output_error(
+            "lease_unsupported_scope",
+            f"Task {task_id!r} resolves from a registered worktree's own "
+            f"task store, not the canonical checkout. --lease-ttl is not "
+            f"supported there: crash-safety sweeps always act on the "
+            f"canonical store, so a lease on a worktree-scoped task could "
+            f"never be correctly reaped. Dispatch without --lease-ttl, or "
+            f"dispatch the canonical copy of this task.",
+            fmt=fmt,
+        )
         sys.exit(1)
 
     project = get_project(config, project_id)

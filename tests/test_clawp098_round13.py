@@ -612,6 +612,63 @@ class TestMaterializationStatFaultFailsClosed:
         assert active_sessions(git_portfolio["root"]) == []
 
 
+class TestDoctorRunsCanonicallyFromAWorktree:
+    """Codex P1, round 16: `projects_to_check` is built from `discover_projects`
+    / `get_project` (canonical, cwd-independent), but the body's task lookups
+    went through the session-scoped chokepoint — a doctor run with cwd inside
+    a registered worktree combined the canonical project's blocked-task list
+    with the WORKTREE's dependency state."""
+
+    def test_list_tasks_is_called_under_suppression(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        import clawpm.cli.project as proj_mod
+        from clawpm.sessions import _suppress_session_resolution
+
+        _registered_worktree(git_portfolio, tmp_path, monkeypatch, _OWN_SETTINGS)
+        seen: list[bool] = []
+        real = proj_mod.list_tasks
+
+        def _record(config, project_id, *a, **k):
+            seen.append(_suppress_session_resolution.get())
+            return real(config, project_id, *a, **k)
+
+        monkeypatch.setattr(proj_mod, "list_tasks", _record)
+        r = CliRunner().invoke(main, ["doctor"])
+        assert r.exit_code == 0, r.output
+        assert seen, "list_tasks was never called"
+        assert all(seen), "doctor must suppress session resolution throughout"
+
+    def test_suppression_is_what_makes_the_worktree_task_invisible(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        """Confirms the suppression actually changes what's seen, not just
+        that the flag is set: unsuppressed, cwd inside the worktree redirects
+        `list_tasks` there (this IS what makes `tasks list` worktree-aware,
+        by design); suppressed — what `doctor` now does throughout — it
+        reads the canonical store instead, where this task was never
+        created."""
+        from clawpm.sessions import suppress_session_resolution
+        from clawpm.tasks import list_tasks
+
+        _registered_worktree(git_portfolio, tmp_path, monkeypatch, _OWN_SETTINGS)
+        task = add_task(  # lands in the worktree's own store (cwd is wt)
+            git_portfolio["config"], "test", "worktree-only-for-doctor",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+        assert task is not None
+
+        unsuppressed_ids = {t.id for t in list_tasks(git_portfolio["config"], "test")}
+        assert task.id in unsuppressed_ids
+
+        with suppress_session_resolution():
+            suppressed_ids = {t.id for t in list_tasks(git_portfolio["config"], "test")}
+        assert task.id not in suppressed_ids, (
+            "doctor's canonical scope must not see a task that only exists "
+            "in the worktree's own store"
+        )
+
+
 # ---------------------------------------------------------------------------
 # P1: dispatch_agent from a registered worktree stays in the canonical store
 # ---------------------------------------------------------------------------
@@ -861,6 +918,62 @@ class TestWriterFailureIsRolledBack:
 
         monkeypatch.setattr("clawpm.sessions.os.stat", _boom)
         assert _settings_still_present(tmp_path / "settings.local.json") is True
+
+    def test_worktree_scoped_task_refuses_lease_ttl(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        """Codex P1, round 16: `apply_fallback` always runs canonically
+        (`suppress_session_resolution`), so a lease on a worktree-scoped
+        task could never be correctly reaped. Refuse it up front."""
+        _registered_worktree(git_portfolio, tmp_path, monkeypatch, _OWN_SETTINGS)
+        task = add_task(  # lands in the worktree's own store
+            git_portfolio["config"], "test", "leased-in-worktree",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+        assert task is not None
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", task.id, "--lease-ttl", "60"],
+        )
+        assert r.exit_code == 1, r.output
+        assert "lease_unsupported_scope" in r.output
+        assert not settings_path(Path.cwd()).exists(), (
+            "nothing should have been installed"
+        )
+
+    def test_canonical_task_still_accepts_lease_ttl(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        _registered_worktree(git_portfolio, tmp_path, monkeypatch, _OWN_SETTINGS)
+        from clawpm.sessions import suppress_session_resolution
+
+        with suppress_session_resolution():
+            canonical = add_task(
+                git_portfolio["config"], "test", "canonical-leased",
+                predictions=Predictions(success_criteria=["C1"]),
+            )
+        assert canonical is not None
+        outside = tmp_path / "elsewhere"
+        r = CliRunner().invoke(
+            main, ["-p", "test", "tasks", "dispatch", canonical.id,
+                   "--target-dir", str(outside), "--lease-ttl", "60"],
+        )
+        assert r.exit_code == 0, r.output
+        assert settings_path(outside).exists()
+
+    def test_lease_grant_cli_refuses_a_worktree_scoped_task_too(
+        self, git_portfolio, tmp_path, monkeypatch
+    ):
+        _registered_worktree(git_portfolio, tmp_path, monkeypatch, _OWN_SETTINGS)
+        task = add_task(
+            git_portfolio["config"], "test", "leased-in-worktree-2",
+            predictions=Predictions(success_criteria=["C1"]),
+        )
+        assert task is not None
+        r = CliRunner().invoke(
+            main, ["-p", "test", "lease", "grant", "--task", task.id, "--ttl", "60"],
+        )
+        assert r.exit_code == 1, r.output
+        assert "lease_unsupported_scope" in r.output
 
     def test_dispatch_agent_writes_under_the_target_lock(
         self, git_portfolio, monkeypatch
