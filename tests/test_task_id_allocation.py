@@ -236,6 +236,50 @@ class TestHyphenOnSliceBoundary:
         assert "--" not in short  # CLAWP-096: no doubled separator either
         assert short != long_, (short, long_)
 
+    def test_taskless_twins_that_collapse_to_the_same_final_candidate_both_refuse(
+        self, tmp_path, monkeypatch
+    ):
+        # CLAWP-121 round 4 (grok-4.5, PR #60 round 3): round 3's fix
+        # discarded the excluding project's own final candidate
+        # UNCONDITIONALLY (unless a THIRD project had a resolved claim on
+        # it). That missed the case where TWO task-less siblings' final
+        # candidates are the identical string because trailing-separator
+        # stripping collapses both to it -- "clawpm-" and "clawpm---" both
+        # end at "CLAWPM" with nothing left to extend into. Each
+        # independent assign_task_prefix call discarded "CLAWPM" from its
+        # OWN used set and returned it -- both minted "CLAWPM", an actual
+        # literal id collision, which is worse than the pre-CLAWP-121
+        # behaviour (both correctly raised ValueError).
+        #
+        # Fix: a task-less PEER whose own final candidate equals the
+        # excluder's is treated as contesting it too -- neither discards,
+        # both correctly refuse (there is no ordering-free way to pick a
+        # winner between two projects that both have nowhere else to go).
+        _make_portfolio(tmp_path, monkeypatch, "clawpm-")
+        _add_project(tmp_path, "clawpm---")  # also collapses to "CLAWPM", task-less
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        results = {}
+        errors = {}
+        for pid in ("clawpm-", "clawpm---"):
+            try:
+                results[pid] = assign_task_prefix(
+                    pid, tmp_path / "projects" / pid / ".project" / "tasks", config,
+                )
+            except ValueError as exc:
+                errors[pid] = exc
+        # The actual invariant: never mint the same id for both. Refusing
+        # both (fail closed) satisfies it; minting the same string for both
+        # (round 3's bug) does not.
+        assert len(results) < 2 or len(set(results.values())) == len(results), (
+            results, errors,
+        )
+        # Pin the specific fix: both sides refuse rather than collide.
+        assert set(errors) == {"clawpm-", "clawpm---"}, (results, errors)
+
 
 # ---------------------------------------------------------------------------
 # CLAWP-048: cross-project prefix uniqueness (near-name-twin projects must not

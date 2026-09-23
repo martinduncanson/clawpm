@@ -1339,12 +1339,14 @@ def _naive_prefix_chain(project_id: str) -> set[str]:
     This over-reserves relative to what the sibling will actually end up
     claiming. ``_portfolio_prefixes`` compensates for the one case where
     that over-reservation would otherwise starve the EXCLUDING project
-    entirely -- see its docstring for the two rounds this went through
-    (a length-based cap was tried first, round 2, and found imprecise by
-    review: stripping can collapse two different-length slices to the same
-    string, so a RAW-length cap doesn't reliably protect the excluding
-    project's true last-resort candidate; round 3 protects that exact
-    string directly instead).
+    entirely, and for the case where two task-less siblings genuinely
+    contest the SAME final candidate -- see its docstring for the rounds
+    this went through (a length-based cap, round 2, found imprecise by
+    review since stripping can collapse two different-length slices to the
+    same string; an unconditional discard of the excluder's own final
+    candidate, round 3, found to let two genuinely-colliding task-less
+    twins both mint the same id; round 4 discards only when that final
+    candidate isn't ALSO independently claimed or contested by a peer).
     """
     full = project_id.upper()
     chain = {_naive_prefix_placeholder(project_id)}
@@ -1412,17 +1414,31 @@ def _portfolio_prefixes(config, exclude_id: str) -> set[str]:
     reach that exact string necessarily has room to extend past it instead
     (the same priority `exclude_can_extend` already gives a length-5
     project over a longer one, generalised to any length). So `exclude_id`'s
-    own final candidate is discarded from `used` at the end, UNLESS some
-    OTHER project has a real (resolved) claim on that exact string, which
-    must still block it -- `exclude_final_is_real_claim` tracks that.
+    own final candidate is discarded from `used` at the end, UNLESS it is
+    genuinely CONTESTED -- `exclude_final_is_contested` tracks two distinct
+    ways that can happen:
+
+    1. Some OTHER project has a real (resolved) claim on that exact string
+       -- a `task_prefix`/inferred prefix, which must always block it.
+    2. A task-less PEER's own final candidate (its full id, stripped) is
+       the IDENTICAL string. This is not the over-reservation artifact the
+       discard exists to undo -- it is a genuine ambiguity between two
+       projects that both, independently, have no room to go anywhere
+       else. (Round 3 discarded unconditionally and missed this: task-less
+       `clawpm-` / `clawpm---` both collapse to `CLAWPM` with nothing left
+       to extend into, so unconditionally discarding let BOTH independent
+       `assign_task_prefix` calls return `CLAWPM` -- an actual literal id
+       collision, worse than the pre-CLAWP-121 behaviour of both correctly
+       raising. grok-4.5, PR #60 round 3.) Failing closed (both refuse) is
+       correct here; there is no ordering-free way to pick a winner.
+
     (Round 2 tried capping each sibling's contributed chain by RAW id
-    length instead; grok-4.5 + Codex both found it imprecise, since
-    trailing-separator stripping can collapse two different-length slices
-    to the same string -- `"clawpm-"` and `"clawpm"` both end at `CLAWPM`
-    despite different raw lengths, so a length-only cap doesn't reliably
-    track the actual candidate string that needs protecting. Discarding the
-    exact stripped string directly, instead of a length proxy for it,
-    closes that gap.)
+    length instead of discarding a specific string; grok-4.5 + Codex both
+    found it imprecise, since trailing-separator stripping can collapse two
+    different-length slices to the same string -- `"clawpm-"` and
+    `"clawpm"` both end at `CLAWPM` despite different raw lengths, so a
+    length-only cap doesn't reliably track the actual candidate string that
+    needs protecting.)
 
     Raises:
         PortfolioPrefixScanError: a sibling's own tasks directory couldn't
@@ -1435,7 +1451,7 @@ def _portfolio_prefixes(config, exclude_id: str) -> set[str]:
 
     exclude_can_extend = len(exclude_id.upper()) > 5
     exclude_final = _strip_trailing_non_alnum(exclude_id.upper())
-    exclude_final_is_real_claim = False
+    exclude_final_is_contested = False
     used: set[str] = set()
     for p in discover_projects(config):
         if p.id == exclude_id:
@@ -1447,14 +1463,20 @@ def _portfolio_prefixes(config, exclude_id: str) -> set[str]:
         if resolved is not None:
             used.add(resolved)
             if resolved == exclude_final:
-                exclude_final_is_real_claim = True
+                exclude_final_is_contested = True
             continue
         if not exclude_can_extend and len(p.id.upper()) > 5:
             # We have no room to move; a flexible sibling's mere guess must
             # not block our only candidate -- it can step around us instead.
             continue
+        if _strip_trailing_non_alnum(p.id.upper()) == exclude_final:
+            # A task-less PEER's own final candidate is the identical
+            # string -- a genuine ambiguity (grok-4.5, PR #60 round 3), not
+            # the over-reservation artifact the discard below exists to
+            # undo. Leave it contested so both sides correctly refuse.
+            exclude_final_is_contested = True
         used.update(_naive_prefix_chain(p.id))
-    if not exclude_final_is_real_claim:
+    if not exclude_final_is_contested:
         used.discard(exclude_final)
     return used
 
