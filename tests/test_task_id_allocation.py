@@ -179,9 +179,10 @@ class TestHyphenOnSliceBoundary:
         # candidate at all -- a spurious ValueError -- even though the
         # shorter project has no room to move and the longer one does.
         #
-        # Fix: a sibling's chain reservation is capped at the EXCLUDING
-        # project's own full length, so a project always keeps a candidate
-        # at its own maximum length uncontested.
+        # Fix (round 3 -- see the next test for why round 2's length-cap
+        # version of this fix wasn't precise enough): `exclude_id`'s own
+        # final stripped candidate is always discarded from the reserved
+        # set unless some OTHER project has a genuine resolved claim on it.
         _make_portfolio(tmp_path, monkeypatch, "clawpm")
         _add_project(tmp_path, "clawpm-extra")  # literal-prefix sibling, task-less
 
@@ -198,6 +199,41 @@ class TestHyphenOnSliceBoundary:
             config,
         )
         assert short is not None  # must not raise/refuse -- a real candidate exists
+        assert short != long_, (short, long_)
+
+    def test_trailing_separator_id_still_keeps_its_own_final_candidate(
+        self, tmp_path, monkeypatch
+    ):
+        # CLAWP-121 round 3 (grok-4.5 + Codex, PR #60): round 2's fix capped
+        # a sibling's reservation by RAW id length (`n < len(exclude_id)`).
+        # That cap doesn't track the actual STRIPPED candidate string when
+        # the excluding project's own id ends in a separator -- "clawpm-"
+        # (7 raw chars) and "clawpm" (6 raw chars) both collapse to the same
+        # final candidate "CLAWPM" once `_strip_trailing_non_alnum` runs,
+        # but the length-based cap only protected candidates of length < 7,
+        # which still let a sibling's chain entry AT length 6 ("CLAWPM")
+        # block "clawpm-"'s only real last-resort value -- a spurious
+        # ValueError the length cap was specifically supposed to prevent.
+        #
+        # Fix: discard the excluding project's exact final candidate STRING
+        # (not a length boundary) from the reserved set.
+        _make_portfolio(tmp_path, monkeypatch, "clawpm-")
+        _add_project(tmp_path, "clawpm-extra")  # task-less, shares the collapse
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        short = assign_task_prefix(
+            "clawpm-", tmp_path / "projects" / "clawpm-" / ".project" / "tasks", config,
+        )
+        long_ = assign_task_prefix(
+            "clawpm-extra",
+            tmp_path / "projects" / "clawpm-extra" / ".project" / "tasks",
+            config,
+        )
+        assert short is not None
+        assert "--" not in short  # CLAWP-096: no doubled separator either
         assert short != long_, (short, long_)
 
 
