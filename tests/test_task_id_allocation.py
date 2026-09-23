@@ -129,6 +129,43 @@ class TestHyphenOnSliceBoundary:
         assert pre(second) != pre(first), (first, second)  # distinct namespaces
         assert len({first, second}) == 2, (first, second)  # no literal id collision
 
+    def test_two_taskless_siblings_with_deep_collision_do_not_converge_on_the_same_extension(
+        self, tmp_path, monkeypatch
+    ):
+        # CLAWP-121 (grok-4.6 repro, PR #57 round-17 fallout): "code-quorum"
+        # and "code-quiz" both reduce to base "CODE" -- AND their first
+        # extension also collides (both slice to "CODE-Q" at n=6). The
+        # previous test above ("code-quorum"/"code-runner") only diverges at
+        # n=6 ("CODE-Q" vs "CODE-R"), so it never exercised this.
+        #
+        # `_portfolio_prefixes` used to reserve only a task-less sibling's
+        # 5-char placeholder ("CODE"), not the full chain of extended
+        # candidates that sibling could still grow into. doctor's per-project
+        # loop calls `assign_task_prefix` independently for each task-less
+        # project (neither has minted, so neither sees the other's REAL
+        # resolution) -- so both calls saw only "CODE" reserved and both
+        # independently extended past it to the SAME "CODE-Q".
+        _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        _add_project(tmp_path, "code-quiz")  # also task-less at this point
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        # Independent calls, mirroring doctor's per-project loop -- neither
+        # persists a mint, so both see an identical task-less portfolio.
+        a = assign_task_prefix(
+            "code-quorum",
+            tmp_path / "projects" / "code-quorum" / ".project" / "tasks",
+            config,
+        )
+        b = assign_task_prefix(
+            "code-quiz",
+            tmp_path / "projects" / "code-quiz" / ".project" / "tasks",
+            config,
+        )
+        assert a != b, (a, b)  # the actual id-uniqueness invariant under test
+
 
 # ---------------------------------------------------------------------------
 # CLAWP-048: cross-project prefix uniqueness (near-name-twin projects must not

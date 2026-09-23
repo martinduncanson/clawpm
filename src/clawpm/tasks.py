@@ -1317,6 +1317,40 @@ def _naive_prefix_placeholder(project_id: str) -> str:
     return _strip_trailing_non_alnum(base)
 
 
+def _naive_prefix_chain(project_id: str) -> set[str]:
+    """Every prefix a still task-less project could still mint into.
+
+    The full candidate chain ``assign_task_prefix`` walks for a fresh
+    project: the 5-char base (``_naive_prefix_placeholder``), then each
+    longer stripped slice through the full id -- mirroring that function's
+    own extension loop exactly, so this reservation can never diverge from
+    what the allocator would actually try.
+
+    CLAWP-121: ``_portfolio_prefixes`` used to reserve only the 5-char base
+    for a task-less sibling, not this full chain. Two siblings whose ids
+    share more than 5 characters (``code-quorum`` / ``code-quiz``, both ->
+    ``CODE``) can also collide on their FIRST extension (both -> ``CODE-Q``)
+    -- reserving only the base left that shared extension invisible to
+    ``_portfolio_prefixes``, so two independent ``assign_task_prefix`` calls
+    (doctor's per-project loop, as opposed to sequential ``tasks add``
+    calls where the second sees the first's REAL minted prefix) each
+    independently concluded ``CODE-Q`` was free and both minted it.
+
+    This over-reserves relative to what the sibling will actually end up
+    claiming -- a sibling stops extending at its own first free candidate,
+    which may be much shorter than its full id. That is a deliberate
+    trade: a caller may occasionally be pushed to a longer-than-strictly-
+    necessary prefix, but two task-less siblings computed independently can
+    no longer converge on the same one, which is the actual invariant
+    (uniqueness, not shortness).
+    """
+    full = project_id.upper()
+    chain = {_naive_prefix_placeholder(project_id)}
+    for n in range(6, len(full) + 1):
+        chain.add(_strip_trailing_non_alnum(full[:n]))
+    return chain
+
+
 class PortfolioPrefixScanError(OSError):
     """A sibling's tasks directory couldn't be scanned while collecting
     portfolio prefixes.
@@ -1359,6 +1393,13 @@ def _portfolio_prefixes(config, exclude_id: str) -> set[str]:
     prefix (explicit `task_prefix`, or inferred from tasks it already
     minted) is a real claim regardless and is always included.
 
+    When a task-less sibling IS included, its entire reachable candidate
+    chain is reserved (`_naive_prefix_chain`), not just its first-candidate
+    guess -- CLAWP-121: two task-less siblings sharing more than 5
+    characters can also collide on their first EXTENSION (both -> the same
+    6-char candidate), which only the full chain makes visible to each
+    other's independent `assign_task_prefix` call.
+
     Raises:
         PortfolioPrefixScanError: a sibling's own tasks directory couldn't
             be scanned (locked/unreadable). Distinguished from a bare
@@ -1384,7 +1425,7 @@ def _portfolio_prefixes(config, exclude_id: str) -> set[str]:
             # We have no room to move; a flexible sibling's mere guess must
             # not block our only candidate -- it can step around us instead.
             continue
-        used.add(_naive_prefix_placeholder(p.id))
+        used.update(_naive_prefix_chain(p.id))
     return used
 
 
