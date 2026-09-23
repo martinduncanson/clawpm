@@ -166,6 +166,40 @@ class TestHyphenOnSliceBoundary:
         )
         assert a != b, (a, b)  # the actual id-uniqueness invariant under test
 
+    def test_taskless_sibling_whose_id_is_a_literal_prefix_does_not_starve_the_shorter_project(
+        self, tmp_path, monkeypatch
+    ):
+        # CLAWP-121 round 2 (code-reviewer + history-lens PRE-REVIEW, PR #60):
+        # the FIRST fix (reserving a task-less sibling's full extension
+        # chain, above) over-corrected. When one sibling's id is a literal
+        # prefix of another's ("clawpm" / "clawpm-extra" -- this repo's own
+        # naming pattern), the LONGER sibling's full chain contains the
+        # SHORTER project's own full id as one of its entries. Reserving
+        # that unconditionally left the shorter project with NO free
+        # candidate at all -- a spurious ValueError -- even though the
+        # shorter project has no room to move and the longer one does.
+        #
+        # Fix: a sibling's chain reservation is capped at the EXCLUDING
+        # project's own full length, so a project always keeps a candidate
+        # at its own maximum length uncontested.
+        _make_portfolio(tmp_path, monkeypatch, "clawpm")
+        _add_project(tmp_path, "clawpm-extra")  # literal-prefix sibling, task-less
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        short = assign_task_prefix(
+            "clawpm", tmp_path / "projects" / "clawpm" / ".project" / "tasks", config,
+        )
+        long_ = assign_task_prefix(
+            "clawpm-extra",
+            tmp_path / "projects" / "clawpm-extra" / ".project" / "tasks",
+            config,
+        )
+        assert short is not None  # must not raise/refuse -- a real candidate exists
+        assert short != long_, (short, long_)
+
 
 # ---------------------------------------------------------------------------
 # CLAWP-048: cross-project prefix uniqueness (near-name-twin projects must not

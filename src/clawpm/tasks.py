@@ -1317,36 +1317,43 @@ def _naive_prefix_placeholder(project_id: str) -> str:
     return _strip_trailing_non_alnum(base)
 
 
-def _naive_prefix_chain(project_id: str) -> set[str]:
-    """Every prefix a still task-less project could still mint into.
+def _naive_prefix_chain(project_id: str, exclude_full_len: int) -> set[str]:
+    """Every prefix a still task-less project could still mint into --
+    reserved on behalf of a SPECIFIC excluding project, capped at that
+    project's own maximum reach.
 
-    The full candidate chain ``assign_task_prefix`` walks for a fresh
-    project: the 5-char base (``_naive_prefix_placeholder``), then each
-    longer stripped slice through the full id -- mirroring that function's
-    own extension loop exactly, so this reservation can never diverge from
-    what the allocator would actually try.
+    The uncapped candidate chain ``assign_task_prefix`` walks for a fresh
+    project is the 5-char base (``_naive_prefix_placeholder``), then each
+    longer stripped slice through the full id. Reserving that whole chain
+    for every sibling fixes CLAWP-121's original bug (two task-less
+    siblings sharing more than 5 characters -- ``code-quorum`` / ``code-
+    quiz``, both -> ``CODE`` -- can also collide on their first EXTENSION,
+    both -> ``CODE-Q``, invisible to a base-only reservation) but
+    over-reserving unconditionally reintroduces the CLAWP-119 bug class in
+    a new shape: if one sibling's id is a literal prefix of the other's
+    (``clawpm`` / ``clawpm-extra``), the LONGER sibling's uncapped chain
+    contains the SHORTER project's own full id as one of its entries --
+    reserving it left the shorter project with no candidate left at all
+    (spurious ``ValueError``), even though the shorter project has no room
+    to move and should always win that candidate over a sibling that (by
+    construction, having more characters left) has somewhere else to go.
 
-    CLAWP-121: ``_portfolio_prefixes`` used to reserve only the 5-char base
-    for a task-less sibling, not this full chain. Two siblings whose ids
-    share more than 5 characters (``code-quorum`` / ``code-quiz``, both ->
-    ``CODE``) can also collide on their FIRST extension (both -> ``CODE-Q``)
-    -- reserving only the base left that shared extension invisible to
-    ``_portfolio_prefixes``, so two independent ``assign_task_prefix`` calls
-    (doctor's per-project loop, as opposed to sequential ``tasks add``
-    calls where the second sees the first's REAL minted prefix) each
-    independently concluded ``CODE-Q`` was free and both minted it.
-
-    This over-reserves relative to what the sibling will actually end up
-    claiming -- a sibling stops extending at its own first free candidate,
-    which may be much shorter than its full id. That is a deliberate
-    trade: a caller may occasionally be pushed to a longer-than-strictly-
-    necessary prefix, but two task-less siblings computed independently can
-    no longer converge on the same one, which is the actual invariant
-    (uniqueness, not shortness).
+    Capping a sibling's contributed entries to lengths strictly less than
+    ``exclude_full_len`` (the excluding project's own full id length)
+    generalises the existing ``exclude_can_extend`` priority rule: a
+    project at its own maximum length always keeps a candidate at that
+    length uncontested, and any sibling long enough to also reach that
+    exact string necessarily has room to extend past it instead. Verified
+    (CLAWP-121 round 2, PR #60): every one of ``clawpm``/``clawpm-extra``,
+    ``code-quorum``/``code-quiz``, ``code-quiz``/``code-quiz-legacy``, and
+    a worst-case prefix ladder (``code``/``code-a``/``code-ab``/
+    ``code-abc``) resolves to distinct, collision-free prefixes with this
+    cap, where the uncapped version raised ``ValueError`` on the first two.
     """
     full = project_id.upper()
     chain = {_naive_prefix_placeholder(project_id)}
-    for n in range(6, len(full) + 1):
+    limit = min(len(full) + 1, exclude_full_len)
+    for n in range(6, limit):
         chain.add(_strip_trailing_non_alnum(full[:n]))
     return chain
 
@@ -1393,12 +1400,15 @@ def _portfolio_prefixes(config, exclude_id: str) -> set[str]:
     prefix (explicit `task_prefix`, or inferred from tasks it already
     minted) is a real claim regardless and is always included.
 
-    When a task-less sibling IS included, its entire reachable candidate
-    chain is reserved (`_naive_prefix_chain`), not just its first-candidate
-    guess -- CLAWP-121: two task-less siblings sharing more than 5
-    characters can also collide on their first EXTENSION (both -> the same
-    6-char candidate), which only the full chain makes visible to each
-    other's independent `assign_task_prefix` call.
+    When a task-less sibling IS included, its reachable candidate chain is
+    reserved (`_naive_prefix_chain`), not just its first-candidate guess --
+    CLAWP-121: two task-less siblings sharing more than 5 characters can
+    also collide on their first EXTENSION (both -> the same 6-char
+    candidate), which only the fuller chain makes visible to each other's
+    independent `assign_task_prefix` call. That chain is capped at
+    `exclude_id`'s own full length (round 2 of the same fix) so a longer
+    sibling's reservation can never swallow a shorter project's own last-
+    resort candidate -- see `_naive_prefix_chain`'s docstring.
 
     Raises:
         PortfolioPrefixScanError: a sibling's own tasks directory couldn't
@@ -1409,7 +1419,8 @@ def _portfolio_prefixes(config, exclude_id: str) -> set[str]:
     """
     from .discovery import discover_projects
 
-    exclude_can_extend = len(exclude_id.upper()) > 5
+    exclude_full_len = len(exclude_id.upper())
+    exclude_can_extend = exclude_full_len > 5
     used: set[str] = set()
     for p in discover_projects(config):
         if p.id == exclude_id:
@@ -1425,7 +1436,7 @@ def _portfolio_prefixes(config, exclude_id: str) -> set[str]:
             # We have no room to move; a flexible sibling's mere guess must
             # not block our only candidate -- it can step around us instead.
             continue
-        used.update(_naive_prefix_chain(p.id))
+        used.update(_naive_prefix_chain(p.id, exclude_full_len))
     return used
 
 
