@@ -1434,37 +1434,52 @@ def _mint_taskless_candidate(project_id: str, used: set[str]) -> str:
 def _assign_taskless_prefixes(
     taskless_ids: set[str], used: set[str]
 ) -> tuple[dict[str, str], dict[str, ValueError]]:
-    """Mint every id in ``taskless_ids`` in ONE fixed order, adding each
-    mint to ``used`` before the next id is considered.
+    """Mint every id in ``taskless_ids``, one at a time, always picking the
+    MOST-CONSTRAINED remaining id next and adding its mint to ``used``
+    before the next pick -- so every later pick sees the true, current
+    state of the world, not a snapshot from before this pass started.
 
-    This is the deterministic pass itself (CLAWP-121). The order is the
-    MOST-CONSTRAINED-FIRST: ``(len(_naive_prefix_reach(pid)), pid.upper(),
-    pid)`` -- the id with the FEWEST distinct reachable candidates is
-    always minted before an id with more, so a flexible sibling can never
-    grab a shared candidate out from under one that has nowhere else to
-    go. This generalises CLAWP-119's "a project with no room to extend
-    must not be starved by a flexible sibling's mere guess" from its
-    original special case (an exactly-5-char id has exactly one
-    candidate) to every id, of any shape.
+    This is the deterministic pass itself (CLAWP-121). "Most constrained"
+    is measured freshly at EVERY step as ``len(_naive_prefix_reach(pid) -
+    used)`` -- how many of `pid`'s candidates are STILL free, right now --
+    not a one-time count computed before the loop begins. This generalises
+    CLAWP-119's "a project with no room to extend must not be starved by a
+    flexible sibling's mere guess" from its original special case (an
+    exactly-5-char id has exactly one candidate, full stop) to every id,
+    of any shape, and to the REMAINING candidates after both real claims
+    and every mint already made this pass -- not just the id's raw total.
 
-    Plain alphabetical-by-raw-id order (this pass's first cut -- see git
-    history) is NOT sufficient: it happens to agree with reach-count for
-    literal string prefixes (CLAWP-119's own case and most of this file's
-    other tests), but Codex + grok-4.6 both independently found a
-    counter-example on PR #60's first round of this rewrite --
-    trailing-separator stripping can make a raw-alphabetically-LATER id
-    have FEWER real options than one that sorts earlier (``"ab-cd_"``,
-    whose only extension collapses back to its own base, vs
-    ``"ab-cd-f"``, which merely shares that base but can extend past it).
-    Reach-count sorts by the thing that actually matters (how many
-    DISTINCT candidates remain) rather than by raw string content, so it
-    is immune to that class of counter-example by construction. The
-    secondary keys (``pid.upper()``, then ``pid``) break ties among
-    equally-constrained ids with a total order that is independent of set
-    iteration order (which varies with Python's hash seed) -- without
-    them, two case-variant ids (``"abcde"`` / ``"ABCDE"``) tie at every
-    prior key and the pass could pick a different winner across separate
-    process runs (Codex, same round).
+    Two earlier, weaker orderings on this same PR round each looked
+    sufficient until a review round found the case they missed:
+      1. Plain alphabetical-by-raw-id (this pass's first cut) failed on
+         trailing-separator ids -- ``"ab-cd_"`` (one real extension, which
+         collapses back to its own base) can sort AFTER a sibling that
+         merely shares its base but has genuine room (``"ab-cd-f"``),
+         because alphabetical order tracks raw string content, not how
+         many candidates remain (Codex + grok-4.6, independently).
+      2. A STATIC sort by TOTAL reach-count (``len(_naive_prefix_reach
+         (pid))``, computed once before the loop) fixed (1) but missed
+         that pre-existing REAL claims can consume a flexible-LOOKING id's
+         options unevenly: task-less ``abcdefg`` (3 total candidates) and
+         ``abcdefhi`` (4 total) with ``ABCDE``/``ABCDEFH``/``ABCDEFHI``
+         already claimed by resolved siblings -- ``abcdefhi`` has only
+         ONE candidate left (``ABCDEF``) once those claims are subtracted,
+         genuinely MORE constrained than ``abcdefg``'s two remaining
+         (``ABCDEF``, ``ABCDEFG``), but total-reach ranked them the other
+         way round and let ``abcdefg`` grab the shared ``ABCDEF`` first,
+         starving ``abcdefhi`` even though the valid assignment
+         ``abcdefg -> ABCDEFG`` / ``abcdefhi -> ABCDEF`` exists (Codex,
+         round 2 of this rewrite).
+
+    Recomputing against the LIVE ``used`` set at every step closes both:
+    it already reflects real claims from the start, and it reflects every
+    taskless mint made so far in THIS pass too, so a later pick can never
+    be blindsided by an earlier one the way a single upfront sort could.
+    Ties are broken by ``(pid.upper(), pid)`` -- a total order independent
+    of `taskless_ids`' set-iteration order (which varies with Python's
+    hash seed) -- without it, two case-variant ids (``"abcde"`` /
+    ``"ABCDE"``) tie completely and the pass could pick a different winner
+    across separate process runs (Codex, round 1).
 
     A project whose candidates are all exhausted (by real claims, or by
     earlier-processed siblings in this same pass) is collected into the
@@ -1475,11 +1490,13 @@ def _assign_taskless_prefixes(
     """
     assignments: dict[str, str] = {}
     errors: dict[str, ValueError] = {}
-    ordered = sorted(
-        taskless_ids,
-        key=lambda pid: (len(_naive_prefix_reach(pid)), pid.upper(), pid),
-    )
-    for pid in ordered:
+    remaining = set(taskless_ids)
+    while remaining:
+        pid = min(
+            remaining,
+            key=lambda p: (len(_naive_prefix_reach(p) - used), p.upper(), p),
+        )
+        remaining.discard(pid)
         try:
             candidate = _mint_taskless_candidate(pid, used)
         except ValueError as exc:

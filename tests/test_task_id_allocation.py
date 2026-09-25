@@ -478,6 +478,63 @@ class TestDeterministicGlobalPrefixPass:
         assert winners_first == winners_second, (first_run, second_run)
         assert len(winners_first) == 1, first_run  # exactly one side can win
 
+    def test_real_claims_that_unevenly_exhaust_a_flexible_siblings_reach_do_not_starve_it(
+        self, tmp_path, monkeypatch
+    ):
+        # PR #60, round 2 of this rewrite (Codex): a STATIC sort by TOTAL
+        # reach-count (computed once, before any minting) fixed round 1's
+        # bug but missed a second one -- pre-existing REAL claims can
+        # consume a nominally-more-flexible sibling's options so unevenly
+        # that it ends up MORE constrained in practice than one with a
+        # smaller total reach.
+        #
+        # Task-less "abcdefg" (own total reach: ABCDE, ABCDEF, ABCDEFG --
+        # 3) and "abcdefgh"-shaped "abcdefhi" (own total reach: ABCDE,
+        # ABCDEF, ABCDEFH, ABCDEFHI -- 4) share "ABCDEF" (both ids start
+        # "abcdef"). Three OTHER projects already hold explicit claims on
+        # ABCDE, ABCDEFH, and ABCDEFHI -- leaving "abcdefhi" with exactly
+        # ONE real option (ABCDEF) despite its total reach of 4, while
+        # "abcdefg" still has TWO (ABCDEF, ABCDEFG) despite its smaller
+        # total reach of 3. A static total-reach sort ranks "abcdefg" as
+        # more constrained (3 < 4) and lets it go first, greedily taking
+        # the shared "ABCDEF" it didn't strictly need -- starving
+        # "abcdefhi", which then has nothing left, even though the valid
+        # assignment "abcdefg -> ABCDEFG" / "abcdefhi -> ABCDEF" exists.
+        #
+        # Fix: recompute each id's REMAINING reach (candidates not yet in
+        # `used`) at EVERY pick, not once upfront -- this already reflects
+        # the real claims from the start, so "abcdefhi"'s true remaining
+        # count (1) correctly beats "abcdefg"'s (2) and it is minted
+        # first.
+        _make_portfolio(tmp_path, monkeypatch, "abcdefg")
+        _add_project(tmp_path, "abcdefhi")  # task-less, shares "abcdef"
+        _add_project(tmp_path, "claim-base", task_prefix="ABCDE")
+        _add_project(tmp_path, "claim-h", task_prefix="ABCDEFH")
+        _add_project(tmp_path, "claim-hi", task_prefix="ABCDEFHI")
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        # Note the inversion this test exists to pin: "abcdefg" (smaller
+        # TOTAL reach, 3) ends up with the LONGER final prefix, while
+        # "abcdefhi" (larger total reach, 4, but only 1 REMAINING once
+        # real claims are subtracted) correctly wins the shorter shared
+        # candidate it has no alternative to.
+        g_result = assign_task_prefix(
+            "abcdefg", tmp_path / "projects" / "abcdefg" / ".project" / "tasks", config,
+        )
+        hi_result = assign_task_prefix(
+            "abcdefhi",
+            tmp_path / "projects" / "abcdefhi" / ".project" / "tasks",
+            config,
+        )
+        assert g_result is not None  # must not raise -- a real candidate exists
+        assert hi_result is not None  # "abcdefhi" must not be starved
+        assert g_result != hi_result, (g_result, hi_result)
+        assert hi_result == "ABCDEF", hi_result  # its only remaining real option
+        assert g_result == "ABCDEFG", g_result  # pushed to its own last resort
+
 
 # ---------------------------------------------------------------------------
 # CLAWP-048: cross-project prefix uniqueness (near-name-twin projects must not
