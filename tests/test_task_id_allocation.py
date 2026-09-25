@@ -129,22 +129,45 @@ class TestHyphenOnSliceBoundary:
         assert pre(second) != pre(first), (first, second)  # distinct namespaces
         assert len({first, second}) == 2, (first, second)  # no literal id collision
 
+
+class TestDeterministicGlobalPrefixPass:
+    """CLAWP-121: two task-less siblings assigned via INDEPENDENT calls to
+    ``assign_task_prefix`` (exactly what ``clawpm doctor``'s per-project loop
+    does — unlike sequential ``clawpm tasks add`` calls, where the second call
+    sees the first's REAL minted prefix already claimed) could each guess a
+    prefix the other would also guess, because the old implementation
+    reserved only a PREDICTION of what a sibling might mint.
+
+    PR #60 tried to fix this by having ``_portfolio_prefixes`` reserve each
+    task-less sibling's full candidate CHAIN instead of just its first
+    guess, then patching the fallout of that over-reservation round by
+    round: capping the chain (round 2), discarding the excluding project's
+    own final candidate (round 3), and re-including that final candidate
+    when a peer genuinely contests it (round 4). Four independent review
+    rounds each found a NEW bug in that approach, including one (Codex,
+    round 3, P1 "Preserve a candidate before a resolved terminal claim")
+    that round 4 never fixed — see PR #60's thread for the full history.
+
+    This class replaces that whole "reserve a prediction, then patch what
+    the prediction gets wrong" design with a single deterministic pass:
+    every task-less project's prefix is decided EXACTLY ONCE, in a fixed
+    (alphabetical) order, from the prefixes already decided for the
+    projects before it in that order — simulating what sequential
+    ``tasks add`` calls already do naturally, with nothing to predict and
+    nothing to over-reserve. Every test below reproduces one of the five
+    distinct bug shapes the four review rounds found and confirms the new
+    pass resolves it cleanly (no collision, no spurious refusal) rather
+    than needing a bespoke patch for that shape.
+    """
+
     def test_two_taskless_siblings_with_deep_collision_do_not_converge_on_the_same_extension(
         self, tmp_path, monkeypatch
     ):
-        # CLAWP-121 (grok-4.6 repro, PR #57 round-17 fallout): "code-quorum"
-        # and "code-quiz" both reduce to base "CODE" -- AND their first
-        # extension also collides (both slice to "CODE-Q" at n=6). The
-        # previous test above ("code-quorum"/"code-runner") only diverges at
-        # n=6 ("CODE-Q" vs "CODE-R"), so it never exercised this.
-        #
-        # `_portfolio_prefixes` used to reserve only a task-less sibling's
-        # 5-char placeholder ("CODE"), not the full chain of extended
-        # candidates that sibling could still grow into. doctor's per-project
-        # loop calls `assign_task_prefix` independently for each task-less
-        # project (neither has minted, so neither sees the other's REAL
-        # resolution) -- so both calls saw only "CODE" reserved and both
-        # independently extended past it to the SAME "CODE-Q".
+        # PR #60 round 1 (grok-4.6 repro): "code-quorum" and "code-quiz"
+        # both reduce to base "CODE" -- AND their first extension also
+        # collides (both slice to "CODE-Q" at n=6). Neither has minted, so
+        # both independent `assign_task_prefix` calls (doctor's per-project
+        # loop) see an identical task-less portfolio.
         _make_portfolio(tmp_path, monkeypatch, "code-quorum")
         _add_project(tmp_path, "code-quiz")  # also task-less at this point
 
@@ -152,8 +175,6 @@ class TestHyphenOnSliceBoundary:
         from clawpm.tasks import assign_task_prefix
 
         config = load_portfolio_config(tmp_path)
-        # Independent calls, mirroring doctor's per-project loop -- neither
-        # persists a mint, so both see an identical task-less portfolio.
         a = assign_task_prefix(
             "code-quorum",
             tmp_path / "projects" / "code-quorum" / ".project" / "tasks",
@@ -169,20 +190,14 @@ class TestHyphenOnSliceBoundary:
     def test_taskless_sibling_whose_id_is_a_literal_prefix_does_not_starve_the_shorter_project(
         self, tmp_path, monkeypatch
     ):
-        # CLAWP-121 round 2 (code-reviewer + history-lens PRE-REVIEW, PR #60):
-        # the FIRST fix (reserving a task-less sibling's full extension
-        # chain, above) over-corrected. When one sibling's id is a literal
-        # prefix of another's ("clawpm" / "clawpm-extra" -- this repo's own
-        # naming pattern), the LONGER sibling's full chain contains the
-        # SHORTER project's own full id as one of its entries. Reserving
-        # that unconditionally left the shorter project with NO free
-        # candidate at all -- a spurious ValueError -- even though the
-        # shorter project has no room to move and the longer one does.
-        #
-        # Fix (round 3 -- see the next test for why round 2's length-cap
-        # version of this fix wasn't precise enough): `exclude_id`'s own
-        # final stripped candidate is always discarded from the reserved
-        # set unless some OTHER project has a genuine resolved claim on it.
+        # PR #60 round 2: when one sibling's id is a literal prefix of
+        # another's ("clawpm" / "clawpm-extra" -- this repo's own naming
+        # pattern), a chain-reservation approach can leave the SHORTER
+        # project with no free candidate at all, even though it has no room
+        # to move and should win. Under a deterministic pass this never
+        # arises: "clawpm" sorts before any sibling whose id starts with
+        # "clawpm" (a strict prefix always sorts first lexicographically),
+        # so it is minted FIRST and simply claims its own base.
         _make_portfolio(tmp_path, monkeypatch, "clawpm")
         _add_project(tmp_path, "clawpm-extra")  # literal-prefix sibling, task-less
 
@@ -204,19 +219,14 @@ class TestHyphenOnSliceBoundary:
     def test_trailing_separator_id_still_keeps_its_own_final_candidate(
         self, tmp_path, monkeypatch
     ):
-        # CLAWP-121 round 3 (grok-4.5 + Codex, PR #60): round 2's fix capped
-        # a sibling's reservation by RAW id length (`n < len(exclude_id)`).
-        # That cap doesn't track the actual STRIPPED candidate string when
-        # the excluding project's own id ends in a separator -- "clawpm-"
-        # (7 raw chars) and "clawpm" (6 raw chars) both collapse to the same
-        # final candidate "CLAWPM" once `_strip_trailing_non_alnum` runs,
-        # but the length-based cap only protected candidates of length < 7,
-        # which still let a sibling's chain entry AT length 6 ("CLAWPM")
-        # block "clawpm-"'s only real last-resort value -- a spurious
-        # ValueError the length cap was specifically supposed to prevent.
-        #
-        # Fix: discard the excluding project's exact final candidate STRING
-        # (not a length boundary) from the reserved set.
+        # PR #60 round 3 (grok-4.5 + Codex): a length-based cap on a
+        # sibling's reservation doesn't track the actual STRIPPED candidate
+        # string when the excluding project's own id ends in a separator --
+        # "clawpm-" (7 raw chars) and "clawpm" (6 raw chars) can collapse
+        # onto the same stripped string despite different raw lengths. A
+        # deterministic pass has no cap to get wrong: "clawpm-"'s base is
+        # "CLAWP" (its OWN first-5-chars slice, distinct from "clawpm-extra"'s
+        # base once stripped), minted directly with nothing to contest it.
         _make_portfolio(tmp_path, monkeypatch, "clawpm-")
         _add_project(tmp_path, "clawpm-extra")  # task-less, shares the collapse
 
@@ -236,25 +246,27 @@ class TestHyphenOnSliceBoundary:
         assert "--" not in short  # CLAWP-096: no doubled separator either
         assert short != long_, (short, long_)
 
-    def test_taskless_twins_that_collapse_to_the_same_final_candidate_both_refuse(
+    def test_taskless_twins_whose_ids_collapse_to_the_same_final_candidate_resolve_without_collision(
         self, tmp_path, monkeypatch
     ):
-        # CLAWP-121 round 4 (grok-4.5, PR #60 round 3): round 3's fix
-        # discarded the excluding project's own final candidate
-        # UNCONDITIONALLY (unless a THIRD project had a resolved claim on
-        # it). That missed the case where TWO task-less siblings' final
-        # candidates are the identical string because trailing-separator
-        # stripping collapses both to it -- "clawpm-" and "clawpm---" both
-        # end at "CLAWPM" with nothing left to extend into. Each
-        # independent assign_task_prefix call discarded "CLAWPM" from its
-        # OWN used set and returned it -- both minted "CLAWPM", an actual
-        # literal id collision, which is worse than the pre-CLAWP-121
-        # behaviour (both correctly raised ValueError).
+        # PR #60 round 4 (grok-4.5): "clawpm-" and "clawpm---" both
+        # trailing-separator-collapse to the same FINAL candidate ("CLAWPM")
+        # once each has exhausted every shorter slice. The chain-reservation
+        # approach's round-3 fix unconditionally discarded the excluding
+        # project's own final candidate from the reserved set -- which let
+        # BOTH independent calls discard it and mint the identical "CLAWPM",
+        # an actual literal id collision (worse than refusing).
         #
-        # Fix: a task-less PEER whose own final candidate equals the
-        # excluder's is treated as contesting it too -- neither discards,
-        # both correctly refuse (there is no ordering-free way to pick a
-        # winner between two projects that both have nowhere else to go).
+        # Under a deterministic pass there is no "final candidate" special
+        # case at all: "clawpm-" sorts before "clawpm---" (a strict prefix),
+        # is minted first, and claims its own BASE ("CLAWP", not "CLAWPM"
+        # -- it never needs to reach its final candidate because nothing
+        # has claimed its base yet). "clawpm---" is minted second, sees
+        # "CLAWP" already taken, and extends to "CLAWPM". Both resolve
+        # cleanly with DISTINCT prefixes -- a strictly better outcome than
+        # PR #60's fix, which had both sides refuse (CLAWP-121's premise:
+        # switching approaches removes this failure mode rather than
+        # patching around it).
         _make_portfolio(tmp_path, monkeypatch, "clawpm-")
         _add_project(tmp_path, "clawpm---")  # also collapses to "CLAWPM", task-less
 
@@ -263,22 +275,78 @@ class TestHyphenOnSliceBoundary:
 
         config = load_portfolio_config(tmp_path)
         results = {}
-        errors = {}
         for pid in ("clawpm-", "clawpm---"):
-            try:
-                results[pid] = assign_task_prefix(
-                    pid, tmp_path / "projects" / pid / ".project" / "tasks", config,
-                )
-            except ValueError as exc:
-                errors[pid] = exc
-        # The actual invariant: never mint the same id for both. Refusing
-        # both (fail closed) satisfies it; minting the same string for both
-        # (round 3's bug) does not.
-        assert len(results) < 2 or len(set(results.values())) == len(results), (
-            results, errors,
+            results[pid] = assign_task_prefix(
+                pid, tmp_path / "projects" / pid / ".project" / "tasks", config,
+            )
+        # Neither call may raise (unlike PR #60's fix), and the two must
+        # never share a namespace.
+        assert len(set(results.values())) == 2, results
+
+    def test_taskless_sibling_with_room_to_extend_is_not_starved_by_a_flexible_peers_reservation(
+        self, tmp_path, monkeypatch
+    ):
+        # PR #60 round 3, Codex P1 "Preserve a candidate before a resolved
+        # terminal claim" -- the ONE finding round 4 never fixed (PR #60
+        # paused there per its own stop condition rather than attempting a
+        # round 5). Task-less "abcdefg" and "abcdefgh" plus a THIRD project
+        # with an explicit claim on "ABCDEFG": a chain-reservation approach
+        # has the longer sibling ("abcdefgh") speculatively reserve EVERY
+        # candidate through its own full length, including "ABCDE" and
+        # "ABCDEF" -- entries it doesn't actually need, since it has room
+        # to sit at "ABCDEFGH" instead. That over-reservation, combined
+        # with the real "ABCDEFG" claim, exhausted "abcdefg" entirely even
+        # though a collision-free assignment plainly exists.
+        #
+        # A deterministic pass never reserves a merely-POSSIBLE candidate:
+        # "abcdefg" is minted first (sorts before "abcdefgh", a strict
+        # prefix) and simply claims its own free base "ABCDE" -- nothing
+        # has claimed it yet, so there is nothing to starve.
+        _make_portfolio(tmp_path, monkeypatch, "abcdefg")
+        _add_project(tmp_path, "abcdefgh")  # task-less, shares the base
+        _add_project(tmp_path, "claimant", task_prefix="ABCDEFG")
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        short = assign_task_prefix(
+            "abcdefg", tmp_path / "projects" / "abcdefg" / ".project" / "tasks", config,
         )
-        # Pin the specific fix: both sides refuse rather than collide.
-        assert set(errors) == {"clawpm-", "clawpm---"}, (results, errors)
+        long_ = assign_task_prefix(
+            "abcdefgh",
+            tmp_path / "projects" / "abcdefgh" / ".project" / "tasks",
+            config,
+        )
+        assert short is not None  # must not raise -- a real candidate exists
+        assert long_ is not None
+        assert short != long_, (short, long_)
+        assert short != "ABCDEFG" and long_ != "ABCDEFG"  # the real claim
+
+    def test_three_way_prefix_ladder_resolves_without_collision(self, tmp_path, monkeypatch):
+        # Round-1 review concern (not itself a confirmed bug, but explicitly
+        # flagged as unverified): 3+ task-less siblings that are all mutual
+        # id-prefixes of one another ("code" / "code-a" / "code-ab" /
+        # "code-abc") all share the same 5-char base. A deterministic pass
+        # handles this the same way as the 2-sibling cases: alphabetical
+        # order matches shortest-prefix-first, so each is minted in turn
+        # and extends only as far as it needs to.
+        _make_portfolio(tmp_path, monkeypatch, "code")
+        _add_project(tmp_path, "code-a")
+        _add_project(tmp_path, "code-ab")
+        _add_project(tmp_path, "code-abc")
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        results = {
+            pid: assign_task_prefix(
+                pid, tmp_path / "projects" / pid / ".project" / "tasks", config,
+            )
+            for pid in ("code", "code-a", "code-ab", "code-abc")
+        }
+        assert len(set(results.values())) == 4, results
 
 
 # ---------------------------------------------------------------------------
