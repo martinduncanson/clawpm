@@ -348,6 +348,136 @@ class TestDeterministicGlobalPrefixPass:
         }
         assert len(set(results.values())) == 4, results
 
+    def test_trailing_separator_id_with_no_real_extension_is_not_starved_by_a_flexible_sibling(
+        self, tmp_path, monkeypatch
+    ):
+        # PR #60, round 1 of THIS rewrite (Codex + grok-4.6, independently,
+        # different concrete repros converging on the same root cause):
+        # sorting task-less ids ALPHABETICALLY BY RAW ID does not correctly
+        # encode "who has less room to move". "ab-cd_" (trailing "_" strips
+        # away, so its ONLY extension collapses right back to its own base
+        # -- genuinely zero room) sorts AFTER "ab-cd-f" (shares that same
+        # base but can extend to "AB-CD-F") under plain alphabetical order,
+        # because '_' > '-' in ASCII. The flexible sibling was minted
+        # first, greedily took the shared base it didn't actually need,
+        # and starved the constrained one -- exactly the CLAWP-119 failure
+        # mode this whole design is supposed to prevent, reopened by the
+        # new sort key.
+        #
+        # Fix: order by ``len(_naive_prefix_reach(pid))`` ascending (how
+        # many DISTINCT candidates an id can reach) instead of raw id
+        # content -- "ab-cd_" has exactly 1 reachable candidate, "ab-cd-f"
+        # has 2, so the constrained one is always minted first regardless
+        # of what either raw id looks like.
+        _make_portfolio(tmp_path, monkeypatch, "ab-cd_")
+        _add_project(tmp_path, "ab-cd-f")  # shares the base, but can extend
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        short = assign_task_prefix(
+            "ab-cd_", tmp_path / "projects" / "ab-cd_" / ".project" / "tasks", config,
+        )
+        long_ = assign_task_prefix(
+            "ab-cd-f",
+            tmp_path / "projects" / "ab-cd-f" / ".project" / "tasks",
+            config,
+        )
+        assert short is not None  # must not raise -- "ab-cd-f" can step around
+        assert long_ is not None
+        assert short != long_, (short, long_)
+
+    def test_case_variant_twins_resolve_deterministically_across_runs(
+        self, tmp_path, monkeypatch
+    ):
+        # PR #60, round 1 of this rewrite (Codex): two task-less ids that
+        # differ only by case ("abcde" / "ABCDE") both uppercase to the
+        # IDENTICAL string, so a sort keyed only on `pid.upper()` (or
+        # `len(reach)` alone, which also ties for these two) leaves the
+        # relative order dependent on `taskless_ids`' set-iteration order
+        # -- which varies with Python's per-process hash seed. Two
+        # concurrent processes could each pick a DIFFERENT winner and both
+        # believe they minted the free candidate.
+        #
+        # A same-process test can't directly observe a DIFFERENT hash
+        # seed (it's fixed for the life of the process, so calling the
+        # allocator twice in one test process trivially agrees with
+        # itself regardless of whether the tiebreak is hash-independent).
+        # The property that actually needs pinning is the SORT KEY
+        # ITSELF: does it produce the same ordering no matter what order
+        # its inputs are handed to it in (the same thing a different
+        # process's hash seed would vary)? Test that directly against the
+        # private key function -- sorting the SAME two ids as two
+        # differently-ORDERED input lists must agree, which is exactly
+        # what set-iteration-order independence requires.
+        from clawpm.tasks import _naive_prefix_reach
+
+        def _sort_key(pid: str) -> tuple:
+            return (len(_naive_prefix_reach(pid)), pid.upper(), pid)
+
+        forward = sorted(["abcde", "ABCDE"], key=_sort_key)
+        reverse = sorted(["ABCDE", "abcde"], key=_sort_key)
+        assert forward == reverse, (forward, reverse)
+        # Case-sensitive comparison ('A' < 'a' in ASCII) is what actually
+        # makes this deterministic -- a key without the raw-`pid` tiebreak
+        # (just `(len(reach), pid.upper())`) would tie completely on this
+        # pair and fall through to input order, which is exactly the
+        # hash-seed-dependent behaviour being fixed.
+        assert forward[0] == "ABCDE", forward
+
+        # End-to-end sanity check through the public API: whichever side
+        # wins must be the SAME side every time this process resolves it
+        # (weaker than the property above, but confirms the private key
+        # is the one actually driving `assign_task_prefix`).
+        #
+        # Windows directory names are case-insensitive, so the two
+        # projects can't live in dirs named "abcde" / "ABCDE" (they'd
+        # collide on disk) -- a project's id comes from its settings.toml
+        # `id =` field, not its directory name, so two distinctly-named
+        # directories declaring case-variant ids reproduces the same
+        # logical scenario without touching the filesystem's own
+        # case-folding.
+        ids = {"proj-lower": "abcde", "proj-upper": "ABCDE"}
+        _make_portfolio(tmp_path, monkeypatch, "proj-lower")
+        (tmp_path / "projects" / "proj-lower" / ".project" / "settings.toml").write_text(
+            'id = "abcde"\nname = "proj-lower"\nstatus = "active"\npriority = 3\n',
+            encoding="utf-8",
+        )
+        meta = tmp_path / "projects" / "proj-upper" / ".project"
+        (meta / "tasks" / "done").mkdir(parents=True)
+        (meta / "tasks" / "blocked").mkdir(parents=True)
+        (meta / "settings.toml").write_text(
+            'id = "ABCDE"\nname = "proj-upper"\nstatus = "active"\npriority = 3\n',
+            encoding="utf-8",
+        )
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+
+        def _resolve():
+            results = {}
+            for dirname, pid in ids.items():
+                try:
+                    results[pid] = assign_task_prefix(
+                        pid, tmp_path / "projects" / dirname / ".project" / "tasks", config,
+                    )
+                except ValueError as exc:
+                    results[pid] = exc
+            return results
+
+        first_run = _resolve()
+        second_run = _resolve()
+        # Whichever side won (got "ABCDE" back, not a ValueError) must be
+        # the SAME side both times -- not merely "some deterministic
+        # result", but the identical winner across repeated calls.
+        winners_first = {pid for pid, v in first_run.items() if isinstance(v, str)}
+        winners_second = {pid for pid, v in second_run.items() if isinstance(v, str)}
+        assert winners_first == winners_second, (first_run, second_run)
+        assert len(winners_first) == 1, first_run  # exactly one side can win
+
 
 # ---------------------------------------------------------------------------
 # CLAWP-048: cross-project prefix uniqueness (near-name-twin projects must not

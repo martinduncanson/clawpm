@@ -1342,10 +1342,49 @@ class PortfolioPrefixScanError(OSError):
         super().__init__(message)
 
 
+def _naive_prefix_candidates(project_id: str):
+    """The full id-derived candidate sequence for ``project_id``, shortest
+    first: the base (``_naive_prefix_placeholder``), then each longer
+    stripped slice through the full id -- in the exact order
+    ``_mint_taskless_candidate`` tries them.
+
+    NOT deduplicated: trailing-separator stripping can make more than one
+    slice length collapse to the identical string (``"clawpm-".upper()``'s
+    ``[:6]`` and ``[:7]`` both strip to ``"CLAWPM"``), so this can yield
+    the same value more than once. ``_mint_taskless_candidate`` (first
+    available) and ``_naive_prefix_reach`` (distinct set, for ordering) both
+    derive from this ONE sequence, so they can never disagree about what a
+    given id's chain contains.
+    """
+    full = project_id.upper()
+    yield _naive_prefix_placeholder(project_id)
+    for n in range(6, len(full) + 1):
+        yield _strip_trailing_non_alnum(full[:n])
+
+
+def _naive_prefix_reach(project_id: str) -> frozenset[str]:
+    """The DISTINCT id-derived candidates ``project_id`` could ever mint
+    into -- the size of this set is the project's real flexibility.
+
+    CLAWP-121 round-1-of-this-rewrite (Codex + grok-4.6, PR #60): sorting
+    task-less ids alphabetically by raw id does NOT correctly prioritise
+    "no room to extend" the way CLAWP-119 needs, because trailing-
+    separator stripping can make a SHORT-on-real-options id (e.g.
+    ``"ab-cd_"``, whose only extension collapses right back to its own
+    base) sort AFTER a sibling that merely shares its base but has real
+    room to move (e.g. ``"ab-cd-f"``) -- alphabetical order tracks raw
+    string content, not how many DISTINCT prefixes an id can actually
+    reach. Sorting by ``len(_naive_prefix_reach(...))`` ascending instead
+    generalises CLAWP-119 exactly: an id with only ONE reachable candidate
+    (no room at all -- the original CLAWP-119 case) is always processed
+    before any id with more, regardless of raw id length or content.
+    """
+    return frozenset(_naive_prefix_candidates(project_id))
+
+
 def _mint_taskless_candidate(project_id: str, used: set[str]) -> str:
     """The shortest id-derived prefix for ``project_id`` not already in
-    ``used`` -- the base (``_naive_prefix_placeholder``), then each longer
-    stripped slice through the full id.
+    ``used`` -- see ``_naive_prefix_candidates`` for the exact sequence.
 
     Shared by ``assign_task_prefix``'s own-candidate search and
     ``_assign_taskless_prefixes``'s sequential pass, so the two can never
@@ -1356,11 +1395,7 @@ def _mint_taskless_candidate(project_id: str, used: set[str]) -> str:
             already in ``used``.
     """
     full = project_id.upper()
-    base = _naive_prefix_placeholder(project_id)
-    if base and base not in used:
-        return base
-    for n in range(6, len(full) + 1):
-        candidate = _strip_trailing_non_alnum(full[:n])
+    for candidate in _naive_prefix_candidates(project_id):
         if candidate not in used:
             return candidate
     # ids are portfolio-unique, so id-derived candidates can't collide with
@@ -1399,17 +1434,37 @@ def _mint_taskless_candidate(project_id: str, used: set[str]) -> str:
 def _assign_taskless_prefixes(
     taskless_ids: set[str], used: set[str]
 ) -> tuple[dict[str, str], dict[str, ValueError]]:
-    """Mint every id in ``taskless_ids`` in ONE fixed (alphabetical) order,
-    adding each mint to ``used`` before the next id is considered.
+    """Mint every id in ``taskless_ids`` in ONE fixed order, adding each
+    mint to ``used`` before the next id is considered.
 
-    This is the deterministic pass itself (CLAWP-121): the shortest id is
-    always minted before any longer id that shares its prefix, because a
-    strict string prefix always sorts before the string it prefixes --
-    which is exactly the priority CLAWP-119's "a project with no room to
-    extend must not be starved by a flexible sibling's mere guess" carved
-    out as a special case for the old reserve-based design. Here it falls
-    out of the ordering for free: nothing is ever reserved on a sibling's
-    behalf, so nothing needs correcting afterward.
+    This is the deterministic pass itself (CLAWP-121). The order is the
+    MOST-CONSTRAINED-FIRST: ``(len(_naive_prefix_reach(pid)), pid.upper(),
+    pid)`` -- the id with the FEWEST distinct reachable candidates is
+    always minted before an id with more, so a flexible sibling can never
+    grab a shared candidate out from under one that has nowhere else to
+    go. This generalises CLAWP-119's "a project with no room to extend
+    must not be starved by a flexible sibling's mere guess" from its
+    original special case (an exactly-5-char id has exactly one
+    candidate) to every id, of any shape.
+
+    Plain alphabetical-by-raw-id order (this pass's first cut -- see git
+    history) is NOT sufficient: it happens to agree with reach-count for
+    literal string prefixes (CLAWP-119's own case and most of this file's
+    other tests), but Codex + grok-4.6 both independently found a
+    counter-example on PR #60's first round of this rewrite --
+    trailing-separator stripping can make a raw-alphabetically-LATER id
+    have FEWER real options than one that sorts earlier (``"ab-cd_"``,
+    whose only extension collapses back to its own base, vs
+    ``"ab-cd-f"``, which merely shares that base but can extend past it).
+    Reach-count sorts by the thing that actually matters (how many
+    DISTINCT candidates remain) rather than by raw string content, so it
+    is immune to that class of counter-example by construction. The
+    secondary keys (``pid.upper()``, then ``pid``) break ties among
+    equally-constrained ids with a total order that is independent of set
+    iteration order (which varies with Python's hash seed) -- without
+    them, two case-variant ids (``"abcde"`` / ``"ABCDE"``) tie at every
+    prior key and the pass could pick a different winner across separate
+    process runs (Codex, same round).
 
     A project whose candidates are all exhausted (by real claims, or by
     earlier-processed siblings in this same pass) is collected into the
@@ -1420,7 +1475,11 @@ def _assign_taskless_prefixes(
     """
     assignments: dict[str, str] = {}
     errors: dict[str, ValueError] = {}
-    for pid in sorted(taskless_ids, key=str.upper):
+    ordered = sorted(
+        taskless_ids,
+        key=lambda pid: (len(_naive_prefix_reach(pid)), pid.upper(), pid),
+    )
+    for pid in ordered:
         try:
             candidate = _mint_taskless_candidate(pid, used)
         except ValueError as exc:
