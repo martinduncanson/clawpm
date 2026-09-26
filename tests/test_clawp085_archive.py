@@ -354,6 +354,22 @@ class TestArchiveConsumerConsistency:
         )
         assert 1 in _existing_child_nums(tasks_dir, "CLAWP-500")
 
+    def test_existing_child_nums_counts_rejected_parent_children(self, tmp_path, monkeypatch):
+        """CLAWP-127 (grok-4.6 + grok-4.5, PR #62 round 3): a REJECTED
+        directory-task parent's own dir needs the same ordinal visibility as
+        the archived case, or a wholesale-rejected parent's already-existing
+        child ordinals get silently re-minted."""
+        from clawpm.emit_tree import _existing_child_nums
+
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch)
+        rejected_parent = tasks_dir / "rejected" / "CLAWP-501"
+        rejected_parent.mkdir(parents=True)
+        (rejected_parent / "_task.md").write_text("---\nid: CLAWP-501\n---\n", encoding="utf-8")
+        (rejected_parent / "CLAWP-501-001.md").write_text(
+            "---\nid: CLAWP-501-001\nparent: CLAWP-501\n---\n", encoding="utf-8"
+        )
+        assert 1 in _existing_child_nums(tasks_dir, "CLAWP-501")
+
 
 class TestArchiveRobustness:
     def test_destination_exists_is_skipped_not_clobbered(self, tmp_path, monkeypatch):
@@ -515,6 +531,29 @@ class TestArchiveRound3:
             "leaves": [{"ref": "a", "title": "t", "leaf_key": "leafA"}],
         })
         assert "leafA" in _resolve_idempotency(_config(), "clawpm", "CLAWP-600", doc.leaves)
+
+    def test_resolve_idempotency_sees_children_of_a_wholesale_rejected_parent(
+        self, tmp_path, monkeypatch
+    ):
+        """grok-4.5 MEDIUM (PR #62 round 3): the new rejected/<parent_id> nest
+        line must actually be exercised, not just the flat rejected/<child>.md
+        case — a decomposed parent rejected wholesale (change_task_state moves
+        the whole directory) leaves its own children as flat files under
+        rejected/<parent_id>/, mirroring the existing archived-parent nest."""
+        from clawpm.emit_tree import _resolve_idempotency, parse_emit_document
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch)
+        rejected_parent = tasks_dir / "rejected" / "CLAWP-700"
+        rejected_parent.mkdir(parents=True)
+        (rejected_parent / "_task.md").write_text("---\nid: CLAWP-700\n---\n", encoding="utf-8")
+        (rejected_parent / "CLAWP-700-001.md").write_text(
+            "---\nid: CLAWP-700-001\nparent: CLAWP-700\nleaf_key: leafB\n---\n", encoding="utf-8"
+        )
+        doc = parse_emit_document({
+            "schema_version": 1,
+            "root": {"attach_to": "CLAWP-700"},
+            "leaves": [{"ref": "b", "title": "t", "leaf_key": "leafB"}],
+        })
+        assert "leafB" in _resolve_idempotency(_config(), "clawpm", "CLAWP-700", doc.leaves)
 
     def test_is_archived_path_case_insensitive(self):
         from pathlib import Path

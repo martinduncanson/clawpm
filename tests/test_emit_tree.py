@@ -869,6 +869,57 @@ class TestEmitTreeGates:
         with pytest.raises(EmitValidationError, match="strict"):
             emit_tree(config, "emittest", doc, strict=True)
 
+    def test_reject_gate_survives_idempotent_leaf_key_match(self, temp_portfolio):
+        """CLAWP-127 (Codex P2, PR #62 round 3): _resolve_idempotency was
+        extended (this same PR) to also recognise a REJECTED leaf_key match,
+        so a rejected-then-re-emitted leaf isn't silently re-minted. But
+        filtering leaves_to_emit by idempotency BEFORE _check_reject_match
+        ran would have silently swallowed the pre-existing strict-mode
+        reject-gate contract for exactly that leaf (idempotency drops it from
+        leaves_to_emit before the reject-gate ever sees it). The reject-gate
+        check must run against the FULL leaf set regardless of what
+        idempotency separately decides to skip.
+
+        Uses attach_to (not a fresh new-root) so the SAME parent_id is
+        scanned by idempotency across both emit calls -- idempotency is
+        scoped per-parent, and a new-root emit predicts a different parent_id
+        each call, which would never re-exercise this path."""
+        config = temp_portfolio["config"]
+
+        parent = add_task(config, "emittest", "Existing parent")
+        assert parent is not None
+        raw = {
+            "schema_version": 1,
+            "root": {"attach_to": parent.id},
+            "leaves": [
+                {
+                    "ref": "R1",
+                    "parent_ref": None,
+                    "title": "Leaf one",
+                    "leaf_key": "reject-order-R1",
+                    "success_criteria": [],
+                    "scope": [],
+                    "stop_conditions": [],
+                    "delegability": "either",
+                    "predictions": {},
+                },
+            ],
+        }
+
+        first = emit_tree(config, "emittest", parse_emit_document(raw))
+        assert first.rejected == []
+        child_id = next(e["id"] for e in first.emitted if e["id"] != parent.id)
+
+        from clawpm.tasks import change_task_state
+        change_task_state(config, "emittest", child_id, TaskState.REJECTED, rationale="won't do")
+
+        # Re-emit the SAME doc: "Leaf one" now matches the reject ledger by
+        # EXACT title AND its leaf_key matches the now-rejected child.
+        # strict mode must still raise -- the reject-gate report must not be
+        # silently bypassed by the idempotency skip.
+        with pytest.raises(EmitValidationError, match="strict"):
+            emit_tree(config, "emittest", parse_emit_document(raw), strict=True)
+
     def test_constitution_violation_graceful_noop(self, temp_portfolio):
         """Constitution module absent → graceful no-op, emission proceeds."""
         config = temp_portfolio["config"]
