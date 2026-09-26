@@ -1745,7 +1745,16 @@ def add_task(
             # never re-minted. add_task is not a hot path, so paying the extra
             # archive scan here (unlike list/next/reflect) is the correct
             # trade — a silently reused ID would clobber archived history.
-            for scan_dir in [tasks_dir, tasks_dir / "done", tasks_dir / "blocked", tasks_dir / "done" / "archive"]:
+            # CLAWP-127: rejected/ carries the same risk (CLAWP-053's won't-do
+            # ledger) and was missing from this list — a rejected task's id
+            # could be silently re-minted for a brand-new task.
+            for scan_dir in [
+                tasks_dir,
+                tasks_dir / "done",
+                tasks_dir / "blocked",
+                tasks_dir / "done" / "archive",
+                tasks_dir / "rejected",
+            ]:
                 if not scan_dir.exists():
                     continue
                 # .md files at this level. Subtask files ({prefix}-000-001.md) live

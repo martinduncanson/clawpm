@@ -20,6 +20,7 @@ from clawpm.cli import main
 from clawpm.discovery import load_portfolio_config
 from clawpm.tasks import (
     archive_done_tasks,
+    change_task_state,
     get_task,
     get_next_task,
     list_tasks,
@@ -191,6 +192,24 @@ class TestArchiveResolutionAndScans:
         # done/ root is now empty; naive numbering would reissue CLAWP-000.
         second = _add("clawpm", "task one")
         assert second != first, "auto-numbering reused an archived id"
+        assert second == "CLAWP-001"
+
+    def test_rejected_id_not_reused_by_auto_numbering(self, tmp_path, monkeypatch):
+        """CLAWP-127: add_task's scan must include rejected/, same as done/archive."""
+        _make_portfolio(tmp_path, monkeypatch)
+        config = load_portfolio_config(tmp_path)
+
+        first = _add("clawpm", "idea that gets rejected")  # CLAWP-000
+        result = change_task_state(
+            config, "clawpm", first, TaskState.REJECTED,
+            rationale="Not worth pursuing",
+        )
+        assert result is not None
+        assert "rejected" in result.file_path.parts
+
+        # tasks_dir root is now empty; naive numbering would reissue CLAWP-000.
+        second = _add("clawpm", "a genuinely new task")
+        assert second != first, "auto-numbering reused a rejected id"
         assert second == "CLAWP-001"
 
 
