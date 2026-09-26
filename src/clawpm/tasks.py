@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import shutil
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -26,6 +26,7 @@ from .frontmatter import (
     require_mapping,
     split_frontmatter,
     stamp_updated,
+    today_utc_iso,
 )
 from .models import Task, TaskState, TaskComplexity, Predictions, PortfolioConfig, normalize_tags
 from .discovery import get_project_dir, find_project_dir_fallback
@@ -551,7 +552,7 @@ def _stamp_updated_file(file_path: Path, when: str | None = None) -> None:
     leaving state + work-log inconsistent.
     """
     text = retry_transient(lambda: file_path.read_text(encoding="utf-8"))
-    new_text = _set_updated_line(text, when or date.today().isoformat())
+    new_text = _set_updated_line(text, when or today_utc_iso())
     if new_text is None:
         return  # no well-formed frontmatter fence — leave the file untouched
     tmp = file_path.with_suffix(file_path.suffix + ".tmp")
@@ -1766,7 +1767,8 @@ def add_task(
             task_id = f"{prefix}-{next_num:03d}"
 
         # Build frontmatter. CLAWP-086 — `updated` equals `created` at add time.
-        _today = date.today().isoformat()
+        # CLAWP-126: UTC calendar day, not local — see today_utc_iso().
+        _today = today_utc_iso()
         frontmatter = {
             "id": task_id,
             "priority": priority,
@@ -2334,7 +2336,8 @@ def add_subtask(
         subtask_id = f"{parent_id}-{next_num:03d}"
 
         # Build frontmatter. CLAWP-086 — `updated` equals `created` at add time.
-        _today = date.today().isoformat()
+        # CLAWP-126: UTC calendar day, not local — see today_utc_iso().
+        _today = today_utc_iso()
         frontmatter: dict = {
             "id": subtask_id,
             "priority": priority,

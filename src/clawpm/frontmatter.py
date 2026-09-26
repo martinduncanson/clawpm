@@ -38,12 +38,31 @@ change on-disk bytes.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import datetime, timezone
 from typing import Any
 
 import yaml
 
 _FENCE = "---"
+
+
+def today_utc_iso() -> str:
+    """Today's UTC calendar date, ISO-formatted (CLAWP-126).
+
+    Single source of the calendar-day definition every ``updated``/``created``
+    writer must agree with. Doctor's stale-blocked reader (``cli/project.py``)
+    interprets a date-only stamp CONSERVATIVELY as end-of-day UTC on that same
+    date (CLAWP-086) — so the writer has to stamp the UTC calendar day, not
+    the local one, or the two disagree by up to a day depending on the host's
+    UTC offset: a false positive on a negative-offset host (a task blocked
+    late in the local day lands on the NEXT UTC day, so the reader's cutoff
+    is already stale by the time the block is even a day old), and delayed
+    detection on a positive-offset host (a block just after local midnight
+    still reads as the PREVIOUS UTC day, pushing the reader's cutoff up to a
+    day into the future relative to the real block time). ``date.today()``
+    returns the LOCAL calendar date; this returns the UTC one instead.
+    """
+    return datetime.now(timezone.utc).date().isoformat()
 
 
 def _none_to_empty(parsed: Any) -> Any:
@@ -67,11 +86,12 @@ def stamp_updated(frontmatter: dict[str, Any], when: str | None = None) -> None:
     """Set the ``updated`` timestamp on a frontmatter mapping, in place (CLAWP-086).
 
     Single source of the field name + ISO-date format so every task mutator
-    stamps identically. ``when`` defaults to today's ISO date; a caller that
-    also stamps ``created`` in the same write passes the shared value so
+    stamps identically. ``when`` defaults to today's UTC ISO date (CLAWP-126
+    — see :func:`today_utc_iso` for why UTC, not local); a caller that also
+    stamps ``created`` in the same write passes the shared value so
     ``created == updated`` holds on creation.
     """
-    frontmatter["updated"] = when or date.today().isoformat()
+    frontmatter["updated"] = when or today_utc_iso()
 
 
 class FrontmatterError(ValueError):
