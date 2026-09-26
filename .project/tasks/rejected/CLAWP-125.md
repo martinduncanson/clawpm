@@ -24,6 +24,12 @@ predictions:
   - 'If confirmed: a fix (portfolio-wide lock, versioned reservation, or documented-acceptable-risk)
     is proposed and reviewed; if refuted: close with the reproduction/reasoning documented'
 priority: 4
+rationale: 'Duplicate of CLAWP-116 (filed 2026-09-03 from PR #57 round 5, Codex) --
+  same defect (no portfolio-wide lock coordinates prefix selection with the task-file
+  write), same proposed fix shape (portfolio lock outer, per-project lock inner).
+  Should have checked existing tasks before filing; fresh CLAWP-121/PR #60 repro evidence
+  attached to CLAWP-116 as a log note instead of duplicating the task.'
+supersedes: CLAWP-116
 tags:
 - task-id-allocation
 - concurrency

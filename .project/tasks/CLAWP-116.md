@@ -13,7 +13,7 @@ predictions:
     projects and asserts distinct prefixes, plus the lock-ordering invariant documented
     at both lock sites
 priority: 5
-updated: '2026-09-03'
+updated: '2026-09-26'
 ---
 # Coordinate first-mint prefix allocation with the task-file write
 
