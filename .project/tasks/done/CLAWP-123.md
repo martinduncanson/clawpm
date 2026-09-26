@@ -10,7 +10,7 @@ priority: 8
 tags:
 - testing
 - flaky
-updated: '2026-09-22'
+updated: '2026-09-26'
 ---
 # Flaky test: TestDoctorStaleBlocked::test_doctor_flags_blocked_with_done_deps (clock/tz sensitive)
 
