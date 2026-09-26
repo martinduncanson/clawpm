@@ -370,6 +370,34 @@ class TestArchiveConsumerConsistency:
         )
         assert 1 in _existing_child_nums(tasks_dir, "CLAWP-501")
 
+    def test_existing_child_nums_counts_done_parent_children(self, tmp_path, monkeypatch):
+        """CLAWP-127 (grok-4.5, PR #62 round 4): same wholesale-parent nest
+        gap as the rejected case, still open for done/."""
+        from clawpm.emit_tree import _existing_child_nums
+
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch)
+        done_parent = tasks_dir / "done" / "CLAWP-502"
+        done_parent.mkdir(parents=True)
+        (done_parent / "_task.md").write_text("---\nid: CLAWP-502\n---\n", encoding="utf-8")
+        (done_parent / "CLAWP-502-001.md").write_text(
+            "---\nid: CLAWP-502-001\nparent: CLAWP-502\n---\n", encoding="utf-8"
+        )
+        assert 1 in _existing_child_nums(tasks_dir, "CLAWP-502")
+
+    def test_existing_child_nums_counts_blocked_parent_children(self, tmp_path, monkeypatch):
+        """CLAWP-127 (grok-4.5, PR #62 round 4): same wholesale-parent nest
+        gap as the rejected case, still open for blocked/."""
+        from clawpm.emit_tree import _existing_child_nums
+
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch)
+        blocked_parent = tasks_dir / "blocked" / "CLAWP-503"
+        blocked_parent.mkdir(parents=True)
+        (blocked_parent / "_task.md").write_text("---\nid: CLAWP-503\n---\n", encoding="utf-8")
+        (blocked_parent / "CLAWP-503-001.md").write_text(
+            "---\nid: CLAWP-503-001\nparent: CLAWP-503\n---\n", encoding="utf-8"
+        )
+        assert 1 in _existing_child_nums(tasks_dir, "CLAWP-503")
+
 
 class TestArchiveRobustness:
     def test_destination_exists_is_skipped_not_clobbered(self, tmp_path, monkeypatch):

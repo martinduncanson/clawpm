@@ -2201,21 +2201,25 @@ def _child_state_dirs(tasks_dir: Path, parent_dir: Path) -> list[Path]:
     are included too, so a re-decompose can never re-mint an ordinal that has
     been archived out of ``done/``.
 
-    CLAWP-127 (grok-4.6 + grok-4.5, PR #62 round 3, independently): a
-    REJECTED directory-task parent's own dir needs the same treatment as the
-    archived case — ``change_task_state`` moves a rejected directory parent
-    wholesale to ``tasks/rejected/<parent_id>/``, taking its children with it,
-    and ``emit_tree``'s ``attach_to`` path always resolves ``parent_dir`` to
-    the LIVE ``tasks/<parent_id>/`` path — without this entry a wholesale-
-    rejected parent's already-existing child ordinals are invisible and would
-    be re-minted.
+    CLAWP-127 (grok-4.6 + grok-4.5, PR #62 rounds 3-4): a directory-task
+    parent's own dir needs the same treatment as the archived case for EVERY
+    terminal state, not just archived — ``change_task_state`` moves a
+    done/blocked/rejected directory parent wholesale to
+    ``tasks/<state>/<parent_id>/``, taking its children with it, and
+    ``emit_tree``'s ``attach_to`` path always resolves ``parent_dir`` to the
+    LIVE ``tasks/<parent_id>/`` path — without these entries a wholesale-
+    moved parent's already-existing child ordinals are invisible and would be
+    re-minted. (Round 3 added only the ``rejected/`` nest; round 4 found the
+    same gap still open for ``done/``/``blocked/``.)
     """
     parent_id = parent_dir.name
     return [
         parent_dir,
         tasks_dir,
         tasks_dir / "done",
+        tasks_dir / "done" / parent_id,
         tasks_dir / "blocked",
+        tasks_dir / "blocked" / parent_id,
         tasks_dir / "rejected",
         tasks_dir / "rejected" / parent_id,
         tasks_dir / "done" / "archive",
