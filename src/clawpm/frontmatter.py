@@ -49,8 +49,11 @@ _FENCE = "---"
 def today_utc_iso() -> str:
     """Today's UTC calendar date, ISO-formatted (CLAWP-126).
 
-    Single source of the calendar-day definition every ``updated``/``created``
-    writer must agree with. Doctor's stale-blocked reader (``cli/project.py``)
+    Single source of the calendar-day definition every task ``updated``/
+    ``created`` writer must agree with (CLAWP-126, grok-4.5 PR #63: this
+    docstring previously overstated scope — "every writer" — it means every
+    TASK frontmatter writer, not every ``date.today()`` call site in the
+    codebase; see below). Doctor's stale-blocked reader (``cli/project.py``)
     interprets a date-only stamp CONSERVATIVELY as end-of-day UTC on that same
     date (CLAWP-086) — so the writer has to stamp the UTC calendar day, not
     the local one, or the two disagree by up to a day depending on the host's
@@ -61,6 +64,12 @@ def today_utc_iso() -> str:
     still reads as the PREVIOUS UTC day, pushing the reader's cutoff up to a
     day into the future relative to the real block time). ``date.today()``
     returns the LOCAL calendar date; this returns the UTC one instead.
+
+    Deliberate holdouts, NOT migrated to this helper (CLAWP-126 scope was the
+    task ``updated``/``created`` stamp specifically, not every ``date.today()``
+    call in the codebase): ``research.py`` (research-file `created`/filename
+    dates) and ``mission.py`` (mission `created` + deadline-countdown math).
+    Neither is read by the stale-blocked check this helper exists for.
     """
     return datetime.now(timezone.utc).date().isoformat()
 

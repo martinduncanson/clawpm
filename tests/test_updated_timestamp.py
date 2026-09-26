@@ -458,11 +458,18 @@ class TestDoctorPrefersUpdated:
         import clawpm.frontmatter as fm_mod
 
         fixed_instant = datetime(2099, 6, 15, 23, 30, 0, tzinfo=timezone.utc)
+        # A different calendar day for the naive (no-tz) branch: if
+        # today_utc_iso() ever regressed to a naive `datetime.now()` (dropping
+        # `timezone.utc`), this fake must make that regression VISIBLE rather
+        # than accidentally passing anyway (grok-4.5, PR #63: the original
+        # fake ignored `tz` and returned the same instant either way, so it
+        # could not have caught exactly the local-vs-UTC bug CLAWP-126 fixes).
+        fixed_naive_local = datetime(2099, 6, 16, 2, 0, 0)
 
         class _FakeDatetime(datetime):
             @classmethod
             def now(cls, tz=None):
-                return fixed_instant
+                return fixed_instant if tz is not None else fixed_naive_local
 
         monkeypatch.setattr(fm_mod, "datetime", _FakeDatetime)
 
