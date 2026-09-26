@@ -496,6 +496,26 @@ class TestArchiveRound3:
         })
         assert "leafA" in _resolve_idempotency(_config(), "clawpm", "CLAWP-600", doc.leaves)
 
+    def test_resolve_idempotency_sees_rejected_leaf(self, tmp_path, monkeypatch):
+        """CLAWP-127 (grok-4.5, PR #62): a previously-emitted child that was
+        later rejected must still be visible to idempotent re-emit, or a
+        title drift / fail-open in _check_reject_match leaves it invisible
+        to both checks and it gets silently re-minted."""
+        from clawpm.emit_tree import _resolve_idempotency, parse_emit_document
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch)
+        # An emitted-then-rejected standalone child carrying a leaf_key.
+        rejected_dir = tasks_dir / "rejected"
+        rejected_dir.mkdir(parents=True)
+        (rejected_dir / "CLAWP-600-001.md").write_text(
+            "---\nid: CLAWP-600-001\nparent: CLAWP-600\nleaf_key: leafA\n---\n", encoding="utf-8"
+        )
+        doc = parse_emit_document({
+            "schema_version": 1,
+            "root": {"attach_to": "CLAWP-600"},
+            "leaves": [{"ref": "a", "title": "t", "leaf_key": "leafA"}],
+        })
+        assert "leafA" in _resolve_idempotency(_config(), "clawpm", "CLAWP-600", doc.leaves)
+
     def test_is_archived_path_case_insensitive(self):
         from pathlib import Path
         # A case-preserving Windows FS (or external creation) can surface mixed

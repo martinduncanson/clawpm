@@ -520,11 +520,17 @@ def _resolve_idempotency(
     """Return leaf_keys of leaves that already exist (idempotent re-emit).
 
     Scans every location a previously-emitted child of ``parent_id`` can live —
-    the live parent dir, plus ``done/``, ``blocked/``, and (CLAWP-085) the
-    ``done/archive/`` silo (standalone and inside a wholesale-archived parent) —
-    for matching ``leaf_key`` frontmatter. Without the terminal-state dirs, a
-    child that was completed (and possibly archived) since the last emit would
-    not be recognised and the same leaf would be minted twice (Codex review r2).
+    the live parent dir, plus ``done/``, ``blocked/``, ``rejected/``, and
+    (CLAWP-085) the ``done/archive/`` silo (standalone and inside a
+    wholesale-archived parent) — for matching ``leaf_key`` frontmatter.
+    Without the terminal-state dirs, a child that was completed (and possibly
+    archived) since the last emit would not be recognised and the same leaf
+    would be minted twice (Codex review r2). CLAWP-127 (grok-4.5, PR #62):
+    ``rejected/`` too, for the identical reason — ``_check_reject_match``
+    (title-based) is the intended gate for a rejected leaf, but it fail-opens
+    on an unreadable ledger and only matches on an EXACT title, so a title
+    that drifted between emits would leave the previously-emitted-then-
+    rejected child invisible to BOTH checks and get silently re-minted.
     """
     from .tasks import get_tasks_dir
 
@@ -539,6 +545,8 @@ def _resolve_idempotency(
         tasks_dir / parent_id,                          # live children
         tasks_dir / "done",                             # completed standalone children
         tasks_dir / "blocked",                          # blocked standalone children
+        tasks_dir / "rejected",                         # rejected standalone children
+        tasks_dir / "rejected" / parent_id,             # children of a rejected parent
         tasks_dir / "done" / "archive",                 # archived standalone children
         tasks_dir / "done" / "archive" / parent_id,     # children of a wholesale-archived parent
     )
