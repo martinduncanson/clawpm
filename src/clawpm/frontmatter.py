@@ -67,9 +67,14 @@ def today_utc_iso() -> str:
 
     Deliberate holdouts, NOT migrated to this helper (CLAWP-126 scope was the
     task ``updated``/``created`` stamp specifically, not every ``date.today()``
-    call in the codebase): ``research.py`` (research-file `created`/filename
-    dates) and ``mission.py`` (mission `created` + deadline-countdown math).
-    Neither is read by the stale-blocked check this helper exists for.
+    call in the codebase) — same category, same rationale, so treat this as
+    one open bucket rather than a closed list (grok-4.5, PR #63 round 2):
+    research-file / mission calendar dates, e.g. ``research.py`` (research-file
+    ``created`` + filename dates), ``mission.py`` (mission ``created`` +
+    deadline-countdown math), and ``emit_tree.py``'s OWN research-file
+    ``created``/filename sites (distinct from the task-stamp site in this same
+    module that WAS migrated). None of these is read by the stale-blocked
+    check this helper exists for.
     """
     return datetime.now(timezone.utc).date().isoformat()
 
