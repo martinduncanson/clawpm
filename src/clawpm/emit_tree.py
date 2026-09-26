@@ -30,6 +30,7 @@ from .frontmatter import (
     parse_frontmatter,
     split_frontmatter,
     stamp_updated,
+    today_utc_iso,
 )
 from .models import (
     Predictions,
@@ -603,7 +604,8 @@ def _render_task_content(
     not silently lost.
     """
     # CLAWP-086 — mirror add_task/add_subtask: `updated` == `created` at emit time.
-    _today = date.today().isoformat()
+    # CLAWP-126: UTC calendar day, not local — see today_utc_iso().
+    _today = today_utc_iso()
     frontmatter: dict[str, Any] = {
         "id": task_id,
         "priority": 5,
