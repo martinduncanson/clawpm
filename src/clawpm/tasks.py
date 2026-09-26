@@ -1245,7 +1245,18 @@ def _infer_prefix_from_tasks(tasks_dir: Path) -> str | None:
     counts: Counter[str] = Counter()
     # CLAWP-085: include done/archive so prefix inference stays stable even when
     # every non-archived task of a project has been archived out of the hot path.
-    for scan_dir in (tasks_dir, tasks_dir / "done", tasks_dir / "blocked", tasks_dir / "done" / "archive"):
+    # CLAWP-127 (Codex P1, PR #62): rejected/ too — a rejected-only project's
+    # prefix claim must still be seen by the PORTFOLIO-wide allocator, or a
+    # different taskless project can be assigned the same prefix and mint a
+    # colliding id (this project's own rejected/ dir would be empty from that
+    # OTHER project's perspective, so nothing local would catch it).
+    for scan_dir in (
+        tasks_dir,
+        tasks_dir / "done",
+        tasks_dir / "blocked",
+        tasks_dir / "done" / "archive",
+        tasks_dir / "rejected",
+    ):
         if not scan_dir.exists():
             continue
         for entry in scan_dir.iterdir():

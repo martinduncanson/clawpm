@@ -718,7 +718,17 @@ def _predict_parent_id(
     # CLAWP-085: include done/archive so this prediction stays in lockstep with
     # add_task's (archive-aware) allocator — otherwise emit-tree could re-mint an
     # archived root id and clobber archived history.
-    for scan_dir in [tasks_dir, tasks_dir / "done", tasks_dir / "blocked", tasks_dir / "done" / "archive"]:
+    # CLAWP-127 (grok-4.6, PR #62): rejected/ too, for the same lockstep reason —
+    # add_task's scan already covers it; this predictor must match or a rejected
+    # root id can be silently re-minted via emit-tree even though direct add_task
+    # would refuse to reuse it.
+    for scan_dir in [
+        tasks_dir,
+        tasks_dir / "done",
+        tasks_dir / "blocked",
+        tasks_dir / "done" / "archive",
+        tasks_dir / "rejected",
+    ]:
         if not scan_dir.exists():
             continue
         for f in scan_dir.glob(f"{prefix}-*.md"):

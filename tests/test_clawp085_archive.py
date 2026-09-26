@@ -212,6 +212,22 @@ class TestArchiveResolutionAndScans:
         assert second != first, "auto-numbering reused a rejected id"
         assert second == "CLAWP-001"
 
+    def test_infer_prefix_from_tasks_includes_rejected(self, tmp_path, monkeypatch):
+        """CLAWP-127 (Codex P1, PR #62): a rejected-only project must still be
+        seen by the PORTFOLIO-wide prefix allocator, or a different taskless
+        project can be assigned the same prefix and mint a colliding id."""
+        from clawpm.tasks import _infer_prefix_from_tasks
+
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch)
+        first = _add("clawpm", "idea that gets rejected")  # CLAWP-000
+        config = load_portfolio_config(tmp_path)
+        change_task_state(
+            config, "clawpm", first, TaskState.REJECTED,
+            rationale="Not worth pursuing",
+        )
+        # tasks_dir root is now empty; a scan that omits rejected/ returns None.
+        assert _infer_prefix_from_tasks(tasks_dir) == "CLAWP"
+
 
 class TestArchiveCli:
     def test_cli_archive_reports_moved(self, tmp_path, monkeypatch):
@@ -305,6 +321,25 @@ class TestArchiveConsumerConsistency:
         # done/ is now empty; a naive scan would re-predict CLAWP-000.
         doc = SimpleNamespace(root=SimpleNamespace(attach_to=None))
         assert _predict_parent_id(doc, _config(), "clawpm") == "CLAWP-001"
+
+    def test_emit_predict_parent_id_skips_rejected_root(self, tmp_path, monkeypatch):
+        """CLAWP-127 (grok-4.6/4.5, PR #62): the twin predictor must stay in
+        lockstep with add_task's rejected/ scan too, or emit-tree can remint
+        a rejected root id even though direct add_task would refuse to reuse
+        it."""
+        from types import SimpleNamespace
+        from clawpm.emit_tree import _predict_parent_id
+
+        _make_portfolio(tmp_path, monkeypatch)
+        config = _config()
+        a = _add("clawpm", "root")  # CLAWP-000
+        result = change_task_state(
+            config, "clawpm", a, TaskState.REJECTED, rationale="no longer needed",
+        )
+        assert "rejected" in result.file_path.parts
+        # tasks_dir root is now empty; a naive scan would re-predict CLAWP-000.
+        doc = SimpleNamespace(root=SimpleNamespace(attach_to=None))
+        assert _predict_parent_id(doc, config, "clawpm") == "CLAWP-001"
 
     def test_existing_child_nums_counts_archived_children(self, tmp_path, monkeypatch):
         from clawpm.emit_tree import _existing_child_nums
