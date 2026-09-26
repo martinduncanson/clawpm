@@ -230,6 +230,177 @@ class TestIdAllocationUnderContention:
 
 
 # ---------------------------------------------------------------------------
+# Test: PORTFOLIO-wide prefix allocation under cross-project contention
+# (CLAWP-116)
+# ---------------------------------------------------------------------------
+
+_CROSS_PROJECT_WORKER_SCRIPT = textwrap.dedent("""\
+    import sys, json
+    from pathlib import Path
+    sys.path.insert(0, r'{src_path}')
+    from clawpm.discovery import load_portfolio_config
+    from clawpm.tasks import add_task
+
+    portfolio_root = Path(r'{portfolio_root}')
+    project_id = '{project_id}'
+    title = sys.argv[1]
+    config = load_portfolio_config(portfolio_root)
+    task = add_task(config, project_id, title)
+    if task is None:
+        print(json.dumps({{"error": "add_task returned None", "project": project_id}}))
+        sys.exit(1)
+    print(json.dumps({{"id": task.id, "project": project_id}}))
+""")
+
+_CROSS_PROJECT_WORKER_SCRIPT_NO_LOCK = textwrap.dedent("""\
+    import sys, json, time
+    from pathlib import Path
+    sys.path.insert(0, r'{src_path}')
+    from clawpm.discovery import load_portfolio_config, get_project
+    from clawpm.tasks import assign_task_prefix, get_tasks_dir
+
+    portfolio_root = Path(r'{portfolio_root}')
+    project_id = '{project_id}'
+    title = sys.argv[1]
+    config = load_portfolio_config(portfolio_root)
+    tasks_dir = get_tasks_dir(config, project_id)
+    _settings = get_project(config, project_id)
+
+    # CLAWP-116 regression: compute the portfolio-wide prefix WITHOUT any
+    # lock (bypassing add_task's own portfolio_prefix_lock entirely --
+    # this is add_task's PRE-CLAWP-116 sequence), sleep to widen the
+    # cross-process window between "decided" and "written", then write.
+    prefix = assign_task_prefix(
+        project_id, tasks_dir, config,
+        explicit_prefix=getattr(_settings, 'task_prefix', None) if _settings else None,
+    )
+    time.sleep(0.05)
+    task_id = f'{{prefix}}-000'
+    file_path = tasks_dir / f'{{task_id}}.md'
+    file_path.write_text(f'---\\nid: {{task_id}}\\n---\\n# {{title}}\\n', encoding='utf-8')
+    print(json.dumps({{"id": task_id, "project": project_id, "prefix": prefix}}))
+""")
+
+
+def _make_multi_project_portfolio(tmp_dir: Path, project_ids: list[str]) -> Path:
+    """Set up a portfolio with several TASK-LESS sibling projects."""
+    (tmp_dir / "portfolio.toml").write_text(
+        f'portfolio_root = "{tmp_dir.as_posix()}"\n'
+        f'project_roots = ["{(tmp_dir / "projects").as_posix()}"]\n',
+        encoding="utf-8",
+    )
+    for project_id in project_ids:
+        meta = tmp_dir / "projects" / project_id / ".project"
+        tasks_dir = meta / "tasks"
+        (tasks_dir / "done").mkdir(parents=True)
+        (tasks_dir / "blocked").mkdir(parents=True)
+        (meta / "settings.toml").write_text(
+            f'id = "{project_id}"\nname = "{project_id}"\nstatus = "active"\npriority = 3\n',
+            encoding="utf-8",
+        )
+    return tmp_dir
+
+
+def _spawn_cross_project_workers(
+    script: str, tmp_dir: Path, project_ids: list[str]
+) -> list[dict]:
+    """Spawn one subprocess PER project id, all launched before any is
+    awaited (true concurrency, no stagger), each minting that project's
+    first task. Returns each worker's parsed JSON result."""
+    import subprocess
+
+    src_path = str(Path(__file__).parent.parent / "src")
+    env = {**os.environ, "CLAWPM_PORTFOLIO": str(tmp_dir)}
+    procs = []
+    for project_id in project_ids:
+        code = script.format(
+            src_path=src_path,
+            portfolio_root=str(tmp_dir),
+            project_id=project_id,
+        )
+        procs.append((
+            project_id,
+            subprocess.Popen(
+                [sys.executable, "-c", code, f"first task for {project_id}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+            ),
+        ))
+    results = []
+    for project_id, proc in procs:
+        out, err = proc.communicate(timeout=30)
+        raw = out.decode("utf-8", errors="replace").strip()
+        if proc.returncode != 0 or not raw:
+            pytest.fail(
+                f"Worker for {project_id} failed (rc={proc.returncode}):\n"
+                f"stdout: {raw!r}\nstderr: {err.decode('utf-8', errors='replace')!r}"
+            )
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            pytest.fail(f"Worker for {project_id} produced non-JSON: {raw!r}")
+        if "error" in data:
+            pytest.fail(f"Worker for {project_id} add_task error: {data['error']}")
+        results.append(data)
+    return results
+
+
+def _prefix_of(task_id: str) -> str:
+    """The prefix portion of a minted id ('ABCDE1-000' -> 'ABCDE1')."""
+    return task_id.rsplit("-", 1)[0]
+
+
+class TestPortfolioWidePrefixAllocationContention:
+    """CLAWP-116: two (or more) task-less near-twin projects minting their
+    FIRST task concurrently must never derive the same prefix -- the
+    portfolio-wide allocator's read (scan every sibling) -> decide ->
+    write sequence must be serialised against every OTHER concurrent
+    first-minter, or two calls can observe a torn snapshot and collide.
+    """
+
+    PROJECT_IDS = ["abcde1", "abcde2", "abcde3", "abcde4"]
+
+    def test_concurrent_first_mints_never_collide_on_prefix(self, tmp_path):
+        """With portfolio_prefix_lock in place, N concurrent first-minters
+        (near-twin task-less projects sharing a base) always derive
+        distinct prefixes."""
+        _make_multi_project_portfolio(tmp_path, self.PROJECT_IDS)
+
+        results = _spawn_cross_project_workers(
+            _CROSS_PROJECT_WORKER_SCRIPT, tmp_path, self.PROJECT_IDS
+        )
+        prefixes = [_prefix_of(r["id"]) for r in results]
+        assert len(set(prefixes)) == len(self.PROJECT_IDS), (
+            f"Duplicate prefix across concurrent first mints (lock failed!): {results}"
+        )
+
+    def test_race_without_portfolio_lock_can_produce_duplicate_prefixes(self, tmp_path):
+        """Regression: bypassing the portfolio lock (computing the prefix
+        directly, sleeping, then writing -- add_task's PRE-CLAWP-116
+        sequence) can produce the SAME prefix for two different task-less
+        projects. Probabilistic like its single-project sibling
+        (test_race_without_lock_produces_duplicates above) -- xfail rather
+        than a hard failure if the race isn't triggered this run."""
+        _make_multi_project_portfolio(tmp_path, self.PROJECT_IDS)
+
+        results = _spawn_cross_project_workers(
+            _CROSS_PROJECT_WORKER_SCRIPT_NO_LOCK, tmp_path, self.PROJECT_IDS
+        )
+        prefixes = [r["prefix"] for r in results]
+        if len(set(prefixes)) == len(self.PROJECT_IDS):
+            pytest.xfail(
+                "Race not triggered this run (fast I/O / scheduling) -- "
+                "lock still validated by "
+                "test_concurrent_first_mints_never_collide_on_prefix."
+            )
+        else:
+            assert len(set(prefixes)) < len(self.PROJECT_IDS), (
+                f"Expected duplicate prefixes without the portfolio lock, got: {results}"
+            )
+
+
+# ---------------------------------------------------------------------------
 # Test: state-transition serialisation
 # ---------------------------------------------------------------------------
 

@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import shutil
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1600,6 +1601,61 @@ def assign_all_prefixes(
     return assignments, errors
 
 
+def _portfolio_prefix_lock_path(portfolio_root: Path) -> Path:
+    """Sentinel path serialising portfolio-wide prefix allocation (CLAWP-116).
+
+    Lives under ``<portfolio_root>/locks/``, mirroring dispatch's own lock
+    convention (``dispatch.py``'s ``dispatch_lock_path``) -- a single fixed
+    name is correct here (unlike dispatch's per-target digest) because
+    there is only ever ONE portfolio-wide allocator critical section, not
+    one per project.
+    """
+    return portfolio_root / "locks" / "prefix-allocation.lock"
+
+
+@contextmanager
+def portfolio_prefix_lock(portfolio_root: Path):
+    """Hold the portfolio-wide prefix-allocation lock (CLAWP-116, Codex P1
+    on PR #57 round 5).
+
+    Serialises the READ (scan every sibling project's resolved prefix,
+    ``assign_all_prefixes``) -> DECIDE (the matching pass) -> WRITE (the
+    task file that makes the decided prefix REAL) sequence for a
+    first-mint auto-ID create against every OTHER concurrent first-minter
+    in the same portfolio. Acquired ONLY on a first mint (when the calling
+    project has neither an explicit nor an inferred prefix yet) so
+    ordinary task creation for an already-prefixed project stays fully
+    parallel across projects -- this is a first-mint-only critical
+    section, not a global serialisation of ``add_task``.
+
+    Without this lock, two first-minters' portfolio-wide reads can
+    interleave with each other's writes and each observe a torn snapshot
+    that never existed as one consistent portfolio state at any instant --
+    CLAWP-121/124's determinism guarantee ("two calls can never converge
+    on the same candidate") assumes both calls see the IDENTICAL snapshot,
+    which a torn/interleaved read violates. The non-injective-extension
+    scenario this task was originally filed against (PR #57: two
+    near-twin task-less projects both independently selecting the same
+    candidate) predates the current deterministic global pass and no
+    longer reproduces as originally described, but the underlying gap it
+    named -- no coordination between prefix SELECTION and the task-file
+    WRITE that reserves it -- is real and is what this lock closes.
+
+    LOCK ORDERING INVARIANT (must never be reversed, or two callers
+    acquiring both locks in opposite orders deadlock): this portfolio lock
+    is always OUTER, a per-project ``.clawpm-tasks.lock`` is always INNER.
+    Nothing else currently takes this lock, so there is no inversion risk
+    today -- this must not change without re-auditing every caller.
+
+    Reentrant per-thread (via the shared :func:`file_lock` primitive),
+    like every other lock in this module.
+    """
+    lock_path = _portfolio_prefix_lock_path(portfolio_root)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock(lock_path):
+        yield
+
+
 def assign_task_prefix(
     project_id: str, tasks_dir: Path, config, explicit_prefix: str | None = None
 ) -> str:
@@ -1713,11 +1769,46 @@ def add_task(
     # Granularity: one lock file per tasks-dir — different projects run freely.
     # DEADLOCK SAFETY: do NOT call any function that re-enters file_lock on
     # the same lock_path from within this block.
+    #
+    # LOCK ORDERING INVARIANT (CLAWP-116, see portfolio_prefix_lock's own
+    # docstring): this per-project lock is always INNER, relative to the
+    # portfolio-wide lock acquired below when this is a first mint — never
+    # the reverse. The `with _portfolio_lock_cm, file_lock(_lock_path):`
+    # statement a few lines down enforces the ordering syntactically (the
+    # portfolio lock, when present, is entered first).
     _lock_path = tasks_dir / ".clawpm-tasks.lock"
     # Capture whether this is an explicit-ID create BEFORE entering the lock
     # so the clobber guard (Finding 2) can be applied inside atomically.
     _explicit_id = task_id is not None
-    with file_lock(_lock_path):
+
+    # CLAWP-116 — a first-mint auto-ID create is about to touch the
+    # PORTFOLIO-wide allocator (assign_task_prefix -> assign_all_prefixes),
+    # which reads every sibling project's resolved prefix. That read, the
+    # decision it produces, and the task-file write below that makes the
+    # decision real must be serialised against every OTHER concurrent
+    # first-minter in this portfolio, or two such calls can observe a torn
+    # snapshot that never existed as one consistent state (see
+    # portfolio_prefix_lock's docstring). Mirror assign_task_prefix's own
+    # check order EXACTLY (explicit -> inferred -> portfolio) so this
+    # pre-lock decision agrees with what that call will actually do inside
+    # the lock: skip the portfolio lock entirely for an explicit-ID create,
+    # an explicit `task_prefix`, or a project that already has a stable
+    # inferred prefix — only a genuine first mint pays this cost, so
+    # ordinary task creation for an already-prefixed project stays fully
+    # parallel across projects.
+    _explicit_prefix = getattr(_settings, "task_prefix", None) if _settings else None
+    _needs_portfolio_lock = (
+        not _explicit_id
+        and not _explicit_prefix
+        and _infer_prefix_from_tasks(tasks_dir) is None
+    )
+    _portfolio_lock_cm = (
+        portfolio_prefix_lock(config.portfolio_root)
+        if _needs_portfolio_lock
+        else nullcontext()
+    )
+
+    with _portfolio_lock_cm, file_lock(_lock_path):
         # Generate task ID if not provided (inside lock: scan is now serialised)
         if not task_id:
             # CLAWP-048: resolve a portfolio-unique prefix (explicit task_prefix ->
@@ -1730,7 +1821,7 @@ def add_task(
                 project_id,
                 tasks_dir,
                 config,
-                explicit_prefix=getattr(_settings, "task_prefix", None) if _settings else None,
+                explicit_prefix=_explicit_prefix,
             )
 
             # Find highest existing task number.
