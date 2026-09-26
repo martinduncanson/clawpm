@@ -130,6 +130,412 @@ class TestHyphenOnSliceBoundary:
         assert len({first, second}) == 2, (first, second)  # no literal id collision
 
 
+class TestDeterministicGlobalPrefixPass:
+    """CLAWP-121: two task-less siblings assigned via INDEPENDENT calls to
+    ``assign_task_prefix`` (exactly what ``clawpm doctor``'s per-project loop
+    does — unlike sequential ``clawpm tasks add`` calls, where the second call
+    sees the first's REAL minted prefix already claimed) could each guess a
+    prefix the other would also guess, because the old implementation
+    reserved only a PREDICTION of what a sibling might mint.
+
+    PR #60 tried to fix this by having ``_portfolio_prefixes`` reserve each
+    task-less sibling's full candidate CHAIN instead of just its first
+    guess, then patching the fallout of that over-reservation round by
+    round: capping the chain (round 2), discarding the excluding project's
+    own final candidate (round 3), and re-including that final candidate
+    when a peer genuinely contests it (round 4). Four independent review
+    rounds each found a NEW bug in that approach, including one (Codex,
+    round 3, P1 "Preserve a candidate before a resolved terminal claim")
+    that round 4 never fixed — see PR #60's thread for the full history.
+
+    This class replaces that whole "reserve a prediction, then patch what
+    the prediction gets wrong" design with a single deterministic pass:
+    every task-less project's prefix is decided EXACTLY ONCE, in a fixed
+    (alphabetical) order, from the prefixes already decided for the
+    projects before it in that order — simulating what sequential
+    ``tasks add`` calls already do naturally, with nothing to predict and
+    nothing to over-reserve. Every test below reproduces one of the five
+    distinct bug shapes the four review rounds found and confirms the new
+    pass resolves it cleanly (no collision, no spurious refusal) rather
+    than needing a bespoke patch for that shape.
+    """
+
+    def test_two_taskless_siblings_with_deep_collision_do_not_converge_on_the_same_extension(
+        self, tmp_path, monkeypatch
+    ):
+        # PR #60 round 1 (grok-4.6 repro): "code-quorum" and "code-quiz"
+        # both reduce to base "CODE" -- AND their first extension also
+        # collides (both slice to "CODE-Q" at n=6). Neither has minted, so
+        # both independent `assign_task_prefix` calls (doctor's per-project
+        # loop) see an identical task-less portfolio.
+        _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        _add_project(tmp_path, "code-quiz")  # also task-less at this point
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        a = assign_task_prefix(
+            "code-quorum",
+            tmp_path / "projects" / "code-quorum" / ".project" / "tasks",
+            config,
+        )
+        b = assign_task_prefix(
+            "code-quiz",
+            tmp_path / "projects" / "code-quiz" / ".project" / "tasks",
+            config,
+        )
+        assert a != b, (a, b)  # the actual id-uniqueness invariant under test
+
+    def test_taskless_sibling_whose_id_is_a_literal_prefix_does_not_starve_the_shorter_project(
+        self, tmp_path, monkeypatch
+    ):
+        # PR #60 round 2: when one sibling's id is a literal prefix of
+        # another's ("clawpm" / "clawpm-extra" -- this repo's own naming
+        # pattern), a chain-reservation approach can leave the SHORTER
+        # project with no free candidate at all, even though it has no room
+        # to move and should win. Under a deterministic pass this never
+        # arises: "clawpm" sorts before any sibling whose id starts with
+        # "clawpm" (a strict prefix always sorts first lexicographically),
+        # so it is minted FIRST and simply claims its own base.
+        _make_portfolio(tmp_path, monkeypatch, "clawpm")
+        _add_project(tmp_path, "clawpm-extra")  # literal-prefix sibling, task-less
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        short = assign_task_prefix(
+            "clawpm", tmp_path / "projects" / "clawpm" / ".project" / "tasks", config,
+        )
+        long_ = assign_task_prefix(
+            "clawpm-extra",
+            tmp_path / "projects" / "clawpm-extra" / ".project" / "tasks",
+            config,
+        )
+        assert short is not None  # must not raise/refuse -- a real candidate exists
+        assert short != long_, (short, long_)
+
+    def test_trailing_separator_id_still_keeps_its_own_final_candidate(
+        self, tmp_path, monkeypatch
+    ):
+        # PR #60 round 3 (grok-4.5 + Codex): a length-based cap on a
+        # sibling's reservation doesn't track the actual STRIPPED candidate
+        # string when the excluding project's own id ends in a separator --
+        # "clawpm-" (7 raw chars) and "clawpm" (6 raw chars) can collapse
+        # onto the same stripped string despite different raw lengths. A
+        # deterministic pass has no cap to get wrong: "clawpm-"'s base is
+        # "CLAWP" (its OWN first-5-chars slice, distinct from "clawpm-extra"'s
+        # base once stripped), minted directly with nothing to contest it.
+        _make_portfolio(tmp_path, monkeypatch, "clawpm-")
+        _add_project(tmp_path, "clawpm-extra")  # task-less, shares the collapse
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        short = assign_task_prefix(
+            "clawpm-", tmp_path / "projects" / "clawpm-" / ".project" / "tasks", config,
+        )
+        long_ = assign_task_prefix(
+            "clawpm-extra",
+            tmp_path / "projects" / "clawpm-extra" / ".project" / "tasks",
+            config,
+        )
+        assert short is not None
+        assert "--" not in short  # CLAWP-096: no doubled separator either
+        assert short != long_, (short, long_)
+
+    def test_taskless_twins_whose_ids_collapse_to_the_same_final_candidate_resolve_without_collision(
+        self, tmp_path, monkeypatch
+    ):
+        # PR #60 round 4 (grok-4.5): "clawpm-" and "clawpm---" both
+        # trailing-separator-collapse to the same FINAL candidate ("CLAWPM")
+        # once each has exhausted every shorter slice. The chain-reservation
+        # approach's round-3 fix unconditionally discarded the excluding
+        # project's own final candidate from the reserved set -- which let
+        # BOTH independent calls discard it and mint the identical "CLAWPM",
+        # an actual literal id collision (worse than refusing).
+        #
+        # Under a deterministic pass there is no "final candidate" special
+        # case at all: "clawpm-" sorts before "clawpm---" (a strict prefix),
+        # is minted first, and claims its own BASE ("CLAWP", not "CLAWPM"
+        # -- it never needs to reach its final candidate because nothing
+        # has claimed its base yet). "clawpm---" is minted second, sees
+        # "CLAWP" already taken, and extends to "CLAWPM". Both resolve
+        # cleanly with DISTINCT prefixes -- a strictly better outcome than
+        # PR #60's fix, which had both sides refuse (CLAWP-121's premise:
+        # switching approaches removes this failure mode rather than
+        # patching around it).
+        _make_portfolio(tmp_path, monkeypatch, "clawpm-")
+        _add_project(tmp_path, "clawpm---")  # also collapses to "CLAWPM", task-less
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        results = {}
+        for pid in ("clawpm-", "clawpm---"):
+            results[pid] = assign_task_prefix(
+                pid, tmp_path / "projects" / pid / ".project" / "tasks", config,
+            )
+        # Neither call may raise (unlike PR #60's fix), and the two must
+        # never share a namespace.
+        assert len(set(results.values())) == 2, results
+
+    def test_taskless_sibling_with_room_to_extend_is_not_starved_by_a_flexible_peers_reservation(
+        self, tmp_path, monkeypatch
+    ):
+        # PR #60 round 3, Codex P1 "Preserve a candidate before a resolved
+        # terminal claim" -- the ONE finding round 4 never fixed (PR #60
+        # paused there per its own stop condition rather than attempting a
+        # round 5). Task-less "abcdefg" and "abcdefgh" plus a THIRD project
+        # with an explicit claim on "ABCDEFG": a chain-reservation approach
+        # has the longer sibling ("abcdefgh") speculatively reserve EVERY
+        # candidate through its own full length, including "ABCDE" and
+        # "ABCDEF" -- entries it doesn't actually need, since it has room
+        # to sit at "ABCDEFGH" instead. That over-reservation, combined
+        # with the real "ABCDEFG" claim, exhausted "abcdefg" entirely even
+        # though a collision-free assignment plainly exists.
+        #
+        # A deterministic pass never reserves a merely-POSSIBLE candidate:
+        # "abcdefg" is minted first (sorts before "abcdefgh", a strict
+        # prefix) and simply claims its own free base "ABCDE" -- nothing
+        # has claimed it yet, so there is nothing to starve.
+        _make_portfolio(tmp_path, monkeypatch, "abcdefg")
+        _add_project(tmp_path, "abcdefgh")  # task-less, shares the base
+        _add_project(tmp_path, "claimant", task_prefix="ABCDEFG")
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        short = assign_task_prefix(
+            "abcdefg", tmp_path / "projects" / "abcdefg" / ".project" / "tasks", config,
+        )
+        long_ = assign_task_prefix(
+            "abcdefgh",
+            tmp_path / "projects" / "abcdefgh" / ".project" / "tasks",
+            config,
+        )
+        assert short is not None  # must not raise -- a real candidate exists
+        assert long_ is not None
+        assert short != long_, (short, long_)
+        assert short != "ABCDEFG" and long_ != "ABCDEFG"  # the real claim
+
+    def test_three_way_prefix_ladder_resolves_without_collision(self, tmp_path, monkeypatch):
+        # Round-1 review concern (not itself a confirmed bug, but explicitly
+        # flagged as unverified): 3+ task-less siblings that are all mutual
+        # id-prefixes of one another ("code" / "code-a" / "code-ab" /
+        # "code-abc") all share the same 5-char base. A deterministic pass
+        # handles this the same way as the 2-sibling cases: alphabetical
+        # order matches shortest-prefix-first, so each is minted in turn
+        # and extends only as far as it needs to.
+        _make_portfolio(tmp_path, monkeypatch, "code")
+        _add_project(tmp_path, "code-a")
+        _add_project(tmp_path, "code-ab")
+        _add_project(tmp_path, "code-abc")
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        results = {
+            pid: assign_task_prefix(
+                pid, tmp_path / "projects" / pid / ".project" / "tasks", config,
+            )
+            for pid in ("code", "code-a", "code-ab", "code-abc")
+        }
+        assert len(set(results.values())) == 4, results
+
+    def test_trailing_separator_id_with_no_real_extension_is_not_starved_by_a_flexible_sibling(
+        self, tmp_path, monkeypatch
+    ):
+        # PR #60, round 1 of THIS rewrite (Codex + grok-4.6, independently,
+        # different concrete repros converging on the same root cause):
+        # sorting task-less ids ALPHABETICALLY BY RAW ID does not correctly
+        # encode "who has less room to move". "ab-cd_" (trailing "_" strips
+        # away, so its ONLY extension collapses right back to its own base
+        # -- genuinely zero room) sorts AFTER "ab-cd-f" (shares that same
+        # base but can extend to "AB-CD-F") under plain alphabetical order,
+        # because '_' > '-' in ASCII. The flexible sibling was minted
+        # first, greedily took the shared base it didn't actually need,
+        # and starved the constrained one -- exactly the CLAWP-119 failure
+        # mode this whole design is supposed to prevent, reopened by the
+        # new sort key.
+        #
+        # Fix: order by ``len(_naive_prefix_reach(pid))`` ascending (how
+        # many DISTINCT candidates an id can reach) instead of raw id
+        # content -- "ab-cd_" has exactly 1 reachable candidate, "ab-cd-f"
+        # has 2, so the constrained one is always minted first regardless
+        # of what either raw id looks like.
+        _make_portfolio(tmp_path, monkeypatch, "ab-cd_")
+        _add_project(tmp_path, "ab-cd-f")  # shares the base, but can extend
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        short = assign_task_prefix(
+            "ab-cd_", tmp_path / "projects" / "ab-cd_" / ".project" / "tasks", config,
+        )
+        long_ = assign_task_prefix(
+            "ab-cd-f",
+            tmp_path / "projects" / "ab-cd-f" / ".project" / "tasks",
+            config,
+        )
+        assert short is not None  # must not raise -- "ab-cd-f" can step around
+        assert long_ is not None
+        assert short != long_, (short, long_)
+
+    def test_case_variant_twins_resolve_deterministically_across_runs(
+        self, tmp_path, monkeypatch
+    ):
+        # PR #60, round 1 of this rewrite (Codex): two task-less ids that
+        # differ only by case ("abcde" / "ABCDE") both uppercase to the
+        # IDENTICAL string, so a sort keyed only on `pid.upper()` (or
+        # `len(reach)` alone, which also ties for these two) leaves the
+        # relative order dependent on `taskless_ids`' set-iteration order
+        # -- which varies with Python's per-process hash seed. Two
+        # concurrent processes could each pick a DIFFERENT winner and both
+        # believe they minted the free candidate.
+        #
+        # A same-process test can't directly observe a DIFFERENT hash
+        # seed (it's fixed for the life of the process, so calling the
+        # allocator twice in one test process trivially agrees with
+        # itself regardless of whether the tiebreak is hash-independent).
+        # The property that actually needs pinning is the SORT KEY
+        # ITSELF: does it produce the same ordering no matter what order
+        # its inputs are handed to it in (the same thing a different
+        # process's hash seed would vary)? Test that directly against the
+        # private key function -- sorting the SAME two ids as two
+        # differently-ORDERED input lists must agree, which is exactly
+        # what set-iteration-order independence requires.
+        from clawpm.tasks import _naive_prefix_reach
+
+        def _sort_key(pid: str) -> tuple:
+            return (len(_naive_prefix_reach(pid)), pid.upper(), pid)
+
+        forward = sorted(["abcde", "ABCDE"], key=_sort_key)
+        reverse = sorted(["ABCDE", "abcde"], key=_sort_key)
+        assert forward == reverse, (forward, reverse)
+        # Case-sensitive comparison ('A' < 'a' in ASCII) is what actually
+        # makes this deterministic -- a key without the raw-`pid` tiebreak
+        # (just `(len(reach), pid.upper())`) would tie completely on this
+        # pair and fall through to input order, which is exactly the
+        # hash-seed-dependent behaviour being fixed.
+        assert forward[0] == "ABCDE", forward
+
+        # End-to-end sanity check through the public API: whichever side
+        # wins must be the SAME side every time this process resolves it
+        # (weaker than the property above, but confirms the private key
+        # is the one actually driving `assign_task_prefix`).
+        #
+        # Windows directory names are case-insensitive, so the two
+        # projects can't live in dirs named "abcde" / "ABCDE" (they'd
+        # collide on disk) -- a project's id comes from its settings.toml
+        # `id =` field, not its directory name, so two distinctly-named
+        # directories declaring case-variant ids reproduces the same
+        # logical scenario without touching the filesystem's own
+        # case-folding.
+        ids = {"proj-lower": "abcde", "proj-upper": "ABCDE"}
+        _make_portfolio(tmp_path, monkeypatch, "proj-lower")
+        (tmp_path / "projects" / "proj-lower" / ".project" / "settings.toml").write_text(
+            'id = "abcde"\nname = "proj-lower"\nstatus = "active"\npriority = 3\n',
+            encoding="utf-8",
+        )
+        meta = tmp_path / "projects" / "proj-upper" / ".project"
+        (meta / "tasks" / "done").mkdir(parents=True)
+        (meta / "tasks" / "blocked").mkdir(parents=True)
+        (meta / "settings.toml").write_text(
+            'id = "ABCDE"\nname = "proj-upper"\nstatus = "active"\npriority = 3\n',
+            encoding="utf-8",
+        )
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+
+        def _resolve():
+            results = {}
+            for dirname, pid in ids.items():
+                try:
+                    results[pid] = assign_task_prefix(
+                        pid, tmp_path / "projects" / dirname / ".project" / "tasks", config,
+                    )
+                except ValueError as exc:
+                    results[pid] = exc
+            return results
+
+        first_run = _resolve()
+        second_run = _resolve()
+        # Whichever side won (got "ABCDE" back, not a ValueError) must be
+        # the SAME side both times -- not merely "some deterministic
+        # result", but the identical winner across repeated calls.
+        winners_first = {pid for pid, v in first_run.items() if isinstance(v, str)}
+        winners_second = {pid for pid, v in second_run.items() if isinstance(v, str)}
+        assert winners_first == winners_second, (first_run, second_run)
+        assert len(winners_first) == 1, first_run  # exactly one side can win
+
+    def test_real_claims_that_unevenly_exhaust_a_flexible_siblings_reach_do_not_starve_it(
+        self, tmp_path, monkeypatch
+    ):
+        # PR #60, round 2 of this rewrite (Codex): a STATIC sort by TOTAL
+        # reach-count (computed once, before any minting) fixed round 1's
+        # bug but missed a second one -- pre-existing REAL claims can
+        # consume a nominally-more-flexible sibling's options so unevenly
+        # that it ends up MORE constrained in practice than one with a
+        # smaller total reach.
+        #
+        # Task-less "abcdefg" (own total reach: ABCDE, ABCDEF, ABCDEFG --
+        # 3) and "abcdefgh"-shaped "abcdefhi" (own total reach: ABCDE,
+        # ABCDEF, ABCDEFH, ABCDEFHI -- 4) share "ABCDEF" (both ids start
+        # "abcdef"). Three OTHER projects already hold explicit claims on
+        # ABCDE, ABCDEFH, and ABCDEFHI -- leaving "abcdefhi" with exactly
+        # ONE real option (ABCDEF) despite its total reach of 4, while
+        # "abcdefg" still has TWO (ABCDEF, ABCDEFG) despite its smaller
+        # total reach of 3. A static total-reach sort ranks "abcdefg" as
+        # more constrained (3 < 4) and lets it go first, greedily taking
+        # the shared "ABCDEF" it didn't strictly need -- starving
+        # "abcdefhi", which then has nothing left, even though the valid
+        # assignment "abcdefg -> ABCDEFG" / "abcdefhi -> ABCDEF" exists.
+        #
+        # Fix: recompute each id's REMAINING reach (candidates not yet in
+        # `used`) at EVERY pick, not once upfront -- this already reflects
+        # the real claims from the start, so "abcdefhi"'s true remaining
+        # count (1) correctly beats "abcdefg"'s (2) and it is minted
+        # first.
+        _make_portfolio(tmp_path, monkeypatch, "abcdefg")
+        _add_project(tmp_path, "abcdefhi")  # task-less, shares "abcdef"
+        _add_project(tmp_path, "claim-base", task_prefix="ABCDE")
+        _add_project(tmp_path, "claim-h", task_prefix="ABCDEFH")
+        _add_project(tmp_path, "claim-hi", task_prefix="ABCDEFHI")
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        # Note the inversion this test exists to pin: "abcdefg" (smaller
+        # TOTAL reach, 3) ends up with the LONGER final prefix, while
+        # "abcdefhi" (larger total reach, 4, but only 1 REMAINING once
+        # real claims are subtracted) correctly wins the shorter shared
+        # candidate it has no alternative to.
+        g_result = assign_task_prefix(
+            "abcdefg", tmp_path / "projects" / "abcdefg" / ".project" / "tasks", config,
+        )
+        hi_result = assign_task_prefix(
+            "abcdefhi",
+            tmp_path / "projects" / "abcdefhi" / ".project" / "tasks",
+            config,
+        )
+        assert g_result is not None  # must not raise -- a real candidate exists
+        assert hi_result is not None  # "abcdefhi" must not be starved
+        assert g_result != hi_result, (g_result, hi_result)
+        assert hi_result == "ABCDEF", hi_result  # its only remaining real option
+        assert g_result == "ABCDEFG", g_result  # pushed to its own last resort
+
+
 # ---------------------------------------------------------------------------
 # CLAWP-048: cross-project prefix uniqueness (near-name-twin projects must not
 # share an ID namespace) + explicit task_prefix override + doctor detection.

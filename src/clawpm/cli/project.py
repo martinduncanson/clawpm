@@ -865,7 +865,7 @@ def _project_doctor_impl(
             # dir is NOT about `proj` -- `proj` may be perfectly healthy and
             # simply happened to be the taskless project whose mint
             # triggered the portfolio scan that touched the broken sibling.
-            # `_portfolio_prefixes` wraps that case as
+            # `assign_all_prefixes` wraps that case as
             # `PortfolioPrefixScanError` (carrying the sibling's own id), so
             # only the plain-`OSError` case below -- proj's OWN resolve,
             # where `proj.id` really is the failing project -- gets the

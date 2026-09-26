@@ -1305,7 +1305,7 @@ def _naive_prefix_placeholder(project_id: str) -> str:
 
     Mirrors ``assign_task_prefix``'s own ``base`` candidate exactly
     (``id.upper()[:5]`` + the CLAWP-096 trailing-separator strip). Used as
-    the ``_portfolio_prefixes`` collision-set placeholder for a sibling
+    the ``assign_all_prefixes`` collision-set placeholder for a sibling
     project that has no explicit ``task_prefix`` and no tasks minted yet —
     if this placeholder disagreed with what ``assign_task_prefix`` actually
     derives, two still-task-less siblings whose slices land on the same
@@ -1321,7 +1321,7 @@ class PortfolioPrefixScanError(OSError):
     """A sibling's tasks directory couldn't be scanned while collecting
     portfolio prefixes.
 
-    Raised by ``_portfolio_prefixes`` (not ``resolve_existing_prefix``
+    Raised by ``assign_all_prefixes`` (not ``resolve_existing_prefix``
     itself, whose own-project callers still want a bare ``OSError``) so a
     caller iterating a DIFFERENT project can tell "my own resolve failed"
     apart from "a sibling's scan failed" and attribute the issue to the
@@ -1342,100 +1342,66 @@ class PortfolioPrefixScanError(OSError):
         super().__init__(message)
 
 
-def _portfolio_prefixes(config, exclude_id: str) -> set[str]:
-    """Prefixes already claimed by OTHER projects (resolved, or the naive
-    first-mint placeholder for the task-less ones, so a new project can't
-    grab a prefix another would derive).
+def _naive_prefix_candidates(project_id: str):
+    """The full id-derived candidate sequence for ``project_id``, shortest
+    first: the base (``_naive_prefix_placeholder``), then each longer
+    stripped slice through the full id -- in the exact order
+    ``_mint_taskless_candidate`` tries them.
 
-    A task-less sibling's naive placeholder is only a PREDICTION of its own
-    first candidate, not a pin -- if that sibling still has a 6th+ character
-    to extend into, it can always move out of the way, so its guess must not
-    manufacture an unavoidable collision for a project that has no room to
-    extend at all (CLAWP-119 fallout, PR #57: this previously made minting
-    `alpha` alongside a task-less `alpha-extra` raise unconditionally, since
-    `alpha`'s own 5-char id equals its base with nothing to extend into,
-    breaking every caller that mints a first task for it regardless of
-    whether the two projects ever actually collide). A sibling's RESOLVED
-    prefix (explicit `task_prefix`, or inferred from tasks it already
-    minted) is a real claim regardless and is always included.
-
-    Raises:
-        PortfolioPrefixScanError: a sibling's own tasks directory couldn't
-            be scanned (locked/unreadable). Distinguished from a bare
-            ``OSError`` so callers can attribute the failure to the sibling
-            (``sibling_id``) rather than to the project whose resolve/mint
-            triggered this scan.
+    NOT deduplicated: trailing-separator stripping can make more than one
+    slice length collapse to the identical string (``"clawpm-".upper()``'s
+    ``[:6]`` and ``[:7]`` both strip to ``"CLAWPM"``), so this can yield
+    the same value more than once. ``_mint_taskless_candidate`` (first
+    available) and ``_naive_prefix_reach`` (distinct set, for ordering) both
+    derive from this ONE sequence, so they can never disagree about what a
+    given id's chain contains.
     """
-    from .discovery import discover_projects
-
-    exclude_can_extend = len(exclude_id.upper()) > 5
-    used: set[str] = set()
-    for p in discover_projects(config):
-        if p.id == exclude_id:
-            continue
-        try:
-            resolved = resolve_existing_prefix(p)
-        except OSError as exc:
-            raise PortfolioPrefixScanError(p.id, exc) from exc
-        if resolved is not None:
-            used.add(resolved)
-            continue
-        if not exclude_can_extend and len(p.id.upper()) > 5:
-            # We have no room to move; a flexible sibling's mere guess must
-            # not block our only candidate -- it can step around us instead.
-            continue
-        used.add(_naive_prefix_placeholder(p.id))
-    return used
-
-
-def assign_task_prefix(
-    project_id: str, tasks_dir: Path, config, explicit_prefix: str | None = None
-) -> str:
-    """Resolve the prefix to mint a new task under (CLAWP-048).
-
-    explicit ``task_prefix`` -> inferred-from-existing (stability) -> shortest
-    collision-free extension of ``id.upper()[:5]``. A new project that would
-    collide on ``[:5]`` gets the shortest longer prefix no other project uses.
-    The base candidate is derived via ``_naive_prefix_placeholder`` (CLAWP-096)
-    so a slice boundary landing on a hyphen never produces a doubled separator
-    once ``-{num:03d}`` is appended, and so this function's own candidate
-    always agrees with what ``_portfolio_prefixes`` assumes OTHER task-less
-    projects would derive. Extension-loop candidates beyond the base are
-    stripped the same way -- no arm of this function can emit a trailing
-    separator.
-
-    EVERY arm is a pure function of ``project_id`` and the portfolio's other
-    prefixes; none depends on a scanned counter. That is what makes concurrent
-    first mints safe without a lock: two different projects cannot converge on
-    the same candidate, so there is nothing to serialise (Codex P1, PR #57 --
-    see the last-resort comment for why a lock would not have fixed it).
-    There is no synthesised last resort at all (CLAWP-119): when every
-    id-derived candidate is claimed this raises rather than inventing one.
-
-    Raises:
-        ValueError: if every id-derived candidate is already claimed. Only
-            reachable when sibling projects set explicit ``task_prefix``
-            values that exhaust them; the remedy is an explicit
-            ``task_prefix`` on this project, which the message names.
-    """
-    if explicit_prefix:
-        return explicit_prefix.upper()
-    inferred = _infer_prefix_from_tasks(tasks_dir)
-    if inferred:
-        return inferred
     full = project_id.upper()
-    used = _portfolio_prefixes(config, project_id)
-    base = _naive_prefix_placeholder(project_id)
-    if base and base not in used:
-        return base
+    yield _naive_prefix_placeholder(project_id)
     for n in range(6, len(full) + 1):
-        candidate = _strip_trailing_non_alnum(full[:n])
+        yield _strip_trailing_non_alnum(full[:n])
+
+
+def _naive_prefix_reach(project_id: str) -> frozenset[str]:
+    """The DISTINCT id-derived candidates ``project_id`` could ever mint
+    into -- the size of this set is the project's real flexibility.
+
+    CLAWP-121 round-1-of-this-rewrite (Codex + grok-4.6, PR #60): sorting
+    task-less ids alphabetically by raw id does NOT correctly prioritise
+    "no room to extend" the way CLAWP-119 needs, because trailing-
+    separator stripping can make a SHORT-on-real-options id (e.g.
+    ``"ab-cd_"``, whose only extension collapses right back to its own
+    base) sort AFTER a sibling that merely shares its base but has real
+    room to move (e.g. ``"ab-cd-f"``) -- alphabetical order tracks raw
+    string content, not how many DISTINCT prefixes an id can actually
+    reach. Sorting by ``len(_naive_prefix_reach(...))`` ascending instead
+    generalises CLAWP-119 exactly: an id with only ONE reachable candidate
+    (no room at all -- the original CLAWP-119 case) is always processed
+    before any id with more, regardless of raw id length or content.
+    """
+    return frozenset(_naive_prefix_candidates(project_id))
+
+
+def _mint_taskless_candidate(project_id: str, used: set[str]) -> str:
+    """The shortest id-derived prefix for ``project_id`` not already in
+    ``used`` -- see ``_naive_prefix_candidates`` for the exact sequence.
+
+    Shared by ``assign_task_prefix``'s own-candidate search and
+    ``_assign_taskless_prefixes``'s sequential pass, so the two can never
+    disagree about what a given id mints into for a given ``used`` set.
+
+    Raises:
+        ValueError: every id-derived candidate through the full id is
+            already in ``used``.
+    """
+    full = project_id.upper()
+    for candidate in _naive_prefix_candidates(project_id):
         if candidate not in used:
             return candidate
-    # ids are portfolio-unique, so the id-derived candidates above can't
-    # collide with another project's OWN id-derived prefix. But `used` also
-    # holds EXPLICIT `task_prefix` values -- arbitrary strings a sibling can
-    # set independent of its own id -- so every candidate above can still be
+    # ids are portfolio-unique, so id-derived candidates can't collide with
+    # another project's OWN id-derived prefix. But `used` also holds
+    # EXPLICIT `task_prefix` values -- arbitrary strings a sibling can set
+    # independent of its own id -- so every candidate above can still be
     # claimed (Codex P1, PR #57: siblings with explicit prefixes "ABCDE" and
     # "ABCDE-F" exhaust every stripped candidate through n=len(full)).
     #
@@ -1463,6 +1429,208 @@ def assign_task_prefix(
         f"claimed by another project. "
         f"Set an explicit `task_prefix` in this project's settings.toml."
     )
+
+
+def _assign_taskless_prefixes(
+    taskless_ids: set[str], used: set[str]
+) -> tuple[dict[str, str], dict[str, ValueError]]:
+    """Mint every id in ``taskless_ids``, one at a time, always picking the
+    MOST-CONSTRAINED remaining id next and adding its mint to ``used``
+    before the next pick -- so every later pick sees the true, current
+    state of the world, not a snapshot from before this pass started.
+
+    This is the deterministic pass itself (CLAWP-121). "Most constrained"
+    is measured freshly at EVERY step as ``len(_naive_prefix_reach(pid) -
+    used)`` -- how many of `pid`'s candidates are STILL free, right now --
+    not a one-time count computed before the loop begins. This generalises
+    CLAWP-119's "a project with no room to extend must not be starved by a
+    flexible sibling's mere guess" from its original special case (an
+    exactly-5-char id has exactly one candidate, full stop) to every id,
+    of any shape, and to the REMAINING candidates after both real claims
+    and every mint already made this pass -- not just the id's raw total.
+
+    Two earlier, weaker orderings on this same PR round each looked
+    sufficient until a review round found the case they missed:
+      1. Plain alphabetical-by-raw-id (this pass's first cut) failed on
+         trailing-separator ids -- ``"ab-cd_"`` (one real extension, which
+         collapses back to its own base) can sort AFTER a sibling that
+         merely shares its base but has genuine room (``"ab-cd-f"``),
+         because alphabetical order tracks raw string content, not how
+         many candidates remain (Codex + grok-4.6, independently).
+      2. A STATIC sort by TOTAL reach-count (``len(_naive_prefix_reach
+         (pid))``, computed once before the loop) fixed (1) but missed
+         that pre-existing REAL claims can consume a flexible-LOOKING id's
+         options unevenly: task-less ``abcdefg`` (3 total candidates) and
+         ``abcdefhi`` (4 total) with ``ABCDE``/``ABCDEFH``/``ABCDEFHI``
+         already claimed by resolved siblings -- ``abcdefhi`` has only
+         ONE candidate left (``ABCDEF``) once those claims are subtracted,
+         genuinely MORE constrained than ``abcdefg``'s two remaining
+         (``ABCDEF``, ``ABCDEFG``), but total-reach ranked them the other
+         way round and let ``abcdefg`` grab the shared ``ABCDEF`` first,
+         starving ``abcdefhi`` even though the valid assignment
+         ``abcdefg -> ABCDEFG`` / ``abcdefhi -> ABCDEF`` exists (Codex,
+         round 2 of this rewrite).
+
+    Recomputing against the LIVE ``used`` set at every step closes both:
+    it already reflects real claims from the start, and it reflects every
+    taskless mint made so far in THIS pass too, so a later pick can never
+    be blindsided by an earlier one the way a single upfront sort could.
+    Ties are broken by ``(pid.upper(), pid)`` -- a total order independent
+    of `taskless_ids`' set-iteration order (which varies with Python's
+    hash seed) -- without it, two case-variant ids (``"abcde"`` /
+    ``"ABCDE"``) tie completely and the pass could pick a different winner
+    across separate process runs (Codex, round 1).
+
+    A project whose candidates are all exhausted (by real claims, or by
+    earlier-processed siblings in this same pass) is collected into the
+    returned error map rather than aborting the whole pass -- a sibling
+    that can't get a prefix contributes nothing to `used` and must not
+    block anyone else's unrelated resolution (mirrors doctor's existing
+    "skipping the map entry doesn't drop it from the check" reasoning).
+    """
+    assignments: dict[str, str] = {}
+    errors: dict[str, ValueError] = {}
+    remaining = set(taskless_ids)
+    while remaining:
+        pid = min(
+            remaining,
+            key=lambda p: (len(_naive_prefix_reach(p) - used), p.upper(), p),
+        )
+        remaining.discard(pid)
+        try:
+            candidate = _mint_taskless_candidate(pid, used)
+        except ValueError as exc:
+            errors[pid] = exc
+            continue
+        assignments[pid] = candidate
+        used.add(candidate)
+    return assignments, errors
+
+
+def assign_all_prefixes(
+    config, extra_taskless_id: str | None = None
+) -> tuple[dict[str, str], dict[str, ValueError]]:
+    """Deterministic global pass (CLAWP-121): resolve every project's task-id
+    prefix in ONE fixed run, instead of predicting what each task-less
+    sibling might independently mint and reserving against the prediction.
+
+    PR #60 (this task's first attempt) reserved each task-less sibling's
+    naive placeholder, then its full candidate CHAIN, in the `used` set
+    passed to a project's OWN independent `assign_task_prefix` call --
+    treating a sibling's eventual mint as something to guess and defend
+    against. Four review rounds each found a new way that guess could be
+    wrong: too narrow (misses a shared first EXTENSION, not just a shared
+    base), too broad (a chain reservation can starve the very project whose
+    id the chain is a literal prefix of), imprecise (a length-based cap
+    doesn't track what trailing-separator stripping actually collapses to),
+    and still-too-broad even after three patches (a flexible sibling's
+    speculative reservation can starve a THIRD project that never needed
+    to touch that candidate at all). See PR #60's thread for the specifics.
+
+    This function does not predict anything. Real claims (explicit
+    ``task_prefix``, or inferred from tasks a project already minted) are
+    resolved first and never move. Every remaining task-less project is
+    then minted in a single deterministic order via
+    ``_assign_taskless_prefixes`` -- exactly simulating what already
+    happens for sequential ``clawpm tasks add`` calls (the second call
+    sees the first's REAL minted prefix already claimed and naturally
+    extends past it), just run once up front instead of relying on mint
+    order to happen to be sequential. There is no chain to reserve and no
+    set-algebra to get subtly wrong, because nothing is ever reserved on
+    another project's behalf -- each project's own entry in the returned
+    map is either a real claim or an actually-minted value.
+
+    Args:
+        extra_taskless_id: when the caller already knows this specific
+            project is task-less (about to mint its first task, so it has
+            its own -- possibly session/worktree-scoped -- ``tasks_dir``
+            to resolve against, per CLAWP-098), pass its id here so this
+            pass treats it as task-less without re-resolving it via
+            ``discover_projects``' canonical project_dir, which could
+            disagree with the caller's session-scoped resolution.
+
+    Returns:
+        ``(assignments, errors)``. ``assignments`` maps every successfully
+        resolved/minted project id to its prefix. ``errors`` maps any
+        task-less project id whose candidates were all exhausted to the
+        ``ValueError`` it hit -- collected rather than raised immediately,
+        so one project's refusal doesn't abort resolution for the rest of
+        the portfolio (doctor's cross-project scan needs this; a single
+        ``assign_task_prefix`` call re-raises its own project's entry).
+
+    Raises:
+        PortfolioPrefixScanError: a project's own tasks directory couldn't
+            be scanned (locked/unreadable) while resolving its REAL claim.
+            Unlike a taskless mint refusal, this aborts the whole pass --
+            it means the portfolio's true state genuinely couldn't be
+            read, not that one candidate space is exhausted.
+    """
+    from .discovery import discover_projects
+
+    resolved: dict[str, str] = {}
+    taskless_ids: set[str] = set()
+    if extra_taskless_id is not None:
+        taskless_ids.add(extra_taskless_id)
+    for p in discover_projects(config):
+        if p.id == extra_taskless_id:
+            continue
+        try:
+            prefix = resolve_existing_prefix(p)
+        except OSError as exc:
+            raise PortfolioPrefixScanError(p.id, exc) from exc
+        if prefix is not None:
+            resolved[p.id] = prefix
+        else:
+            taskless_ids.add(p.id)
+
+    used = set(resolved.values())
+    taskless_assignments, errors = _assign_taskless_prefixes(taskless_ids, used)
+    assignments = {**resolved, **taskless_assignments}
+    return assignments, errors
+
+
+def assign_task_prefix(
+    project_id: str, tasks_dir: Path, config, explicit_prefix: str | None = None
+) -> str:
+    """Resolve the prefix to mint a new task under (CLAWP-048).
+
+    explicit ``task_prefix`` -> inferred-from-existing (stability) -> shortest
+    collision-free extension of ``id.upper()[:5]``. A new project that would
+    collide on ``[:5]`` gets the shortest longer prefix no other project uses.
+    The base candidate is derived via ``_naive_prefix_placeholder`` (CLAWP-096)
+    so a slice boundary landing on a hyphen never produces a doubled separator
+    once ``-{num:03d}`` is appended.
+
+    The portfolio-wide candidate search (once this project's own explicit/
+    inferred prefix is ruled out) delegates to ``assign_all_prefixes``
+    (CLAWP-121): a single deterministic pass that mints every task-less
+    project in the portfolio in one fixed order, rather than this call
+    trying to predict what OTHER task-less siblings might independently
+    mint and defending against the prediction. That pass is a pure function
+    of the portfolio's real claims and the full set of currently task-less
+    ids -- independent of which project happens to be asking -- so two
+    different projects' calls can never converge on the same candidate
+    (Codex P1, PR #57: what makes concurrent first mints safe without a
+    lock -- see the pass's own docstring for why a reservation-based
+    design kept finding new ways to disagree with itself across review
+    rounds instead).
+
+    Raises:
+        ValueError: if every id-derived candidate is already claimed. Only
+            reachable when sibling projects set explicit ``task_prefix``
+            values (or earlier-processed task-less siblings, in this same
+            pass) exhaust them; the remedy is an explicit ``task_prefix``
+            on this project, which the message names.
+    """
+    if explicit_prefix:
+        return explicit_prefix.upper()
+    inferred = _infer_prefix_from_tasks(tasks_dir)
+    if inferred:
+        return inferred
+    assignments, errors = assign_all_prefixes(config, extra_taskless_id=project_id)
+    if project_id in errors:
+        raise errors[project_id]
+    return assignments[project_id]
 
 
 def add_task(
