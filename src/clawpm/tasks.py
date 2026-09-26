@@ -1347,15 +1347,18 @@ def _naive_prefix_candidates(project_id: str):
     """The full id-derived candidate sequence for ``project_id``, shortest
     first: the base (``_naive_prefix_placeholder``), then each longer
     stripped slice through the full id -- in the exact order
-    ``_mint_taskless_candidate`` tries them.
+    ``_assign_taskless_prefixes``'s bipartite matching (CLAWP-124) tries
+    them, both for a pid's own search and for a reassignment attempt when
+    augmenting a path through an already-matched candidate.
 
     NOT deduplicated: trailing-separator stripping can make more than one
     slice length collapse to the identical string (``"clawpm-".upper()``'s
     ``[:6]`` and ``[:7]`` both strip to ``"CLAWPM"``), so this can yield
-    the same value more than once. ``_mint_taskless_candidate`` (first
-    available) and ``_naive_prefix_reach`` (distinct set, for ordering) both
-    derive from this ONE sequence, so they can never disagree about what a
-    given id's chain contains.
+    the same value more than once. The matching search's own ``visited``
+    guard (per augmenting-path attempt) makes a repeated value harmless --
+    it's just skipped the second time. ``_naive_prefix_reach`` (distinct
+    set) derives from this same ONE sequence, so the two can never
+    disagree about what a given id's chain contains.
     """
     full = project_id.upper()
     yield _naive_prefix_placeholder(project_id)
@@ -1383,128 +1386,105 @@ def _naive_prefix_reach(project_id: str) -> frozenset[str]:
     return frozenset(_naive_prefix_candidates(project_id))
 
 
-def _mint_taskless_candidate(project_id: str, used: set[str]) -> str:
-    """The shortest id-derived prefix for ``project_id`` not already in
-    ``used`` -- see ``_naive_prefix_candidates`` for the exact sequence.
-
-    Shared by ``assign_task_prefix``'s own-candidate search and
-    ``_assign_taskless_prefixes``'s sequential pass, so the two can never
-    disagree about what a given id mints into for a given ``used`` set.
-
-    Raises:
-        ValueError: every id-derived candidate through the full id is
-            already in ``used``.
-    """
-    full = project_id.upper()
-    for candidate in _naive_prefix_candidates(project_id):
-        if candidate not in used:
-            return candidate
-    # ids are portfolio-unique, so id-derived candidates can't collide with
-    # another project's OWN id-derived prefix. But `used` also holds
-    # EXPLICIT `task_prefix` values -- arbitrary strings a sibling can set
-    # independent of its own id -- so every candidate above can still be
-    # claimed (Codex P1, PR #57: siblings with explicit prefixes "ABCDE" and
-    # "ABCDE-F" exhaust every stripped candidate through n=len(full)).
-    #
-    # There is no synthesised last resort: this fails loudly and tells the
-    # operator to set an explicit `task_prefix`.
-    #
-    # A generated fallback was tried across PR #57 rounds 4-9 (a digest of the
-    # project id, stem-truncated to fit dispatch's 64-character id cap) and
-    # split back out to CLAWP-119. It was correct in isolation and wrong in
-    # aggregate: it produced a review finding in five consecutive rounds, and
-    # its length budget cannot be made correct by tuning. `emit_tree` mints
-    # child ids as `f"{parent_id}-{ordinal:03d}"` recursively with no depth
-    # cap, so ANY fixed suffix reserve is a wall at some depth -- a 52-char
-    # generated prefix passes the cap at depth 3 and fails it at depth 4.
-    # Bounding it properly means enforcing the cap where ids are MINTED, which
-    # is a change to the task-id system, not to this PR's CLI ergonomics.
-    #
-    # Failing here costs little: this arm is reached only when the base AND
-    # every extension through len(full) are claimed, which needs siblings with
-    # explicit prefixes engineered to exhaust them. An actionable error in that
-    # corner beats a synthesised prefix the rest of the tool cannot use.
-    raise ValueError(
-        f"Cannot derive a collision-free task prefix for project "
-        f"{project_id!r}: every id-derived candidate through {full!r} is "
-        f"claimed by another project. "
-        f"Set an explicit `task_prefix` in this project's settings.toml."
-    )
-
-
 def _assign_taskless_prefixes(
     taskless_ids: set[str], used: set[str]
 ) -> tuple[dict[str, str], dict[str, ValueError]]:
-    """Mint every id in ``taskless_ids``, one at a time, always picking the
-    MOST-CONSTRAINED remaining id next and adding its mint to ``used``
-    before the next pick -- so every later pick sees the true, current
-    state of the world, not a snapshot from before this pass started.
+    """Assign every id in ``taskless_ids`` a collision-free prefix via
+    MAXIMUM BIPARTITE MATCHING (Kuhn's algorithm / augmenting paths;
+    CLAWP-124), not greedy most-constrained-first (CLAWP-121, superseded).
 
-    This is the deterministic pass itself (CLAWP-121). "Most constrained"
-    is measured freshly at EVERY step as ``len(_naive_prefix_reach(pid) -
-    used)`` -- how many of `pid`'s candidates are STILL free, right now --
-    not a one-time count computed before the loop begins. This generalises
-    CLAWP-119's "a project with no room to extend must not be starved by a
-    flexible sibling's mere guess" from its original special case (an
-    exactly-5-char id has exactly one candidate, full stop) to every id,
-    of any shape, and to the REMAINING candidates after both real claims
-    and every mint already made this pass -- not just the id's raw total.
+    Left nodes: task-less project ids. Right nodes: id-derived candidate
+    strings (:func:`_naive_prefix_candidates`, shortest-first per id).
+    Edges: a pid's own candidate chain. Real claims in ``used`` are FIXED
+    pre-occupied right-nodes -- never part of the matching search space,
+    never reassigned.
 
-    Two earlier, weaker orderings on this same PR round each looked
-    sufficient until a review round found the case they missed:
-      1. Plain alphabetical-by-raw-id (this pass's first cut) failed on
-         trailing-separator ids -- ``"ab-cd_"`` (one real extension, which
-         collapses back to its own base) can sort AFTER a sibling that
-         merely shares its base but has genuine room (``"ab-cd-f"``),
-         because alphabetical order tracks raw string content, not how
-         many candidates remain (Codex + grok-4.6, independently).
-      2. A STATIC sort by TOTAL reach-count (``len(_naive_prefix_reach
-         (pid))``, computed once before the loop) fixed (1) but missed
-         that pre-existing REAL claims can consume a flexible-LOOKING id's
-         options unevenly: task-less ``abcdefg`` (3 total candidates) and
-         ``abcdefhi`` (4 total) with ``ABCDE``/``ABCDEFH``/``ABCDEFHI``
-         already claimed by resolved siblings -- ``abcdefhi`` has only
-         ONE candidate left (``ABCDEF``) once those claims are subtracted,
-         genuinely MORE constrained than ``abcdefg``'s two remaining
-         (``ABCDEF``, ``ABCDEFG``), but total-reach ranked them the other
-         way round and let ``abcdefg`` grab the shared ``ABCDEF`` first,
-         starving ``abcdefhi`` even though the valid assignment
-         ``abcdefg -> ABCDEFG`` / ``abcdefhi -> ABCDEF`` exists (Codex,
-         round 2 of this rewrite).
+    Why greedy was replaced (not just re-tuned again): greedy commits each
+    pid's pick immediately and never reconsiders an earlier one, which is
+    PROVABLY INCOMPLETE for this problem -- it can spuriously refuse a
+    project even when a valid, collision-free assignment for the whole
+    portfolio exists. Concrete counter-example (Codex, PR #60 round 3):
+    three ids tying at reach=2 -- ``abcde-c`` -> {ABCDE, ABCDE-C},
+    ``abcdeb-`` -> {ABCDE, ABCDEB}, ``abcdeb--`` -> {ABCDE, ABCDEB}
+    (identical to `abcdeb-`'s, via trailing-separator collapse). Greedy
+    processes `abcde-c` first (tiebreak), takes ABCDE even though it has a
+    perfectly good alternative (ABCDE-C) -- leaving the two `abcdeb*` ids
+    to split {ABCDE, ABCDEB} with ABCDE gone, so one of them refuses, even
+    though `abcde-c -> ABCDE-C` plus the two `abcdeb*` ids splitting
+    {ABCDE, ABCDEB} is a fully valid assignment. No greedy tiebreak fixes
+    this: the flaw is the SHAPE of the algorithm (never reconsiders a
+    commitment), not the ordering heuristic on top of it -- three prior
+    ordering heuristics on this exact function each patched one bug shape
+    and exposed another (see the CLAWP-121/PR #60 history this docstring
+    used to carry). Augmenting-path matching is provably COMPLETE for
+    bipartite matching (Hall's/König's theorem): a valid assignment is
+    found whenever one exists, because reassigning an earlier pick to free
+    up its OWN alternate candidate is exactly what an augmenting path does.
 
-    Recomputing against the LIVE ``used`` set at every step closes both:
-    it already reflects real claims from the start, and it reflects every
-    taskless mint made so far in THIS pass too, so a later pick can never
-    be blindsided by an earlier one the way a single upfront sort could.
-    Ties are broken by ``(pid.upper(), pid)`` -- a total order independent
-    of `taskless_ids`' set-iteration order (which varies with Python's
-    hash seed) -- without it, two case-variant ids (``"abcde"`` /
-    ``"ABCDE"``) tie completely and the pass could pick a different winner
-    across separate process runs (Codex, round 1).
+    Determinism (an explicit invariant to preserve, not a nice-to-have --
+    concurrent first-mint safety depends on it, CLAWP-116/PR #57): left
+    nodes are processed in a FIXED total order (``(pid.upper(), pid)``,
+    independent of `taskless_ids`' set-iteration order / hash seed);
+    within each pid's own search, candidates are tried in
+    :func:`_naive_prefix_candidates`'s fixed shortest-first order, and a
+    reassignment attempt explores the CURRENT holder's candidates in that
+    same fixed order too. Two runs against the same portfolio state always
+    produce the same assignment.
 
-    A project whose candidates are all exhausted (by real claims, or by
-    earlier-processed siblings in this same pass) is collected into the
-    returned error map rather than aborting the whole pass -- a sibling
-    that can't get a prefix contributes nothing to `used` and must not
-    block anyone else's unrelated resolution (mirrors doctor's existing
+    A pid with no augmenting path (every reachable candidate is
+    permanently claimed, transitively) is collected into the returned
+    error map rather than aborting the whole pass -- a sibling that can't
+    get a prefix contributes nothing to the matching and must not block
+    anyone else's unrelated resolution (mirrors doctor's existing
     "skipping the map entry doesn't drop it from the check" reasoning).
     """
-    assignments: dict[str, str] = {}
+    fixed_used = frozenset(used)
+    match_candidate_to_pid: dict[str, str] = {}
+
+    def try_augment(pid: str, visited: set[str]) -> bool:
+        for candidate in _naive_prefix_candidates(pid):
+            if candidate in fixed_used or candidate in visited:
+                continue
+            visited.add(candidate)
+            holder = match_candidate_to_pid.get(candidate)
+            if holder is None or try_augment(holder, visited):
+                match_candidate_to_pid[candidate] = pid
+                return True
+        return False
+
+    order = sorted(taskless_ids, key=lambda p: (p.upper(), p))
     errors: dict[str, ValueError] = {}
-    remaining = set(taskless_ids)
-    while remaining:
-        pid = min(
-            remaining,
-            key=lambda p: (len(_naive_prefix_reach(p) - used), p.upper(), p),
-        )
-        remaining.discard(pid)
-        try:
-            candidate = _mint_taskless_candidate(pid, used)
-        except ValueError as exc:
-            errors[pid] = exc
-            continue
-        assignments[pid] = candidate
-        used.add(candidate)
+    for pid in order:
+        if not try_augment(pid, set()):
+            # No augmenting path exists: every candidate reachable from pid,
+            # transitively through reassignment, is permanently claimed by a
+            # REAL (explicit or inferred) prefix -- `used` holds those, and
+            # they are never part of the matching search space. This is only
+            # reachable when sibling projects set explicit `task_prefix`
+            # values that exhaust the whole chain (Codex P1, PR #57: siblings
+            # "ABCDE" and "ABCDE-F" exhaust every stripped candidate through
+            # n=len(full)).
+            #
+            # There is no synthesised last-resort candidate here: this fails
+            # loudly and tells the operator to set an explicit `task_prefix`.
+            # A generated fallback (a digest of the project id) was tried
+            # across PR #57 rounds 4-9 and split back out to CLAWP-119 -- it
+            # was correct in isolation and wrong in aggregate (a review
+            # finding in five consecutive rounds; its length budget can't be
+            # made correct by tuning, since emit_tree mints child ids
+            # recursively with no depth cap, so ANY fixed suffix reserve is a
+            # wall at SOME depth). An actionable error beats a synthesised
+            # prefix the rest of the tool cannot use.
+            full = pid.upper()
+            errors[pid] = ValueError(
+                f"Cannot derive a collision-free task prefix for project "
+                f"{pid!r}: every id-derived candidate through {full!r} is "
+                f"claimed by another project. "
+                f"Set an explicit `task_prefix` in this project's settings.toml."
+            )
+
+    assignments = {pid: candidate for candidate, pid in match_candidate_to_pid.items()}
+    used.update(assignments.values())
     return assignments, errors
 
 
