@@ -313,9 +313,62 @@ def _backdate_blocked_task(blocked_path: Path, old_date_iso: str) -> None:
     os.utime(blocked_path, (old_ts, old_ts))
 
 
+def _fake_local_date_one_day_ahead_of_utc(monkeypatch) -> date:
+    """Simulate a machine whose LOCAL calendar date already reads one day
+    ahead of the REAL current UTC date -- realistic for large positive
+    UTC offsets shortly after local midnight (e.g. UTC+14).
+
+    Rebinds THIS MODULE's own `date` name (not the builtin type itself,
+    which is immutable and can't be monkeypatched directly -- confirmed:
+    ``date.today = ...`` raises ``TypeError``) to a subclass whose
+    ``today()`` is faked. `datetime.now(timezone.utc)` -- what doctor's
+    own stale-blocked reader and this function's own `real_utc_today`
+    both actually call -- is left completely untouched, so callers below
+    exercise the REAL interpretation gap between two genuinely different
+    clock reads, not a fully mocked clock. Returns the real UTC date the
+    fake is anchored to, for callers' own assertions.
+    """
+    real_utc_today = datetime.now(timezone.utc).date()
+
+    class _FakeDate(date):
+        @classmethod
+        def today(cls):
+            return real_utc_today + timedelta(days=1)
+
+    monkeypatch.setattr(sys.modules[__name__], "date", _FakeDate)
+    return real_utc_today
+
+
 class TestDoctorStaleBlocked:
     def test_doctor_flags_blocked_with_done_deps(self, temp_portfolio, monkeypatch):
-        """A task in blocked/ whose deps are all done is stale-blocked."""
+        """A task in blocked/ whose deps are all done is stale-blocked --
+        including under the exact adversarial timezone condition that
+        used to flake this test (CLAWP-123).
+
+        Doctor's stale-blocked reader treats a date-only `updated` stamp
+        as END-OF-DAY UTC on that date (project.py, CLAWP-086: "so a task
+        blocked late on day D isn't falsely reported the next morning").
+        The pre-fix version of this test backdated using LOCAL
+        `date.today()`, which is only the same calendar day as UTC's
+        current date part of the time on a positive-UTC-offset machine --
+        for part of each day, local `date.today()` already reads
+        "tomorrow" relative to UTC, understating a "2 days ago" backdate
+        to under the 24h cutoff once reinterpreted, so the task silently
+        wasn't flagged.
+
+        Fix: derive the backdate from ``datetime.now(timezone.utc)
+        .date()`` instead, matching the reader's own interpretation
+        exactly. This test now applies `_fake_local_date_one_day_ahead_
+        of_utc` directly (grok-4.5, PR #61 round 1: the fix and its
+        regression guard must be the SAME test, or reverting the fix back
+        to `date.today()` here would stay green on a UTC-timezone CI
+        runner while the flake returns on any positive-offset machine) --
+        if a future edit reintroduces `date.today()` on the line below,
+        THIS test starts failing under the fake, regardless of what
+        timezone actually runs it.
+        """
+        _fake_local_date_one_day_ahead_of_utc(monkeypatch)
+
         config = temp_portfolio["config"]
         parent = add_task(config, "test", title="Parent")
         child = add_task(
@@ -333,21 +386,21 @@ class TestDoctorStaleBlocked:
         # (the authoritative signal — the block above stamped it to today) and
         # the mtime as the legacy fallback.
         #
-        # CLAWP-123: backdate using UTC's current date, not the LOCAL
-        # `date.today()` — doctor's own stale-blocked reader deliberately
-        # interprets a date-only `updated` stamp as END-OF-DAY UTC
-        # (project.py, CLAWP-086: "so a task blocked late on day D isn't
-        # falsely reported the next morning"). `date.today()` and "UTC's
-        # current date" are only the same calendar day when the test
-        # happens to run in UTC or during the part of the day both agree
-        # on — on a positive-UTC-offset machine, local `date.today()` can
-        # already be tomorrow's UTC date for part of the day, understating
-        # the 2-day backdate to under the 24h cutoff and flaking this test
-        # (see test_local_date_today_backdating_can_understate_utc_staleness
-        # below for a deterministic reproduction of exactly this). Deriving
-        # the backdate from UTC's date instead matches the reader's own
-        # interpretation exactly, so the gap is always >= 24h regardless of
-        # the test machine's timezone or time of day.
+        # 2 UTC days back, not 3: this MUST stay 2, not a wider "safer-looking"
+        # margin — PRE-REVIEW suggested 3 (matching test_updated_timestamp.py's
+        # wider margins), but verified by direct computation that with the
+        # adversarial fake above applied, a REVERTED `date.today()` at N=3
+        # still resolves past the 24h cutoff (gap >= 24h for every time of
+        # day) and would NOT be caught as a regression — only N=2 makes the
+        # fake actually distinguish "fixed" from "buggy" (grok-4.5, PR #61
+        # round 1). Separately verified N=2 with the UTC-date fix is itself
+        # never flaky on its own (gap >= ~24.0003h for every time of day,
+        # confirmed by direct computation across a full day's sweep) — the
+        # PRE-REVIEW ~1s-margin observation was correct but was about
+        # cosmetic consistency with sibling tests' wider margins, not an
+        # actual flake; widening it here would have silently defeated the
+        # regression guard above instead. `date.today()` is faked above but
+        # this line never calls it -- that's the point.
         child_blocked_path = (
             temp_portfolio["tasks_dir"] / "blocked" / f"{child.id}.md"
         )
@@ -364,54 +417,45 @@ class TestDoctorStaleBlocked:
         sb_ids = [sb["task_id"] for sb in payload.get("stale_blocked", [])]
         assert child.id in sb_ids
 
-    def _fake_local_date_one_day_ahead_of_utc(self, monkeypatch) -> date:
-        """Simulate a machine whose LOCAL calendar date already reads one
-        day ahead of the REAL current UTC date -- realistic for large
-        positive UTC offsets shortly after local midnight (e.g. UTC+14).
-
-        Rebinds this test MODULE's own `date` name (not the builtin type
-        itself, which is immutable and can't be monkeypatched directly --
-        confirmed: ``date.today = ...`` raises ``TypeError``) to a
-        subclass whose ``today()`` is faked. `datetime.now(timezone.utc)`
-        -- what doctor's own stale-blocked reader and this test's
-        `real_utc_today` both actually call -- is left completely
-        untouched, so the two tests below exercise the REAL
-        interpretation gap between two genuinely different clock reads,
-        not a fully mocked clock. Returns the real UTC date the fake is
-        anchored to, for the tests' own assertions.
-        """
-        real_utc_today = datetime.now(timezone.utc).date()
-
-        class _FakeDate(date):
-            @classmethod
-            def today(cls):
-                return real_utc_today + timedelta(days=1)
-
-        monkeypatch.setattr(sys.modules[__name__], "date", _FakeDate)
-        return real_utc_today
-
     def test_local_date_today_backdating_can_understate_utc_staleness(
         self, temp_portfolio, monkeypatch
     ):
-        """CLAWP-123: deterministic reproduction of the flake in
-        ``test_doctor_flags_blocked_with_done_deps`` before its fix
-        (backdating via LOCAL `date.today()` instead of UTC's current
-        date) -- a permanent record of the confirmed bug pattern, so a
-        future edit can't silently reintroduce it into that test.
+        """CLAWP-123: deterministic reproduction of the flake in the test
+        above, before its fix (backdating via LOCAL `date.today()` instead
+        of UTC's current date) -- a permanent, documented record of the
+        confirmed bug pattern, kept as a negative control alongside the
+        positive test above (grok-4.5, PR #61 round 1: the two together
+        show BOTH that the old pattern fails and the new one doesn't,
+        under the identical adversarial condition).
 
-        Doctor's stale-blocked reader treats a date-only `updated` stamp
-        as END-OF-DAY UTC on that date (project.py, CLAWP-086). The
-        pre-fix test computed its 2-day backdate from `date.today()` --
-        the LOCAL calendar date. Those two are the same calendar day only
-        part of the time on a positive-UTC-offset machine: for part of
-        each day, local `date.today()` is already "tomorrow" relative to
-        UTC's current date, understating a "2 days ago" backdate to only
-        ONE real UTC day back once reinterpreted as UTC end-of-day --
-        under the 24h STALE_BLOCKED_HOURS cutoff for virtually any time
-        of day the check runs, so the task is NOT flagged and the
-        pre-fix test flaked.
+        See the test above for the mechanism. This one backdates 2 LOCAL
+        days back (the pre-CLAWP-123 computation) instead of 3 UTC days,
+        and asserts the task is NOT flagged -- reproducing the historical
+        flake on demand rather than waiting to hit it by chance.
+
+        Guards against its OWN much narrower residual timing risk (grok-
+        4.5 + PRE-REVIEW, both independently, PR #61 round 1): the
+        backdated stamp resolves to end-of-day UTC on `real_utc_today -
+        1`, so the "not yet stale" window closes at exactly UTC
+        `23:59:59` on `real_utc_today` -- if the doctor invocation below
+        happens to run in the last instants of the UTC day (or straddles
+        the UTC midnight rollover), the assertion direction flips. That
+        window is ~1 second wide out of 86400, but it's the same flake
+        SHAPE this task exists to eliminate, so skip rather than risk it.
         """
-        real_utc_today = self._fake_local_date_one_day_ahead_of_utc(monkeypatch)
+        now = datetime.now(timezone.utc)
+        _seconds_to_utc_midnight = (
+            86400 - (now.hour * 3600 + now.minute * 60 + now.second)
+        )
+        if _seconds_to_utc_midnight < 30:
+            pytest.skip(
+                "within 30s of UTC midnight -- this test's own backdated "
+                "stamp resolves to exactly that boundary; skip rather than "
+                "risk the ~1s/day flake this reproduction would otherwise "
+                "have (see docstring)"
+            )
+
+        real_utc_today = _fake_local_date_one_day_ahead_of_utc(monkeypatch)
 
         config = temp_portfolio["config"]
         parent = add_task(config, "test", title="Parent")
@@ -441,46 +485,4 @@ class TestDoctorStaleBlocked:
             "staleness here (that's the bug this task fixed) -- if this "
             "now fails, either doctor's reader semantics changed or this "
             "reproduction no longer models the original flake"
-        )
-
-    def test_utc_date_backdating_is_immune_to_the_local_date_understatement(
-        self, temp_portfolio, monkeypatch
-    ):
-        """CLAWP-123: the FIX (`test_doctor_flags_blocked_with_done_deps`'s
-        current backdating, derived from ``datetime.now(timezone.utc)
-        .date()`` rather than `date.today()`) correctly detects staleness
-        even under the EXACT SAME adversarial local-date fake that
-        defeats the pre-fix pattern in the test above -- proving the fix
-        is robust against the specific mechanism that caused the flake,
-        not just coincidentally passing on this machine's timezone.
-        """
-        self._fake_local_date_one_day_ahead_of_utc(monkeypatch)
-
-        config = temp_portfolio["config"]
-        parent = add_task(config, "test", title="Parent")
-        child = add_task(config, "test", title="Child", depends=[parent.id])
-        change_task_state(config, "test", child.id, TaskState.BLOCKED)
-        change_task_state(config, "test", parent.id, TaskState.DONE)
-
-        child_blocked_path = (
-            temp_portfolio["tasks_dir"] / "blocked" / f"{child.id}.md"
-        )
-        assert child_blocked_path.exists()
-        # The FIXED computation: 2 UTC days back. `date.today()` is faked
-        # in this test too (via the same helper), but this call never
-        # reaches it -- proving the fix doesn't merely avoid the fake by
-        # accident.
-        _old_date = (
-            datetime.now(timezone.utc).date() - timedelta(days=2)
-        ).isoformat()
-        _backdate_blocked_task(child_blocked_path, _old_date)
-
-        runner = CliRunner()
-        r = runner.invoke(main, ["doctor"])
-        assert r.exit_code == 0, r.output
-        payload = json.loads(r.output)
-        sb_ids = [sb["task_id"] for sb in payload.get("stale_blocked", [])]
-        assert child.id in sb_ids, (
-            "the UTC-date-based backdate should be immune to the "
-            "local-date-ahead-of-UTC scenario that broke the old pattern"
         )
