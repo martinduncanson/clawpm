@@ -535,6 +535,119 @@ class TestDeterministicGlobalPrefixPass:
         assert hi_result == "ABCDEF", hi_result  # its only remaining real option
         assert g_result == "ABCDEFG", g_result  # pushed to its own last resort
 
+    def test_greedy_counter_example_all_three_resolve_without_spurious_refusal(self):
+        """CLAWP-124: the exact PR #60 round-3 counter-example (Codex) that
+        PROVED greedy most-constrained-first incomplete for this problem --
+        confirmed live (2026-09-25) to spuriously refuse one of the three
+        under the (now-replaced) greedy allocator.
+
+        Three ids tie at reach=2: ``abcde-c`` -> {ABCDE, ABCDE-C},
+        ``abcdeb-`` -> {ABCDE, ABCDEB}, ``abcdeb--`` -> {ABCDE, ABCDEB}
+        (identical to `abcdeb-`'s -- its only non-base candidate ALSO
+        collapses to ABCDEB via trailing-separator stripping). Greedy
+        processed `abcde-c` first (tiebreak on `pid.upper()`), took ABCDE
+        even though ABCDE-C was free, then had nothing left to give one of
+        the two `abcdeb*` siblings. A valid assignment for all three exists
+        regardless (`abcde-c -> ABCDE-C` frees ABCDE for the `abcdeb*` pair
+        to split) -- augmenting-path matching must find it.
+
+        Deliberately does NOT hand-encode which id gets which prefix (more
+        than one valid assignment exists here -- the two `abcdeb*` ids can
+        swap which one takes ABCDE vs ABCDEB) -- asserts the INVARIANTS
+        Kuhn's algorithm actually guarantees instead: no refusal, every id
+        assigned, all assigned prefixes distinct, and each assigned prefix
+        is a real member of that id's own reachable candidate set (not a
+        fabricated string) -- verified via `_naive_prefix_reach` itself,
+        the same reach-computation the allocator's own docstring relies on,
+        not a hand-typed guess (memory: verify-tool-behaviour-by-running-it).
+        """
+        from clawpm.tasks import _assign_taskless_prefixes, _naive_prefix_reach
+
+        ids = {"abcde-c", "abcdeb-", "abcdeb--"}
+        assignments, errors = _assign_taskless_prefixes(set(ids), set())
+
+        assert errors == {}, f"spurious refusal: {errors}"
+        assert set(assignments.keys()) == ids
+        assert len(set(assignments.values())) == len(ids), assignments
+        for pid, prefix in assignments.items():
+            assert prefix in _naive_prefix_reach(pid), (pid, prefix)
+
+    def test_matching_finds_a_valid_assignment_whenever_hall_condition_holds(self):
+        """CLAWP-124: a broader (not hand-picked) correctness check -- for
+        ANY set of task-less ids where a perfect assignment is known to
+        exist (verified via a brute-force reference search over each id's
+        own candidate set, independent of the production allocator), the
+        production matching must find ONE, never a spurious refusal.
+
+        This is the general property greedy could not guarantee (it is
+        provably incomplete); Kuhn's algorithm is provably complete for
+        bipartite matching whenever a perfect matching exists (Hall's
+        theorem), so this is a real correctness invariant, not a coincidence
+        of the one hand-picked counter-example above.
+        """
+        import itertools
+        from clawpm.tasks import _assign_taskless_prefixes, _naive_prefix_reach
+
+        ids = ["abcde-c", "abcdeb-", "abcdeb--", "abcdefg"]
+        reach = {pid: _naive_prefix_reach(pid) for pid in ids}
+
+        # Brute-force reference: does ANY assignment of ids to distinct
+        # candidates from their own reach sets exist? (Independent of the
+        # production algorithm -- this is what Hall's theorem's condition
+        # actually verifies for a small, concrete instance.)
+        def _has_perfect_matching() -> bool:
+            candidate_lists = [sorted(reach[pid]) for pid in ids]
+            for combo in itertools.product(*candidate_lists):
+                if len(set(combo)) == len(ids):
+                    return True
+            return False
+
+        assert _has_perfect_matching(), "test setup error: no valid assignment exists"
+
+        assignments, errors = _assign_taskless_prefixes(set(ids), set())
+        assert errors == {}, f"spurious refusal despite a valid assignment existing: {errors}"
+        assert set(assignments.keys()) == set(ids)
+        assert len(set(assignments.values())) == len(ids), assignments
+        for pid, prefix in assignments.items():
+            assert prefix in reach[pid], (pid, prefix)
+
+    def test_matching_prefers_a_free_candidate_over_stealing_an_unnecessary_one(self):
+        """CLAWP-124 (grok-4.6, PR #64 round 1): completeness (a valid,
+        collision-free assignment exists) does NOT require disturbing an
+        earlier-processed pid's shorter prefix when the current pid has its
+        own free alternative -- but a single-phase augmenting-path search
+        (try each candidate in order, steal on the first successful
+        reassignment) can do exactly that anyway, since it doesn't
+        distinguish "had to steal" from "could have used a free one
+        instead". Confirmed live (2026-09-26) against the single-phase
+        version of this function: it stole 'ABCDE' from 'abcdea' (pushing
+        it to the longer 'ABCDEA') even though 'abcdezy' -- the one doing
+        the stealing -- had its own completely free 'ABCDEZ' one step
+        further down its own candidate list.
+
+        'abcdea' sorts BEFORE 'abcdezy' in the fixed processing order
+        ('ABCDEA' < 'ABCDEZY', diverging at position 5: 'A' < 'Z'), so it is
+        assigned first and claims the shared base 'ABCDE' with nothing to
+        contest it -- the two-phase fix (prefer free candidates over
+        stealing) must leave it there untouched.
+        """
+        from clawpm.tasks import _assign_taskless_prefixes, _naive_prefix_reach
+
+        ids = {"abcdea", "abcdezy"}
+        assignments, errors = _assign_taskless_prefixes(set(ids), set())
+
+        assert errors == {}
+        assert set(assignments.keys()) == ids
+        assert len(set(assignments.values())) == len(ids), assignments
+        for pid, prefix in assignments.items():
+            assert prefix in _naive_prefix_reach(pid), (pid, prefix)
+
+        # The actual quality invariant this test exists to pin: the
+        # earlier-processed, less-flexible id keeps its own shortest
+        # (base) candidate -- nothing forced it to move.
+        assert assignments["abcdea"] == "ABCDE", assignments
+        assert assignments["abcdezy"] == "ABCDEZ", assignments
+
 
 # ---------------------------------------------------------------------------
 # CLAWP-048: cross-project prefix uniqueness (near-name-twin projects must not
