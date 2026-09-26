@@ -1397,7 +1397,13 @@ def _assign_taskless_prefixes(
     strings (:func:`_naive_prefix_candidates`, shortest-first per id).
     Edges: a pid's own candidate chain. Real claims in ``used`` are FIXED
     pre-occupied right-nodes -- never part of the matching search space,
-    never reassigned.
+    never reassigned. A pid only ever STEALS an already-held candidate
+    (reassigning the holder via an augmenting path) when NONE of its own
+    candidates are outright free -- an outright-free candidate is always
+    preferred first (grok-4.6, PR #64 round 1: completeness doesn't
+    require disturbing an earlier pid's shorter prefix when the current
+    one has its own unclaimed alternative; doing so anyway would violate
+    this function's own "simulates sequential `tasks add`" contract below).
 
     Why greedy was replaced (not just re-tuned again): greedy commits each
     pid's pick immediately and never reconsiders an earlier one, which is
@@ -1442,12 +1448,36 @@ def _assign_taskless_prefixes(
     match_candidate_to_pid: dict[str, str] = {}
 
     def try_augment(pid: str, visited: set[str]) -> bool:
-        for candidate in _naive_prefix_candidates(pid):
+        candidates = list(_naive_prefix_candidates(pid))
+        # Phase 1: prefer an OUTRIGHT-FREE candidate of pid's own over
+        # stealing one that's already held (grok-4.6, PR #64 round 1). A
+        # single combined pass -- steal on the FIRST held candidate whose
+        # holder happens to have SOME alternate, even when pid itself has a
+        # free candidate later in its own list -- still finds *a* valid
+        # assignment (completeness is unaffected either way), but needlessly
+        # disturbs an earlier pid's shorter prefix when nothing forced it
+        # to. This violates assign_all_prefixes' own documented intent of
+        # simulating what sequential `tasks add` calls would do (the first
+        # real mint is never retroactively bumped). Preferring free
+        # candidates first means a pid only ever steals when it has no
+        # candidate of its own left to try.
+        for candidate in candidates:
+            if candidate in fixed_used or candidate in visited:
+                continue
+            if candidate not in match_candidate_to_pid:
+                visited.add(candidate)
+                match_candidate_to_pid[candidate] = pid
+                return True
+        # Phase 2: no free candidate of pid's own -- fall back to
+        # augmenting through an already-held candidate, in the same fixed
+        # order. Every candidate reaching here is held by construction
+        # (phase 1 already ruled out every free one).
+        for candidate in candidates:
             if candidate in fixed_used or candidate in visited:
                 continue
             visited.add(candidate)
-            holder = match_candidate_to_pid.get(candidate)
-            if holder is None or try_augment(holder, visited):
+            holder = match_candidate_to_pid[candidate]
+            if try_augment(holder, visited):
                 match_candidate_to_pid[candidate] = pid
                 return True
         return False
