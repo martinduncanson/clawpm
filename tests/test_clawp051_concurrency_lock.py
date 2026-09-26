@@ -252,36 +252,6 @@ _CROSS_PROJECT_WORKER_SCRIPT = textwrap.dedent("""\
     print(json.dumps({{"id": task.id, "project": project_id}}))
 """)
 
-_CROSS_PROJECT_WORKER_SCRIPT_NO_LOCK = textwrap.dedent("""\
-    import sys, json, time
-    from pathlib import Path
-    sys.path.insert(0, r'{src_path}')
-    from clawpm.discovery import load_portfolio_config, get_project
-    from clawpm.tasks import assign_task_prefix, get_tasks_dir
-
-    portfolio_root = Path(r'{portfolio_root}')
-    project_id = '{project_id}'
-    title = sys.argv[1]
-    config = load_portfolio_config(portfolio_root)
-    tasks_dir = get_tasks_dir(config, project_id)
-    _settings = get_project(config, project_id)
-
-    # CLAWP-116 regression: compute the portfolio-wide prefix WITHOUT any
-    # lock (bypassing add_task's own portfolio_prefix_lock entirely --
-    # this is add_task's PRE-CLAWP-116 sequence), sleep to widen the
-    # cross-process window between "decided" and "written", then write.
-    prefix = assign_task_prefix(
-        project_id, tasks_dir, config,
-        explicit_prefix=getattr(_settings, 'task_prefix', None) if _settings else None,
-    )
-    time.sleep(0.05)
-    task_id = f'{{prefix}}-000'
-    file_path = tasks_dir / f'{{task_id}}.md'
-    file_path.write_text(f'---\\nid: {{task_id}}\\n---\\n# {{title}}\\n', encoding='utf-8')
-    print(json.dumps({{"id": task_id, "project": project_id, "prefix": prefix}}))
-""")
-
-
 def _make_multi_project_portfolio(tmp_dir: Path, project_ids: list[str]) -> Path:
     """Set up a portfolio with several TASK-LESS sibling projects."""
     (tmp_dir / "portfolio.toml").write_text(
@@ -375,29 +345,91 @@ class TestPortfolioWidePrefixAllocationContention:
             f"Duplicate prefix across concurrent first mints (lock failed!): {results}"
         )
 
-    def test_race_without_portfolio_lock_can_produce_duplicate_prefixes(self, tmp_path):
-        """Regression: bypassing the portfolio lock (computing the prefix
-        directly, sleeping, then writing -- add_task's PRE-CLAWP-116
-        sequence) can produce the SAME prefix for two different task-less
-        projects. Probabilistic like its single-project sibling
-        (test_race_without_lock_produces_duplicates above) -- xfail rather
-        than a hard failure if the race isn't triggered this run."""
-        _make_multi_project_portfolio(tmp_path, self.PROJECT_IDS)
+    def test_portfolio_lock_actually_serializes_add_task(self, tmp_path):
+        """Direct proof the lock is load-bearing, not just present-but-
+        unused (Codex P2 + grok-4.5 HIGH, PR #65 round 1: the cross-process
+        'without lock' reproduction below could never actually collide
+        under CLAWP-124's deterministic matching -- a same-snapshot
+        concurrent read yields distinct candidates per caller BY
+        CONSTRUCTION, so that test's positive counterpart would also pass
+        with the lock replaced by a no-op, proving nothing). This test
+        instead holds ``portfolio_prefix_lock`` directly in a background
+        thread and confirms a concurrent ``add_task`` call for a
+        task-less project BLOCKS until the holder releases it -- this
+        WOULD fail if ``add_task`` stopped taking the lock (e.g. reverted
+        to a conditional skip, or removed entirely)."""
+        import threading
+        import time as _time
+        from clawpm.tasks import portfolio_prefix_lock, add_task
+        from clawpm.discovery import load_portfolio_config
 
-        results = _spawn_cross_project_workers(
-            _CROSS_PROJECT_WORKER_SCRIPT_NO_LOCK, tmp_path, self.PROJECT_IDS
-        )
-        prefixes = [r["prefix"] for r in results]
-        if len(set(prefixes)) == len(self.PROJECT_IDS):
-            pytest.xfail(
-                "Race not triggered this run (fast I/O / scheduling) -- "
-                "lock still validated by "
-                "test_concurrent_first_mints_never_collide_on_prefix."
+        _make_multi_project_portfolio(tmp_path, ["abcde1"])
+        config = load_portfolio_config(tmp_path)
+
+        held = threading.Event()
+        release = threading.Event()
+
+        def holder():
+            with portfolio_prefix_lock(config.portfolio_root):
+                held.set()
+                release.wait(10)
+
+        t = threading.Thread(target=holder)
+        t.start()
+        try:
+            assert held.wait(5), "holder thread failed to acquire the portfolio lock"
+            threading.Timer(0.4, release.set).start()
+            start = _time.monotonic()
+            task = add_task(config, "abcde1", "first task")
+            elapsed = _time.monotonic() - start
+            assert task is not None
+            assert elapsed >= 0.35, (
+                f"add_task returned after {elapsed:.3f}s -- did not wait for "
+                "the held portfolio lock (lock is not load-bearing)"
             )
-        else:
-            assert len(set(prefixes)) < len(self.PROJECT_IDS), (
-                f"Expected duplicate prefixes without the portfolio lock, got: {results}"
+        finally:
+            release.set()
+            t.join(10)
+
+    def test_portfolio_lock_also_serializes_explicit_id_creates(self, tmp_path):
+        """Codex P1 (PR #65 round 1): an explicit-ID create for a project's
+        OWN first task never calls assign_task_prefix, yet still
+        establishes that project's future inferred prefix -- it needs the
+        SAME portfolio-lock coordination against a sibling's concurrent
+        auto-mint. Same direct blocking proof as above, with an explicit
+        task_id."""
+        import threading
+        import time as _time
+        from clawpm.tasks import portfolio_prefix_lock, add_task
+        from clawpm.discovery import load_portfolio_config
+
+        _make_multi_project_portfolio(tmp_path, ["abcde1"])
+        config = load_portfolio_config(tmp_path)
+
+        held = threading.Event()
+        release = threading.Event()
+
+        def holder():
+            with portfolio_prefix_lock(config.portfolio_root):
+                held.set()
+                release.wait(10)
+
+        t = threading.Thread(target=holder)
+        t.start()
+        try:
+            assert held.wait(5), "holder thread failed to acquire the portfolio lock"
+            threading.Timer(0.4, release.set).start()
+            start = _time.monotonic()
+            task = add_task(config, "abcde1", "first task", task_id="ABCDE1-900")
+            elapsed = _time.monotonic() - start
+            assert task is not None
+            assert elapsed >= 0.35, (
+                f"explicit-ID add_task returned after {elapsed:.3f}s -- did "
+                "not wait for the held portfolio lock"
             )
+        finally:
+            release.set()
+            t.join(10)
 
 
 # ---------------------------------------------------------------------------

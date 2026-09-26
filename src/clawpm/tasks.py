@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import shutil
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1618,28 +1618,47 @@ def portfolio_prefix_lock(portfolio_root: Path):
     """Hold the portfolio-wide prefix-allocation lock (CLAWP-116, Codex P1
     on PR #57 round 5).
 
-    Serialises the READ (scan every sibling project's resolved prefix,
-    ``assign_all_prefixes``) -> DECIDE (the matching pass) -> WRITE (the
-    task file that makes the decided prefix REAL) sequence for a
-    first-mint auto-ID create against every OTHER concurrent first-minter
-    in the same portfolio. Acquired ONLY on a first mint (when the calling
-    project has neither an explicit nor an inferred prefix yet) so
-    ordinary task creation for an already-prefixed project stays fully
-    parallel across projects -- this is a first-mint-only critical
-    section, not a global serialisation of ``add_task``.
+    Serialises EVERY ``add_task`` call's critical section (prefix
+    resolution -- explicit, inferred, or the portfolio-wide
+    ``assign_all_prefixes`` scan-decide pass -- through the task-file
+    write that follows it) against every OTHER concurrent
+    ``add_task`` call in the same portfolio, across ALL projects, not just
+    first mints.
 
-    Without this lock, two first-minters' portfolio-wide reads can
-    interleave with each other's writes and each observe a torn snapshot
-    that never existed as one consistent portfolio state at any instant --
-    CLAWP-121/124's determinism guarantee ("two calls can never converge
-    on the same candidate") assumes both calls see the IDENTICAL snapshot,
-    which a torn/interleaved read violates. The non-injective-extension
-    scenario this task was originally filed against (PR #57: two
-    near-twin task-less projects both independently selecting the same
-    candidate) predates the current deterministic global pass and no
-    longer reproduces as originally described, but the underlying gap it
-    named -- no coordination between prefix SELECTION and the task-file
-    WRITE that reserves it -- is real and is what this lock closes.
+    Held unconditionally (round 2 of this fix; PR #65 round 1 tried to
+    acquire it only for a heuristically-detected first mint, skipping it
+    whenever a pre-lock read of the calling project's OWN state looked
+    like it already had a stable prefix -- three independent review
+    findings showed that optimisation unsound: the pre-check is itself an
+    unlocked read that can go stale in the window before the per-project
+    lock is taken (e.g. this project's one inferred-from task gets
+    concurrently REJECTED by another session in that exact window,
+    silently reopening the first-mint path without this lock), and an
+    explicit-ID create for a project's own first task never calls
+    ``assign_task_prefix`` at all yet still establishes that project's
+    future inferred prefix, so it needs the same coordination against a
+    sibling's concurrent auto-mint even though it never touches the
+    allocator itself). Given the portfolio scale this tool targets (dozens
+    of projects, not a high-throughput hot path -- CLAWP-124's own sizing
+    note), a short-lived lock held for the duration of one local-disk
+    ``add_task`` call is the correct trade against a subtly-incomplete
+    "skip it sometimes" optimisation.
+
+    Without this lock, prefix selection for one project and the task-file
+    write that reserves it are not atomic relative to a sibling's
+    concurrent first mint -- the specific non-injective-extension scenario
+    this task was originally filed against (PR #57: two near-twin
+    task-less projects both independently selecting the same candidate)
+    predates the current deterministic global pass (CLAWP-121/124) and is
+    not straightforwardly reproducible against it in isolation (confirmed
+    empirically, PR #65 round 1: a same-snapshot concurrent read of the
+    whole taskless set deterministically yields distinct candidates per
+    caller, by construction), but the underlying gap it named -- no
+    coordination between prefix SELECTION and the task-file WRITE that
+    reserves it, across a portfolio scan that reads each sibling
+    one-at-a-time rather than atomically -- remains real, and this lock is
+    defense-in-depth against it regardless of which specific interleaving
+    would trigger a collision.
 
     LOCK ORDERING INVARIANT (must never be reversed, or two callers
     acquiring both locks in opposite orders deadlock): this portfolio lock
@@ -1772,43 +1791,36 @@ def add_task(
     #
     # LOCK ORDERING INVARIANT (CLAWP-116, see portfolio_prefix_lock's own
     # docstring): this per-project lock is always INNER, relative to the
-    # portfolio-wide lock acquired below when this is a first mint — never
-    # the reverse. The `with _portfolio_lock_cm, file_lock(_lock_path):`
-    # statement a few lines down enforces the ordering syntactically (the
-    # portfolio lock, when present, is entered first).
+    # portfolio-wide lock acquired below — never the reverse. The
+    # `with portfolio_prefix_lock(...), file_lock(_lock_path):` statement a
+    # few lines down enforces the ordering syntactically (the portfolio
+    # lock is always entered first).
     _lock_path = tasks_dir / ".clawpm-tasks.lock"
     # Capture whether this is an explicit-ID create BEFORE entering the lock
     # so the clobber guard (Finding 2) can be applied inside atomically.
     _explicit_id = task_id is not None
-
-    # CLAWP-116 — a first-mint auto-ID create is about to touch the
-    # PORTFOLIO-wide allocator (assign_task_prefix -> assign_all_prefixes),
-    # which reads every sibling project's resolved prefix. That read, the
-    # decision it produces, and the task-file write below that makes the
-    # decision real must be serialised against every OTHER concurrent
-    # first-minter in this portfolio, or two such calls can observe a torn
-    # snapshot that never existed as one consistent state (see
-    # portfolio_prefix_lock's docstring). Mirror assign_task_prefix's own
-    # check order EXACTLY (explicit -> inferred -> portfolio) so this
-    # pre-lock decision agrees with what that call will actually do inside
-    # the lock: skip the portfolio lock entirely for an explicit-ID create,
-    # an explicit `task_prefix`, or a project that already has a stable
-    # inferred prefix — only a genuine first mint pays this cost, so
-    # ordinary task creation for an already-prefixed project stays fully
-    # parallel across projects.
     _explicit_prefix = getattr(_settings, "task_prefix", None) if _settings else None
-    _needs_portfolio_lock = (
-        not _explicit_id
-        and not _explicit_prefix
-        and _infer_prefix_from_tasks(tasks_dir) is None
-    )
-    _portfolio_lock_cm = (
-        portfolio_prefix_lock(config.portfolio_root)
-        if _needs_portfolio_lock
-        else nullcontext()
-    )
 
-    with _portfolio_lock_cm, file_lock(_lock_path):
+    # CLAWP-116 — the portfolio lock is held UNCONDITIONALLY here, not just
+    # for a heuristically-detected "first mint". An earlier version tried
+    # to skip it whenever a pre-lock read of THIS project's own state
+    # looked like it already had a stable prefix — three independent
+    # findings (Codex P1 x2, grok-4.5, PR #65 round 1) showed that
+    # optimization is unsound: the pre-check itself is an unlocked read
+    # that can go stale between the check and the per-project lock
+    # acquisition (e.g. this project's one inferred-from task gets
+    # concurrently REJECTED by another session in that exact window,
+    # silently flipping this call onto the portfolio-wide path without the
+    # lock that path needs), and an explicit-ID create for a project's
+    # OWN first task never calls assign_task_prefix at all yet still
+    # establishes that project's future inferred prefix, so it needs the
+    # SAME coordination against a sibling's concurrent auto-mint even
+    # though it never touches the allocator itself. Given the portfolio
+    # scale this tool targets (dozens of projects, not a high-throughput
+    # hot path — see CLAWP-124's own sizing note), a short-lived lock held
+    # for the DURATION of one local-disk add_task call is cheap; a subtly
+    # incorrect "skip it sometimes" optimization is not worth its risk.
+    with portfolio_prefix_lock(config.portfolio_root), file_lock(_lock_path):
         # Generate task ID if not provided (inside lock: scan is now serialised)
         if not task_id:
             # CLAWP-048: resolve a portfolio-unique prefix (explicit task_prefix ->
