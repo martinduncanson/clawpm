@@ -20,6 +20,7 @@ from clawpm.cli import main
 from clawpm.discovery import load_portfolio_config
 from clawpm.tasks import (
     archive_done_tasks,
+    change_task_state,
     get_task,
     get_next_task,
     list_tasks,
@@ -193,6 +194,40 @@ class TestArchiveResolutionAndScans:
         assert second != first, "auto-numbering reused an archived id"
         assert second == "CLAWP-001"
 
+    def test_rejected_id_not_reused_by_auto_numbering(self, tmp_path, monkeypatch):
+        """CLAWP-127: add_task's scan must include rejected/, same as done/archive."""
+        _make_portfolio(tmp_path, monkeypatch)
+        config = load_portfolio_config(tmp_path)
+
+        first = _add("clawpm", "idea that gets rejected")  # CLAWP-000
+        result = change_task_state(
+            config, "clawpm", first, TaskState.REJECTED,
+            rationale="Not worth pursuing",
+        )
+        assert result is not None
+        assert "rejected" in result.file_path.parts
+
+        # tasks_dir root is now empty; naive numbering would reissue CLAWP-000.
+        second = _add("clawpm", "a genuinely new task")
+        assert second != first, "auto-numbering reused a rejected id"
+        assert second == "CLAWP-001"
+
+    def test_infer_prefix_from_tasks_includes_rejected(self, tmp_path, monkeypatch):
+        """CLAWP-127 (Codex P1, PR #62): a rejected-only project must still be
+        seen by the PORTFOLIO-wide prefix allocator, or a different taskless
+        project can be assigned the same prefix and mint a colliding id."""
+        from clawpm.tasks import _infer_prefix_from_tasks
+
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch)
+        first = _add("clawpm", "idea that gets rejected")  # CLAWP-000
+        config = load_portfolio_config(tmp_path)
+        change_task_state(
+            config, "clawpm", first, TaskState.REJECTED,
+            rationale="Not worth pursuing",
+        )
+        # tasks_dir root is now empty; a scan that omits rejected/ returns None.
+        assert _infer_prefix_from_tasks(tasks_dir) == "CLAWP"
+
 
 class TestArchiveCli:
     def test_cli_archive_reports_moved(self, tmp_path, monkeypatch):
@@ -287,6 +322,25 @@ class TestArchiveConsumerConsistency:
         doc = SimpleNamespace(root=SimpleNamespace(attach_to=None))
         assert _predict_parent_id(doc, _config(), "clawpm") == "CLAWP-001"
 
+    def test_emit_predict_parent_id_skips_rejected_root(self, tmp_path, monkeypatch):
+        """CLAWP-127 (grok-4.6/4.5, PR #62): the twin predictor must stay in
+        lockstep with add_task's rejected/ scan too, or emit-tree can remint
+        a rejected root id even though direct add_task would refuse to reuse
+        it."""
+        from types import SimpleNamespace
+        from clawpm.emit_tree import _predict_parent_id
+
+        _make_portfolio(tmp_path, monkeypatch)
+        config = _config()
+        a = _add("clawpm", "root")  # CLAWP-000
+        result = change_task_state(
+            config, "clawpm", a, TaskState.REJECTED, rationale="no longer needed",
+        )
+        assert "rejected" in result.file_path.parts
+        # tasks_dir root is now empty; a naive scan would re-predict CLAWP-000.
+        doc = SimpleNamespace(root=SimpleNamespace(attach_to=None))
+        assert _predict_parent_id(doc, config, "clawpm") == "CLAWP-001"
+
     def test_existing_child_nums_counts_archived_children(self, tmp_path, monkeypatch):
         from clawpm.emit_tree import _existing_child_nums
 
@@ -299,6 +353,50 @@ class TestArchiveConsumerConsistency:
             "---\nid: CLAWP-500-001\nparent: CLAWP-500\n---\n", encoding="utf-8"
         )
         assert 1 in _existing_child_nums(tasks_dir, "CLAWP-500")
+
+    def test_existing_child_nums_counts_rejected_parent_children(self, tmp_path, monkeypatch):
+        """CLAWP-127 (grok-4.6 + grok-4.5, PR #62 round 3): a REJECTED
+        directory-task parent's own dir needs the same ordinal visibility as
+        the archived case, or a wholesale-rejected parent's already-existing
+        child ordinals get silently re-minted."""
+        from clawpm.emit_tree import _existing_child_nums
+
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch)
+        rejected_parent = tasks_dir / "rejected" / "CLAWP-501"
+        rejected_parent.mkdir(parents=True)
+        (rejected_parent / "_task.md").write_text("---\nid: CLAWP-501\n---\n", encoding="utf-8")
+        (rejected_parent / "CLAWP-501-001.md").write_text(
+            "---\nid: CLAWP-501-001\nparent: CLAWP-501\n---\n", encoding="utf-8"
+        )
+        assert 1 in _existing_child_nums(tasks_dir, "CLAWP-501")
+
+    def test_existing_child_nums_counts_done_parent_children(self, tmp_path, monkeypatch):
+        """CLAWP-127 (grok-4.5, PR #62 round 4): same wholesale-parent nest
+        gap as the rejected case, still open for done/."""
+        from clawpm.emit_tree import _existing_child_nums
+
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch)
+        done_parent = tasks_dir / "done" / "CLAWP-502"
+        done_parent.mkdir(parents=True)
+        (done_parent / "_task.md").write_text("---\nid: CLAWP-502\n---\n", encoding="utf-8")
+        (done_parent / "CLAWP-502-001.md").write_text(
+            "---\nid: CLAWP-502-001\nparent: CLAWP-502\n---\n", encoding="utf-8"
+        )
+        assert 1 in _existing_child_nums(tasks_dir, "CLAWP-502")
+
+    def test_existing_child_nums_counts_blocked_parent_children(self, tmp_path, monkeypatch):
+        """CLAWP-127 (grok-4.5, PR #62 round 4): same wholesale-parent nest
+        gap as the rejected case, still open for blocked/."""
+        from clawpm.emit_tree import _existing_child_nums
+
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch)
+        blocked_parent = tasks_dir / "blocked" / "CLAWP-503"
+        blocked_parent.mkdir(parents=True)
+        (blocked_parent / "_task.md").write_text("---\nid: CLAWP-503\n---\n", encoding="utf-8")
+        (blocked_parent / "CLAWP-503-001.md").write_text(
+            "---\nid: CLAWP-503-001\nparent: CLAWP-503\n---\n", encoding="utf-8"
+        )
+        assert 1 in _existing_child_nums(tasks_dir, "CLAWP-503")
 
 
 class TestArchiveRobustness:
@@ -441,6 +539,49 @@ class TestArchiveRound3:
             "leaves": [{"ref": "a", "title": "t", "leaf_key": "leafA"}],
         })
         assert "leafA" in _resolve_idempotency(_config(), "clawpm", "CLAWP-600", doc.leaves)
+
+    def test_resolve_idempotency_sees_rejected_leaf(self, tmp_path, monkeypatch):
+        """CLAWP-127 (grok-4.5, PR #62): a previously-emitted child that was
+        later rejected must still be visible to idempotent re-emit, or a
+        title drift / fail-open in _check_reject_match leaves it invisible
+        to both checks and it gets silently re-minted."""
+        from clawpm.emit_tree import _resolve_idempotency, parse_emit_document
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch)
+        # An emitted-then-rejected standalone child carrying a leaf_key.
+        rejected_dir = tasks_dir / "rejected"
+        rejected_dir.mkdir(parents=True)
+        (rejected_dir / "CLAWP-600-001.md").write_text(
+            "---\nid: CLAWP-600-001\nparent: CLAWP-600\nleaf_key: leafA\n---\n", encoding="utf-8"
+        )
+        doc = parse_emit_document({
+            "schema_version": 1,
+            "root": {"attach_to": "CLAWP-600"},
+            "leaves": [{"ref": "a", "title": "t", "leaf_key": "leafA"}],
+        })
+        assert "leafA" in _resolve_idempotency(_config(), "clawpm", "CLAWP-600", doc.leaves)
+
+    def test_resolve_idempotency_sees_children_of_a_wholesale_rejected_parent(
+        self, tmp_path, monkeypatch
+    ):
+        """grok-4.5 MEDIUM (PR #62 round 3): the new rejected/<parent_id> nest
+        line must actually be exercised, not just the flat rejected/<child>.md
+        case — a decomposed parent rejected wholesale (change_task_state moves
+        the whole directory) leaves its own children as flat files under
+        rejected/<parent_id>/, mirroring the existing archived-parent nest."""
+        from clawpm.emit_tree import _resolve_idempotency, parse_emit_document
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch)
+        rejected_parent = tasks_dir / "rejected" / "CLAWP-700"
+        rejected_parent.mkdir(parents=True)
+        (rejected_parent / "_task.md").write_text("---\nid: CLAWP-700\n---\n", encoding="utf-8")
+        (rejected_parent / "CLAWP-700-001.md").write_text(
+            "---\nid: CLAWP-700-001\nparent: CLAWP-700\nleaf_key: leafB\n---\n", encoding="utf-8"
+        )
+        doc = parse_emit_document({
+            "schema_version": 1,
+            "root": {"attach_to": "CLAWP-700"},
+            "leaves": [{"ref": "b", "title": "t", "leaf_key": "leafB"}],
+        })
+        assert "leafB" in _resolve_idempotency(_config(), "clawpm", "CLAWP-700", doc.leaves)
 
     def test_is_archived_path_case_insensitive(self):
         from pathlib import Path

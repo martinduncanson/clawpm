@@ -1246,7 +1246,18 @@ def _infer_prefix_from_tasks(tasks_dir: Path) -> str | None:
     counts: Counter[str] = Counter()
     # CLAWP-085: include done/archive so prefix inference stays stable even when
     # every non-archived task of a project has been archived out of the hot path.
-    for scan_dir in (tasks_dir, tasks_dir / "done", tasks_dir / "blocked", tasks_dir / "done" / "archive"):
+    # CLAWP-127 (Codex P1, PR #62): rejected/ too — a rejected-only project's
+    # prefix claim must still be seen by the PORTFOLIO-wide allocator, or a
+    # different taskless project can be assigned the same prefix and mint a
+    # colliding id (this project's own rejected/ dir would be empty from that
+    # OTHER project's perspective, so nothing local would catch it).
+    for scan_dir in (
+        tasks_dir,
+        tasks_dir / "done",
+        tasks_dir / "blocked",
+        tasks_dir / "done" / "archive",
+        tasks_dir / "rejected",
+    ):
         if not scan_dir.exists():
             continue
         for entry in scan_dir.iterdir():
@@ -1756,7 +1767,16 @@ def add_task(
             # never re-minted. add_task is not a hot path, so paying the extra
             # archive scan here (unlike list/next/reflect) is the correct
             # trade — a silently reused ID would clobber archived history.
-            for scan_dir in [tasks_dir, tasks_dir / "done", tasks_dir / "blocked", tasks_dir / "done" / "archive"]:
+            # CLAWP-127: rejected/ carries the same risk (CLAWP-053's won't-do
+            # ledger) and was missing from this list — a rejected task's id
+            # could be silently re-minted for a brand-new task.
+            for scan_dir in [
+                tasks_dir,
+                tasks_dir / "done",
+                tasks_dir / "blocked",
+                tasks_dir / "done" / "archive",
+                tasks_dir / "rejected",
+            ]:
                 if not scan_dir.exists():
                     continue
                 # .md files at this level. Subtask files ({prefix}-000-001.md) live
@@ -2192,14 +2212,28 @@ def _child_state_dirs(tasks_dir: Path, parent_dir: Path) -> list[Path]:
     archived directory-task parent's own dir (its children travelled with it)
     are included too, so a re-decompose can never re-mint an ordinal that has
     been archived out of ``done/``.
+
+    CLAWP-127 (grok-4.6 + grok-4.5, PR #62 rounds 3-4): a directory-task
+    parent's own dir needs the same treatment as the archived case for EVERY
+    terminal state, not just archived — ``change_task_state`` moves a
+    done/blocked/rejected directory parent wholesale to
+    ``tasks/<state>/<parent_id>/``, taking its children with it, and
+    ``emit_tree``'s ``attach_to`` path always resolves ``parent_dir`` to the
+    LIVE ``tasks/<parent_id>/`` path — without these entries a wholesale-
+    moved parent's already-existing child ordinals are invisible and would be
+    re-minted. (Round 3 added only the ``rejected/`` nest; round 4 found the
+    same gap still open for ``done/``/``blocked/``.)
     """
     parent_id = parent_dir.name
     return [
         parent_dir,
         tasks_dir,
         tasks_dir / "done",
+        tasks_dir / "done" / parent_id,
         tasks_dir / "blocked",
+        tasks_dir / "blocked" / parent_id,
         tasks_dir / "rejected",
+        tasks_dir / "rejected" / parent_id,
         tasks_dir / "done" / "archive",
         tasks_dir / "done" / "archive" / parent_id,
     ]

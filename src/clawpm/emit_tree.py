@@ -521,11 +521,38 @@ def _resolve_idempotency(
     """Return leaf_keys of leaves that already exist (idempotent re-emit).
 
     Scans every location a previously-emitted child of ``parent_id`` can live —
-    the live parent dir, plus ``done/``, ``blocked/``, and (CLAWP-085) the
-    ``done/archive/`` silo (standalone and inside a wholesale-archived parent) —
-    for matching ``leaf_key`` frontmatter. Without the terminal-state dirs, a
-    child that was completed (and possibly archived) since the last emit would
-    not be recognised and the same leaf would be minted twice (Codex review r2).
+    the live parent dir, plus ``done/``, ``blocked/``, ``rejected/``, and
+    (CLAWP-085) the ``done/archive/`` silo (standalone and inside a
+    wholesale-archived parent) — for matching ``leaf_key`` frontmatter.
+    Without the terminal-state dirs, a child that was completed (and possibly
+    archived) since the last emit would not be recognised and the same leaf
+    would be minted twice (Codex review r2). CLAWP-127 (grok-4.5, PR #62):
+    ``rejected/`` too, for the identical reason — ``_check_reject_match``
+    (title-based) is the intended gate for a rejected leaf, but it fail-opens
+    on an unreadable ledger and only matches on an EXACT title, so a title
+    that drifted between emits would leave the previously-emitted-then-
+    rejected child invisible to BOTH checks and get silently re-minted.
+
+    Also covers the WHOLESALE-PARENT nest for done/blocked, not just
+    rejected/archive (grok-4.5, PR #62 round 3): ``parent_id`` itself can be a
+    directory task that was completed or blocked wholesale (``change_task_state``
+    moves the whole directory, ``tasks.py`` ~712-719), landing its own children
+    at ``done/<parent_id>/`` or ``blocked/<parent_id>/`` — the same shape
+    CLAWP-085 already handled for the archived case
+    (``done/archive/<parent_id>/``). Without these, a decomposed parent that
+    finishes or blocks would make its own already-emitted children invisible
+    to a later re-emit under the same parent.
+
+    NOT yet covered (tracked as a follow-up, out of this fix's scope): a
+    CHILD that is ITSELF a directory task (has its own children) stores its
+    metadata at ``<state-dir>/<child_id>/_task.md`` rather than a flat
+    ``<state-dir>/<child_id>.md`` — the glob below only matches flat files, so
+    such a child moved to any terminal state is still invisible here (Codex
+    P2, PR #62 round 3). This is a materially different traversal shape (glob
+    into ``{parent_id}-*/`` subdirectories for ``_task.md``, not just add
+    another directory to this tuple) and affects done/blocked/rejected/archive
+    alike — deliberately scoped out of CLAWP-127 as a distinct bug class; see
+    the filed follow-up task.
     """
     from .tasks import get_tasks_dir
 
@@ -539,7 +566,11 @@ def _resolve_idempotency(
     scan_dirs = (
         tasks_dir / parent_id,                          # live children
         tasks_dir / "done",                             # completed standalone children
+        tasks_dir / "done" / parent_id,                 # children of a wholesale-done parent
         tasks_dir / "blocked",                          # blocked standalone children
+        tasks_dir / "blocked" / parent_id,              # children of a wholesale-blocked parent
+        tasks_dir / "rejected",                         # rejected standalone children
+        tasks_dir / "rejected" / parent_id,             # children of a wholesale-rejected parent
         tasks_dir / "done" / "archive",                 # archived standalone children
         tasks_dir / "done" / "archive" / parent_id,     # children of a wholesale-archived parent
     )
@@ -720,7 +751,17 @@ def _predict_parent_id(
     # CLAWP-085: include done/archive so this prediction stays in lockstep with
     # add_task's (archive-aware) allocator — otherwise emit-tree could re-mint an
     # archived root id and clobber archived history.
-    for scan_dir in [tasks_dir, tasks_dir / "done", tasks_dir / "blocked", tasks_dir / "done" / "archive"]:
+    # CLAWP-127 (grok-4.6, PR #62): rejected/ too, for the same lockstep reason —
+    # add_task's scan already covers it; this predictor must match or a rejected
+    # root id can be silently re-minted via emit-tree even though direct add_task
+    # would refuse to reuse it.
+    for scan_dir in [
+        tasks_dir,
+        tasks_dir / "done",
+        tasks_dir / "blocked",
+        tasks_dir / "done" / "archive",
+        tasks_dir / "rejected",
+    ]:
         if not scan_dir.exists():
             continue
         for f in scan_dir.glob(f"{prefix}-*.md"):
@@ -799,14 +840,22 @@ def emit_tree(
     # Predict parent/root task ID (before writing anything)
     parent_id = _predict_parent_id(doc, config, project_id)
 
+    # Won't-do reject-match (CLAWP-053) — classify against the FULL leaf set,
+    # before idempotency filtering. CLAWP-127 (Codex P2, PR #62 round 3):
+    # _resolve_idempotency now also recognises a rejected leaf_key match (so
+    # it isn't silently re-minted) — but idempotency-filtering leaves_to_emit
+    # FIRST would remove that same leaf before this check ever saw it,
+    # silently swallowing the documented "every matching incoming leaf is
+    # reported, and strict mode raises" contract. Running this against
+    # doc.leaves directly preserves that contract regardless of what
+    # idempotency separately decides to skip.
+    rejected = _check_reject_match(doc.leaves, config, project_id)
+
     # Idempotent re-emit: leaves whose leaf_key already exists are skipped
     already_emitted_keys = _resolve_idempotency(
         config, project_id, parent_id, doc.leaves
     )
     leaves_to_emit = [lf for lf in doc.leaves if lf.leaf_key not in already_emitted_keys]
-
-    # Won't-do reject-match (CLAWP-053)
-    rejected = _check_reject_match(leaves_to_emit, config, project_id)
     if rejected and strict:
         raise EmitValidationError(
             f"Emission aborted (--strict): {len(rejected)} leaf(ves) matched the won't-do ledger: "
