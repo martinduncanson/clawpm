@@ -1609,8 +1609,17 @@ def _portfolio_prefix_lock_path(portfolio_root: Path) -> Path:
     name is correct here (unlike dispatch's per-target digest) because
     there is only ever ONE portfolio-wide allocator critical section, not
     one per project.
+
+    ``.resolve()`` (Codex P1, PR #65 round 3): ``PortfolioConfig.portfolio_root``
+    is only ``.expanduser()``-ed at load time (``models.py``), which expands
+    ``~`` but does NOT absolutize an otherwise-relative value (e.g.
+    ``portfolio_root = "."`` in ``portfolio.toml``, or a bare relative
+    ``CLAWPM_PORTFOLIO``). ``file_lock`` requires an absolute path and
+    raises ``ValueError`` otherwise — without resolving here, EVERY
+    ``add_task`` call in such a configuration would fail outright, not just
+    under contention.
     """
-    return portfolio_root / "locks" / "prefix-allocation.lock"
+    return portfolio_root.resolve() / "locks" / "prefix-allocation.lock"
 
 
 @contextmanager
