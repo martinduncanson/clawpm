@@ -70,3 +70,44 @@ against ANY future allocation before CLAWP-129 either; CLAWP-129 only
 closed the "colliding with a claim that already exists" half of the
 invariant).
 
+**Two more gaps in the same family, found by Codex on PR #66 round 2
+(2026-09-27), folded in here rather than filed separately since all three
+need the same kind of judgment call (how far to widen "real claim"
+detection) and are candidates for one combined design pass:**
+
+- **`discover_projects()` silently swallows a malformed/unreadable
+  sibling's `settings.toml`** (catches `Exception`, `continue`s) —
+  `check_explicit_id_prefix_collision`'s own `except OSError` around
+  `resolve_existing_prefix(sibling)` never even SEES that sibling, since
+  `discover_projects` already dropped it a layer up. This is NOT unique to
+  CLAWP-129's new code — `assign_all_prefixes` has the identical blind
+  spot via the same `discover_projects` call — so CLAWP-129's fail-closed
+  fix is exactly as protective as the pre-existing auto-ID path, no more
+  and no less. Fixing it properly means a stricter discovery variant (or
+  propagating skipped-project load failures) used by BOTH paths, which is
+  a `discover_projects`-level change with many callers, not a
+  `tasks.py`-local one.
+- **`resolve_existing_prefix` only returns a sibling's DOMINANT inferred
+  prefix** (majority vote across minted tasks, by design — see
+  `_infer_prefix_from_tasks`'s "stability" docstring). A project with a
+  genuinely mixed history (e.g. mid-migration: `OLD-001` + `NEW-001` +
+  `NEW-002` → resolves to `NEW` only) has a MINORITY prefix invisible to
+  this check — an explicit `--id OLD-001` elsewhere would proceed even
+  though `OLD-001` already exists as a real file in the sibling. Fixing
+  this means enumerating every prefix in a sibling's persisted task
+  history (a new helper mirroring `_infer_prefix_from_tasks`'s internal
+  `Counter` but returning the whole key set), not just the one dominant
+  value every other caller in this module already treats as "the"
+  prefix — another change that reaches beyond this one check.
+
+**Pushed back on (not filed), Codex PR #66 round 2:** "if two projects
+already currently share a real prefix (pre-existing broken state), an
+explicit-ID create matching this project's own prefix returns early
+without checking whether ANOTHER sibling also currently claims it" — this
+is a portfolio-HEALTH audit (does the portfolio already violate its own
+uniqueness invariant), which `doctor` already implements independently
+(`cli/project.py`'s `prefix_map` cross-project collision check, ~line 823).
+CLAWP-129's job is preventing a NEW create from introducing a fresh
+collision, not re-auditing a pre-existing one on every `add_task` call —
+that's `doctor`'s job, already shipped.
+

@@ -1695,16 +1695,14 @@ def portfolio_prefix_lock(portfolio_root: Path):
         yield
 
 
-def _prefix_from_explicit_id(task_id: str) -> str | None:
-    """The prefix segment of an explicit ``task_id``, or ``None`` if it
-    doesn't match the ``PREFIX-NNN`` shape ``_PREFIX_NUM_RE`` expects.
-
-    An id that doesn't match this shape (no trailing number) can't be
-    validated against the portfolio's prefix claims -- there is nothing to
-    compare it to. CLAWP-129 only guards the common ``PREFIX-NNN`` case.
+def _prefix_candidates_from_explicit_id(task_id: str) -> list[str]:
+    """Every prefix an explicit ``task_id`` could plausibly derive from, or
+    ``[]`` if it doesn't match the ``PREFIX-NNN`` shape ``_PREFIX_NUM_RE``
+    expects at all. An id that doesn't match can't be validated against the
+    portfolio's prefix claims -- there is nothing to compare it to.
 
     Two normalisations, both confirmed live by review (grok-4.6/4.5 +
-    PRE-REVIEW, PR #66):
+    PRE-REVIEW, PR #66 round 1):
 
     - Matched case-insensitively (``task_id.upper()``): ``_PREFIX_NUM_RE``
       requires ``[A-Z]``, so a caller-supplied lowercase id (``--id
@@ -1712,27 +1710,32 @@ def _prefix_from_explicit_id(task_id: str) -> str | None:
       check entirely -- while ``expand_task_id`` (``context.py``)
       upper-cases every *reference* to that same id, so ``sib-001`` and a
       sibling's real ``SIB-001`` resolve to the same portfolio handle
-      elsewhere in the tool. The returned prefix still reflects the
-      original casing convention (prefixes are always upper-cased by
-      every other caller in this module).
-    - A subtask-shaped explicit id (``SIB-001-002``) previously derived
-      ``"SIB-001"`` -- the *parent* task id, not the project prefix --
-      because ``_PREFIX_NUM_RE``'s number group only strips the LAST
-      ``-NNN``. No real project prefix ever ends in ``-<digits>``
-      (``_infer_prefix_from_tasks`` explicitly excludes that shape for the
-      same reason), so ``"SIB-001"`` could never match any sibling's real
-      claim and the guard silently no-opped for every subtask-shaped
-      explicit id. Peeling trailing ``-<digits>`` segments recovers the
-      true top-level prefix (mirrors ``_parent_id_of``'s single-level
-      strip, applied recursively).
+      elsewhere in the tool.
+    - A subtask-shaped explicit id (``SIB-001-002``) derives the whole
+      PEEL CHAIN, not a single value: ``["SIB-001", "SIB"]``. A single
+      fully-peeled value is wrong in BOTH directions (grok-4.6 round 2
+      catch): peeling every trailing ``-<digits>`` segment on the
+      assumption that "a real prefix never ends in a digit segment" is
+      true of ``_infer_prefix_from_tasks`` (which explicitly excludes that
+      shape) but FALSE of an explicit ``task_prefix`` in settings.toml,
+      which ``resolve_existing_prefix`` returns verbatim -- a sibling can
+      legitimately set ``task_prefix = "FOO-1"``. Committing to one
+      terminal value either over-strips past a real ``"FOO-1"`` claim (a
+      miss) or under-strips and false-refuses against an unrelated
+      sibling that happens to own the over-stripped remainder (a false
+      positive). Returning the whole chain and checking every element
+      against every sibling's real claim is correct regardless of which
+      chain element turns out to be someone's actual prefix -- that
+      boundary is only knowable by comparing against real claims, never
+      from the id's shape alone.
     """
     m = _PREFIX_NUM_RE.match(task_id.upper())
     if not m:
-        return None
-    prefix = m.group(1)
-    while re.search(r"-\d+$", prefix):
-        prefix = prefix.rsplit("-", 1)[0]
-    return prefix or None
+        return []
+    chain = [m.group(1)]
+    while re.search(r"-\d+$", chain[-1]):
+        chain.append(chain[-1].rsplit("-", 1)[0])
+    return chain
 
 
 def check_explicit_id_prefix_collision(
@@ -1789,14 +1792,14 @@ def check_explicit_id_prefix_collision(
             activity, the precise race window the portfolio lock exists to
             protect.
     """
-    derived = _prefix_from_explicit_id(task_id)
-    if derived is None:
+    candidates = _prefix_candidates_from_explicit_id(task_id)
+    if not candidates:
         return  # doesn't match PREFIX-NNN; nothing to validate against
 
     own_prefix = (
         explicit_prefix.upper() if explicit_prefix else _infer_prefix_from_tasks(tasks_dir)
     )
-    if own_prefix and derived == own_prefix:
+    if own_prefix and own_prefix in candidates:
         return  # matches this project's own established prefix
 
     from .discovery import discover_projects
@@ -1808,9 +1811,9 @@ def check_explicit_id_prefix_collision(
             sibling_prefix = resolve_existing_prefix(sibling)
         except OSError as exc:
             raise PortfolioPrefixScanError(sibling.id, exc) from exc
-        if sibling_prefix == derived:
+        if sibling_prefix and sibling_prefix in candidates:
             raise ValueError(
-                f"Task id '{task_id}' derives prefix '{derived}', which is "
+                f"Task id '{task_id}' derives prefix '{sibling_prefix}', which is "
                 f"already claimed by project '{sibling.id}'. Pass a "
                 "different task_id, or omit it to auto-generate one."
             )

@@ -178,6 +178,41 @@ class TestExplicitIdPrefixCollision:
         with pytest.raises(ValueError, match="SIB.*proj-b"):
             add_task(config, "proj-a", "Lowercase squat", task_id="sib-001")
 
+    def test_sibling_prefix_ending_in_digit_still_refuses_collision(self, tmp_path, monkeypatch):
+        """A real `task_prefix` can itself end in a digit segment (e.g.
+        "TEAM-2") -- round-2 review (grok-4.6, Codex) caught the recursive
+        peel over-stripping past this to "TEAM", missing the sibling's
+        actual claim. Checking the WHOLE peel chain (not just the fully-
+        peeled value) must still catch it."""
+        _make_portfolio(tmp_path, "proj-a")
+        _add_sibling_project(tmp_path, "proj-b", task_prefix="TEAM-2")
+        config = _load_isolated_config(tmp_path, monkeypatch)
+
+        with pytest.raises(ValueError, match="TEAM-2.*proj-b"):
+            add_task(config, "proj-a", "Digit-suffixed prefix squat", task_id="TEAM-2-001")
+
+    def test_own_digit_suffixed_prefix_not_false_refused(self, tmp_path, monkeypatch):
+        """The other direction of the same bug: THIS project's own real
+        prefix ending in a digit ("TEAM-2") must not be false-refused just
+        because an unrelated sibling happens to own the OVER-stripped
+        remainder ("TEAM")."""
+        _make_portfolio(tmp_path, "proj-a")
+        _add_sibling_project(tmp_path, "proj-b", task_prefix="TEAM")
+        config = _load_isolated_config(tmp_path, monkeypatch)
+
+        # proj-a's own explicit prefix is "TEAM-2" -- distinct from proj-b's "TEAM".
+        settings_path = tmp_path / "projects" / "proj-a" / ".project" / "settings.toml"
+        settings_path.write_text(
+            'id = "proj-a"\nname = "proj-a"\nstatus = "active"\npriority = 3\n'
+            'task_prefix = "TEAM-2"\n',
+            encoding="utf-8",
+        )
+        config = _load_isolated_config(tmp_path, monkeypatch)
+
+        task = add_task(config, "proj-a", "Own digit-suffixed prefix", task_id="TEAM-2-001")
+        assert task is not None
+        assert task.id == "TEAM-2-001"
+
     def test_unreadable_sibling_fails_closed(self, tmp_path, monkeypatch):
         """An unreadable/locked sibling directory must FAIL CLOSED (raise
         PortfolioPrefixScanError), not be silently treated as "no
