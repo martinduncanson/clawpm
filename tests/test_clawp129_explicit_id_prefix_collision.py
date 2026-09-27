@@ -213,6 +213,39 @@ class TestExplicitIdPrefixCollision:
         assert task is not None
         assert task.id == "TEAM-2-001"
 
+    def test_own_prefix_as_peel_ancestor_still_refuses_more_specific_sibling(
+        self, tmp_path, monkeypatch
+    ):
+        """round-3 review (grok-4.5) catch: the own-prefix short-circuit
+        must only fire on the MOST SPECIFIC candidate. This project's own
+        prefix is "TEAM" (a peeled ANCESTOR of the id's chain); sibling B's
+        real, MORE SPECIFIC claim is "TEAM-2". Matching "TEAM" anywhere in
+        the chain must not skip checking "TEAM-2" against proj-b first."""
+        _make_portfolio(tmp_path, "proj-a")
+        _add_sibling_project(tmp_path, "proj-b", task_prefix="TEAM-2")
+        config = _load_isolated_config(tmp_path, monkeypatch)
+
+        # Establish proj-a's own prefix as the plain "TEAM" (auto-mint).
+        seed = add_task(config, "proj-a", "proj-a's own first task", task_id="TEAM-000")
+        assert seed is not None
+
+        with pytest.raises(ValueError, match="TEAM-2.*proj-b"):
+            add_task(config, "proj-a", "Squats proj-b's more specific claim", task_id="TEAM-2-001")
+
+    def test_prefix_with_underscore_still_refuses_collision(self, tmp_path, monkeypatch):
+        """A real `task_prefix` isn't restricted to the `_PREFIX_NUM_RE`
+        character set ([A-Z0-9-]) -- `ProjectSettings`/`assign_task_prefix`
+        accept and mint any string verbatim (round-3 Codex catch:
+        `task_prefix = "OPS_TEAM"`, an underscore). The check must compare
+        directly against the real prefix STRING, not a regex-derived one,
+        so a namespace outside that character set still gets caught."""
+        _make_portfolio(tmp_path, "proj-a")
+        _add_sibling_project(tmp_path, "proj-b", task_prefix="OPS_TEAM")
+        config = _load_isolated_config(tmp_path, monkeypatch)
+
+        with pytest.raises(ValueError, match="OPS_TEAM.*proj-b"):
+            add_task(config, "proj-a", "Underscore-prefix squat", task_id="OPS_TEAM-001")
+
     def test_unreadable_sibling_fails_closed(self, tmp_path, monkeypatch):
         """An unreadable/locked sibling directory must FAIL CLOSED (raise
         PortfolioPrefixScanError), not be silently treated as "no
