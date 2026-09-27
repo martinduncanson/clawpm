@@ -348,18 +348,17 @@ class TestPortfolioWidePrefixAllocationContention:
     def test_portfolio_lock_actually_serializes_add_task(self, tmp_path):
         """Direct proof the lock is load-bearing, not just present-but-
         unused (Codex P2 + grok-4.5 HIGH, PR #65 round 1: the cross-process
-        'without lock' reproduction below could never actually collide
-        under CLAWP-124's deterministic matching -- a same-snapshot
-        concurrent read yields distinct candidates per caller BY
-        CONSTRUCTION, so that test's positive counterpart would also pass
-        with the lock replaced by a no-op, proving nothing). This test
-        instead holds ``portfolio_prefix_lock`` directly in a background
-        thread and confirms a concurrent ``add_task`` call for a
-        task-less project BLOCKS until the holder releases it -- this
-        WOULD fail if ``add_task`` stopped taking the lock (e.g. reverted
-        to a conditional skip, or removed entirely)."""
+        'without lock' reproduction could never actually collide under
+        CLAWP-124's deterministic matching, so that test's positive
+        counterpart proved nothing). Mirrors
+        test_split_task_acquires_project_lock's event-based shape exactly
+        (Codex P2 + grok-4.5, PR #65 round 2: a wall-clock-elapsed
+        threshold races add_task's unlocked prologue -- resolve_baseline_ref
+        can invoke git, get_scoped_project_settings does its own I/O -- so
+        `elapsed >= 0.35` could false-pass without ever contending on the
+        lock. `done.wait(N)` observes an EVENT, not a duration, so it can't
+        false-pass that way)."""
         import threading
-        import time as _time
         from clawpm.tasks import portfolio_prefix_lock, add_task
         from clawpm.discovery import load_portfolio_config
 
@@ -376,30 +375,36 @@ class TestPortfolioWidePrefixAllocationContention:
 
         t = threading.Thread(target=holder)
         t.start()
+
+        done = threading.Event()
+        result_box: dict = {}
+
+        def adder():
+            result_box["r"] = add_task(config, "abcde1", "first task")
+            done.set()
+
+        a = threading.Thread(target=adder)
         try:
             assert held.wait(5), "holder thread failed to acquire the portfolio lock"
-            threading.Timer(0.4, release.set).start()
-            start = _time.monotonic()
-            task = add_task(config, "abcde1", "first task")
-            elapsed = _time.monotonic() - start
-            assert task is not None
-            assert elapsed >= 0.35, (
-                f"add_task returned after {elapsed:.3f}s -- did not wait for "
-                "the held portfolio lock (lock is not load-bearing)"
-            )
+            a.start()
+            # While the portfolio lock is held elsewhere, add_task must be blocked.
+            assert not done.wait(0.6), "add_task did not block on the held portfolio lock"
+            release.set()
+            assert done.wait(10), "add_task did not complete after release"
+            assert result_box["r"] is not None
         finally:
             release.set()
             t.join(10)
+            a.join(10)
 
     def test_portfolio_lock_also_serializes_explicit_id_creates(self, tmp_path):
         """Codex P1 (PR #65 round 1): an explicit-ID create for a project's
         OWN first task never calls assign_task_prefix, yet still
         establishes that project's future inferred prefix -- it needs the
         SAME portfolio-lock coordination against a sibling's concurrent
-        auto-mint. Same direct blocking proof as above, with an explicit
-        task_id."""
+        auto-mint. Same event-based blocking proof as above (Codex P2 +
+        grok-4.5, PR #65 round 2), with an explicit task_id."""
         import threading
-        import time as _time
         from clawpm.tasks import portfolio_prefix_lock, add_task
         from clawpm.discovery import load_portfolio_config
 
@@ -416,20 +421,30 @@ class TestPortfolioWidePrefixAllocationContention:
 
         t = threading.Thread(target=holder)
         t.start()
+
+        done = threading.Event()
+        result_box: dict = {}
+
+        def adder():
+            result_box["r"] = add_task(
+                config, "abcde1", "first task", task_id="ABCDE1-900"
+            )
+            done.set()
+
+        a = threading.Thread(target=adder)
         try:
             assert held.wait(5), "holder thread failed to acquire the portfolio lock"
-            threading.Timer(0.4, release.set).start()
-            start = _time.monotonic()
-            task = add_task(config, "abcde1", "first task", task_id="ABCDE1-900")
-            elapsed = _time.monotonic() - start
-            assert task is not None
-            assert elapsed >= 0.35, (
-                f"explicit-ID add_task returned after {elapsed:.3f}s -- did "
-                "not wait for the held portfolio lock"
+            a.start()
+            assert not done.wait(0.6), (
+                "explicit-ID add_task did not block on the held portfolio lock"
             )
+            release.set()
+            assert done.wait(10), "explicit-ID add_task did not complete after release"
+            assert result_box["r"] is not None
         finally:
             release.set()
             t.join(10)
+            a.join(10)
 
 
 # ---------------------------------------------------------------------------
