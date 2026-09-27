@@ -21,7 +21,7 @@ predictions:
 priority: 3
 tags:
 - task-id-allocation
-updated: '2026-09-26'
+updated: '2026-09-27'
 ---
 # add_task's ID-numbering scan omits rejected/, can silently reuse a rejected task's id
 
