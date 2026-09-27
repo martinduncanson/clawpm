@@ -1695,6 +1695,93 @@ def portfolio_prefix_lock(portfolio_root: Path):
         yield
 
 
+def _prefix_from_explicit_id(task_id: str) -> str | None:
+    """The prefix segment of an explicit ``task_id``, or ``None`` if it
+    doesn't match the ``PREFIX-NNN`` shape ``_PREFIX_NUM_RE`` expects.
+
+    An id that doesn't match this shape (no trailing number) can't be
+    validated against the portfolio's prefix claims -- there is nothing to
+    compare it to. CLAWP-129 only guards the common ``PREFIX-NNN`` case.
+    """
+    m = _PREFIX_NUM_RE.match(task_id)
+    return m.group(1) if m else None
+
+
+def check_explicit_id_prefix_collision(
+    task_id: str,
+    project_id: str,
+    tasks_dir: Path,
+    config,
+    explicit_prefix: str | None,
+) -> None:
+    """Refuse an explicit-ID create whose derived prefix belongs to a
+    DIFFERENT project's real (explicit or inferred) claim (CLAWP-129).
+
+    Before this check, an explicit ``--id`` create was never validated
+    against the portfolio at all -- only the same-project clobber guard
+    (Finding 2, CLAWP-051, a few lines below in ``add_task``) ran, which
+    catches a literal id reused within ONE project but has nothing to say
+    about ``tasks add --project foo --id BAR-001`` when ``BAR`` is another
+    project's prefix. That silently broke the "task id is a
+    portfolio-unique handle" invariant this module's own CLAWP-048 comment
+    names, feeding the same cross-project-isolation bug class the resolver
+    already guards against for auto-generated ids.
+
+    Must run under the SAME portfolio lock as the auto-ID path (the caller
+    already holds it, per ``portfolio_prefix_lock``) -- reading another
+    project's real prefix without the lock races a concurrent sibling
+    establishing its own first-mint prefix in the exact window this check
+    is trying to protect.
+
+    An id whose derived prefix matches no OTHER project's real claim is
+    let through even when it doesn't match THIS project's own prefix yet
+    -- exactly the "explicit-ID create for a project's own first task ...
+    still establishes that project's future inferred prefix" case already
+    documented on :func:`portfolio_prefix_lock`. There is nothing to refuse
+    until a second project actually claims the same prefix; refusing here
+    on mere non-identity with this project's own (possibly still-unset)
+    prefix would block every project's legitimate first explicit-ID task.
+
+    Raises:
+        ValueError: the derived prefix is already a REAL claim (explicit
+            ``task_prefix`` or inferred from minted tasks) of a different
+            project. Operator policy (2026-09-27): refuse outright rather
+            than warn-and-proceed or auto-suffix -- a silent id rewrite
+            would surprise a caller that expected their literal id.
+    """
+    derived = _prefix_from_explicit_id(task_id)
+    if derived is None:
+        return  # doesn't match PREFIX-NNN; nothing to validate against
+
+    own_prefix = (
+        explicit_prefix.upper() if explicit_prefix else _infer_prefix_from_tasks(tasks_dir)
+    )
+    if own_prefix and derived == own_prefix:
+        return  # matches this project's own established prefix
+
+    from .discovery import discover_projects
+
+    for sibling in discover_projects(config):
+        if sibling.id == project_id:
+            continue
+        try:
+            sibling_prefix = resolve_existing_prefix(sibling)
+        except OSError:
+            # Mirrors assign_all_prefixes: an unreadable sibling can't be
+            # ruled out, but a single explicit-ID create shouldn't abort
+            # over a locked/unreadable sibling directory -- treat as "not
+            # this one" rather than raising (the auto-ID path's portfolio
+            # scan already treats a scan failure as more severe than this
+            # spot-check does; this check is best-effort by design).
+            continue
+        if sibling_prefix == derived:
+            raise ValueError(
+                f"Task id '{task_id}' derives prefix '{derived}', which is "
+                f"already claimed by project '{sibling.id}'. Pass a "
+                "different task_id, or omit it to auto-generate one."
+            )
+
+
 def assign_task_prefix(
     project_id: str, tasks_dir: Path, config, explicit_prefix: str | None = None
 ) -> str:
@@ -1907,6 +1994,14 @@ def add_task(
 
             next_num = max(existing_nums, default=-1) + 1
             task_id = f"{prefix}-{next_num:03d}"
+        else:
+            # CLAWP-129 — an explicit id was never checked against the
+            # portfolio's real prefix claims at all (only the same-project
+            # clobber guard below, which is a different check). Must run
+            # inside the same portfolio lock the auto-ID path uses above.
+            check_explicit_id_prefix_collision(
+                task_id, project_id, tasks_dir, config, _explicit_prefix
+            )
 
         # Build frontmatter. CLAWP-086 — `updated` equals `created` at add time.
         # CLAWP-126: UTC calendar day, not local — see today_utc_iso().
