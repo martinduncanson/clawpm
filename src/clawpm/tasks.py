@@ -1702,9 +1702,37 @@ def _prefix_from_explicit_id(task_id: str) -> str | None:
     An id that doesn't match this shape (no trailing number) can't be
     validated against the portfolio's prefix claims -- there is nothing to
     compare it to. CLAWP-129 only guards the common ``PREFIX-NNN`` case.
+
+    Two normalisations, both confirmed live by review (grok-4.6/4.5 +
+    PRE-REVIEW, PR #66):
+
+    - Matched case-insensitively (``task_id.upper()``): ``_PREFIX_NUM_RE``
+      requires ``[A-Z]``, so a caller-supplied lowercase id (``--id
+      sib-001``) previously matched nothing and silently skipped this
+      check entirely -- while ``expand_task_id`` (``context.py``)
+      upper-cases every *reference* to that same id, so ``sib-001`` and a
+      sibling's real ``SIB-001`` resolve to the same portfolio handle
+      elsewhere in the tool. The returned prefix still reflects the
+      original casing convention (prefixes are always upper-cased by
+      every other caller in this module).
+    - A subtask-shaped explicit id (``SIB-001-002``) previously derived
+      ``"SIB-001"`` -- the *parent* task id, not the project prefix --
+      because ``_PREFIX_NUM_RE``'s number group only strips the LAST
+      ``-NNN``. No real project prefix ever ends in ``-<digits>``
+      (``_infer_prefix_from_tasks`` explicitly excludes that shape for the
+      same reason), so ``"SIB-001"`` could never match any sibling's real
+      claim and the guard silently no-opped for every subtask-shaped
+      explicit id. Peeling trailing ``-<digits>`` segments recovers the
+      true top-level prefix (mirrors ``_parent_id_of``'s single-level
+      strip, applied recursively).
     """
-    m = _PREFIX_NUM_RE.match(task_id)
-    return m.group(1) if m else None
+    m = _PREFIX_NUM_RE.match(task_id.upper())
+    if not m:
+        return None
+    prefix = m.group(1)
+    while re.search(r"-\d+$", prefix):
+        prefix = prefix.rsplit("-", 1)[0]
+    return prefix or None
 
 
 def check_explicit_id_prefix_collision(
@@ -1748,6 +1776,18 @@ def check_explicit_id_prefix_collision(
             project. Operator policy (2026-09-27): refuse outright rather
             than warn-and-proceed or auto-suffix -- a silent id rewrite
             would surprise a caller that expected their literal id.
+        PortfolioPrefixScanError: a sibling's tasks directory couldn't be
+            scanned. FAILS CLOSED here, matching ``assign_all_prefixes``'s
+            own contract for the identical failure (an unreadable sibling
+            means the portfolio's true state genuinely can't be read, not
+            that this one candidate is ruled out) -- three independent
+            reviewers (grok-4.6, grok-4.5, a history-lens pass, PR #66)
+            caught an earlier version of this function silently treating
+            an unreadable sibling as "not a collision" and letting the
+            create through, which is exactly backwards: a locked/
+            unreadable sibling directory is itself a signal of concurrent
+            activity, the precise race window the portfolio lock exists to
+            protect.
     """
     derived = _prefix_from_explicit_id(task_id)
     if derived is None:
@@ -1766,14 +1806,8 @@ def check_explicit_id_prefix_collision(
             continue
         try:
             sibling_prefix = resolve_existing_prefix(sibling)
-        except OSError:
-            # Mirrors assign_all_prefixes: an unreadable sibling can't be
-            # ruled out, but a single explicit-ID create shouldn't abort
-            # over a locked/unreadable sibling directory -- treat as "not
-            # this one" rather than raising (the auto-ID path's portfolio
-            # scan already treats a scan failure as more severe than this
-            # spot-check does; this check is best-effort by design).
-            continue
+        except OSError as exc:
+            raise PortfolioPrefixScanError(sibling.id, exc) from exc
         if sibling_prefix == derived:
             raise ValueError(
                 f"Task id '{task_id}' derives prefix '{derived}', which is "
