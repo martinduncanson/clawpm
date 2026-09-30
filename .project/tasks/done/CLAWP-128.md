@@ -21,7 +21,7 @@ predictions:
     after moving to done/blocked/rejected/archive, with a regression test using that
     exact shape
 priority: 3
-updated: '2026-09-27'
+updated: '2026-09-30'
 ---
 # emit-tree idempotency blind to a directory-shaped (has-its-own-children) rejected/done/blocked child
 

@@ -543,16 +543,16 @@ def _resolve_idempotency(
     finishes or blocks would make its own already-emitted children invisible
     to a later re-emit under the same parent.
 
-    NOT yet covered (tracked as a follow-up, out of this fix's scope): a
-    CHILD that is ITSELF a directory task (has its own children) stores its
-    metadata at ``<state-dir>/<child_id>/_task.md`` rather than a flat
-    ``<state-dir>/<child_id>.md`` — the glob below only matches flat files, so
-    such a child moved to any terminal state is still invisible here (Codex
-    P2, PR #62 round 3). This is a materially different traversal shape (glob
-    into ``{parent_id}-*/`` subdirectories for ``_task.md``, not just add
-    another directory to this tuple) and affects done/blocked/rejected/archive
-    alike — deliberately scoped out of CLAWP-127 as a distinct bug class; see
-    the filed follow-up task.
+    Also covers a CHILD that is itself a directory task (has its own
+    children), which stores its metadata at ``<state-dir>/<child_id>/
+    _task.md`` rather than a flat ``<state-dir>/<child_id>.md`` (CLAWP-128;
+    Codex P2, PR #62 round 3). The flat-file glob above can never match that
+    shape, so each ``scan_dir`` is also globbed for ``{parent_id}-*``
+    subdirectories containing ``_task.md`` — mirroring how
+    ``_existing_child_ordinals`` (``tasks.py``) already scans both shapes for
+    the identical reason (a directory-shaped child moved to done/blocked/
+    rejected/archive must not have its ordinal, or here its leaf_key, treated
+    as free).
     """
     from .tasks import get_tasks_dir
 
@@ -562,6 +562,29 @@ def _resolve_idempotency(
 
     leaf_keys = {lf.leaf_key for lf in leaves}
     already_emitted: list[str] = []
+
+    def _leaf_key_of(task_file: Path) -> str | None:
+        # Fails open on a missing/unreadable/malformed file, matching this
+        # function's own pre-existing contract for the flat-file case (grok
+        # PR #67: worth naming explicitly, not silently inherited) — a
+        # leaf_key this can't read is treated as "not yet seen", so the
+        # worst case is a re-mint (visible, recoverable), never a silent
+        # collision. isinstance-guarded so a non-string leaf_key (malformed
+        # YAML) can't reach the `in leaf_keys` set-membership test below.
+        if not task_file.is_file():
+            return None
+        try:
+            # errors="replace" (not a stricter decode + exception list): a
+            # non-UTF-8 byte in one sibling's hand-edited file must not abort
+            # the whole emit (grok-4.6 PR #67 round 2 — a bare `except
+            # OSError` missed UnicodeDecodeError, which read_text raises as a
+            # ValueError, not an OSError).
+            text = task_file.read_text(encoding="utf-8", errors="replace")
+            fm, _ = parse_frontmatter(text)
+            lk = fm.get("leaf_key") if isinstance(fm, dict) else None
+        except OSError:
+            return None
+        return lk if isinstance(lk, str) else None
 
     scan_dirs = (
         tasks_dir / parent_id,                          # live children
@@ -578,14 +601,15 @@ def _resolve_idempotency(
         if not scan_dir.exists():
             continue
         for f in scan_dir.glob(f"{parent_id}-*.md"):
-            try:
-                text = f.read_text(encoding="utf-8")
-                fm, _ = parse_frontmatter(text)
-                lk = fm.get("leaf_key")
-                if lk and lk in leaf_keys:
-                    already_emitted.append(lk)
-            except Exception:
-                pass
+            lk = _leaf_key_of(f)
+            if lk and lk in leaf_keys:
+                already_emitted.append(lk)
+        for d in scan_dir.glob(f"{parent_id}-*"):
+            if not d.is_dir():
+                continue
+            lk = _leaf_key_of(d / "_task.md")
+            if lk and lk in leaf_keys:
+                already_emitted.append(lk)
 
     return already_emitted
 
