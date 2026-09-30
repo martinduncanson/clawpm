@@ -564,12 +564,22 @@ def _resolve_idempotency(
     already_emitted: list[str] = []
 
     def _leaf_key_of(task_file: Path) -> str | None:
+        # Fails open on a missing/unreadable/malformed file, matching this
+        # function's own pre-existing contract for the flat-file case (grok
+        # PR #67: worth naming explicitly, not silently inherited) — a
+        # leaf_key this can't read is treated as "not yet seen", so the
+        # worst case is a re-mint (visible, recoverable), never a silent
+        # collision. isinstance-guarded so a non-string leaf_key (malformed
+        # YAML) can't reach the `in leaf_keys` set-membership test below.
+        if not task_file.is_file():
+            return None
         try:
             text = task_file.read_text(encoding="utf-8")
             fm, _ = parse_frontmatter(text)
-            return fm.get("leaf_key")
-        except Exception:
+            lk = fm.get("leaf_key") if isinstance(fm, dict) else None
+        except OSError:
             return None
+        return lk if isinstance(lk, str) else None
 
     scan_dirs = (
         tasks_dir / parent_id,                          # live children

@@ -1203,10 +1203,24 @@ class TestEmitTreeIdempotent:
         grandchild = add_subtask(config, "emittest", child_id, "Grandchild")
         assert grandchild is not None
 
-        # Complete the child wholesale -- change_task_state moves the whole
-        # directory to tasks/done/<child_id>/_task.md, taking the
-        # grandchild with it.
-        change_task_state(config, "emittest", child_id, TaskState.DONE)
+        # force=True: the rollup gate would otherwise refuse DONE while the
+        # grandchild is still OPEN (test_parent_done_blocked_while_child_open)
+        # -- a real, already-tested workflow (test_force_overrides_gate), and
+        # it sidesteps needing the grandchild independently resolvable by id
+        # (get_task's candidate-path probing for a subtask-of-a-subtask nested
+        # two directories deep is a separate, pre-existing gap unrelated to
+        # this fix -- grok-4.6, PR #67 round 1 caught the ORIGINAL version of
+        # this test not actually reaching done/ at all; this sidesteps that
+        # without dragging in a second, unrelated bug class to make a normal
+        # non-force rollup succeed).
+        child_done = change_task_state(config, "emittest", child_id, TaskState.DONE, force=True)
+        assert child_done is not None and child_done.state == TaskState.DONE
+
+        # Pin the on-disk shape this test actually relies on, rather than
+        # trusting change_task_state's return value alone.
+        tasks_dir = temp_portfolio["tasks_dir"]
+        assert (tasks_dir / "done" / child_id / "_task.md").exists()
+        assert not (tasks_dir / parent.id / child_id).exists()
 
         # Re-emit the SAME doc: "Leaf one" / leaf_key "dirchild-R1" already
         # exists as a directory-shaped done child. Idempotency must
