@@ -100,6 +100,34 @@ detection) and are candidates for one combined design pass:**
   value every other caller in this module already treats as "the"
   prefix — another change that reaches beyond this one check.
 
+**A third gap in the same family, found by grok-4.6 on PR #66's round-4 local
+review (commit `727a1ac`, 2026-09-27), folded in here for the same reason —
+same judgment call about how far to widen "real claim" detection:**
+
+- **`_infer_prefix_from_tasks`'s `_PREFIX_NUM_RE` is itself character-
+  restricted** (`^[A-Z][A-Z0-9-]*?-(\d+)`), even though CLAWP-129's own
+  `_id_is_within_prefix_namespace` was rewritten specifically so the
+  INCOMING id comparison has no such restriction (a `task_prefix` like
+  `"OPS_TEAM"` matches fine on that side, round-3/4 fix). But sibling CLAIM
+  DISCOVERY still goes through `resolve_existing_prefix` ->
+  `_infer_prefix_from_tasks` when the sibling has no explicit
+  `task_prefix` — so a sibling whose first-minted task used an explicit id
+  outside that regex's character set (lowercase `sib-000`, underscored
+  `ops_team-000`) is invisible as a claim: `resolve_existing_prefix`
+  returns `None`, `check_explicit_id_prefix_collision`'s sibling loop skips
+  it, and a later `--id SIB-001` / `--id OPS_TEAM-001` in a different
+  project proceeds uncontested — the exact squat CLAWP-129 exists to stop.
+  Same root class as the two gaps above (a `resolve_existing_prefix`
+  discovery blind spot, not an `_id_is_within_prefix_namespace` bug), and
+  shared identically with the auto-ID path (`assign_all_prefixes` calls the
+  same resolver for the same reason). Fixing it means inference itself
+  handling an unrestricted character set — which reopens the exact
+  prefix/number split ambiguity CLAWP-129 deliberately avoided by comparing
+  against KNOWN real strings instead of deriving one; there is no known
+  real string to compare against when the prefix was never explicit and
+  must be split out of an arbitrarily-charactered filename. Needs its own
+  design pass, not a `tasks.py`-local patch.
+
 **Pushed back on (not filed), Codex PR #66 round 2:** "if two projects
 already currently share a real prefix (pre-existing broken state), an
 explicit-ID create matching this project's own prefix returns early
