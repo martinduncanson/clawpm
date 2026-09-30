@@ -574,7 +574,12 @@ def _resolve_idempotency(
         if not task_file.is_file():
             return None
         try:
-            text = task_file.read_text(encoding="utf-8")
+            # errors="replace" (not a stricter decode + exception list): a
+            # non-UTF-8 byte in one sibling's hand-edited file must not abort
+            # the whole emit (grok-4.6 PR #67 round 2 — a bare `except
+            # OSError` missed UnicodeDecodeError, which read_text raises as a
+            # ValueError, not an OSError).
+            text = task_file.read_text(encoding="utf-8", errors="replace")
             fm, _ = parse_frontmatter(text)
             lk = fm.get("leaf_key") if isinstance(fm, dict) else None
         except OSError:
