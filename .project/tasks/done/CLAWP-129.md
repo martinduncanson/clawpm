@@ -34,11 +34,33 @@ Note: minted as CLAWP-128 initially, then renamed to CLAWP-129 before commit
 numbering scan can't see an unmerged branch's task files. Renamed here to
 avoid a collision once that branch merges.
 
-
+**Operator policy decision (2026-09-27): refuse outright on collision** —
+matches the auto-numbering path's existing behaviour; warn-and-proceed and
+auto-suffix were rejected as options.
 
 ## Acceptance Criteria
 
-- [ ] (Add criteria here)
+- [x] `check_explicit_id_prefix_collision` derives the explicit id's prefix
+  (`_PREFIX_NUM_RE`) and, under the portfolio lock, compares it against
+  every OTHER project's real (explicit `task_prefix` or inferred-from-tasks)
+  prefix — raising `ValueError` on a match.
+- [x] An id matching THIS project's own established prefix, or a project's
+  own first explicit-ID mint (no other project has claimed that prefix
+  yet), is allowed through — not a false positive.
+- [x] An explicit id that doesn't match the `PREFIX-NNN` shape skips
+  validation (nothing to compare) rather than being rejected.
+- [x] 5 new tests (`tests/test_clawp129_explicit_id_prefix_collision.py`)
+  covering: explicit-prefix collision, inferred-prefix collision, own-prefix
+  match, own-first-mint-unclaimed, malformed-id skip. Full suite green
+  (1708 passed).
 
 ## Notes
+
+Implementation lives in `src/clawpm/tasks.py`: `_prefix_from_explicit_id`
++ `check_explicit_id_prefix_collision`, called from `add_task`'s `else`
+branch (the explicit-ID path) alongside the existing CLAWP-051 same-project
+clobber guard. Reuses `resolve_existing_prefix` / `discover_projects` —
+the same portfolio-scan primitives `assign_all_prefixes` already uses for
+the auto-ID path — so the two paths can't disagree about what counts as a
+"real" claim.
 

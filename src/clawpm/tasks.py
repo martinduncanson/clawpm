@@ -1695,6 +1695,133 @@ def portfolio_prefix_lock(portfolio_root: Path):
         yield
 
 
+def _id_is_within_prefix_namespace(task_id: str, prefix: str) -> bool:
+    """Whether ``task_id`` (case-insensitively) IS ``prefix``, or ``prefix``
+    followed by one or more ``-<digits>`` segments (any subtask nesting
+    depth) and an optional ``.progress`` suffix -- i.e. whether ``task_id``
+    lives inside ``prefix``'s id-namespace.
+
+    Compares the id directly against a REAL prefix STRING rather than first
+    trying to derive "the" prefix from ``task_id`` alone via a fixed
+    character-class regex. An explicit ``task_prefix`` in settings.toml is
+    accepted and minted VERBATIM by ``ProjectSettings``/``assign_task_prefix``
+    with no character restriction -- ``task_prefix = "OPS_TEAM"`` (an
+    underscore) is valid and real, but the old ``_PREFIX_NUM_RE``-based
+    derivation (``[A-Z0-9-]`` only) couldn't match it at all, silently
+    exempting that whole namespace from this check (Codex catch, PR #66
+    round 3). Comparing directly against each REAL claim string sidesteps
+    that character-set problem entirely -- there is no "derive, then guess
+    where the prefix ends and numbering begins" step to get wrong.
+    """
+    upper_id = task_id.upper()
+    upper_prefix = prefix.upper()
+    if upper_id == upper_prefix:
+        return True
+    if not upper_id.startswith(upper_prefix + "-"):
+        return False
+    remainder = upper_id[len(upper_prefix) + 1:]
+    remainder = re.sub(r"\.PROGRESS$", "", remainder)
+    return bool(remainder) and all(seg.isdigit() for seg in remainder.split("-"))
+
+
+def check_explicit_id_prefix_collision(
+    task_id: str,
+    project_id: str,
+    tasks_dir: Path,
+    config,
+    explicit_prefix: str | None,
+) -> None:
+    """Refuse an explicit-ID create whose namespace belongs to a DIFFERENT
+    project's real (explicit or inferred) claim (CLAWP-129).
+
+    Before this check, an explicit ``--id`` create was never validated
+    against the portfolio at all -- only the same-project clobber guard
+    (Finding 2, CLAWP-051, a few lines below in ``add_task``) ran, which
+    catches a literal id reused within ONE project but has nothing to say
+    about ``tasks add --project foo --id BAR-001`` when ``BAR`` is another
+    project's prefix. That silently broke the "task id is a
+    portfolio-unique handle" invariant this module's own CLAWP-048 comment
+    names, feeding the same cross-project-isolation bug class the resolver
+    already guards against for auto-generated ids.
+
+    Must run under the SAME portfolio lock as the auto-ID path (the caller
+    already holds it, per ``portfolio_prefix_lock``) -- reading another
+    project's real prefix without the lock races a concurrent sibling
+    establishing its own first-mint prefix in the exact window this check
+    is trying to protect.
+
+    LONGEST-MATCH tie-break (grok-4.5 + Codex, PR #66 round 3): a shorter
+    real prefix can be a syntactic ANCESTOR of a longer one -- this
+    project's own ``"TEAM"`` and a sibling's real ``"TEAM-2"`` can BOTH
+    match ``"TEAM-2-001"``'s namespace-shape, since ``"2-001"`` reads as
+    valid subtask numbering under either. That ambiguity is real, not a
+    bug to eliminate -- the id's shape alone cannot say which is intended.
+    The safe resolution: whichever REAL claim matches MOST SPECIFICALLY
+    (longest matching prefix) wins. This also means an id matching only
+    THIS project's own claim (no sibling matches, or every matching
+    sibling is less specific than our own) is let through even when it
+    doesn't match this project's prefix at position zero -- including a
+    project's own first explicit-ID task establishing its future inferred
+    prefix (nothing else claims it yet, so nothing outscores "no claim").
+
+    Raises:
+        ValueError: the MOST SPECIFIC real claim (explicit ``task_prefix``
+            or inferred from minted tasks) matching this id's namespace
+            belongs to a different project. Operator policy (2026-09-27):
+            refuse outright rather than warn-and-proceed or auto-suffix --
+            a silent id rewrite would surprise a caller that expected
+            their literal id.
+        PortfolioPrefixScanError: a sibling's tasks directory couldn't be
+            scanned. FAILS CLOSED here, matching ``assign_all_prefixes``'s
+            own contract for the identical failure (an unreadable sibling
+            means the portfolio's true state genuinely can't be read, not
+            that this one candidate is ruled out) -- three independent
+            reviewers (grok-4.6, grok-4.5, a history-lens pass, PR #66)
+            caught an earlier version of this function silently treating
+            an unreadable sibling as "not a collision" and letting the
+            create through, which is exactly backwards: a locked/
+            unreadable sibling directory is itself a signal of concurrent
+            activity, the precise race window the portfolio lock exists to
+            protect.
+    """
+    own_prefix = (
+        explicit_prefix.upper() if explicit_prefix else _infer_prefix_from_tasks(tasks_dir)
+    )
+
+    best_len = -1
+    best_owner: str | None = None  # None = this project itself
+    best_prefix = ""
+
+    if own_prefix and _id_is_within_prefix_namespace(task_id, own_prefix):
+        best_len = len(own_prefix)
+        best_prefix = own_prefix
+
+    from .discovery import discover_projects
+
+    for sibling in discover_projects(config):
+        if sibling.id == project_id:
+            continue
+        try:
+            sibling_prefix = resolve_existing_prefix(sibling)
+        except OSError as exc:
+            raise PortfolioPrefixScanError(sibling.id, exc) from exc
+        if (
+            sibling_prefix
+            and _id_is_within_prefix_namespace(task_id, sibling_prefix)
+            and len(sibling_prefix) > best_len
+        ):
+            best_len = len(sibling_prefix)
+            best_owner = sibling.id
+            best_prefix = sibling_prefix
+
+    if best_owner is not None:
+        raise ValueError(
+            f"Task id '{task_id}' derives prefix '{best_prefix}', which is "
+            f"already claimed by project '{best_owner}'. Pass a "
+            "different task_id, or omit it to auto-generate one."
+        )
+
+
 def assign_task_prefix(
     project_id: str, tasks_dir: Path, config, explicit_prefix: str | None = None
 ) -> str:
@@ -1907,6 +2034,14 @@ def add_task(
 
             next_num = max(existing_nums, default=-1) + 1
             task_id = f"{prefix}-{next_num:03d}"
+        else:
+            # CLAWP-129 — an explicit id was never checked against the
+            # portfolio's real prefix claims at all (only the same-project
+            # clobber guard below, which is a different check). Must run
+            # inside the same portfolio lock the auto-ID path uses above.
+            check_explicit_id_prefix_collision(
+                task_id, project_id, tasks_dir, config, _explicit_prefix
+            )
 
         # Build frontmatter. CLAWP-086 — `updated` equals `created` at add time.
         # CLAWP-126: UTC calendar day, not local — see today_utc_iso().
