@@ -1159,6 +1159,61 @@ class TestEmitTreeIdempotent:
         # result2 should note the re-emitted leaves as already present
         assert result2.emitted == [] or len(result2.emitted) == 0
 
+    def test_idempotency_recognises_directory_shaped_done_child(self, temp_portfolio):
+        """CLAWP-128 (Codex P2, PR #62 round 3): a previously-emitted child
+        that is itself a directory task (has its own children) stores its
+        frontmatter at ``<state-dir>/<child_id>/_task.md``, not the flat
+        ``<state-dir>/<child_id>.md`` shape ``_resolve_idempotency``'s glob
+        matched before this fix. Moved to a terminal state (done here), such
+        a child was invisible to idempotency and would be silently re-minted
+        on the next re-emit under the same parent.
+
+        Uses attach_to (not a fresh new-root) so the SAME parent_id is
+        scanned by idempotency across both emit calls, mirroring
+        test_reject_gate_survives_idempotent_leaf_key_match."""
+        config = temp_portfolio["config"]
+
+        parent = add_task(config, "emittest", "Existing parent")
+        assert parent is not None
+        raw = {
+            "schema_version": 1,
+            "root": {"attach_to": parent.id},
+            "leaves": [
+                {
+                    "ref": "R1",
+                    "parent_ref": None,
+                    "title": "Leaf one",
+                    "leaf_key": "dirchild-R1",
+                    "success_criteria": [],
+                    "scope": [],
+                    "stop_conditions": [],
+                    "delegability": "either",
+                    "predictions": {},
+                },
+            ],
+        }
+
+        first = emit_tree(config, "emittest", parse_emit_document(raw))
+        assert first.rejected == []
+        child_id = next(e["id"] for e in first.emitted if e["id"] != parent.id)
+
+        # Give the child its own subtask -- add_subtask auto-splits a flat
+        # task into a directory (<child_id>/_task.md + <child_id>-001.md).
+        from clawpm.tasks import add_subtask, change_task_state
+        grandchild = add_subtask(config, "emittest", child_id, "Grandchild")
+        assert grandchild is not None
+
+        # Complete the child wholesale -- change_task_state moves the whole
+        # directory to tasks/done/<child_id>/_task.md, taking the
+        # grandchild with it.
+        change_task_state(config, "emittest", child_id, TaskState.DONE)
+
+        # Re-emit the SAME doc: "Leaf one" / leaf_key "dirchild-R1" already
+        # exists as a directory-shaped done child. Idempotency must
+        # recognise it and not mint a second copy.
+        second = emit_tree(config, "emittest", parse_emit_document(raw))
+        assert second.emitted == []
+
 
 # ---------------------------------------------------------------------------
 # CLI surface tests
