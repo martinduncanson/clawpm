@@ -7,7 +7,7 @@ predictions:
   confidence: 2
   filled_by: agent
 priority: 4
-updated: '2026-09-27'
+updated: '2026-10-01'
 ---
 # Explicit-ID create can squat a prefix a taskless sibling later auto-mints into
 
