@@ -1732,9 +1732,10 @@ def check_explicit_id_prefix_collision(
     explicit_prefix: str | None,
 ) -> None:
     """Refuse an explicit-ID create whose namespace belongs to a DIFFERENT
-    project's real (explicit or inferred) claim (CLAWP-129).
+    project's real claim OR future deterministic mint (CLAWP-129, widened
+    CLAWP-130).
 
-    Before this check, an explicit ``--id`` create was never validated
+    Before CLAWP-129, an explicit ``--id`` create was never validated
     against the portfolio at all -- only the same-project clobber guard
     (Finding 2, CLAWP-051, a few lines below in ``add_task``) ran, which
     catches a literal id reused within ONE project but has nothing to say
@@ -1744,11 +1745,29 @@ def check_explicit_id_prefix_collision(
     names, feeding the same cross-project-isolation bug class the resolver
     already guards against for auto-generated ids.
 
+    CLAWP-129 compared only against each sibling's CURRENT real claim
+    (``resolve_existing_prefix``: an explicit ``task_prefix`` or the
+    dominant inferred prefix). That left a still-taskless sibling's FUTURE
+    first mint uncovered: project A explicitly creates ``--id BRAVO-900``
+    (allowed -- nothing currently claims ``BRAVO``); a still-taskless
+    ``bravo-project`` later auto-mints its first task via
+    ``assign_all_prefixes``, deterministically lands on ``BRAVO`` (nothing
+    has claimed it, by construction), and mints ``BRAVO-000`` -- colliding
+    with A's pre-existing ``BRAVO-900``. CLAWP-130 (operator decision,
+    2026-10-01, option 2) closes this by comparing against
+    ``assign_all_prefixes``' full returned assignment map instead of each
+    sibling's ``resolve_existing_prefix`` individually -- that map already
+    covers every currently-taskless sibling's deterministic candidate, not
+    just real claims. Accepted consequence: an explicit id that nobody
+    currently holds can now be refused solely because the deterministic
+    allocator would someday assign its prefix to a different still-taskless
+    project.
+
     Must run under the SAME portfolio lock as the auto-ID path (the caller
-    already holds it, per ``portfolio_prefix_lock``) -- reading another
-    project's real prefix without the lock races a concurrent sibling
-    establishing its own first-mint prefix in the exact window this check
-    is trying to protect.
+    already holds it, per ``portfolio_prefix_lock``) -- reading the
+    portfolio's prefix assignments without the lock races a concurrent
+    sibling establishing its own first-mint prefix in the exact window this
+    check is trying to protect.
 
     LONGEST-MATCH tie-break (grok-4.5 + Codex, PR #66 round 3): a shorter
     real prefix can be a syntactic ANCESTOR of a longer one -- this
@@ -1796,22 +1815,27 @@ def check_explicit_id_prefix_collision(
         best_len = len(own_prefix)
         best_prefix = own_prefix
 
-    from .discovery import discover_projects
+    # CLAWP-130: the full deterministic assignment map, not just each
+    # sibling's CURRENT real claim -- covers a still-taskless sibling's
+    # future first-mint candidate too. `assign_all_prefixes` itself raises
+    # `PortfolioPrefixScanError` for an unreadable sibling's REAL-claim
+    # scan (same fail-closed contract this check already had); a
+    # taskless sibling whose own candidate chain is exhausted is absent
+    # from `assignments` (collected in the returned `errors` instead) and
+    # is correctly skipped below, same as an unresolvable sibling was
+    # skipped before this widening.
+    assignments, _errors = assign_all_prefixes(config)
 
-    for sibling in discover_projects(config):
-        if sibling.id == project_id:
+    for sibling_id, sibling_prefix in assignments.items():
+        if sibling_id == project_id:
             continue
-        try:
-            sibling_prefix = resolve_existing_prefix(sibling)
-        except OSError as exc:
-            raise PortfolioPrefixScanError(sibling.id, exc) from exc
         if (
             sibling_prefix
             and _id_is_within_prefix_namespace(task_id, sibling_prefix)
             and len(sibling_prefix) > best_len
         ):
             best_len = len(sibling_prefix)
-            best_owner = sibling.id
+            best_owner = sibling_id
             best_prefix = sibling_prefix
 
     if best_owner is not None:

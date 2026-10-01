@@ -74,11 +74,28 @@ Options, roughly in order of invasiveness:
   even_if_unclaimed` (CLAWP-116 precedent) still passes — a project's own
   future first-mint candidate should never collide with itself.
 
-- [ ] Add a regression test reproducing the `BRAVO-900` / `bravo-project`
+- [x] Add a regression test reproducing the `BRAVO-900` / `bravo-project`
   scenario above (explicit id squats a prefix; a different taskless
   sibling's deterministic future candidate collides).
-- [ ] Verify `test_explicit_id_for_own_first_mint_is_allowed_even_if_
+
+  Added `tests/test_clawp130_explicit_id_future_mint_squat.py` — the
+  BRAVO-900/bravo-project repro, a sanity check that an unrelated prefix
+  still passes (the widened check must not over-refuse), and a
+  re-verification of the CLAWP-116 own-first-mint precedent against the
+  widened check specifically.
+
+- [x] Verify `test_explicit_id_for_own_first_mint_is_allowed_even_if_
   unclaimed` still passes unchanged.
+
+  Confirmed — all 12 existing CLAWP-129 tests plus the 3 new CLAWP-130
+  tests pass (15/15, 2026-10-01).
+
+Implementation: `check_explicit_id_prefix_collision` (`src/clawpm/tasks.py`)
+now calls `assign_all_prefixes(config)` once and iterates its full
+assignment map instead of calling `resolve_existing_prefix` per sibling.
+Fail-closed contract (`PortfolioPrefixScanError` on an unreadable sibling)
+is preserved since `assign_all_prefixes` itself raises it for the identical
+failure.
 
 ## Notes
 
