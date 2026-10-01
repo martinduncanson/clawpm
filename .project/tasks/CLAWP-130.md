@@ -57,10 +57,28 @@ Options, roughly in order of invasiveness:
 
 ## Acceptance Criteria
 
-- [ ] Operator picks one of the above (or another option) and records the
+- [x] Operator picks one of the above (or another option) and records the
   decision here before implementation starts.
-- [ ] Whichever option is chosen, add a regression test reproducing the
-  `BRAVO-900` / `bravo-project` scenario above.
+
+  **Decision (2026-10-01, operator):** Option 2 — widen
+  `check_explicit_id_prefix_collision` to call `assign_all_prefixes(config)`
+  and compare the explicit id's prefix against its full returned
+  assignment map, not just each sibling's `resolve_existing_prefix`.
+  Rationale given: this is the third independent reviewer (Codex x2,
+  grok-4.6 x1) to find a variant of this gap across CLAWP-129's review —
+  leaving it open has already cost multiple review rounds and will keep
+  costing them. Explicitly accepted consequence: an explicit id that
+  nobody currently holds can now be refused because the deterministic
+  allocator would someday assign it to a different still-taskless
+  project. Must verify `test_explicit_id_for_own_first_mint_is_allowed_
+  even_if_unclaimed` (CLAWP-116 precedent) still passes — a project's own
+  future first-mint candidate should never collide with itself.
+
+- [ ] Add a regression test reproducing the `BRAVO-900` / `bravo-project`
+  scenario above (explicit id squats a prefix; a different taskless
+  sibling's deterministic future candidate collides).
+- [ ] Verify `test_explicit_id_for_own_first_mint_is_allowed_even_if_
+  unclaimed` still passes unchanged.
 
 ## Notes
 
