@@ -194,6 +194,30 @@ def _parent_id_of(task_id: str) -> str | None:
     return None
 
 
+def _ancestor_chain(task_id: str) -> list[str]:
+    """Full ancestor-id chain of a subtask id, shallowest first (CLAWP-131).
+
+    ``PARENT-001-001`` -> ``["PARENT", "PARENT-001"]``; a top-level id (no
+    ``-NNN`` suffix) or a single-level subtask id (``PARENT-001``, chain
+    length 1) returns a list whose length never exceeds what
+    ``_parent_id_of`` alone already resolves — the one-level probes
+    elsewhere stay correct on their own; this exists for the 2+-level case
+    they miss. ``add_subtask`` always nests a child inside its parent's
+    CURRENT directory, wherever that directory itself lives, so this chain
+    is exactly the directory path a still-open grandchild+ task occupies.
+    """
+    chain: list[str] = []
+    current = task_id
+    while True:
+        parent = _parent_id_of(current)
+        if parent is None:
+            break
+        chain.append(parent)
+        current = parent
+    chain.reverse()
+    return chain
+
+
 def _archive_candidate_paths(tasks_dir: Path, task_id: str) -> list[Path]:
     """Every ``done/archive/`` location a task with ``task_id`` could occupy.
 
@@ -213,6 +237,18 @@ def _archive_candidate_paths(tasks_dir: Path, task_id: str) -> list[Path]:
         paths.extend([
             archive / parent_id / f"{task_id}.md",        # archived subtask file
             archive / parent_id / task_id / "_task.md",   # nested decomposed archived subtask
+        ])
+    # CLAWP-131: the one-level probes above assume the immediate parent's
+    # archived directory sits at the top of done/archive/. A grandchild+
+    # whose immediate parent is itself nested under an ancestor's archived
+    # directory needs the FULL chain, same gap and same fix shape as
+    # _candidate_task_paths below.
+    ancestor_chain = _ancestor_chain(task_id)
+    if len(ancestor_chain) >= 2:
+        nested_archive_dir = archive.joinpath(*ancestor_chain)
+        paths.extend([
+            nested_archive_dir / f"{task_id}.md",
+            nested_archive_dir / task_id / "_task.md",
         ])
     return paths
 
@@ -261,6 +297,24 @@ def _candidate_task_paths(tasks_dir: Path, task_id: str) -> list[Path]:
             # so the existing tasks_dir/done/<task_id>/_task.md probe
             # already covers the terminal states.
             tasks_dir / parent_id / task_id / "_task.md",
+        ])
+
+    # CLAWP-131: the one-level probes above assume the immediate parent's
+    # OWN directory sits at the TOP level of tasks_dir. A grandchild+ whose
+    # immediate parent is itself nested under an ancestor's directory (e.g.
+    # parent -> add_subtask -> child [nests under parent] -> add_subtask ->
+    # grandchild [nests under child, itself nested under parent]) lives at
+    # tasks_dir/<ancestor_1>/.../<ancestor_n>/<task_id>.md, which the
+    # one-level probe never reaches. Only the FULL chain's nested directory
+    # is a real candidate here (add_subtask always creates inside the
+    # parent's CURRENT directory) — no need to probe partial prefixes.
+    ancestor_chain = _ancestor_chain(task_id)
+    if len(ancestor_chain) >= 2:
+        nested_dir = tasks_dir.joinpath(*ancestor_chain)
+        possible_paths.extend([
+            nested_dir / f"{task_id}.md",
+            nested_dir / f"{task_id}.progress.md",
+            nested_dir / task_id / "_task.md",  # the grandchild itself further decomposed
         ])
 
     # CLAWP-085 — archived done tasks live under done/archive/ (every path shape,
