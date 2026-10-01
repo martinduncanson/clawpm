@@ -8,6 +8,7 @@ predictions:
   duration_min: 480
   filled_by: agent
 priority: 5
+updated: '2026-10-01'
 ---
 # MCP server interface for clawpm (clawpm mcp, stdio)
 
