@@ -222,7 +222,7 @@ def _ancestor_chain(task_id: str) -> list[str]:
 
 
 def _nested_dir_candidates(task_id: str) -> list[list[str]]:
-    """Every 2+-level-deep directory-nesting candidate for ``task_id``
+    """Every 1+-level-deep directory-nesting candidate for ``task_id``
     (CLAWP-131), shallowest-chain-first.
 
     ``_ancestor_chain`` can over-count the real nesting depth (see its
@@ -232,15 +232,25 @@ def _nested_dir_candidates(task_id: str) -> list[list[str]]:
     SOME contiguous suffix of the full chain, since ``add_subtask`` only
     ever peels off exactly one ``-NNN`` group per real nesting level, the
     same operation ``_parent_id_of`` itself performs. Returning every
-    suffix of length >= 2 (shorter ones are already covered by the
-    existing one-level probes) means the genuine nesting depth is always
+    suffix, INCLUDING length-1 (grok-4.6 review catch, PR #69: a length-1
+    suffix is NOT already covered by the existing one-level probes for the
+    done/blocked/rejected state roots -- that probe only checks ``task_id``'s
+    DIRECTORY form under the OPEN root, reasoning that ``task_id`` moving to
+    a terminal state relocates it to the top-level ``<state>/<task_id>/``.
+    That reasoning only holds when ``task_id`` ITSELF transitions. It misses
+    the case where ``task_id`` is itself a directory task (further
+    decomposed) whose IMMEDIATE PARENT transitions independently while
+    ``task_id`` stays open -- then the parent's whole directory, with
+    ``task_id``'s subdirectory still nested inside it, relocates to
+    ``<state>/<parent_id>/<task_id>/_task.md``, which only this length-1
+    suffix candidate reaches) means the genuine nesting depth is always
     among the candidates, whichever one it turns out to be -- each is
     existence-checked by the caller, so a wrong guess costs a harmless
     stat call, never a false match (every candidate still embeds
     ``task_id`` in the final path component).
     """
     chain = _ancestor_chain(task_id)
-    return [chain[i:] for i in range(len(chain) - 1)]
+    return [chain[i:] for i in range(len(chain))]
 
 
 def _archive_candidate_paths(tasks_dir: Path, task_id: str) -> list[Path]:
@@ -319,7 +329,12 @@ def _candidate_task_paths(tasks_dir: Path, task_id: str) -> list[Path]:
             # When marked done/blocked the directory migrates to the top-
             # level done/<child>/ or blocked/<child>/ via change_task_state,
             # so the existing tasks_dir/done/<task_id>/_task.md probe
-            # already covers the terminal states.
+            # already covers task_id's OWN transition. The orthogonal case --
+            # task_id stays open but its immediate PARENT transitions, moving
+            # the parent's whole directory (task_id's subdirectory still
+            # nested inside it) to <state>/parent_id/task_id/_task.md -- is
+            # covered by the length-1 _nested_dir_candidates suffix in the
+            # state-root loop below (grok-4.6 review catch, PR #69), not here.
             tasks_dir / parent_id / task_id / "_task.md",
         ])
 

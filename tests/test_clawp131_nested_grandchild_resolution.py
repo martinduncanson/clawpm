@@ -69,17 +69,25 @@ class TestNestedDirCandidates:
     version silently broke on realistic PREFIX-NNN ids); a future off-by-one
     in the slicing should fail here, not only transitively via get_task."""
 
-    def test_one_level_id_has_no_candidates(self):
-        # chain length 1 -- already covered by the existing one-level probe.
-        assert _nested_dir_candidates("PARENT-001") == []
+    def test_one_level_id_has_one_candidate(self):
+        # chain length 1 -- grok-4.6 review catch (PR #69): this length-1
+        # suffix is NOT already covered by the existing one-level probe for
+        # the done/blocked/rejected roots (that probe only handles task_id's
+        # OWN state transition, not its PARENT's independent transition
+        # while task_id itself stays open and is a directory task).
+        assert _nested_dir_candidates("PARENT-001") == [["PARENT"]]
 
-    def test_two_level_chain_has_one_candidate(self):
-        assert _nested_dir_candidates("PARENT-001-001") == [["PARENT", "PARENT-001"]]
+    def test_two_level_chain_has_every_suffix_including_length_one(self):
+        assert _nested_dir_candidates("PARENT-001-001") == [
+            ["PARENT", "PARENT-001"],
+            ["PARENT-001"],
+        ]
 
-    def test_three_level_chain_has_every_suffix_of_length_two_plus(self):
+    def test_three_level_chain_has_every_suffix_including_length_one(self):
         assert _nested_dir_candidates("PARENT-001-001-001") == [
             ["PARENT", "PARENT-001", "PARENT-001-001"],
             ["PARENT-001", "PARENT-001-001"],
+            ["PARENT-001-001"],
         ]
 
     def test_realistic_ambiguous_root_id_includes_the_real_boundary(self):
@@ -207,6 +215,36 @@ class TestNestedGrandchildResolution:
         found = get_task(config, "test", grandchild.id)
         assert found is not None
         assert found.id == grandchild.id
+
+    def test_get_task_resolves_directory_child_after_immediate_parent_blocked(
+        self, temp_portfolio_with_repo,
+    ):
+        """grok-4.6 review catch (PR #69, confidence HIGH, verified live):
+        the orthogonal case to the two tests above. There, the GRANDCHILD
+        (a plain file, two levels down) was looked up after an ancestor
+        moved. Here the task being looked up is `child` itself -- a
+        directory task (split into its own grandchildren) -- and it's
+        child's OWN IMMEDIATE PARENT (one level up, not an ancestor further
+        up a longer chain) that transitions while child stays open. Before
+        the fix, `_nested_dir_candidates(child.id)` returned `[]` (chain
+        length 1, the length-1 suffix was dropped on the false assumption
+        that the existing one-level probe already covered it) -- but that
+        probe only covers `child` transitioning itself, not `child`'s
+        directory relocating because its PARENT moved. `get_task(child.id)`
+        returned None despite the file existing at
+        `blocked/<parent>/<child>/_task.md`."""
+        config = temp_portfolio_with_repo["config"]
+        parent = add_task(config, "test", title="P", task_id="TEST-131-F")
+        child = add_subtask(config, "test", parent.id, "first")
+        split_task(config, "test", child.id)
+        add_subtask(config, "test", child.id, "gchild")
+
+        blocked = change_task_state(config, "test", parent.id, TaskState.BLOCKED)
+        assert blocked is not None
+
+        found = get_task(config, "test", child.id)
+        assert found is not None
+        assert found.id == child.id
 
 
 class TestNestedGrandchildArchiveResolution:
