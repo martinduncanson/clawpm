@@ -12,7 +12,7 @@ predictions:
   reference_tasks:
   - CLAWP-071
 priority: 3
-updated: '2026-10-01'
+updated: '2026-10-02'
 ---
 # get_task cannot resolve a grandchild nested two directory-levels deep
 
