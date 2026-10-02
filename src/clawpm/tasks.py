@@ -194,6 +194,65 @@ def _parent_id_of(task_id: str) -> str | None:
     return None
 
 
+def _ancestor_chain(task_id: str) -> list[str]:
+    """Full ancestor-id chain of a subtask id, shallowest first (CLAWP-131).
+
+    ``PARENT-001-001`` -> ``["PARENT", "PARENT-001"]``. ``_parent_id_of``
+    cannot tell a REAL subtask relationship from a top-level task id that
+    merely LOOKS like one (every ``PREFIX-NNN`` shaped id, including an
+    ordinary top-level task's own id, peels one more level — e.g.
+    ``_ancestor_chain("CLAWP-131-001-001")`` returns ``["CLAWP",
+    "CLAWP-131", "CLAWP-131-001"]`` even though ``CLAWP-131`` is a
+    top-level task, not nested under a real ``CLAWP`` directory). This
+    over-counts by exactly the number of spurious prefix-is-a-project-stem
+    levels; callers must probe every SUFFIX of this chain (see
+    ``_nested_dir_candidates``), not just the chain itself, since the real
+    nesting boundary can start partway through it.
+    """
+    chain: list[str] = []
+    current = task_id
+    while True:
+        parent = _parent_id_of(current)
+        if parent is None:
+            break
+        chain.append(parent)
+        current = parent
+    chain.reverse()
+    return chain
+
+
+def _nested_dir_candidates(task_id: str) -> list[list[str]]:
+    """Every 1+-level-deep directory-nesting candidate for ``task_id``
+    (CLAWP-131), shallowest-chain-first.
+
+    ``_ancestor_chain`` can over-count the real nesting depth (see its
+    docstring) because ``_parent_id_of`` can't distinguish a genuine
+    subtask relationship from a top-level id that merely looks like one.
+    The real on-disk nesting -- wherever it actually starts -- is always
+    SOME contiguous suffix of the full chain, since ``add_subtask`` only
+    ever peels off exactly one ``-NNN`` group per real nesting level, the
+    same operation ``_parent_id_of`` itself performs. Returning every
+    suffix, INCLUDING length-1 (grok-4.6 review catch, PR #69: a length-1
+    suffix is NOT already covered by the existing one-level probes for the
+    done/blocked/rejected state roots -- that probe only checks ``task_id``'s
+    DIRECTORY form under the OPEN root, reasoning that ``task_id`` moving to
+    a terminal state relocates it to the top-level ``<state>/<task_id>/``.
+    That reasoning only holds when ``task_id`` ITSELF transitions. It misses
+    the case where ``task_id`` is itself a directory task (further
+    decomposed) whose IMMEDIATE PARENT transitions independently while
+    ``task_id`` stays open -- then the parent's whole directory, with
+    ``task_id``'s subdirectory still nested inside it, relocates to
+    ``<state>/<parent_id>/<task_id>/_task.md``, which only this length-1
+    suffix candidate reaches) means the genuine nesting depth is always
+    among the candidates, whichever one it turns out to be -- each is
+    existence-checked by the caller, so a wrong guess costs a harmless
+    stat call, never a false match (every candidate still embeds
+    ``task_id`` in the final path component).
+    """
+    chain = _ancestor_chain(task_id)
+    return [chain[i:] for i in range(len(chain))]
+
+
 def _archive_candidate_paths(tasks_dir: Path, task_id: str) -> list[Path]:
     """Every ``done/archive/`` location a task with ``task_id`` could occupy.
 
@@ -213,6 +272,17 @@ def _archive_candidate_paths(tasks_dir: Path, task_id: str) -> list[Path]:
         paths.extend([
             archive / parent_id / f"{task_id}.md",        # archived subtask file
             archive / parent_id / task_id / "_task.md",   # nested decomposed archived subtask
+        ])
+    # CLAWP-131: the one-level probes above assume the immediate parent's
+    # archived directory sits at the top of done/archive/. A grandchild+
+    # whose immediate parent is itself nested under an ancestor's archived
+    # directory needs every 2+-level nesting candidate, same gap and same
+    # fix shape as _candidate_task_paths below.
+    for candidate in _nested_dir_candidates(task_id):
+        nested_archive_dir = archive.joinpath(*candidate)
+        paths.extend([
+            nested_archive_dir / f"{task_id}.md",
+            nested_archive_dir / task_id / "_task.md",
         ])
     return paths
 
@@ -259,9 +329,42 @@ def _candidate_task_paths(tasks_dir: Path, task_id: str) -> list[Path]:
             # When marked done/blocked the directory migrates to the top-
             # level done/<child>/ or blocked/<child>/ via change_task_state,
             # so the existing tasks_dir/done/<task_id>/_task.md probe
-            # already covers the terminal states.
+            # already covers task_id's OWN transition. The orthogonal case --
+            # task_id stays open but its immediate PARENT transitions, moving
+            # the parent's whole directory (task_id's subdirectory still
+            # nested inside it) to <state>/parent_id/task_id/_task.md -- is
+            # covered by the length-1 _nested_dir_candidates suffix in the
+            # state-root loop below (grok-4.6 review catch, PR #69), not here.
             tasks_dir / parent_id / task_id / "_task.md",
         ])
+
+    # CLAWP-131: the one-level probes above assume the immediate parent's
+    # OWN directory sits at the TOP level of tasks_dir. A grandchild+ whose
+    # immediate parent is itself nested under an ancestor's directory (e.g.
+    # parent -> add_subtask -> child [nests under parent] -> add_subtask ->
+    # grandchild [nests under child, itself nested under parent]) lives at
+    # tasks_dir/<ancestor_k>/.../<ancestor_n>/<task_id>.md, which the
+    # one-level probe never reaches. Probe every 2+-level nesting candidate
+    # (see _nested_dir_candidates — the naive full ancestor chain can
+    # overshoot the real nesting depth for an ordinary top-level id).
+    #
+    # Must probe all FOUR state roots, not just tasks_dir itself (reviewer
+    # catch, verified live): an ANCESTOR further up the chain can
+    # independently transition to done/blocked/rejected (change_task_state's
+    # directory-task branch moves that ancestor's whole subtree wholesale,
+    # keeping its relative nested structure), which relocates the
+    # grandchild's nested directory under that state root while the
+    # grandchild itself is still open. The one-level probe above already
+    # covers all four roots for exactly this reason; the nested probe must
+    # match it or the bug reopens via e.g. `tasks state <parent> blocked`.
+    for candidate in _nested_dir_candidates(task_id):
+        for state_root in (tasks_dir, tasks_dir / "done", tasks_dir / "blocked", tasks_dir / "rejected"):
+            nested_dir = state_root.joinpath(*candidate)
+            possible_paths.extend([
+                nested_dir / f"{task_id}.md",
+                nested_dir / f"{task_id}.progress.md",
+                nested_dir / task_id / "_task.md",  # the grandchild itself further decomposed
+            ])
 
     # CLAWP-085 — archived done tasks live under done/archive/ (every path shape,
     # incl. nested decomposed subtasks). Resolvable by get_task so `tasks show`
