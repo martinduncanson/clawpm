@@ -1413,6 +1413,17 @@ def _infer_prefix_from_tasks(tasks_dir: Path) -> str | None:
                 # re-inferred from its own files at all.
                 if _is_subtask_shaped(pfx):
                     continue
+                # CLAWP-113: a legacy doubled-separator mint (``CODE--000``,
+                # pre-dating the CLAWP-096 mint-time fix) is read by the
+                # non-greedy ``_PREFIX_NUM_RE`` as prefix ``"CODE-"``
+                # (trailing hyphen) -- no real mint ever produces a trailing
+                # hyphen (CLAWP-096 strips it before the first mint), so a
+                # pfx ending in one is unambiguously this legacy shape.
+                # Normalizing it here, before counting, merges its votes
+                # with any already-normalized ``"CODE"`` files on disk
+                # instead of letting the two spellings split the Counter and
+                # risk the wrong one winning the plurality.
+                pfx = _strip_trailing_non_alnum(pfx)
                 counts[pfx] += 1
     if not counts:
         return None
@@ -2199,8 +2210,16 @@ def add_task(
             # regex instead (the in-progress `.progress` suffix is part of the
             # stem) — the same shape the directory scan below already uses, so the
             # two scans can't disagree.
-            _dir_pat = re.compile(rf"^{re.escape(prefix)}-(\d+)$")
-            _file_pat = re.compile(rf"^{re.escape(prefix)}-(\d+)(?:\.progress)?$")
+            # CLAWP-113: allow ONE extra hyphen before the number so a
+            # legacy doubled-separator mint (``CODE--006``, pre-dating the
+            # CLAWP-096 mint-time fix) is still counted toward the next
+            # ordinal for the now-normalized prefix ("CODE"). A real mint
+            # never produces two hyphens here (CLAWP-096 strips the
+            # trailing one before the first mint), so widening the match is
+            # unambiguous -- it only ever catches the legacy spelling, never
+            # a different project's prefix.
+            _dir_pat = re.compile(rf"^{re.escape(prefix)}-{{1,2}}(\d+)$")
+            _file_pat = re.compile(rf"^{re.escape(prefix)}-{{1,2}}(\d+)(?:\.progress)?$")
 
             existing_nums = []
 
