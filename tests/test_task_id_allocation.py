@@ -130,6 +130,149 @@ class TestHyphenOnSliceBoundary:
         assert len({first, second}) == 2, (first, second)  # no literal id collision
 
 
+class TestLegacyDoubledSeparatorNormalization:
+    """CLAWP-113: CLAWP-096 stopped `assign_task_prefix` MINTING a doubled
+    separator, but did nothing for a project that already reproduced the
+    papercut on disk. ``_infer_prefix_from_tasks`` is anchored + non-greedy,
+    so it reads an existing ``CODE--000`` as prefix ``CODE-`` (trailing
+    hyphen) and ``assign_task_prefix`` returns that inferred value early,
+    before any normalization -- so such a project keeps minting
+    ``CODE--001``, ``CODE--002`` forever. The fix must recognise the legacy
+    spelling, mint the normalized form going forward, and derive the next
+    ordinal across BOTH spellings already on disk."""
+
+    def test_legacy_doubled_separator_mints_normalized_form(self, tmp_path, monkeypatch):
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        # Pre-existing on-disk tasks already reproduced the doubled-separator
+        # papercut (as if minted before CLAWP-096 shipped).
+        (tasks_dir / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE--001.md").write_text("---\nid: CODE--001\n---\n", encoding="utf-8")
+        next_id = _add("code-quorum", "next task")
+        assert next_id == "CODE-002", next_id
+        assert "--" not in next_id
+
+    def test_legacy_doubled_separator_numbering_continues_across_spellings(
+        self, tmp_path, monkeypatch
+    ):
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        for n in range(6):
+            (tasks_dir / f"CODE--{n:03d}.md").write_text(
+                f"---\nid: CODE--{n:03d}\n---\n", encoding="utf-8"
+            )
+        # The next mint must continue from 006, not restart at 001 and not
+        # collide with any of the six legacy-spelled ids already on disk.
+        assert _add("code-quorum", "next") == "CODE-006"
+
+    def test_mixed_spellings_merge_and_continue(self, tmp_path, monkeypatch):
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        # Legacy files outnumber normalized ones; the votes must merge, and
+        # the highest number across both spellings (and across dir-form,
+        # .progress, done/) drives the next mint.
+        (tasks_dir / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE--001.md").write_text("---\nid: CODE--001\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE-002.md").write_text("---\nid: CODE-002\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE--003.progress.md").write_text("---\nid: CODE--003\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE--004").mkdir()
+        (tasks_dir / "done" / "CODE--007.md").write_text("---\nid: CODE--007\n---\n", encoding="utf-8")
+        assert _add("code-quorum", "next") == "CODE-008"
+
+    def test_infer_prefix_merges_split_votes_directly(self, tmp_path):
+        from clawpm.tasks import _infer_prefix_from_tasks
+
+        # 2x legacy + 1x normalized CODE (3 merged votes) beats 2x OTHER.
+        for name in ("CODE--000", "CODE--001", "CODE-002", "OTHER-000", "OTHER-001"):
+            (tmp_path / f"{name}.md").write_text(f"---\nid: {name}\n---\n", encoding="utf-8")
+        assert _infer_prefix_from_tasks(tmp_path) == "CODE"
+
+    def test_infer_prefix_legacy_only_returns_normalized(self, tmp_path):
+        from clawpm.tasks import _infer_prefix_from_tasks
+
+        (tmp_path / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        assert _infer_prefix_from_tasks(tmp_path) == "CODE"
+
+    def test_infer_prefix_ignores_legacy_doubled_separator_subtasks(self, tmp_path):
+        from clawpm.tasks import _infer_prefix_from_tasks
+
+        # A legacy-spelled subtask (CODE--001--002 parses as prefix "CODE--001-")
+        # must be excluded like CODE-001-002, not stripped to "CODE--001" and
+        # counted as a top-level prefix vote. 2x OTHER must beat 1x CODE here.
+        for name in ("CODE--001--002", "CODE--001--003", "OTHER-000", "OTHER-001", "CODE-005"):
+            (tmp_path / f"{name}.md").write_text(f"---\nid: {name}\n---\n", encoding="utf-8")
+        assert _infer_prefix_from_tasks(tmp_path) == "OTHER"
+
+    @pytest.mark.parametrize(
+        "subdir", ["done", "done/archive", "blocked", "rejected"]
+    )
+    def test_legacy_ids_in_every_scan_location_count(self, tmp_path, monkeypatch, subdir):
+        from clawpm.tasks import _infer_prefix_from_tasks
+
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        loc = tasks_dir / subdir
+        loc.mkdir(parents=True, exist_ok=True)
+        (loc / "CODE--009.md").write_text("---\nid: CODE--009\n---\n", encoding="utf-8")
+        # Re-minting an archived/done/blocked/rejected id would clobber history.
+        assert _infer_prefix_from_tasks(tasks_dir) == "CODE"
+        assert _add("code-quorum", "next") == "CODE-010"
+
+    def test_hyphenated_legacy_prefix_keeps_inner_hyphen(self, tmp_path, monkeypatch):
+        from clawpm.tasks import _infer_prefix_from_tasks
+
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "arb-pipeline")
+        (tasks_dir / "ARB-P--000.md").write_text("---\nid: ARB-P--000\n---\n", encoding="utf-8")
+        assert _infer_prefix_from_tasks(tasks_dir) == "ARB-P"
+        assert _add("arb-pipeline", "next") == "ARB-P-001"
+
+    def test_subtask_shaped_name_excluded_from_ordinal_scan(self, tmp_path, monkeypatch):
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        (tasks_dir / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE-000-001.md").write_text("---\nid: CODE-000-001\n---\n", encoding="utf-8")
+        # The subtask must not be read as top-level ordinal 001 -> next is 001.
+        assert _add("code-quorum", "next") == "CODE-001"
+
+    def test_triple_hyphen_name_not_matched_by_ordinal_scan(self, tmp_path, monkeypatch):
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        (tasks_dir / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        # Locks in current behaviour: only a SINGLE legacy doubled separator
+        # (CLAWP-096's papercut) is recognised. ``CODE---050`` is not a shape
+        # any mint produced, so the -{1,2} scan must not count it.
+        (tasks_dir / "CODE---050.md").write_text("---\nid: CODE---050\n---\n", encoding="utf-8")
+        assert _add("code-quorum", "next") == "CODE-001"
+
+    def test_resolve_existing_prefix_legacy_only(self, tmp_path):
+        from types import SimpleNamespace
+
+        from clawpm.tasks import resolve_existing_prefix
+
+        tasks_dir = tmp_path / ".project" / "tasks"
+        tasks_dir.mkdir(parents=True)
+        (tasks_dir / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        settings = SimpleNamespace(task_prefix=None, project_dir=tmp_path)
+        assert resolve_existing_prefix(settings) == "CODE"
+
+    def test_neighbouring_prefix_is_not_counted(self, tmp_path, monkeypatch):
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        (tasks_dir / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE--001.md").write_text("---\nid: CODE--001\n---\n", encoding="utf-8")
+        # A different prefix that merely starts with CODE- must not bump the ordinal.
+        (tasks_dir / "CODE-X-005.md").write_text("---\nid: CODE-X-005\n---\n", encoding="utf-8")
+        assert _add("code-quorum", "next") == "CODE-002"
+
+    def test_emit_tree_prediction_matches_add_task_for_legacy_project(
+        self, tmp_path, monkeypatch
+    ):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.emit_tree import _predict_parent_id
+
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        for n in range(6):
+            (tasks_dir / f"CODE--{n:03d}.md").write_text(
+                f"---\nid: CODE--{n:03d}\n---\n", encoding="utf-8"
+            )
+        config = load_portfolio_config()
+        doc = type("Doc", (), {"root": type("Root", (), {"attach_to": None})()})()
+        assert _predict_parent_id(doc, config, "code-quorum") == "CODE-006"
+
+
 class TestDeterministicGlobalPrefixPass:
     """CLAWP-121: two task-less siblings assigned via INDEPENDENT calls to
     ``assign_task_prefix`` (exactly what ``clawpm doctor``'s per-project loop
