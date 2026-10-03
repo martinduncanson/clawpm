@@ -176,6 +176,20 @@ class TestLegacyDoubledSeparatorNormalization:
         (tasks_dir / "done" / "CODE--007.md").write_text("---\nid: CODE--007\n---\n", encoding="utf-8")
         assert _add("code-quorum", "next") == "CODE-008"
 
+    def test_infer_prefix_merges_split_votes_directly(self, tmp_path):
+        from clawpm.tasks import _infer_prefix_from_tasks
+
+        # 2x legacy + 1x normalized CODE (3 merged votes) beats 2x OTHER.
+        for name in ("CODE--000", "CODE--001", "CODE-002", "OTHER-000", "OTHER-001"):
+            (tmp_path / f"{name}.md").write_text(f"---\nid: {name}\n---\n", encoding="utf-8")
+        assert _infer_prefix_from_tasks(tmp_path) == "CODE"
+
+    def test_infer_prefix_legacy_only_returns_normalized(self, tmp_path):
+        from clawpm.tasks import _infer_prefix_from_tasks
+
+        (tmp_path / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        assert _infer_prefix_from_tasks(tmp_path) == "CODE"
+
     def test_neighbouring_prefix_is_not_counted(self, tmp_path, monkeypatch):
         tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
         (tasks_dir / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
