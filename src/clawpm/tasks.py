@@ -1411,7 +1411,11 @@ def _infer_prefix_from_tasks(tasks_dir: Path) -> str | None:
                 # needs a LEADING LETTER, so a prefix derived from a
                 # digit-leading id (``2-b`` -> ``2``, ``2024``) is never
                 # re-inferred from its own files at all.
-                if _is_subtask_shaped(pfx):
+                # CLAWP-113: normalize FIRST so a legacy-spelled subtask
+                # (CODE--001--002 parses as "CODE--001-") is still caught.
+                raw_pfx = pfx
+                pfx = _strip_trailing_non_alnum(pfx)
+                if not pfx or _is_subtask_shaped(pfx):
                     continue
                 # CLAWP-113: a legacy doubled-separator mint (``CODE--000``,
                 # pre-dating the CLAWP-096 mint-time fix) is read by the
@@ -1423,7 +1427,6 @@ def _infer_prefix_from_tasks(tasks_dir: Path) -> str | None:
                 # with any already-normalized ``"CODE"`` files on disk
                 # instead of letting the two spellings split the Counter and
                 # risk the wrong one winning the plurality.
-                pfx = _strip_trailing_non_alnum(pfx)
                 counts[pfx] += 1
     if not counts:
         return None
