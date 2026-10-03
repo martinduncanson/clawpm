@@ -768,8 +768,10 @@ def _predict_parent_id(
         explicit_prefix=getattr(_settings, "task_prefix", None) if _settings else None,
     )
 
-    _dir_pat = re.compile(rf"^{re.escape(prefix)}-(\d+)$")
-    _file_pat = re.compile(rf"^{re.escape(prefix)}-(\d+)(?:\.progress)?$")
+    # CLAWP-113: -{1,2} so a legacy doubled-separator id (CODE--006) counts
+    # toward the next ordinal -- must stay in lockstep with add_task's scan.
+    _dir_pat = re.compile(rf"^{re.escape(prefix)}-{{1,2}}(\d+)$")
+    _file_pat = re.compile(rf"^{re.escape(prefix)}-{{1,2}}(\d+)(?:\.progress)?$")
     existing_nums = []
 
     # CLAWP-085: include done/archive so this prediction stays in lockstep with
