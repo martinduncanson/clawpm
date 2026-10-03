@@ -1343,9 +1343,30 @@ def _is_subtask_shaped(prefix: str) -> bool:
     ``_infer_prefix_from_tasks`` treats as "this is a PARENT task id, so a
     file matching it is a stray subtask, not evidence of a real top-level
     prefix" (CLAWP-048), and therefore a shape no candidate this module
-    hands out may stably use (CLAWP-132; see ``_naive_prefix_candidates``).
+    hands out may stably use (CLAWP-132; see ``_desubtask_prefix``, which
+    normalises such a candidate before it is yielded).
     """
     return bool(re.search(r"-\d+$", prefix))
+
+
+def _desubtask_prefix(prefix: str) -> str:
+    """Normalise ``prefix`` until it is no longer subtask-shaped, by removing
+    the hyphen immediately before its trailing digit run (CLAWP-132 decision
+    (b), operator 2026-10-03): ``WEB-2`` -> ``WEB2``, ``TEAM-2`` -> ``TEAM2``.
+
+    Repeats, because a single collapse is not enough when the digit run is
+    itself preceded by another ``-<digits>`` group: ``X-1-2`` -> ``X-12``
+    (still subtask-shaped) -> ``X12``. The result ends in a digit run with no
+    hyphen before it, so ``f"{result}-000"`` is parsed back to ``result`` by
+    ``_PREFIX_NUM_RE`` / ``_infer_prefix_from_tasks`` -- the stability
+    invariant a ``-<digits>`` prefix cannot meet. A prefix that is not
+    subtask-shaped is returned unchanged.
+    """
+    while True:
+        m = re.search(r"-(\d+)$", prefix)
+        if not m:
+            return prefix
+        prefix = prefix[: m.start()] + m.group(1)
 
 
 def _infer_prefix_from_tasks(tasks_dir: Path) -> str | None:
@@ -1384,7 +1405,7 @@ def _infer_prefix_from_tasks(tasks_dir: Path) -> str | None:
                 # subtask, not a top-level task). Mirrors the allocator's
                 # anchored exclusion of {prefix}-NNN-MMM files. CLAWP-132:
                 # this is the SAME shape `_naive_prefix_candidates` now
-                # refuses to hand out, so a project's real, allocator-minted
+                # normalises away before handing out, so a project's real, allocator-minted
                 # prefix can never itself land here and be wrongly excluded.
                 if _is_subtask_shaped(pfx):
                     continue
@@ -1440,10 +1461,14 @@ def _naive_prefix_placeholder(project_id: str) -> str:
     derives, two still-task-less siblings whose slices land on the same
     boundary (e.g. two "code-*" projects, both -> "CODE") could each fail to
     see the other as a collision and independently mint the same prefix.
+
+    A base that is subtask-shaped (``"web-2"`` -> ``"WEB-2"``) is normalised
+    via ``_desubtask_prefix`` (-> ``"WEB2"``; CLAWP-132 decision (b)) so this
+    always equals the FIRST value ``_naive_prefix_candidates`` yields.
     """
     full = project_id.upper()
     base = full[:5] if len(full) >= 5 else full
-    return _strip_trailing_non_alnum(base)
+    return _desubtask_prefix(_strip_trailing_non_alnum(base))
 
 
 class PortfolioPrefixScanError(OSError):
@@ -1488,7 +1513,8 @@ def _naive_prefix_candidates(project_id: str):
     set) derives from this same ONE sequence, so the two can never
     disagree about what a given id's chain contains.
 
-    SUBTASK-SHAPED CANDIDATES ARE NEVER YIELDED (CLAWP-132): a slice that
+    SUBTASK-SHAPED CANDIDATES ARE NORMALISED, NOT YIELDED RAW (CLAWP-132
+    decision (b), operator 2026-10-03): a slice that
     itself ends in ``-<digits>`` (e.g. project id ``"team-2-b"`` sliced to
     ``"TEAM-2"``) is a candidate `_infer_prefix_from_tasks` can NEVER
     stably re-derive once minted -- its own subtask-shape filter treats
@@ -1500,19 +1526,22 @@ def _naive_prefix_candidates(project_id: str):
     old one, which a differently-composed or differently-ordered taskless
     pool can then assign out from under it to a wholly different project
     (reproduced: two projects both minting a real, on-disk ``TEAM-2-000``).
-    Skipping an unstable candidate here means the allocator only ever
-    hands out a prefix `_infer_prefix_from_tasks` can recognise as real
-    forever after -- the one invariant that function's own filter already
-    assumes but this module did not previously guarantee.
+    Such a candidate is rewritten by ``_desubtask_prefix`` (``"TEAM-2"`` ->
+    ``"TEAM2"``, ``"X-1-2"`` -> ``"X12"``) instead of being skipped, so the
+    allocator only ever hands out a prefix `_infer_prefix_from_tasks` can
+    recognise as real forever after -- the one invariant that function's own
+    filter already assumes but this module did not previously guarantee --
+    and a short digit-suffixed id (``"web-2"``) still has a candidate
+    (skipping them left such ids with none, hard-failing ``tasks add``).
+    The chain is therefore never empty: it always yields at least the
+    placeholder. Normalising can make adjacent slices collapse to the same
+    string (``"TEAM-2"`` and ``"TEAM-2-"`` both -> ``"TEAM2"``), which the
+    non-deduplication note above already covers.
     """
     full = project_id.upper()
-    placeholder = _naive_prefix_placeholder(project_id)
-    if not _is_subtask_shaped(placeholder):
-        yield placeholder
+    yield _naive_prefix_placeholder(project_id)
     for n in range(6, len(full) + 1):
-        candidate = _strip_trailing_non_alnum(full[:n])
-        if not _is_subtask_shaped(candidate):
-            yield candidate
+        yield _desubtask_prefix(_strip_trailing_non_alnum(full[:n]))
 
 
 def _naive_prefix_reach(project_id: str) -> frozenset[str]:
@@ -1655,29 +1684,17 @@ def _assign_taskless_prefixes(
             # wall at SOME depth). An actionable error beats a synthesised
             # prefix the rest of the tool cannot use.
             #
-            # CLAWP-132: `candidates` can now be empty outright (every slice
-            # through the full id was subtask-shaped, e.g. a short id like
-            # "ab-2" whose only candidates end in "-<digits>") rather than
-            # non-empty-but-all-claimed -- a distinct root cause from the
-            # "claimed by another project" case below, so it gets its own
-            # accurate message instead of implying a sibling conflict that
-            # doesn't exist here.
+            # CLAWP-132 decision (b): the candidate chain is never empty
+            # (`_naive_prefix_candidates` always yields at least the
+            # placeholder, normalising subtask-shaped slices rather than
+            # skipping them), so this branch only ever means "claimed".
             full = pid.upper()
-            if not list(_naive_prefix_candidates(pid)):
-                errors[pid] = ValueError(
-                    f"Cannot derive a collision-free task prefix for project "
-                    f"{pid!r}: every id-derived candidate through {full!r} "
-                    f"ends in '-<digits>', a shape no prefix can stably use "
-                    f"(it can never be told apart from a subtask reference). "
-                    f"Set an explicit `task_prefix` in this project's settings.toml."
-                )
-            else:
-                errors[pid] = ValueError(
-                    f"Cannot derive a collision-free task prefix for project "
-                    f"{pid!r}: every id-derived candidate through {full!r} is "
-                    f"claimed by another project. "
-                    f"Set an explicit `task_prefix` in this project's settings.toml."
-                )
+            errors[pid] = ValueError(
+                f"Cannot derive a collision-free task prefix for project "
+                f"{pid!r}: every id-derived candidate through {full!r} is "
+                f"claimed by another project. "
+                f"Set an explicit `task_prefix` in this project's settings.toml."
+            )
 
     assignments = {pid: candidate for candidate, pid in match_candidate_to_pid.items()}
     used.update(assignments.values())

@@ -31,10 +31,13 @@ a completely different project to be assigned, in the exact scenario below,
 literally minting an identical ``TEAM-2-000.md`` filename under two
 different projects.
 
-Fix: ``_naive_prefix_candidates`` never yields a subtask-shaped candidate
-(``_is_subtask_shaped``, shared with ``_infer_prefix_from_tasks``'s own
-filter) — the allocator only ever hands out a prefix that function can
-recognise as real forever after.
+Fix (operator decision (b), 2026-10-03): ``_naive_prefix_candidates``
+NORMALISES a subtask-shaped candidate instead of skipping it
+(``_desubtask_prefix``: drop the hyphen before the trailing digit run until
+the shape is gone, ``TEAM-2`` -> ``TEAM2``) — the allocator only ever hands
+out a prefix ``_infer_prefix_from_tasks`` can recognise as real forever
+after, and short digit-suffixed ids (``web-2``) still get a prefix instead
+of hard-failing.
 """
 
 from __future__ import annotations
@@ -45,7 +48,12 @@ from pathlib import Path
 import pytest
 
 from clawpm.discovery import load_portfolio_config
-from clawpm.tasks import _infer_prefix_from_tasks, add_task, assign_all_prefixes
+from clawpm.tasks import (
+    _desubtask_prefix,
+    _infer_prefix_from_tasks,
+    add_task,
+    assign_all_prefixes,
+)
 
 
 def _make_portfolio(tmp_dir: Path, project_id: str) -> None:
@@ -85,9 +93,9 @@ class TestSubtaskShapedPrefixIsNeverAssigned:
 
         candidates = list(_naive_prefix_candidates("team-2-b"))
         assert "TEAM-2" not in candidates, candidates
-        # The chain must still be non-empty -- it extends past the unstable
-        # slice to a stable, longer one instead of just disappearing.
-        assert candidates, "team-2-b must still have a reachable candidate"
+        # Decision (b): the unstable slice is NORMALISED, not dropped.
+        assert "TEAM2" in candidates, candidates
+        assert "TEAM-2-B" in candidates, candidates
         assert all(not re.search(r"-\d+$", c) for c in candidates), candidates
 
     def test_two_near_twin_projects_each_mint_a_stable_distinct_prefix(
@@ -106,14 +114,13 @@ class TestSubtaskShapedPrefixIsNeverAssigned:
         task_b1 = add_task(config, "team-2-b", "b1")
         assert task_a.id == "TEAM-000"
         # Stable, non-subtask-shaped prefix from the very first mint.
-        assert task_b1.id.startswith("TEAM-2-"), task_b1.id
-        assert task_b1.id != "TEAM-2-000", (
-            "must not be minted into the unstable TEAM-2 candidate"
-        )
+        # TEAM is taken by team-2-a; the next candidate is the normalised
+        # "TEAM-2" -> "TEAM2" (never the unstable "TEAM-2").
+        assert task_b1.id == "TEAM2-000", task_b1.id
 
         tasks_dir_b = tmp_path / "projects" / "team-2-b" / ".project" / "tasks"
         inferred = _infer_prefix_from_tasks(tasks_dir_b)
-        assert inferred is not None, (
+        assert inferred == "TEAM2", (
             "team-2-b's own prefix must be stably re-inferable from its "
             "own materialized file, not perpetually None"
         )
@@ -121,9 +128,8 @@ class TestSubtaskShapedPrefixIsNeverAssigned:
         # A second mint must reuse the SAME (now-real) prefix, not re-derive
         # a fresh one from assign_all_prefixes.
         task_b2 = add_task(config, "team-2-b", "b2")
-        assert task_b2.id.rsplit("-", 1)[0] == task_b1.id.rsplit("-", 1)[0], (
-            task_b1.id, task_b2.id,
-        )
+        assert task_b2.id == "TEAM2-001", (task_b1.id, task_b2.id)
+        assert task_a.id.rsplit("-", 1)[0] != task_b2.id.rsplit("-", 1)[0]
 
     def test_abandoned_candidate_cannot_be_squatted_by_a_later_sibling(
         self, tmp_path, monkeypatch
@@ -181,12 +187,86 @@ class TestSubtaskShapedPrefixIsNeverAssigned:
         """Unlike the team-2-b direction, team-2-a creating 'TEAM-2-001'
         explicitly for ITSELF is fine post-fix: nobody else's real or
         predicted prefix is "TEAM-2" any more (team-2-b's own candidate
-        chain now skips straight past it to "TEAM-2-B"), so this is an
-        ordinary self-owned explicit id, not a cross-project collision —
-        unaffected by, and not the bug targeted by, this fix."""
+        chain now normalises it to "TEAM2"), so this is an ordinary
+        self-owned explicit id, not a cross-project collision --
+        unaffected by, and not the bug targeted by, this fix. (Whether it
+        stays a stable inferred prefix for team-2-a is NOT claimed here:
+        the explicit id is a parent-task-shaped file.)"""
         _make_portfolio(tmp_path, "team-2-a")
         _add_project(tmp_path, "team-2-b")
         config = _load_isolated_config(tmp_path, monkeypatch)
 
         task = add_task(config, "team-2-a", "self-owned", task_id="TEAM-2-001")
         assert task.id == "TEAM-2-001"
+
+
+class TestSubtaskShapedCandidateIsNormalisedNotSkipped:
+    """Operator decision (b), 2026-10-03: a digit-suffixed project id must
+    still get a usable, stable prefix (the skip variant hard-failed
+    ``web-2`` / ``ab-2``)."""
+
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            ("WEB-2", "WEB2"),
+            ("AB-2", "AB2"),
+            ("TEAM-2", "TEAM2"),
+            ("X-1-2", "X12"),  # one collapse gives X-12, still subtask-shaped
+            ("Q3-20", "Q320"),
+            ("ARB-P", "ARB-P"),  # not subtask-shaped: untouched
+            ("TEAM2", "TEAM2"),
+        ],
+    )
+    def test_desubtask_prefix(self, raw, expected):
+        assert _desubtask_prefix(raw) == expected
+
+    def test_placeholder_equals_first_candidate(self):
+        from clawpm.tasks import _naive_prefix_candidates, _naive_prefix_placeholder
+
+        for pid in ("web-2", "ab-2", "x-1-2", "q3-2026", "team-2-b", "code-quorum"):
+            assert _naive_prefix_placeholder(pid) == next(
+                iter(_naive_prefix_candidates(pid))
+            ), pid
+
+    def test_no_candidate_is_ever_subtask_shaped_or_empty(self):
+        from clawpm.tasks import _naive_prefix_candidates
+
+        for pid in ("web-2", "ab-2", "x-1", "x-1-2", "q3-2026", "a-1-2-3-4-5-6-7"):
+            cands = list(_naive_prefix_candidates(pid))
+            assert cands, pid
+            assert all(not re.search(r"-\d+$", c) for c in cands), (pid, cands)
+
+    def test_round_trip_file_name_infers_back_to_prefix(self, tmp_path):
+        d = tmp_path / "tasks"
+        d.mkdir()
+        (d / "WEB2-000.md").write_text("x", encoding="utf-8")
+        assert _infer_prefix_from_tasks(d) == "WEB2"
+
+    @pytest.mark.parametrize(
+        "pid, expected",
+        [
+            ("web-2", "WEB2"),
+            ("ab-2", "AB2"),
+            ("x-1-2", "X12"),
+            # "q3-2026".upper()[:5] == "Q3-20" -> normalised "Q320"
+            ("q3-2026", "Q320"),
+        ],
+    )
+    def test_single_taskless_digit_suffixed_project_is_assigned_and_stable(
+        self, tmp_path, monkeypatch, pid, expected
+    ):
+        _make_portfolio(tmp_path, pid)
+        config = _load_isolated_config(tmp_path, monkeypatch)
+
+        assignments, errors = assign_all_prefixes(config)
+        assert errors == {}, errors
+        assert assignments == {pid: expected}
+
+        first = add_task(config, pid, "one")
+        assert first.id == f"{expected}-000"
+        # Stability round-trip: the minted file is re-inferred as the same
+        # prefix, so the next mint continues the sequence.
+        tasks_dir = tmp_path / "projects" / pid / ".project" / "tasks"
+        assert _infer_prefix_from_tasks(tasks_dir) == expected
+        second = add_task(config, pid, "two")
+        assert second.id == f"{expected}-001"
