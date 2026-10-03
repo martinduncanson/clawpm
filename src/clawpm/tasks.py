@@ -1373,7 +1373,10 @@ def _infer_prefix_from_tasks(tasks_dir: Path) -> str | None:
                 # -<digits> (that's a parent task id, so this file is a stray
                 # subtask, not a top-level task). Mirrors the allocator's
                 # anchored exclusion of {prefix}-NNN-MMM files.
-                if re.search(r"-\d+$", pfx):
+                # Normalize FIRST so a legacy-spelled subtask (CODE--001--002
+                # parses as "CODE--001-") is still caught by the exclusion.
+                pfx = _strip_trailing_non_alnum(pfx)
+                if not pfx or re.search(r"-\d+$", pfx):
                     continue
                 # CLAWP-113: a legacy doubled-separator mint (``CODE--000``,
                 # pre-dating the CLAWP-096 mint-time fix) is read by the
@@ -1385,7 +1388,6 @@ def _infer_prefix_from_tasks(tasks_dir: Path) -> str | None:
                 # with any already-normalized ``"CODE"`` files on disk
                 # instead of letting the two spellings split the Counter and
                 # risk the wrong one winning the plurality.
-                pfx = _strip_trailing_non_alnum(pfx)
                 counts[pfx] += 1
     if not counts:
         return None
