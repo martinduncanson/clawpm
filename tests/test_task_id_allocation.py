@@ -163,6 +163,42 @@ class TestLegacyDoubledSeparatorNormalization:
         # collide with any of the six legacy-spelled ids already on disk.
         assert _add("code-quorum", "next") == "CODE-006"
 
+    def test_mixed_spellings_merge_and_continue(self, tmp_path, monkeypatch):
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        # Legacy files outnumber normalized ones; the votes must merge, and
+        # the highest number across both spellings (and across dir-form,
+        # .progress, done/) drives the next mint.
+        (tasks_dir / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE--001.md").write_text("---\nid: CODE--001\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE-002.md").write_text("---\nid: CODE-002\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE--003.progress.md").write_text("---\nid: CODE--003\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE--004").mkdir()
+        (tasks_dir / "done" / "CODE--007.md").write_text("---\nid: CODE--007\n---\n", encoding="utf-8")
+        assert _add("code-quorum", "next") == "CODE-008"
+
+    def test_neighbouring_prefix_is_not_counted(self, tmp_path, monkeypatch):
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        (tasks_dir / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE--001.md").write_text("---\nid: CODE--001\n---\n", encoding="utf-8")
+        # A different prefix that merely starts with CODE- must not bump the ordinal.
+        (tasks_dir / "CODE-X-005.md").write_text("---\nid: CODE-X-005\n---\n", encoding="utf-8")
+        assert _add("code-quorum", "next") == "CODE-002"
+
+    def test_emit_tree_prediction_matches_add_task_for_legacy_project(
+        self, tmp_path, monkeypatch
+    ):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.emit_tree import _predict_parent_id
+
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        for n in range(6):
+            (tasks_dir / f"CODE--{n:03d}.md").write_text(
+                f"---\nid: CODE--{n:03d}\n---\n", encoding="utf-8"
+            )
+        config = load_portfolio_config()
+        doc = type("Doc", (), {"root": type("Root", (), {"attach_to": None})()})()
+        assert _predict_parent_id(doc, config, "code-quorum") == "CODE-006"
+
 
 class TestDeterministicGlobalPrefixPass:
     """CLAWP-121: two task-less siblings assigned via INDEPENDENT calls to
