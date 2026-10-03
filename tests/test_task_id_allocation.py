@@ -130,6 +130,40 @@ class TestHyphenOnSliceBoundary:
         assert len({first, second}) == 2, (first, second)  # no literal id collision
 
 
+class TestLegacyDoubledSeparatorNormalization:
+    """CLAWP-113: CLAWP-096 stopped `assign_task_prefix` MINTING a doubled
+    separator, but did nothing for a project that already reproduced the
+    papercut on disk. ``_infer_prefix_from_tasks`` is anchored + non-greedy,
+    so it reads an existing ``CODE--000`` as prefix ``CODE-`` (trailing
+    hyphen) and ``assign_task_prefix`` returns that inferred value early,
+    before any normalization -- so such a project keeps minting
+    ``CODE--001``, ``CODE--002`` forever. The fix must recognise the legacy
+    spelling, mint the normalized form going forward, and derive the next
+    ordinal across BOTH spellings already on disk."""
+
+    def test_legacy_doubled_separator_mints_normalized_form(self, tmp_path, monkeypatch):
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        # Pre-existing on-disk tasks already reproduced the doubled-separator
+        # papercut (as if minted before CLAWP-096 shipped).
+        (tasks_dir / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE--001.md").write_text("---\nid: CODE--001\n---\n", encoding="utf-8")
+        next_id = _add("code-quorum", "next task")
+        assert next_id == "CODE-002", next_id
+        assert "--" not in next_id
+
+    def test_legacy_doubled_separator_numbering_continues_across_spellings(
+        self, tmp_path, monkeypatch
+    ):
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        for n in range(6):
+            (tasks_dir / f"CODE--{n:03d}.md").write_text(
+                f"---\nid: CODE--{n:03d}\n---\n", encoding="utf-8"
+            )
+        # The next mint must continue from 006, not restart at 001 and not
+        # collide with any of the six legacy-spelled ids already on disk.
+        assert _add("code-quorum", "next") == "CODE-006"
+
+
 class TestDeterministicGlobalPrefixPass:
     """CLAWP-121: two task-less siblings assigned via INDEPENDENT calls to
     ``assign_task_prefix`` (exactly what ``clawpm doctor``'s per-project loop
