@@ -1405,8 +1405,12 @@ def _infer_prefix_from_tasks(tasks_dir: Path) -> str | None:
                 # subtask, not a top-level task). Mirrors the allocator's
                 # anchored exclusion of {prefix}-NNN-MMM files. CLAWP-132:
                 # this is the SAME shape `_naive_prefix_candidates` now
-                # normalises away before handing out, so a project's real, allocator-minted
-                # prefix can never itself land here and be wrongly excluded.
+                # normalises away before handing out, so an allocator-minted
+                # prefix cannot itself land here and be wrongly excluded.
+                # Known pre-existing gap (NOT fixed here): `_PREFIX_NUM_RE`
+                # needs a LEADING LETTER, so a prefix derived from a
+                # digit-leading id (``2-b`` -> ``2``, ``2024``) is never
+                # re-inferred from its own files at all.
                 if _is_subtask_shaped(pfx):
                     continue
                 counts[pfx] += 1
@@ -1528,10 +1532,13 @@ def _naive_prefix_candidates(project_id: str):
     (reproduced: two projects both minting a real, on-disk ``TEAM-2-000``).
     Such a candidate is rewritten by ``_desubtask_prefix`` (``"TEAM-2"`` ->
     ``"TEAM2"``, ``"X-1-2"`` -> ``"X12"``) instead of being skipped, so the
-    allocator only ever hands out a prefix `_infer_prefix_from_tasks` can
-    recognise as real forever after -- the one invariant that function's own
-    filter already assumes but this module did not previously guarantee --
-    and a short digit-suffixed id (``"web-2"``) still has a candidate
+    allocator never hands out a prefix that `_infer_prefix_from_tasks`
+    rejects for being subtask-shaped (a ``-<digits>`` suffix) -- the one
+    invariant that function's own filter already assumes but this module did
+    not previously guarantee. LIMIT (pre-existing, not addressed here): the
+    inference regex ``_PREFIX_NUM_RE`` also requires a LEADING LETTER, so a
+    prefix derived from a digit-leading id (``2-b``, ``2024``) can still
+    never be re-inferred from its own files; that is a separate gap. A short digit-suffixed id (``"web-2"``) still has a candidate
     (skipping them left such ids with none, hard-failing ``tasks add``).
     The chain is therefore never empty: it always yields at least the
     placeholder. Normalising can make adjacent slices collapse to the same

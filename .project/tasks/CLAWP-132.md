@@ -21,7 +21,18 @@ Codex finding on PR #68 (CLAWP-130, 2026-10-01): check_explicit_id_prefix_collis
 
 ## Acceptance Criteria
 
-- [ ] (Add criteria here)
+- [ ] No candidate yielded by `_naive_prefix_candidates` (and no `_naive_prefix_placeholder`) ends in `-<digits>`, and the chain is never empty (test: `test_no_candidate_is_ever_subtask_shaped_or_empty`).
+- [ ] A subtask-shaped slice is normalised, not skipped: `_desubtask_prefix` maps `WEB-2`->`WEB2`, `TEAM-2`->`TEAM2`, `X-1-2`->`X12`, and leaves `ARB-P` and `TEAM2` unchanged (test: `test_desubtask_prefix`).
+- [ ] The team-2-a / team-2-b near-twin scenario mints `TEAM-000` and `TEAM2-000`, then `TEAM2-001`; `_infer_prefix_from_tasks` re-infers `TEAM2`; a later sibling can never mint an identical literal task id (tests in `TestSubtaskShapedPrefixIsNeverAssigned`).
+- [ ] A single taskless digit-suffixed project (`web-2`, `ab-2`, `x-1-2`, `q3-2026`) gets a stable prefix, no errors, and a mint/re-infer round trip (test: `test_single_taskless_digit_suffixed_project_is_assigned_and_stable`).
+- [ ] Known tie, accepted loudly (operator 2026-10-04): taskless `web2` + taskless `web-2` -> `web-2` gets `WEB2`, `web2` gets the "Cannot derive a collision-free task prefix" error; an explicit `task_prefix="WEB2"` vs taskless `web-2` is refused loudly; an explicit `task_prefix` on the losing project lets it mint (`TestNormalisationCollisionIsLoudNotSilent`).
+- [ ] Legacy `WEB-2-000.md` / `WEB-2-001.md` files stay resolvable via `get_task` / `list_tasks`, and the next mint is `WEB2-000` (`TestLegacySubtaskShapedPrefixFiles`).
+- [ ] The `team-2-b` chain is exactly `['TEAM','TEAM2','TEAM2','TEAM-2-B']` and `_naive_prefix_reach` has size 3 (`TestCandidateChainShape`).
+- [ ] The CLAWP-129 and CLAWP-130 tests still pass, and the full suite is green.
+- [ ] Out of scope, documented honestly: digit-LEADING ids (`2-b`, `2024`) yield prefixes `_PREFIX_NUM_RE` (leading letter required) can never re-infer. This predates the PR; docstrings state the limit; a follow-up task is to be filed.
+
+## Decision (b), operator 2026-10-04 [sic: given 2026-10-03]: normalise, don't skip
+
+The literal team-2-a/team-2-b walkthrough in the writeup does not reproduce on the pre-fix code. CLAWP-130's longest-match sibling check already refuses team-2-b's explicit `TEAM-2-001` create, and `_infer_prefix_from_tasks` does not read a materialised `TEAM-2-001.md` as prefix `TEAM` (its subtask-shape filter extracts `TEAM-2` and then excludes it). The real, reproducible bug is upstream: `_naive_prefix_candidates` could hand out a `-<digits>` candidate (`TEAM-2`) that inference can never re-derive, so the project looks taskless again after its first mint and can be re-assigned a different prefix, leaving two projects with a literal `TEAM-2-000.md`. Skipping such candidates fixed that but left short ids like `web-2` with no candidate at all (`tasks add` hard-failed). Normalising (`TEAM-2` -> `TEAM2`) keeps one stable, inferable prefix and still gives every id a candidate. Cost: `web2` and `web-2` now compete for `WEB2`; the loser gets the loud error and the escape hatch is an explicit `task_prefix`.
 
 ## Notes
-

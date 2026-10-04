@@ -35,8 +35,8 @@ Fix (operator decision (b), 2026-10-03): ``_naive_prefix_candidates``
 NORMALISES a subtask-shaped candidate instead of skipping it
 (``_desubtask_prefix``: drop the hyphen before the trailing digit run until
 the shape is gone, ``TEAM-2`` -> ``TEAM2``) — the allocator only ever hands
-out a prefix ``_infer_prefix_from_tasks`` can recognise as real forever
-after, and short digit-suffixed ids (``web-2``) still get a prefix instead
+out a prefix ``_infer_prefix_from_tasks`` does not reject as subtask-shaped,
+and short digit-suffixed ids (``web-2``) still get a prefix instead
 of hard-failing.
 """
 
@@ -270,3 +270,117 @@ class TestSubtaskShapedCandidateIsNormalisedNotSkipped:
         assert _infer_prefix_from_tasks(tasks_dir) == expected
         second = add_task(config, pid, "two")
         assert second.id == f"{expected}-001"
+
+
+def _add_project_with_prefix(tmp_dir: Path, project_id: str, task_prefix: str) -> None:
+    _add_project(tmp_dir, project_id)
+    settings = tmp_dir / "projects" / project_id / ".project" / "settings.toml"
+    with settings.open("a", encoding="utf-8") as fh:
+        fh.write(f'task_prefix = "{task_prefix}"\n')
+
+
+class TestNormalisationCollisionIsLoudNotSilent:
+    """Operator decision (2026-10-04): ``web2`` and ``web-2`` both normalise
+    to ``WEB2``. When both are taskless, ``web-2`` wins the prefix and
+    ``web2`` gets the loud "Cannot derive a collision-free task prefix"
+    error. Accepted: the escape hatch is an explicit ``task_prefix``."""
+
+    def test_taskless_web2_and_web_dash_2_exactly_one_gets_web2(
+        self, tmp_path, monkeypatch
+    ):
+        _make_portfolio(tmp_path, "web2")
+        _add_project(tmp_path, "web-2")
+        config = _load_isolated_config(tmp_path, monkeypatch)
+
+        assignments, errors = assign_all_prefixes(config)
+
+        # Pin the ACTUAL current outcome: the hyphenated id wins.
+        assert assignments == {"web-2": "WEB2"}, assignments
+        assert set(errors) == {"web2"}, errors
+        assert "Cannot derive a collision-free task prefix" in str(errors["web2"])
+        assert "task_prefix" in str(errors["web2"])  # names the escape hatch
+
+        # Loud at mint time too, never a silent duplicate.
+        assert add_task(config, "web-2", "winner").id == "WEB2-000"
+        with pytest.raises(ValueError, match="collision-free task prefix"):
+            add_task(config, "web2", "loser")
+
+    def test_explicit_web2_prefix_vs_taskless_web_dash_2_is_refused_loudly(
+        self, tmp_path, monkeypatch
+    ):
+        _make_portfolio(tmp_path, "web2")
+        # Re-write web2's settings with an explicit task_prefix.
+        settings = tmp_path / "projects" / "web2" / ".project" / "settings.toml"
+        with settings.open("a", encoding="utf-8") as fh:
+            fh.write('task_prefix = "WEB2"\n')
+        _add_project(tmp_path, "web-2")
+        config = _load_isolated_config(tmp_path, monkeypatch)
+
+        assignments, errors = assign_all_prefixes(config)
+        assert "web-2" not in assignments, assignments
+        assert set(errors) == {"web-2"}, errors
+        with pytest.raises(ValueError, match="collision-free task prefix"):
+            add_task(config, "web-2", "refused")
+
+    def test_explicit_task_prefix_on_the_losing_project_lets_it_mint(
+        self, tmp_path, monkeypatch
+    ):
+        """The documented escape hatch for the loser of the web2/web-2 tie."""
+        _make_portfolio(tmp_path, "web2")
+        settings = tmp_path / "projects" / "web2" / ".project" / "settings.toml"
+        with settings.open("a", encoding="utf-8") as fh:
+            fh.write('task_prefix = "WEBTWO"\n')
+        _add_project(tmp_path, "web-2")
+        config = _load_isolated_config(tmp_path, monkeypatch)
+
+        assignments, errors = assign_all_prefixes(config)
+        assert errors == {}, errors
+        assert assignments.get("web-2") == "WEB2", assignments
+
+        assert add_task(config, "web-2", "a").id == "WEB2-000"
+        assert add_task(config, "web2", "b").id == "WEBTWO-000"
+
+
+class TestLegacySubtaskShapedPrefixFiles:
+    def test_legacy_web_dash_2_files_stay_resolvable_and_next_mint_is_web2(
+        self, tmp_path, monkeypatch
+    ):
+        from clawpm.tasks import get_task, list_tasks
+
+        _make_portfolio(tmp_path, "web-2")
+        config = _load_isolated_config(tmp_path, monkeypatch)
+        tasks_dir = tmp_path / "projects" / "web-2" / ".project" / "tasks"
+
+        # Materialise real task files via the writer, then rename them to the
+        # legacy subtask-shaped ids an older allocator would have minted.
+        seed = add_task(config, "web-2", "seed0")
+        seed1 = add_task(config, "web-2", "seed1")
+        assert (seed.id, seed1.id) == ("WEB2-000", "WEB2-001")
+        for old, new in (("WEB2-000", "WEB-2-000"), ("WEB2-001", "WEB-2-001")):
+            src = tasks_dir / f"{old}.md"
+            text = src.read_text(encoding="utf-8").replace(f"id: {old}", f"id: {new}")
+            (tasks_dir / f"{new}.md").write_text(text, encoding="utf-8")
+            src.unlink()
+
+        assert get_task(config, "web-2", "WEB-2-000") is not None
+        assert get_task(config, "web-2", "WEB-2-001") is not None
+        listed = {t.id for t in list_tasks(config, "web-2")}
+        assert {"WEB-2-000", "WEB-2-001"} <= listed, listed
+
+        # Legacy files are subtask-shaped, so inference ignores them and the
+        # next mint uses the normalised prefix, starting at 000.
+        assert _infer_prefix_from_tasks(tasks_dir) is None
+        assert add_task(config, "web-2", "next").id == "WEB2-000"
+
+
+class TestCandidateChainShape:
+    def test_team_2_b_chain_and_reach(self):
+        from clawpm.tasks import _naive_prefix_candidates, _naive_prefix_reach
+
+        assert list(_naive_prefix_candidates("team-2-b")) == [
+            "TEAM",
+            "TEAM2",
+            "TEAM2",
+            "TEAM-2-B",
+        ]
+        assert len(_naive_prefix_reach("team-2-b")) == 3
