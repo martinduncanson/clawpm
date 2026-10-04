@@ -2324,8 +2324,10 @@ def add_task(
             # trailing one before the first mint), so widening the match is
             # unambiguous -- it only ever catches the legacy spelling, never
             # a different project's prefix.
-            _dir_pat = re.compile(rf"^{re.escape(prefix)}-{{1,2}}(\d+)$")
-            _file_pat = re.compile(rf"^{re.escape(prefix)}-{{1,2}}(\d+)(?:\.progress)?$")
+            # A kept-legacy prefix already ends in "-": one more hyphen only.
+            _sep = "-" if prefix.endswith("-") else "-{1,2}"
+            _dir_pat = re.compile(rf"^{re.escape(prefix)}{_sep}(\d+)$")
+            _file_pat = re.compile(rf"^{re.escape(prefix)}{_sep}(\d+)(?:\.progress)?$")
 
             existing_nums = []
 
