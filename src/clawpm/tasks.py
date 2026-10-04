@@ -1338,6 +1338,37 @@ def parent_ready_signal(
 _PREFIX_NUM_RE = re.compile(r"^([A-Z][A-Z0-9-]*?)-(\d+)(?:\.progress)?$")
 
 
+def _is_subtask_shaped(prefix: str) -> bool:
+    """Whether ``prefix`` itself ends in ``-<digits>`` -- the shape
+    ``_infer_prefix_from_tasks`` treats as "this is a PARENT task id, so a
+    file matching it is a stray subtask, not evidence of a real top-level
+    prefix" (CLAWP-048), and therefore a shape no candidate this module
+    hands out may stably use (CLAWP-132; see ``_desubtask_prefix``, which
+    normalises such a candidate before it is yielded).
+    """
+    return bool(re.search(r"-\d+$", prefix))
+
+
+def _desubtask_prefix(prefix: str) -> str:
+    """Normalise ``prefix`` until it is no longer subtask-shaped, by removing
+    the hyphen immediately before its trailing digit run (CLAWP-132 decision
+    (b), operator 2026-10-03): ``WEB-2`` -> ``WEB2``, ``TEAM-2`` -> ``TEAM2``.
+
+    Repeats, because a single collapse is not enough when the digit run is
+    itself preceded by another ``-<digits>`` group: ``X-1-2`` -> ``X-12``
+    (still subtask-shaped) -> ``X12``. The result ends in a digit run with no
+    hyphen before it, so ``f"{result}-000"`` is parsed back to ``result`` by
+    ``_PREFIX_NUM_RE`` / ``_infer_prefix_from_tasks`` -- the stability
+    invariant a ``-<digits>`` prefix cannot meet. A prefix that is not
+    subtask-shaped is returned unchanged.
+    """
+    while True:
+        m = re.search(r"-(\d+)$", prefix)
+        if not m:
+            return prefix
+        prefix = prefix[: m.start()] + m.group(1)
+
+
 def _infer_prefix_from_tasks(tasks_dir: Path) -> str | None:
     """Most common task-ID prefix among existing task files/dirs, or None.
 
@@ -1372,8 +1403,15 @@ def _infer_prefix_from_tasks(tasks_dir: Path) -> str | None:
                 # Skip subtask-shaped names: a real prefix never ends in
                 # -<digits> (that's a parent task id, so this file is a stray
                 # subtask, not a top-level task). Mirrors the allocator's
-                # anchored exclusion of {prefix}-NNN-MMM files.
-                if re.search(r"-\d+$", pfx):
+                # anchored exclusion of {prefix}-NNN-MMM files. CLAWP-132:
+                # this is the SAME shape `_naive_prefix_candidates` now
+                # normalises away before handing out, so an allocator-minted
+                # prefix cannot itself land here and be wrongly excluded.
+                # Known pre-existing gap (NOT fixed here): `_PREFIX_NUM_RE`
+                # needs a LEADING LETTER, so a prefix derived from a
+                # digit-leading id (``2-b`` -> ``2``, ``2024``) is never
+                # re-inferred from its own files at all.
+                if _is_subtask_shaped(pfx):
                     continue
                 counts[pfx] += 1
     if not counts:
@@ -1427,10 +1465,14 @@ def _naive_prefix_placeholder(project_id: str) -> str:
     derives, two still-task-less siblings whose slices land on the same
     boundary (e.g. two "code-*" projects, both -> "CODE") could each fail to
     see the other as a collision and independently mint the same prefix.
+
+    A base that is subtask-shaped (``"web-2"`` -> ``"WEB-2"``) is normalised
+    via ``_desubtask_prefix`` (-> ``"WEB2"``; CLAWP-132 decision (b)) so this
+    always equals the FIRST value ``_naive_prefix_candidates`` yields.
     """
     full = project_id.upper()
     base = full[:5] if len(full) >= 5 else full
-    return _strip_trailing_non_alnum(base)
+    return _desubtask_prefix(_strip_trailing_non_alnum(base))
 
 
 class PortfolioPrefixScanError(OSError):
@@ -1474,11 +1516,39 @@ def _naive_prefix_candidates(project_id: str):
     it's just skipped the second time. ``_naive_prefix_reach`` (distinct
     set) derives from this same ONE sequence, so the two can never
     disagree about what a given id's chain contains.
+
+    SUBTASK-SHAPED CANDIDATES ARE NORMALISED, NOT YIELDED RAW (CLAWP-132
+    decision (b), operator 2026-10-03): a slice that
+    itself ends in ``-<digits>`` (e.g. project id ``"team-2-b"`` sliced to
+    ``"TEAM-2"``) is a candidate `_infer_prefix_from_tasks` can NEVER
+    stably re-derive once minted -- its own subtask-shape filter treats
+    any file named ``{that-candidate}-NNN.md`` as a stray subtask of
+    parent task ``{candidate-minus-its-trailing-"-N"}``, not evidence of a
+    real top-level prefix, so the project would look task-less again on
+    its very next mint and be re-resolved from scratch -- possibly handed
+    a DIFFERENT prefix next time, while its EXISTING files keep using the
+    old one, which a differently-composed or differently-ordered taskless
+    pool can then assign out from under it to a wholly different project
+    (reproduced: two projects both minting a real, on-disk ``TEAM-2-000``).
+    Such a candidate is rewritten by ``_desubtask_prefix`` (``"TEAM-2"`` ->
+    ``"TEAM2"``, ``"X-1-2"`` -> ``"X12"``) instead of being skipped, so the
+    allocator never hands out a prefix that `_infer_prefix_from_tasks`
+    rejects for being subtask-shaped (a ``-<digits>`` suffix) -- the one
+    invariant that function's own filter already assumes but this module did
+    not previously guarantee. LIMIT (pre-existing, not addressed here): the
+    inference regex ``_PREFIX_NUM_RE`` also requires a LEADING LETTER, so a
+    prefix derived from a digit-leading id (``2-b``, ``2024``) can still
+    never be re-inferred from its own files; that is a separate gap. A short digit-suffixed id (``"web-2"``) still has a candidate
+    (skipping them left such ids with none, hard-failing ``tasks add``).
+    The chain is therefore never empty: it always yields at least the
+    placeholder. Normalising can make adjacent slices collapse to the same
+    string (``"TEAM-2"`` and ``"TEAM-2-"`` both -> ``"TEAM2"``), which the
+    non-deduplication note above already covers.
     """
     full = project_id.upper()
     yield _naive_prefix_placeholder(project_id)
     for n in range(6, len(full) + 1):
-        yield _strip_trailing_non_alnum(full[:n])
+        yield _desubtask_prefix(_strip_trailing_non_alnum(full[:n]))
 
 
 def _naive_prefix_reach(project_id: str) -> frozenset[str]:
@@ -1620,6 +1690,11 @@ def _assign_taskless_prefixes(
             # recursively with no depth cap, so ANY fixed suffix reserve is a
             # wall at SOME depth). An actionable error beats a synthesised
             # prefix the rest of the tool cannot use.
+            #
+            # CLAWP-132 decision (b): the candidate chain is never empty
+            # (`_naive_prefix_candidates` always yields at least the
+            # placeholder, normalising subtask-shaped slices rather than
+            # skipping them), so this branch only ever means "claimed".
             full = pid.upper()
             errors[pid] = ValueError(
                 f"Cannot derive a collision-free task prefix for project "
