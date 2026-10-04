@@ -165,9 +165,9 @@ def _collect_project_tasks(
     # Also corrects the single-project path for divergent-prefix projects.
     resolved_prefix = None
     if parent or linked:
-        from clawpm.tasks import resolve_existing_prefix
+        from clawpm.tasks import resolve_portfolio_prefix
         _settings = get_project(config, project_id)
-        resolved_prefix = resolve_existing_prefix(_settings) if _settings else None
+        resolved_prefix = resolve_portfolio_prefix(_settings, config) if _settings else None
     if parent:
         filter_list.append(by_parent(expand_task_id(parent, project_id, resolved_prefix)))
     if linked:

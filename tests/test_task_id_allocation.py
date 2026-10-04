@@ -273,6 +273,125 @@ class TestLegacyDoubledSeparatorNormalization:
         assert _predict_parent_id(doc, config, "code-quorum") == "CODE-006"
 
 
+class TestLegacyNormalizationSiblingCollision:
+    """CLAWP-113 review round 4 (operator decision 2026-10-04). A legacy
+    ``CODE--000`` project used to claim ``CODE-`` while a sibling holding
+    ``CODE-001`` claimed ``CODE``: distinct. Naive normalisation merged them
+    and the legacy project minted a duplicate ``CODE-001``. Rule: normalise
+    only when no sibling claims the clean prefix; otherwise KEEP the legacy
+    spelling (``CODE--NNN``) exactly as before CLAWP-113."""
+
+    @staticmethod
+    def _seed(tasks_dir, *names):
+        for name in names:
+            (tasks_dir / f"{name}.md").write_text(f"---\nid: {name}\n---\n", encoding="utf-8")
+
+    def _collide(self, tmp_path, monkeypatch):
+        legacy_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        self._seed(legacy_dir, "CODE--000")
+        _add_project(tmp_path, "code-sibling")
+        sib_dir = tmp_path / "projects" / "code-sibling" / ".project" / "tasks"
+        self._seed(sib_dir, "CODE-001")
+        return legacy_dir, sib_dir
+
+    def test_collision_keeps_legacy_spelling_no_duplicate(self, tmp_path, monkeypatch):
+        legacy_dir, sib_dir = self._collide(tmp_path, monkeypatch)
+        legacy_next = _add("code-quorum", "legacy next")
+        assert legacy_next == "CODE--001", legacy_next
+        sib_next = _add("code-sibling", "sibling next")
+        assert sib_next == "CODE-002", sib_next
+        ids = {p.stem for d in (legacy_dir, sib_dir) for p in d.glob("CODE-*.md")}
+        assert len(ids) == 4  # CODE--000, CODE--001, CODE-001, CODE-002
+
+    def test_collision_with_explicit_sibling_prefix_keeps_legacy(self, tmp_path, monkeypatch):
+        legacy_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        self._seed(legacy_dir, "CODE--000")
+        _add_project(tmp_path, "other", task_prefix="CODE")
+        assert _add("code-quorum", "next") == "CODE--001"
+
+    def test_assign_all_prefixes_distinct_on_collision(self, tmp_path, monkeypatch):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_all_prefixes
+
+        self._collide(tmp_path, monkeypatch)
+        assignments, errors = assign_all_prefixes(load_portfolio_config())
+        assert not errors
+        assert assignments["code-quorum"] == "CODE-"
+        assert assignments["code-sibling"] == "CODE"
+
+    def test_no_collision_still_normalises(self, tmp_path, monkeypatch):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_all_prefixes
+
+        legacy_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        self._seed(legacy_dir, "CODE--000")
+        _add_project(tmp_path, "unrelated")
+        assignments, _ = assign_all_prefixes(load_portfolio_config())
+        assert assignments["code-quorum"] == "CODE"
+        assert _add("code-quorum", "next") == "CODE-001"
+
+    def test_emit_tree_prediction_agrees_when_kept(self, tmp_path, monkeypatch):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.emit_tree import _predict_parent_id
+
+        self._collide(tmp_path, monkeypatch)
+        doc = type("Doc", (), {"root": type("Root", (), {"attach_to": None})()})()
+        predicted = _predict_parent_id(doc, load_portfolio_config(), "code-quorum")
+        assert predicted == "CODE--001"
+        assert _add("code-quorum", "next") == predicted
+
+    def test_emit_tree_prediction_agrees_when_normalised(self, tmp_path, monkeypatch):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.emit_tree import _predict_parent_id
+
+        legacy_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        self._seed(legacy_dir, "CODE--000")
+        _add_project(tmp_path, "unrelated")
+        doc = type("Doc", (), {"root": type("Root", (), {"attach_to": None})()})()
+        predicted = _predict_parent_id(doc, load_portfolio_config(), "code-quorum")
+        assert predicted == "CODE-001"
+        assert _add("code-quorum", "next") == predicted
+
+    def test_other_project_cannot_explicitly_create_legacy_id_normalised(
+        self, tmp_path, monkeypatch
+    ):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import add_task
+
+        legacy_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        self._seed(legacy_dir, "CODE--000")
+        _add_project(tmp_path, "intruder")
+        with pytest.raises(ValueError, match="CODE"):
+            add_task(load_portfolio_config(), "intruder", "squat", task_id="CODE--000")
+
+    def test_other_project_cannot_explicitly_create_legacy_id_when_kept(
+        self, tmp_path, monkeypatch
+    ):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import add_task
+
+        self._collide(tmp_path, monkeypatch)
+        _add_project(tmp_path, "intruder")
+        with pytest.raises(ValueError, match="CODE"):
+            add_task(load_portfolio_config(), "intruder", "squat", task_id="CODE--000")
+
+    def test_kept_legacy_project_cannot_explicitly_take_sibling_namespace(
+        self, tmp_path, monkeypatch
+    ):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import add_task
+
+        self._collide(tmp_path, monkeypatch)
+        with pytest.raises(ValueError, match="code-sibling"):
+            add_task(load_portfolio_config(), "code-quorum", "x", task_id="CODE-005")
+
+    def test_doctor_reports_no_collision_when_kept(self, tmp_path, monkeypatch):
+        self._collide(tmp_path, monkeypatch)
+        res = CliRunner().invoke(main, ["--format", "json", "doctor"])
+        data = json.loads(res.output)
+        assert data["prefix_collisions"] == [], data
+
+
 class TestDeterministicGlobalPrefixPass:
     """CLAWP-121: two task-less siblings assigned via INDEPENDENT calls to
     ``assign_task_prefix`` (exactly what ``clawpm doctor``'s per-project loop

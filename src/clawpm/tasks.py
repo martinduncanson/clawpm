@@ -1369,8 +1369,11 @@ def _desubtask_prefix(prefix: str) -> str:
         prefix = prefix[: m.start()] + m.group(1)
 
 
-def _infer_prefix_from_tasks(tasks_dir: Path) -> str | None:
+def _infer_prefix_from_tasks(tasks_dir: Path, *, keep_legacy: bool = False) -> str | None:
     """Most common task-ID prefix among existing task files/dirs, or None.
+
+    ``keep_legacy=True`` (CLAWP-113) votes on the RAW on-disk spelling (a
+    legacy ``CODE--000`` stays ``"CODE-"``) instead of the normalised one.
 
     Anchored + non-greedy so a hyphenated prefix (``ARB-P``) is recovered intact
     from ``ARB-P-000`` (cf. CLAWP-047). Subtask files live inside parent dirs,
@@ -1427,7 +1430,7 @@ def _infer_prefix_from_tasks(tasks_dir: Path) -> str | None:
                 # with any already-normalized ``"CODE"`` files on disk
                 # instead of letting the two spellings split the Counter and
                 # risk the wrong one winning the plurality.
-                counts[pfx] += 1
+                counts[raw_pfx if keep_legacy else pfx] += 1
     if not counts:
         return None
     # Most common; deterministic tie-break by longer prefix then lexical.
@@ -1450,6 +1453,78 @@ def resolve_existing_prefix(settings) -> str | None:
         if inferred:
             return inferred
     return None
+
+
+def _legacy_alt_from_dir(tasks_dir: Path, clean: str | None) -> str | None:
+    """The legacy doubled-separator spelling (``"CODE-"``) a project's own
+    files vote for when it differs from the normalised ``clean`` claim
+    (CLAWP-113), else None."""
+    if clean is None:
+        return None
+    raw = _infer_prefix_from_tasks(tasks_dir, keep_legacy=True)
+    if raw and raw != clean and _strip_trailing_non_alnum(raw) == clean:
+        return raw
+    return None
+
+
+def _legacy_alt_prefix(settings, clean: str | None) -> str | None:
+    """``_legacy_alt_from_dir`` for a project's settings; explicit
+    ``task_prefix`` projects never have one."""
+    if clean is None or getattr(settings, "task_prefix", None):
+        return None
+    if not getattr(settings, "project_dir", None):
+        return None
+    return _legacy_alt_from_dir(settings.project_dir / ".project" / "tasks", clean)
+
+
+def _decide_inferred_prefix(clean: str, alt: str | None, sibling_claims: set[str]) -> str:
+    """Normalise-or-keep (CLAWP-113). A legacy project (``alt`` set) takes the
+    normalised ``clean`` prefix only when no sibling already claims it;
+    otherwise it KEEPS the legacy spelling and keeps minting ``CODE--NNN``,
+    so it can never mint an id a sibling already owns. ``sibling_claims``
+    holds each sibling's conservative claim (explicit prefix, its clean
+    inferred prefix, or its legacy spelling) -- never recursive."""
+    if alt is not None and clean in sibling_claims:
+        return alt
+    return clean
+
+
+def _other_projects_claims(config, exclude_id: str) -> set[str]:
+    """Conservative real claims of every project except ``exclude_id``."""
+    from .discovery import discover_projects
+
+    claims: set[str] = set()
+    for p in discover_projects(config):
+        if p.id == exclude_id:
+            continue
+        try:
+            clean = resolve_existing_prefix(p)
+            alt = _legacy_alt_prefix(p, clean)
+        except OSError as exc:
+            raise PortfolioPrefixScanError(p.id, exc) from exc
+        if clean is not None:
+            claims.add(alt or clean)
+    return claims
+
+
+def resolve_portfolio_prefix(settings, config) -> str | None:
+    """``resolve_existing_prefix`` plus the CLAWP-113 normalise-or-keep
+    decision for a legacy doubled-separator project (needs the portfolio)."""
+    clean = resolve_existing_prefix(settings)
+    alt = _legacy_alt_prefix(settings, clean)
+    if clean is None or alt is None:
+        return clean
+    return _decide_inferred_prefix(clean, alt, _other_projects_claims(config, settings.id))
+
+
+def _resolve_own_inferred_prefix(project_id: str, tasks_dir: Path, config) -> str | None:
+    """Own-project inferred prefix from ``tasks_dir`` with the CLAWP-113
+    normalise-or-keep decision against the portfolio."""
+    clean = _infer_prefix_from_tasks(tasks_dir)
+    alt = _legacy_alt_from_dir(tasks_dir, clean)
+    if clean is None or alt is None:
+        return clean
+    return _decide_inferred_prefix(clean, alt, _other_projects_claims(config, project_id))
 
 
 def _strip_trailing_non_alnum(prefix: str) -> str:
@@ -1783,6 +1858,7 @@ def assign_all_prefixes(
     from .discovery import discover_projects
 
     resolved: dict[str, str] = {}
+    legacy: dict[str, tuple[str, str]] = {}  # CLAWP-113: pid -> (clean, alt)
     taskless_ids: set[str] = set()
     if extra_taskless_id is not None:
         taskless_ids.add(extra_taskless_id)
@@ -1791,12 +1867,22 @@ def assign_all_prefixes(
             continue
         try:
             prefix = resolve_existing_prefix(p)
+            alt = _legacy_alt_prefix(p, prefix)
         except OSError as exc:
             raise PortfolioPrefixScanError(p.id, exc) from exc
         if prefix is not None:
             resolved[p.id] = prefix
+            if alt is not None:
+                legacy[p.id] = (prefix, alt)
         else:
             taskless_ids.add(p.id)
+    # CLAWP-113: a legacy project normalises only if no sibling claims the
+    # clean spelling; otherwise it keeps its legacy claim. Decided once from
+    # the already-collected claims (no per-sibling rescans, no recursion).
+    if legacy:
+        claims = {legacy[pid][1] if pid in legacy else pfx for pid, pfx in resolved.items()}
+        for pid, (clean, alt) in legacy.items():
+            resolved[pid] = _decide_inferred_prefix(clean, alt, claims)
 
     used = set(resolved.values())
     taskless_assignments, errors = _assign_taskless_prefixes(taskless_ids, used)
@@ -1913,7 +1999,10 @@ def _id_is_within_prefix_namespace(task_id: str, prefix: str) -> bool:
         return False
     remainder = upper_id[len(upper_prefix) + 1:]
     remainder = re.sub(r"\.PROGRESS$", "", remainder)
-    return bool(remainder) and all(seg.isdigit() for seg in remainder.split("-"))
+    # CLAWP-113: tolerate a legacy doubled separator (``CODE--000``,
+    # ``CODE--001--002``) so a normalised claim still owns its legacy-spelled
+    # ids; "-" re-added to carry the one separator consumed above.
+    return bool(remainder) and bool(re.fullmatch(r"(?:-{1,2}\d+)+", "-" + remainder))
 
 
 def check_explicit_id_prefix_collision(
@@ -1996,7 +2085,9 @@ def check_explicit_id_prefix_collision(
             protect.
     """
     own_prefix = (
-        explicit_prefix.upper() if explicit_prefix else _infer_prefix_from_tasks(tasks_dir)
+        explicit_prefix.upper()
+        if explicit_prefix
+        else _resolve_own_inferred_prefix(project_id, tasks_dir, config)
     )
 
     best_len = -1
@@ -2073,7 +2164,7 @@ def assign_task_prefix(
     """
     if explicit_prefix:
         return explicit_prefix.upper()
-    inferred = _infer_prefix_from_tasks(tasks_dir)
+    inferred = _resolve_own_inferred_prefix(project_id, tasks_dir, config)
     if inferred:
         return inferred
     assignments, errors = assign_all_prefixes(config, extra_taskless_id=project_id)
