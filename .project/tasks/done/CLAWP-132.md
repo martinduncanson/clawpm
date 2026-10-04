@@ -13,7 +13,7 @@ predictions:
   - fix makes that repro pass without breaking the 12 CLAWP-129 tests or the 3 CLAWP-130
     tests
 priority: 6
-updated: '2026-10-01'
+updated: '2026-10-04'
 ---
 # CLAWP-130 residual gap: self-skip + inference drift can still squat a namespace
 
