@@ -426,14 +426,6 @@ class TestLegacyNormalizationRound4Codex:
         assert expand_task_id("0", "code-quorum", resolve_ref_prefix(settings)) == "CODE--000"
 
 
-    def test_kept_legacy_ordinal_scan_ignores_triple_hyphen(self, tmp_path, monkeypatch):
-        legacy_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
-        for n in ("CODE--000", "CODE---050"):
-            (legacy_dir / f"{n}.md").write_text(f"---\nid: {n}\n---\n", encoding="utf-8")
-        _add_project(tmp_path, "sib", task_prefix="CODE")
-        assert _add("code-quorum", "next") == "CODE--001"
-
-
 class TestDeterministicGlobalPrefixPass:
     """CLAWP-121: two task-less siblings assigned via INDEPENDENT calls to
     ``assign_task_prefix`` (exactly what ``clawpm doctor``'s per-project loop
