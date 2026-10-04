@@ -392,6 +392,40 @@ class TestLegacyNormalizationSiblingCollision:
         assert data["prefix_collisions"] == [], data
 
 
+class TestLegacyNormalizationRound4Codex:
+    """Codex round 4: mixed votes whose merged winner differs from the raw
+    winner must still honour sibling claims; short refs must expand to the
+    on-disk spelling of existing legacy ids."""
+
+    def test_mixed_votes_flip_falls_back_to_raw_winner_on_collision(self, tmp_path, monkeypatch):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_all_prefixes
+
+        d = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        for n in ("CODE--000", "CODE--001", "CODE-002", "CODE-003", "OTHER-001", "OTHER-002", "OTHER-003"):
+            (d / f"{n}.md").write_text(f"---\nid: {n}\n---\n", encoding="utf-8")
+        _add_project(tmp_path, "sib")
+        (tmp_path / "projects" / "sib" / ".project" / "tasks" / "CODE-004.md").write_text(
+            "---\nid: CODE-004\n---\n", encoding="utf-8"
+        )
+        assignments, _ = assign_all_prefixes(load_portfolio_config())
+        assert assignments["code-quorum"] == "OTHER"
+        assert assignments["sib"] == "CODE"
+        assert _add("code-quorum", "next") == "OTHER-004"
+
+    def test_short_ref_expands_to_legacy_on_disk_spelling(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+
+        from clawpm.context import expand_task_id
+        from clawpm.tasks import resolve_ref_prefix
+
+        d = tmp_path / ".project" / "tasks"
+        d.mkdir(parents=True)
+        (d / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        settings = SimpleNamespace(task_prefix=None, project_dir=tmp_path)
+        assert expand_task_id("0", "code-quorum", resolve_ref_prefix(settings)) == "CODE--000"
+
+
 class TestDeterministicGlobalPrefixPass:
     """CLAWP-121: two task-less siblings assigned via INDEPENDENT calls to
     ``assign_task_prefix`` (exactly what ``clawpm doctor``'s per-project loop

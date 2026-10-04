@@ -1462,7 +1462,11 @@ def _legacy_alt_from_dir(tasks_dir: Path, clean: str | None) -> str | None:
     if clean is None:
         return None
     raw = _infer_prefix_from_tasks(tasks_dir, keep_legacy=True)
-    if raw and raw != clean and _strip_trailing_non_alnum(raw) == clean:
+    # Any raw winner that differs from the merged winner counts (CLAWP-113
+    # round 4, Codex): merging split votes can flip the plurality to a
+    # DIFFERENT prefix than the pre-merge winner, and a collision must fall
+    # back to that pre-merge claim too.
+    if raw and raw != clean:
         return raw
     return None
 
@@ -1505,6 +1509,14 @@ def _other_projects_claims(config, exclude_id: str) -> set[str]:
         if clean is not None:
             claims.add(alt or clean)
     return claims
+
+
+def resolve_ref_prefix(settings) -> str | None:
+    """Prefix for expanding short refs (``--parent 1``) to EXISTING ids: the
+    RAW on-disk spelling, so a legacy ``CODE--000`` still expands to
+    ``CODE--000`` (CLAWP-113 round 4, Codex). Pre-CLAWP-113 behaviour."""
+    clean = resolve_existing_prefix(settings)
+    return _legacy_alt_prefix(settings, clean) or clean
 
 
 def resolve_portfolio_prefix(settings, config) -> str | None:
