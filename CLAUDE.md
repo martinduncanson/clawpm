@@ -44,3 +44,9 @@ For recurring iteration patterns, see the dispatch playbooks under `docs/playboo
 - **Codex-fix iteration loop** → `docs/playbooks/codex-fix-dispatch.md`. The canonical rubric (`wait-for-codex` clean + tests pass + PR mergeable) plus the dispatch invocation that hands the iteration to a subagent. Use this whenever a Codex review pass would otherwise consume 3-5 rounds of the parent agent's attention.
 
 When a new recurring iteration pattern emerges (e.g. encoding-scan zero-finding loop, dependency-bump compatibility loop), capture it as a sibling playbook so the rubric + invocation are reusable.
+
+## Release discipline
+
+- Every merged feature or fix PR adds one line under `## [Unreleased]` in `CHANGELOG.md` (Added / Changed / Fixed, cite `(#NN)` and the task id). Add it in the same PR.
+- To cut a release: rename `[Unreleased]` to the new version and date, bump `version` in `pyproject.toml` and `__version__` in `src/clawpm/__init__.py`, then tag `vX.Y.Z` on the `fork` remote.
+- Include "CHANGELOG line added" in the review briefing checklist for this repo.
