@@ -144,3 +144,45 @@ def test_project_init_clean_repo_no_warning(tmp_path, monkeypatch, repo):
     )
     assert result.exit_code == 0, result.output
     assert "gitignore" not in result.stderr.lower()
+
+def test_negated_rule_is_not_a_warning(tmp_path, monkeypatch, repo):
+    # check-ignore -v exits 0 when the LAST matching rule is a negation.
+    (repo / ".gitignore").write_text(
+        ".project/*\n!.project/tasks/\n!.project/tasks/*.md\n", encoding="utf-8"
+    )
+    _make_project(repo)
+    assert _doctor_warnings(tmp_path, monkeypatch, tmp_path) == []
+
+
+def test_force_added_tracked_task_does_not_mask_blanket_ignore(tmp_path, monkeypatch, repo):
+    (repo / ".gitignore").write_text(".project/\n", encoding="utf-8")
+    _make_project(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "-f", ".project/tasks/GI-001.md"], check=True
+    )
+    msgs = _doctor_warnings(tmp_path, monkeypatch, tmp_path)
+    assert len(msgs) == 1
+    assert ".gitignore:1" in msgs[0]
+
+
+def test_rejected_subdir_ignore_warns(tmp_path, monkeypatch, repo):
+    (repo / ".gitignore").write_text(".project/tasks/rejected/\n", encoding="utf-8")
+    _make_project(repo)
+    rejected = repo / ".project" / "tasks" / "rejected"
+    rejected.mkdir()
+    (rejected / "GI-002.md").write_text("---\nid: GI-002\n---\n# r\n", encoding="utf-8")
+    msgs = _doctor_warnings(tmp_path, monkeypatch, tmp_path)
+    assert len(msgs) == 1
+
+
+def test_degraded_git_failure_is_logged_not_silent(tmp_path, caplog):
+    import logging
+
+    from clawpm import taskstate_ignore as ti
+
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    _make_project(plain)
+    with caplog.at_level(logging.DEBUG, logger="clawpm.taskstate_ignore"):
+        assert ti.find_ignored_task_state(plain) is None
+    assert any("check-ignore" in r.getMessage() for r in caplog.records)
