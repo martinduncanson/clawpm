@@ -529,6 +529,58 @@ class TestLegacyNormalizationRound7Codex:
         assert not kept.match("CODE---007")
 
 
+class TestRound8Codex:
+    """Codex round 8: suffix test is case-insensitive on every platform, and
+    the portfolio fallback is lazy (an unreadable sibling store must not break
+    refs that resolve locally, nor full-id refs)."""
+
+    def test_uppercase_md_suffix_counts_toward_ordinals(self, tmp_path):
+        from clawpm.tasks import _root_ordinals
+
+        d = tmp_path / "tasks"
+        d.mkdir()
+        (d / "CODE-000.MD").write_text("---\nid: CODE-000\n---\n", encoding="utf-8")
+        assert _root_ordinals(d, "CODE") == [0]
+
+    def test_uppercase_md_suffix_is_not_reminted(self, tmp_path, monkeypatch):
+        d = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        (d / "CODE-000.MD").write_text("---\nid: CODE-000\n---\n", encoding="utf-8")
+        assert _add("code-quorum", "next") == "CODE-001"
+
+    def _legacy_with_broken_sibling(self, tmp_path, monkeypatch):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import PortfolioPrefixScanError
+
+        d = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        (d / "CODE--003.md").write_text("---\nid: CODE--003\n---\n", encoding="utf-8")
+        calls = []
+
+        def boom(*args, **kwargs):
+            calls.append(args)
+            raise PortfolioPrefixScanError("sib", RuntimeError("unreadable"))
+
+        monkeypatch.setattr("clawpm.tasks._other_projects_claims", boom)
+        return load_portfolio_config(), calls
+
+    def test_local_numeric_ref_survives_unreadable_sibling(self, tmp_path, monkeypatch):
+        from clawpm.discovery import get_project
+        from clawpm.tasks import resolve_ref_prefix
+
+        config, calls = self._legacy_with_broken_sibling(tmp_path, monkeypatch)
+        settings = get_project(config, "code-quorum")
+        assert resolve_ref_prefix(settings, config, "3") == "CODE-"
+        assert resolve_ref_prefix(settings, config, "3-001") == "CODE-"
+        assert calls == []
+
+    def test_full_id_parent_does_not_scan_portfolio(self, tmp_path, monkeypatch):
+        config, calls = self._legacy_with_broken_sibling(tmp_path, monkeypatch)
+        res = CliRunner().invoke(
+            main, ["--format", "json", "tasks", "list", "-p", "code-quorum", "--parent", "CODE--003"]
+        )
+        assert res.exit_code == 0, res.output
+        assert calls == []
+
+
 class TestDeterministicGlobalPrefixPass:
     """CLAWP-121: two task-less siblings assigned via INDEPENDENT calls to
     ``assign_task_prefix`` (exactly what ``clawpm doctor``'s per-project loop

@@ -1444,7 +1444,7 @@ def _root_ordinals(tasks_dir: Path, prefix: str, *, strict: bool = False) -> lis
         for entry in scan_dir.iterdir():
             if entry.is_dir():
                 m = dir_pat.match(entry.name)
-            elif entry.suffix == ".md":
+            elif entry.suffix.lower() == ".md":
                 m = file_pat.match(entry.stem)
             else:
                 continue
@@ -1600,16 +1600,19 @@ def resolve_ref_prefix(settings, config=None, task_ref: str | None = None) -> st
     (``config`` given) or the raw winner.
     """
     clean = resolve_existing_prefix(settings)
-    fallback = (
-        resolve_portfolio_prefix(settings, config)
-        if config is not None
-        else (_legacy_alt_prefix(settings, clean) or clean)
-    )
+
+    def fallback() -> str | None:
+        # Lazy: the portfolio scan reads SIBLING stores, so an unreadable
+        # sibling must not break a ref that resolves from local ids alone.
+        if config is not None:
+            return resolve_portfolio_prefix(settings, config)
+        return _legacy_alt_prefix(settings, clean) or clean
+
     if clean is None or task_ref is None or getattr(settings, "task_prefix", None):
-        return fallback
+        return fallback()
     m = re.fullmatch(r"(\d+)(?:-\d+)?", task_ref)
     if not m or not getattr(settings, "project_dir", None):
-        return fallback
+        return fallback()
     tasks_dir = settings.project_dir / ".project" / "tasks"
     ordinal = int(m.group(1))
     spellings = []
@@ -1622,7 +1625,7 @@ def resolve_ref_prefix(settings, config=None, task_ref: str | None = None) -> st
             f"Task reference '{task_ref}' is ambiguous: both '{clean}-{ordinal:03d}' "
             f"and '{clean}--{ordinal:03d}' exist. Use the full task id."
         )
-    return spellings[0] if spellings else fallback
+    return spellings[0] if spellings else fallback()
 
 
 def resolve_portfolio_prefix(settings, config) -> str | None:

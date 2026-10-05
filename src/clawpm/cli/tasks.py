@@ -168,7 +168,13 @@ def _collect_project_tasks(
     # project can hold both `CODE--003` and `CODE-007` (ValueError if one
     # ordinal exists in both spellings).
     def _ref_prefix(ref: str) -> str | None:
+        import re
+
         from clawpm.tasks import resolve_ref_prefix
+        # A full id (CODE-003, CODE--003) never needs a prefix; skip the
+        # resolution (and its portfolio scan) entirely.
+        if not re.fullmatch(r"\d+(?:-\d+)?", ref):
+            return None
         _settings = get_project(config, project_id)
         try:
             return resolve_ref_prefix(_settings, config, ref) if _settings else None
