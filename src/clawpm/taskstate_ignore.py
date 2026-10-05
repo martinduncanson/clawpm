@@ -18,7 +18,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 _TASK_SUBDIRS = ("", "done", "blocked", "rejected")
-_PROBE_NAME = "probe.md"  # check-ignore works on paths that don't exist yet
+_PROBE_NUMBER = "999999"  # hypothetical id: check-ignore works on paths that don't exist yet
 
 FIX_TEXT = "replace `.project/` with `.project/tasks/.clawpm-tasks.lock` in that ignore file"
 
@@ -63,23 +63,63 @@ def _check_ignore_source(project_dir: Path, rel_path: str) -> str | None:
     return source or None
 
 
+def _task_prefix(project_dir: Path, folder: Path) -> str:
+    """Prefix for the hypothetical probe task.
+
+    A real task file in *folder* gives the exact prefix (stem split on the last
+    ``-``). With none (project init), fall back to the project's own prefix, so
+    a filename allowlist such as ``!.project/tasks/GI-*.md`` still matches.
+    """
+    from .tasks import _naive_prefix_placeholder, resolve_existing_prefix
+
+    for path in [*folder.glob("*.md"), *folder.glob("*/_task.md")]:
+        stem = path.parent.name if path.name == "_task.md" else path.stem
+        if "-" in stem:
+            return stem.rsplit("-", 1)[0]
+    try:
+        from .models import ProjectSettings
+
+        settings = ProjectSettings.load(project_dir / ".project" / "settings.toml")
+        return resolve_existing_prefix(settings) or _naive_prefix_placeholder(settings.id)
+    except Exception as exc:
+        logger.debug("could not derive a task prefix for %s: %r", project_dir, exc)
+        return "TASK"
+
+
+def _probe_path(project_dir: Path, sub: str, folder: Path) -> str:
+    """Relative path of a task-shaped, non-existent file in the layout in use."""
+    name = f"{_task_prefix(project_dir, folder)}-{_PROBE_NUMBER}"
+    split_only = (
+        folder.is_dir()
+        and next(folder.glob("*.md"), None) is None
+        and next(folder.glob("*/_task.md"), None) is not None
+    )
+    leaf = f"{name}/_task.md" if split_only else f"{name}.md"
+    return "/".join(p for p in (".project", "tasks", sub, leaf) if p)
+
+
 def find_ignored_task_state(project_dir: Path, *, require_tasks: bool = True) -> str | None:
     """Return the matching ignore rule (``file:line:pattern``) if the project's
     task files are git-ignored, else None.
 
     With *require_tasks* (doctor) a hypothetical new task path is probed in
-    every task directory that already holds ``*.md`` files. A hypothetical
-    path is used because ``check-ignore`` never reports TRACKED files, so a
-    force-added task would mask a blanket rule that swallows new ones. Without
-    it (project init, before any task exists) only the tasks root is probed.
+    every task directory that already holds task files (flat ``*.md`` or
+    split ``<id>/_task.md``). A hypothetical path is used because
+    ``check-ignore`` never reports TRACKED files, so a force-added task would
+    mask a blanket rule that swallows new ones; it is task-shaped (real
+    prefix) so filename allowlists are judged as they apply to real tasks.
+    Without *require_tasks* (project init, before any task exists) only the
+    tasks root is probed.
     """
     tasks_dir = project_dir / ".project" / "tasks"
     for sub in _TASK_SUBDIRS:
         folder = tasks_dir / sub if sub else tasks_dir
-        if require_tasks and not (folder.is_dir() and next(folder.glob("*.md"), None)):
+        if require_tasks and not (
+            folder.is_dir()
+            and (next(folder.glob("*.md"), None) or next(folder.glob("*/_task.md"), None))
+        ):
             continue
-        rel = "/".join(p for p in (".project", "tasks", sub, _PROBE_NAME) if p)
-        source = _check_ignore_source(project_dir, rel)
+        source = _check_ignore_source(project_dir, _probe_path(project_dir, sub, folder))
         if source:
             return source
         if not require_tasks:

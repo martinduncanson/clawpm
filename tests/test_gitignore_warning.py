@@ -200,3 +200,37 @@ def test_malformed_settings_still_warns_and_is_logged(tmp_path, caplog, repo):
         assert ti.is_unversioned_ok(repo) is False
         assert ti.ignored_task_state_warning(repo) is not None
     assert any("unversioned_ok" in r.getMessage() for r in caplog.records)
+
+
+def test_directory_layout_only_project_warns_under_blanket_ignore(tmp_path, monkeypatch, repo):
+    # Split tasks live at tasks/<id>/_task.md -- no direct *.md in the state dir.
+    (repo / ".gitignore").write_text(".project/\n", encoding="utf-8")
+    _make_project(repo)
+    tasks = repo / ".project" / "tasks"
+    (tasks / "GI-001.md").unlink()
+    split = tasks / "GI-001"
+    split.mkdir()
+    (split / "_task.md").write_text("---\nid: GI-001\n---\n# split\n", encoding="utf-8")
+    msgs = _doctor_warnings(tmp_path, monkeypatch, tmp_path)
+    assert len(msgs) == 1
+    assert ".gitignore:1" in msgs[0]
+
+
+ALLOWLIST = ".project/tasks/*\n!.project/tasks/GI-*.md\n"
+
+
+def test_filename_allowlist_does_not_false_warn_in_doctor(tmp_path, monkeypatch, repo):
+    (repo / ".gitignore").write_text(ALLOWLIST, encoding="utf-8")
+    _make_project(repo)
+    assert _doctor_warnings(tmp_path, monkeypatch, tmp_path) == []
+
+
+def test_filename_allowlist_does_not_false_warn_on_init(tmp_path, monkeypatch, repo):
+    (repo / ".gitignore").write_text(ALLOWLIST, encoding="utf-8")
+    _portfolio(tmp_path, monkeypatch, tmp_path)
+    runner = CliRunner(mix_stderr=False) if "mix_stderr" in CliRunner.__init__.__code__.co_varnames else CliRunner()
+    result = runner.invoke(
+        main, ["--format", "json", "project", "init", "--in-repo", str(repo), "--id", "gi"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "gitignore" not in result.stderr.lower()
