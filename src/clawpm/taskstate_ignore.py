@@ -17,8 +17,8 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_TASK_SUBDIRS = ("", "done", "blocked", "rejected")
-_PROBE_NUMBER = "999999"  # hypothetical id: check-ignore works on paths that don't exist yet
+_TASK_SUBDIRS = ("", "done", "done/archive", "blocked", "rejected")
+_DEFAULT_WIDTH = 3  # the allocator mints ``{prefix}-{num:03d}``
 
 FIX_TEXT = "replace `.project/` with `.project/tasks/.clawpm-tasks.lock` in that ignore file"
 
@@ -63,32 +63,46 @@ def _check_ignore_source(project_dir: Path, rel_path: str) -> str | None:
     return source or None
 
 
-def _task_prefix(project_dir: Path, folder: Path) -> str:
-    """Prefix for the hypothetical probe task.
+def _task_shape(project_dir: Path, folder: Path) -> tuple[str, int]:
+    """``(prefix, digit width)`` of the hypothetical probe task.
 
-    A real task file in *folder* gives the exact prefix (stem split on the last
-    ``-``). With none (project init), fall back to the project's own prefix, so
-    a filename allowlist such as ``!.project/tasks/GI-*.md`` still matches.
+    A real task in *folder* gives both exactly (stem split on the last ``-``),
+    so filename allowlists such as ``!.project/tasks/GI-???.md`` judge the probe
+    as they judge real tasks. With none (project init), use the project's own
+    prefix and the allocator's zero-pad width.
     """
     from .tasks import _naive_prefix_placeholder, resolve_existing_prefix
 
     for path in [*folder.glob("*.md"), *folder.glob("*/_task.md")]:
         stem = path.parent.name if path.name == "_task.md" else path.stem
-        if "-" in stem:
-            return stem.rsplit("-", 1)[0]
+        prefix, sep, num = stem.rpartition("-")
+        if sep and prefix and num.isdigit():
+            return prefix, len(num)
     try:
         from .models import ProjectSettings
 
         settings = ProjectSettings.load(project_dir / ".project" / "settings.toml")
-        return resolve_existing_prefix(settings) or _naive_prefix_placeholder(settings.id)
+        prefix = resolve_existing_prefix(settings) or _naive_prefix_placeholder(settings.id)
     except Exception as exc:
         logger.debug("could not derive a task prefix for %s: %r", project_dir, exc)
-        return "TASK"
+        prefix = "TASK"
+    return prefix, _DEFAULT_WIDTH
 
 
 def _probe_path(project_dir: Path, sub: str, folder: Path) -> str:
-    """Relative path of a task-shaped, non-existent file in the layout in use."""
-    name = f"{_task_prefix(project_dir, folder)}-{_PROBE_NUMBER}"
+    """Relative path of a task-shaped file that does NOT exist, in the layout in use.
+
+    ``check-ignore`` never reports existing tracked files, so the number is the
+    highest of the real width that is unused on disk.
+    """
+    prefix, width = _task_shape(project_dir, folder)
+    num = 10**width - 1
+    while num > 0 and (
+        (folder / f"{prefix}-{num:0{width}d}.md").exists()
+        or (folder / f"{prefix}-{num:0{width}d}").exists()
+    ):
+        num -= 1
+    name = f"{prefix}-{num:0{width}d}"
     split_only = (
         folder.is_dir()
         and next(folder.glob("*.md"), None) is None

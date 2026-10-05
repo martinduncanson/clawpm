@@ -234,3 +234,47 @@ def test_filename_allowlist_does_not_false_warn_on_init(tmp_path, monkeypatch, r
     )
     assert result.exit_code == 0, result.output
     assert "gitignore" not in result.stderr.lower()
+
+
+def test_archive_only_project_warns_under_blanket_ignore(tmp_path, monkeypatch, repo):
+    (repo / ".gitignore").write_text(".project/\n", encoding="utf-8")
+    _make_project(repo)
+    tasks = repo / ".project" / "tasks"
+    (tasks / "GI-001.md").unlink()
+    archive = tasks / "done" / "archive"
+    archive.mkdir(parents=True)
+    (archive / "GI-001.md").write_text("---\nid: GI-001\n---\n# a\n", encoding="utf-8")
+    msgs = _doctor_warnings(tmp_path, monkeypatch, tmp_path)
+    assert len(msgs) == 1
+    assert ".gitignore:1" in msgs[0]
+
+
+def test_width_specific_allowlist_does_not_false_warn(tmp_path, monkeypatch, repo):
+    (repo / ".gitignore").write_text(
+        ".project/tasks/*\n!.project/tasks/GI-???.md\n", encoding="utf-8"
+    )
+    _make_project(repo)
+    assert _doctor_warnings(tmp_path, monkeypatch, tmp_path) == []
+
+
+def test_width_specific_allowlist_does_not_false_warn_on_init(tmp_path, monkeypatch, repo):
+    (repo / ".gitignore").write_text(
+        ".project/tasks/*\n!.project/tasks/GI-???.md\n", encoding="utf-8"
+    )
+    _portfolio(tmp_path, monkeypatch, tmp_path)
+    runner = CliRunner(mix_stderr=False) if "mix_stderr" in CliRunner.__init__.__code__.co_varnames else CliRunner()
+    result = runner.invoke(
+        main, ["--format", "json", "project", "init", "--in-repo", str(repo), "--id", "gi"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "gitignore" not in result.stderr.lower()
+
+
+def test_probe_skips_existing_numbers(tmp_path):
+    from clawpm import taskstate_ignore as ti
+
+    proj = tmp_path / "p"
+    _make_project(proj)
+    (proj / ".project" / "tasks" / "GI-999.md").write_text("x", encoding="utf-8")
+    rel = ti._probe_path(proj, "", proj / ".project" / "tasks")
+    assert rel == ".project/tasks/GI-998.md"
