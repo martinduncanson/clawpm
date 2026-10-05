@@ -760,6 +760,10 @@ Auto-initialized by clawpm from git repo.
     # Create learnings.md
     (project_dir / "learnings.md").write_text(f"# Learnings - {project_name}\n\n", encoding="utf-8")
 
+    # CLAWP-134: warn (stderr) when git would ignore the new task state.
+    from .taskstate_ignore import warn_if_task_state_ignored
+    warn_if_task_state_ignored(repo_path)
+
     # Load and return the project
     return ProjectSettings.load(project_dir / "settings.toml")
 
