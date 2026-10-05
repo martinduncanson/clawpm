@@ -113,6 +113,13 @@ labels = []
     except OSError as exc:
         announce_msg = f"; announce skipped ({exc})"
 
+    # CLAWP-134: warn (stderr, so JSON stdout stays parseable) when git would
+    # ignore the new project's task files.
+    from clawpm.taskstate_ignore import ignored_task_state_warning
+    _ignore_warning = ignored_task_state_warning(repo, require_tasks=False)
+    if _ignore_warning:
+        click.echo(f"[WARNING] {_ignore_warning}", err=True)
+
     output_success(f"Project initialized at {project_dir}{announce_msg}", fmt=fmt)
 
 
@@ -381,6 +388,20 @@ def _project_doctor_impl(
                 "project": proj.id,
                 "message": f"repo_path does not exist: {proj.repo_path}",
             })
+
+        # --- CLAWP-134: git-ignored task state ---
+        # A blanket `.project/` ignore keeps every task file off git forever.
+        # Skipped when settings.toml sets `unversioned_ok = true`.
+        if not proj.unversioned_ok:
+            from clawpm.taskstate_ignore import find_ignored_task_state, format_warning
+            _ignored_by = find_ignored_task_state(proj.project_dir)
+            if _ignored_by:
+                issues.append({
+                    "level": "warning",
+                    "scope": "project",
+                    "project": proj.id,
+                    "message": format_warning(_ignored_by),
+                })
 
         # --- CLAWP-082: dangling wiki-link check ---
         # A [[id]] whose target is not a known task/research/mission id in this

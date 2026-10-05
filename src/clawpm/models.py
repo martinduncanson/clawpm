@@ -193,6 +193,9 @@ class ProjectSettings:
     # from existing tasks (stability) or derived collision-free from the id.
     # Set this to disambiguate two projects whose ids share a short prefix.
     task_prefix: str | None = None
+    # CLAWP-134 — deliberately keeps .project/ task state off git; silences the
+    # doctor / init "task state is git-ignored" warning.
+    unversioned_ok: bool = False
 
     @classmethod
     def load(cls, path: Path) -> ProjectSettings:
@@ -212,6 +215,7 @@ class ProjectSettings:
             repo_path=repo_path,
             labels=data.get("labels", []),
             task_prefix=data.get("task_prefix"),
+            unversioned_ok=data.get("unversioned_ok") is True,
         )
         settings.project_dir = path.parent.parent
         return settings
@@ -227,6 +231,7 @@ class ProjectSettings:
             "labels": self.labels,
             "project_dir": str(self.project_dir) if self.project_dir else None,
             "task_prefix": self.task_prefix,
+            "unversioned_ok": self.unversioned_ok,
         }
 
 

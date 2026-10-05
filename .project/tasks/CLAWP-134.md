@@ -42,9 +42,5 @@ Not in scope: auto-editing `.gitignore` or committing in a user's repo. That's a
 - Full suite passes.
 
 
-## Acceptance Criteria
-
-- [ ] (Add criteria here)
-
 ## Notes
 
