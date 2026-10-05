@@ -12,7 +12,9 @@ import click
 from clawpm.concurrency import LockTimeout, file_lock
 from clawpm.models import PortfolioConfig, Predictions, ProjectStatus, SURPRISE_TAXONOMY, SuccessCriterion, Task, TaskComplexity, TaskState, WorkLogAction
 from clawpm.output import OutputFormat, output_error, output_json, output_success, output_task_detail, output_tasks_list
-from clawpm.discovery import discover_projects, get_project, is_task_store_canonical
+from clawpm.discovery import (
+    discover_projects, get_project, get_scoped_project_settings, is_task_store_canonical,
+)
 from clawpm.tasks import add_subtask, add_task, archive_done_tasks, change_task_state, distinct_tags, edit_task, get_task, list_tasks, split_task
 from clawpm.worklog import add_entry, filter_files_changed, read_entries
 from clawpm.context import expand_task_id
@@ -175,7 +177,10 @@ def _collect_project_tasks(
         # resolution (and its portfolio scan) entirely.
         if not re.fullmatch(r"\d+(?:-\d+)?", ref):
             return None
-        _settings = get_project(config, project_id)
+        # Session-scoped (worktree) settings, NOT the canonical checkout's:
+        # the filter reads tasks from the scoped store, so the ref must resolve
+        # against the same ids (CLAWP-113 r9).
+        _settings = get_scoped_project_settings(config, project_id)
         try:
             return resolve_ref_prefix(_settings, config, ref) if _settings else None
         except ValueError as exc:

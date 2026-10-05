@@ -1545,3 +1545,49 @@ class TestSessionScopedTaskPrefix:
                 "from worktree with foreign id",
             )
         assert not list(wt_tasks.glob("*.md"))
+
+
+class TestRefResolutionUsesSessionScopedStore:
+    """Round 9 (Codex): numeric short refs must resolve against the SAME
+    checkout ``list_tasks`` reads. ``get_project`` is the canonical checkout;
+    inside a registered worktree the task store is the worktree's."""
+
+    def _seed(self, d, ids, extra=""):
+        d.mkdir(parents=True, exist_ok=True)
+        for tid in ids:
+            (d / f"{tid}.md").write_text(f"---\nid: {tid}\n{extra}---\n", encoding="utf-8")
+
+    def test_parent_short_ref_resolves_against_worktree_spelling(
+        self, isolated_portfolio, tmp_path, monkeypatch
+    ):
+        from clawpm.sessions import register_session
+
+        # Canonical: legacy CODE--000..006 plus a normalised CODE-007.
+        self._seed(
+            isolated_portfolio.tasks_dir,
+            [f"CODE--{n:03d}" for n in range(7)] + ["CODE-007"],
+        )
+        # Worktree: its own store spells ordinal 7 the legacy way, with a child.
+        wt = tmp_path / "wt"
+        wt_tasks = wt / ".project" / "tasks"
+        for sub in ("progress", "done", "blocked"):
+            (wt_tasks / sub).mkdir(parents=True)
+        (wt / ".project" / "settings.toml").write_text(
+            'id = "test"\nname = "Test"\nstatus = "active"\npriority = 3\n',
+            encoding="utf-8",
+        )
+        self._seed(wt_tasks, ["CODE--007"])
+        self._seed(wt_tasks, ["CODE--007-001"], extra="parent: CODE--007\n")
+
+        register_session(
+            isolated_portfolio.root, "sess-1", "SEED",
+            isolated_portfolio.project_id, wt,
+        )
+        monkeypatch.chdir(wt)
+
+        res = CliRunner().invoke(
+            main, ["--format", "json", "tasks", "list", "-p", "test", "--parent", "7"]
+        )
+        assert res.exit_code == 0, res.output
+        ids = [t["id"] for t in json.loads(res.output)]
+        assert ids == ["CODE--007-001"], res.output
