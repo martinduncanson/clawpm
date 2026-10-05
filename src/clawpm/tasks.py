@@ -1369,8 +1369,95 @@ def _desubtask_prefix(prefix: str) -> str:
         prefix = prefix[: m.start()] + m.group(1)
 
 
-def _infer_prefix_from_tasks(tasks_dir: Path) -> str | None:
+def _parse_root_task_name(name: str) -> tuple[str, str] | None:
+    """Parse a top-level task file stem / directory name into
+    ``(raw_prefix, normalised_prefix)``, or None when it is not a root id.
+
+    The parse-direction half of the shared id rule (see `_task_id_regex`).
+    ``raw_prefix`` keeps a legacy doubled-separator mint's trailing hyphen
+    (``CODE--000`` -> ``"CODE-"``, CLAWP-113: no real mint ever ends a
+    prefix in a hyphen, so that shape is unambiguously legacy);
+    ``normalised_prefix`` strips it. A subtask-shaped result (a prefix that
+    itself ends in ``-<digits>``) is a stray subtask, not evidence of a
+    top-level prefix (CLAWP-048), and returns None -- checked AFTER
+    normalising so a legacy-spelled subtask (``CODE--001--002`` parses as
+    ``"CODE--001-"``) is still caught. Known pre-existing gap: the regex
+    needs a LEADING LETTER, so a prefix derived from a digit-leading id is
+    never re-inferred from its own files.
+    """
+    m = _PREFIX_NUM_RE.match(name)
+    if not m:
+        return None
+    raw = m.group(1)
+    clean = _strip_trailing_non_alnum(raw)
+    if not clean or _is_subtask_shaped(clean):
+        return None
+    return raw, clean
+
+
+def _task_id_regex(
+    prefix: str, *, subtasks: bool = False, progress: bool = True, strict: bool = False
+) -> re.Pattern[str]:
+    """THE separator / id-shape rule (CLAWP-113, Codex round 7): the one place
+    that decides what ``{prefix}{sep}{NNN}`` looks like on disk, shared by the
+    ``add_task`` scan, emit-tree's ``_predict_parent_id``, the namespace check
+    and the short-ref resolver.
+
+    Group 1 is the root ordinal. A NORMALISED prefix (``CODE``) accepts one or
+    two hyphens before the ordinal, because a legacy doubled-separator mint
+    (``CODE--006``, pre-CLAWP-096) must still count toward the next number. A
+    kept-legacy prefix already ends in ``-`` (``CODE-``) and takes exactly one
+    more. ``strict=True`` forces a single hyphen (the normalised spelling
+    ALONE, used to tell ``CODE-007`` from ``CODE--007``). ``subtasks=True``
+    also accepts any ``-{1,2}NNN`` nesting after the root (root ids only
+    otherwise); ``progress`` allows the in-progress ``.progress`` stem suffix.
+    Case-sensitive on the prefix, like the file names it matches.
+    """
+    sep = "-" if strict or prefix.endswith("-") else "-{1,2}"
+    tail = r"(?:-{1,2}\d+)*" if subtasks else ""
+    suffix = r"(?:(?i:\.progress))?" if progress else ""
+    return re.compile(rf"^{re.escape(prefix)}{sep}(\d+){tail}{suffix}$")
+
+
+def _root_ordinals(tasks_dir: Path, prefix: str, *, strict: bool = False) -> list[int]:
+    """Every root-task ordinal minted under ``prefix`` in ``tasks_dir``'s five
+    scan locations (open, done, blocked, done/archive, rejected), as parsed by
+    :func:`_task_id_regex`. Both ``.md`` files AND parent-task directories
+    count (a split task becomes a directory). Subtask files live inside
+    parent dirs and the anchored pattern excludes them anyway.
+
+    CLAWP-085/127: done/archive/rejected are scanned so an archived or
+    rejected id is never silently re-minted.
+    """
+    file_pat = _task_id_regex(prefix, strict=strict)
+    dir_pat = _task_id_regex(prefix, progress=False, strict=strict)
+    nums: list[int] = []
+    for scan_dir in (
+        tasks_dir,
+        tasks_dir / "done",
+        tasks_dir / "blocked",
+        tasks_dir / "done" / "archive",
+        tasks_dir / "rejected",
+    ):
+        if not scan_dir.exists():
+            continue
+        for entry in scan_dir.iterdir():
+            if entry.is_dir():
+                m = dir_pat.match(entry.name)
+            elif entry.suffix.lower() == ".md":
+                m = file_pat.match(entry.stem)
+            else:
+                continue
+            if m:
+                nums.append(int(m.group(1)))
+    return nums
+
+
+def _infer_prefix_from_tasks(tasks_dir: Path, *, keep_legacy: bool = False) -> str | None:
     """Most common task-ID prefix among existing task files/dirs, or None.
+
+    ``keep_legacy=True`` (CLAWP-113) votes on the RAW on-disk spelling (a
+    legacy ``CODE--000`` stays ``"CODE-"``) instead of the normalised one.
 
     Anchored + non-greedy so a hyphenated prefix (``ARB-P``) is recovered intact
     from ``ARB-P-000`` (cf. CLAWP-047). Subtask files live inside parent dirs,
@@ -1397,23 +1484,12 @@ def _infer_prefix_from_tasks(tasks_dir: Path) -> str | None:
             continue
         for entry in scan_dir.iterdir():
             name = entry.stem if entry.is_file() else entry.name
-            m = _PREFIX_NUM_RE.match(name)
-            if m:
-                pfx = m.group(1)
-                # Skip subtask-shaped names: a real prefix never ends in
-                # -<digits> (that's a parent task id, so this file is a stray
-                # subtask, not a top-level task). Mirrors the allocator's
-                # anchored exclusion of {prefix}-NNN-MMM files. CLAWP-132:
-                # this is the SAME shape `_naive_prefix_candidates` now
-                # normalises away before handing out, so an allocator-minted
-                # prefix cannot itself land here and be wrongly excluded.
-                # Known pre-existing gap (NOT fixed here): `_PREFIX_NUM_RE`
-                # needs a LEADING LETTER, so a prefix derived from a
-                # digit-leading id (``2-b`` -> ``2``, ``2024``) is never
-                # re-inferred from its own files at all.
-                if _is_subtask_shaped(pfx):
-                    continue
-                counts[pfx] += 1
+            # CLAWP-113: the shared root-id parse (subtask-shaped and legacy
+            # spellings handled in one place): (raw, normalised) or None.
+            parsed = _parse_root_task_name(name)
+            if parsed:
+                raw_pfx, pfx = parsed
+                counts[raw_pfx if keep_legacy else pfx] += 1
     if not counts:
         return None
     # Most common; deterministic tie-break by longer prefix then lexical.
@@ -1436,6 +1512,140 @@ def resolve_existing_prefix(settings) -> str | None:
         if inferred:
             return inferred
     return None
+
+
+def _legacy_alt_from_dir(tasks_dir: Path, clean: str | None) -> str | None:
+    """The legacy doubled-separator spelling (``"CODE-"``) a project's own
+    files vote for when it differs from the normalised ``clean`` claim
+    (CLAWP-113), else None."""
+    if clean is None:
+        return None
+    raw = _infer_prefix_from_tasks(tasks_dir, keep_legacy=True)
+    # Any raw winner that differs from the merged winner counts (CLAWP-113
+    # round 4, Codex): merging split votes can flip the plurality to a
+    # DIFFERENT prefix than the pre-merge winner, and a collision must fall
+    # back to that pre-merge claim too.
+    if raw and raw != clean:
+        return raw
+    return None
+
+
+def _legacy_alt_prefix(settings, clean: str | None) -> str | None:
+    """``_legacy_alt_from_dir`` for a project's settings; explicit
+    ``task_prefix`` projects never have one."""
+    if clean is None or getattr(settings, "task_prefix", None):
+        return None
+    if not getattr(settings, "project_dir", None):
+        return None
+    return _legacy_alt_from_dir(settings.project_dir / ".project" / "tasks", clean)
+
+
+def _claim_spellings(clean: str, alt: str | None) -> set[str]:
+    """Every spelling a project may end up minting under: its normalised
+    ``clean`` prefix AND, for a legacy project, its raw ``alt``. A sibling
+    claims BOTH (CLAWP-113 round 7, Codex): two legacy projects with distinct
+    raw winners (``CODE-``, ``OTHER``) can share one NORMALISED winner
+    (``CODE``), and each must see the other's normalised candidate as taken
+    or both migrate onto it and mint the same id."""
+    return {clean} | ({alt} if alt else set())
+
+
+def _decide_inferred_prefix(clean: str, alt: str | None, sibling_claims: set[str]) -> str:
+    """THE normalise-or-keep decision (CLAWP-113) -- the only place it is
+    made; allocation (`assign_task_prefix`, `assign_all_prefixes`) and doctor
+    all route through it. A legacy project (``alt`` set) takes the
+    normalised ``clean`` prefix only when no sibling can end up on it;
+    otherwise it KEEPS the legacy spelling and keeps minting ``CODE--NNN``,
+    so it can never mint an id a sibling already owns. ``sibling_claims``
+    is the union of each sibling's :func:`_claim_spellings` -- never
+    recursive."""
+    if alt is not None and clean in sibling_claims:
+        return alt
+    return clean
+
+
+def _other_projects_claims(config, exclude_id: str) -> set[str]:
+    """Conservative real claims of every project except ``exclude_id``: both
+    the raw and the normalised spelling of each (:func:`_claim_spellings`)."""
+    from .discovery import discover_projects
+
+    claims: set[str] = set()
+    for p in discover_projects(config):
+        if p.id == exclude_id:
+            continue
+        try:
+            clean = resolve_existing_prefix(p)
+            alt = _legacy_alt_prefix(p, clean)
+        except OSError as exc:
+            raise PortfolioPrefixScanError(p.id, exc) from exc
+        if clean is not None:
+            claims |= _claim_spellings(clean, alt)
+    return claims
+
+
+def resolve_ref_prefix(settings, config=None, task_ref: str | None = None) -> str | None:
+    """Prefix for expanding a short ref (``--parent 7``) to an EXISTING id.
+
+    Without ``task_ref``: the RAW on-disk spelling, so a legacy
+    ``CODE--000`` still expands to ``CODE--000`` (CLAWP-113 round 4,
+    Codex).
+
+    With a numeric ``task_ref`` (``7`` or ``7-001``; CLAWP-113 round 7,
+    Codex): resolve against the ids ACTUALLY on disk across BOTH spellings.
+    A project-wide prefix cannot be right once a legacy project has also
+    minted normalised ids (``CODE--000..006`` then ``CODE-007``), but ordinals
+    are shared across spellings, so the on-disk match for one ordinal is
+    unique. Both spellings holding the same ordinal raises ``ValueError``
+    (ambiguous). No match falls back to the prefix a new mint would use
+    (``config`` given) or the raw winner.
+    """
+    clean = resolve_existing_prefix(settings)
+
+    def fallback() -> str | None:
+        # Lazy: the portfolio scan reads SIBLING stores, so an unreadable
+        # sibling must not break a ref that resolves from local ids alone.
+        if config is not None:
+            return resolve_portfolio_prefix(settings, config)
+        return _legacy_alt_prefix(settings, clean) or clean
+
+    if clean is None or task_ref is None or getattr(settings, "task_prefix", None):
+        return fallback()
+    m = re.fullmatch(r"(\d+)(?:-\d+)?", task_ref)
+    if not m or not getattr(settings, "project_dir", None):
+        return fallback()
+    tasks_dir = settings.project_dir / ".project" / "tasks"
+    ordinal = int(m.group(1))
+    spellings = []
+    if ordinal in _root_ordinals(tasks_dir, clean, strict=True):
+        spellings.append(clean)
+    if not clean.endswith("-") and ordinal in _root_ordinals(tasks_dir, clean + "-"):
+        spellings.append(clean + "-")
+    if len(spellings) > 1:
+        raise ValueError(
+            f"Task reference '{task_ref}' is ambiguous: both '{clean}-{ordinal:03d}' "
+            f"and '{clean}--{ordinal:03d}' exist. Use the full task id."
+        )
+    return spellings[0] if spellings else fallback()
+
+
+def resolve_portfolio_prefix(settings, config) -> str | None:
+    """``resolve_existing_prefix`` plus the CLAWP-113 normalise-or-keep
+    decision for a legacy doubled-separator project (needs the portfolio)."""
+    clean = resolve_existing_prefix(settings)
+    alt = _legacy_alt_prefix(settings, clean)
+    if clean is None or alt is None:
+        return clean
+    return _decide_inferred_prefix(clean, alt, _other_projects_claims(config, settings.id))
+
+
+def _resolve_own_inferred_prefix(project_id: str, tasks_dir: Path, config) -> str | None:
+    """Own-project inferred prefix from ``tasks_dir`` with the CLAWP-113
+    normalise-or-keep decision against the portfolio."""
+    clean = _infer_prefix_from_tasks(tasks_dir)
+    alt = _legacy_alt_from_dir(tasks_dir, clean)
+    if clean is None or alt is None:
+        return clean
+    return _decide_inferred_prefix(clean, alt, _other_projects_claims(config, project_id))
 
 
 def _strip_trailing_non_alnum(prefix: str) -> str:
@@ -1769,6 +1979,7 @@ def assign_all_prefixes(
     from .discovery import discover_projects
 
     resolved: dict[str, str] = {}
+    legacy: dict[str, tuple[str, str]] = {}  # CLAWP-113: pid -> (clean, alt)
     taskless_ids: set[str] = set()
     if extra_taskless_id is not None:
         taskless_ids.add(extra_taskless_id)
@@ -1777,12 +1988,31 @@ def assign_all_prefixes(
             continue
         try:
             prefix = resolve_existing_prefix(p)
+            alt = _legacy_alt_prefix(p, prefix)
         except OSError as exc:
             raise PortfolioPrefixScanError(p.id, exc) from exc
         if prefix is not None:
             resolved[p.id] = prefix
+            if alt is not None:
+                legacy[p.id] = (prefix, alt)
         else:
             taskless_ids.add(p.id)
+    # CLAWP-113: a legacy project normalises only if no sibling claims the
+    # clean spelling; otherwise it keeps its legacy claim. Decided once from
+    # the already-collected claims (no per-sibling rescans, no recursion).
+    if legacy:
+        spellings = {
+            pid: _claim_spellings(pfx, legacy[pid][1] if pid in legacy else None)
+            for pid, pfx in resolved.items()
+        }
+        decided = {}
+        for pid, (clean, alt) in legacy.items():
+            siblings: set[str] = set()
+            for other, other_claims in spellings.items():
+                if other != pid:
+                    siblings |= other_claims
+            decided[pid] = _decide_inferred_prefix(clean, alt, siblings)
+        resolved.update(decided)
 
     used = set(resolved.values())
     taskless_assignments, errors = _assign_taskless_prefixes(taskless_ids, used)
@@ -1895,12 +2125,11 @@ def _id_is_within_prefix_namespace(task_id: str, prefix: str) -> bool:
     upper_prefix = prefix.upper()
     if upper_id == upper_prefix:
         return True
-    if not upper_id.startswith(upper_prefix + "-"):
-        return False
-    remainder = upper_id[len(upper_prefix) + 1:]
-    remainder = re.sub(r"\.PROGRESS$", "", remainder)
-    return bool(remainder) and all(seg.isdigit() for seg in remainder.split("-"))
-
+    # CLAWP-113: the shared separator rule (`_task_id_regex`) tolerates a
+    # legacy doubled separator (``CODE--000``, ``CODE--001--002``) so a
+    # normalised claim still owns its legacy-spelled ids, and a kept-legacy
+    # ``CODE-`` claim owns exactly ``CODE--NNN``.
+    return bool(_task_id_regex(upper_prefix, subtasks=True).match(upper_id))
 
 def check_explicit_id_prefix_collision(
     task_id: str,
@@ -1982,7 +2211,9 @@ def check_explicit_id_prefix_collision(
             protect.
     """
     own_prefix = (
-        explicit_prefix.upper() if explicit_prefix else _infer_prefix_from_tasks(tasks_dir)
+        explicit_prefix.upper()
+        if explicit_prefix
+        else _resolve_own_inferred_prefix(project_id, tasks_dir, config)
     )
 
     best_len = -1
@@ -2059,7 +2290,7 @@ def assign_task_prefix(
     """
     if explicit_prefix:
         return explicit_prefix.upper()
-    inferred = _infer_prefix_from_tasks(tasks_dir)
+    inferred = _resolve_own_inferred_prefix(project_id, tasks_dir, config)
     if inferred:
         return inferred
     assignments, errors = assign_all_prefixes(config, extra_taskless_id=project_id)
@@ -2199,40 +2430,10 @@ def add_task(
             # regex instead (the in-progress `.progress` suffix is part of the
             # stem) — the same shape the directory scan below already uses, so the
             # two scans can't disagree.
-            _dir_pat = re.compile(rf"^{re.escape(prefix)}-(\d+)$")
-            _file_pat = re.compile(rf"^{re.escape(prefix)}-(\d+)(?:\.progress)?$")
-
-            existing_nums = []
-
-            # CLAWP-085: include done/archive so an archived task's number is
-            # never re-minted. add_task is not a hot path, so paying the extra
-            # archive scan here (unlike list/next/reflect) is the correct
-            # trade — a silently reused ID would clobber archived history.
-            # CLAWP-127: rejected/ carries the same risk (CLAWP-053's won't-do
-            # ledger) and was missing from this list — a rejected task's id
-            # could be silently re-minted for a brand-new task.
-            for scan_dir in [
-                tasks_dir,
-                tasks_dir / "done",
-                tasks_dir / "blocked",
-                tasks_dir / "done" / "archive",
-                tasks_dir / "rejected",
-            ]:
-                if not scan_dir.exists():
-                    continue
-                # .md files at this level. Subtask files ({prefix}-000-001.md) live
-                # inside parent dirs, not here, and the anchored pattern excludes
-                # them regardless, so they never pollute top-level numbering.
-                for f in scan_dir.glob(f"{prefix}-*.md"):
-                    m = _file_pat.match(f.stem)
-                    if m:
-                        existing_nums.append(int(m.group(1)))
-                # Parent-task directories at this level
-                for entry in scan_dir.iterdir():
-                    if entry.is_dir():
-                        m = _dir_pat.match(entry.name)
-                        if m:
-                            existing_nums.append(int(m.group(1)))
+            # CLAWP-113: the separator rule (a legacy ``CODE--006`` still counts
+            # toward the next ordinal) lives in `_task_id_regex`, shared with
+            # emit-tree's predictor so the two scans cannot disagree.
+            existing_nums = _root_ordinals(tasks_dir, prefix)
 
             next_num = max(existing_nums, default=-1) + 1
             task_id = f"{prefix}-{next_num:03d}"

@@ -817,14 +817,14 @@ def _project_doctor_impl(
     # `assign_task_prefix` is a pure function of the project id and the other
     # projects' prefixes, so iteration order does not affect the result.
     from clawpm.tasks import assign_task_prefix as _assign_prefix
-    from clawpm.tasks import resolve_existing_prefix as _resolve_prefix
+    from clawpm.tasks import resolve_portfolio_prefix as _resolve_prefix
     from clawpm.tasks import PortfolioPrefixScanError as _PrefixScanError
 
     prefix_map: dict[str, list[str]] = {}
     all_projects = discover_projects(config)
     for proj in all_projects:
         try:
-            prefix = _resolve_prefix(proj)
+            prefix = _resolve_prefix(proj, config)
             if prefix is None:
                 prefix = _assign_prefix(
                     proj.id,

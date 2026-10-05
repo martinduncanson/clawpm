@@ -12,7 +12,9 @@ import click
 from clawpm.concurrency import LockTimeout, file_lock
 from clawpm.models import PortfolioConfig, Predictions, ProjectStatus, SURPRISE_TAXONOMY, SuccessCriterion, Task, TaskComplexity, TaskState, WorkLogAction
 from clawpm.output import OutputFormat, output_error, output_json, output_success, output_task_detail, output_tasks_list
-from clawpm.discovery import discover_projects, get_project, is_task_store_canonical
+from clawpm.discovery import (
+    discover_projects, get_project, get_scoped_project_settings, is_task_store_canonical,
+)
 from clawpm.tasks import add_subtask, add_task, archive_done_tasks, change_task_state, distinct_tags, edit_task, get_task, list_tasks, split_task
 from clawpm.worklog import add_entry, filter_files_changed, read_entries
 from clawpm.context import expand_task_id
@@ -163,20 +165,36 @@ def _collect_project_tasks(
     # (Codex P2: --all-projects over a project with task_prefix="SAME" stored
     # children under SAME-001 but expanded --parent 1 to ALPHA-001 -> no match).
     # Also corrects the single-project path for divergent-prefix projects.
-    resolved_prefix = None
-    if parent or linked:
-        from clawpm.tasks import resolve_existing_prefix
-        _settings = get_project(config, project_id)
-        resolved_prefix = resolve_existing_prefix(_settings) if _settings else None
+    #
+    # CLAWP-113: resolved PER REF against the ids on disk, because a legacy
+    # project can hold both `CODE--003` and `CODE-007` (ValueError if one
+    # ordinal exists in both spellings).
+    def _ref_prefix(ref: str) -> str | None:
+        import re
+
+        from clawpm.tasks import resolve_ref_prefix
+        # A full id (CODE-003, CODE--003) never needs a prefix; skip the
+        # resolution (and its portfolio scan) entirely.
+        if not re.fullmatch(r"\d+(?:-\d+)?", ref):
+            return None
+        # Session-scoped (worktree) settings, NOT the canonical checkout's:
+        # the filter reads tasks from the scoped store, so the ref must resolve
+        # against the same ids (CLAWP-113 r9).
+        _settings = get_scoped_project_settings(config, project_id)
+        try:
+            return resolve_ref_prefix(_settings, config, ref) if _settings else None
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
+
     if parent:
-        filter_list.append(by_parent(expand_task_id(parent, project_id, resolved_prefix)))
+        filter_list.append(by_parent(expand_task_id(parent, project_id, _ref_prefix(parent))))
     if linked:
         from clawpm.links import build_link_index
         index = build_link_index(config, project_id)
         # Resolve both the expanded (task-style) id and the raw ref so --linked
         # works for research/mission ids that expand_task_id would leave alone.
         refs: set[str] = set()
-        for target in {expand_task_id(linked, project_id, resolved_prefix), linked}:
+        for target in {expand_task_id(linked, project_id, _ref_prefix(linked)), linked}:
             refs |= index.referencing_ids(target)
         filter_list.append(by_linked(refs))
 

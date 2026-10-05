@@ -747,9 +747,8 @@ def _predict_parent_id(
         return doc.root.attach_to
 
     # New root — predict the next ID add_task would generate
-    from .tasks import get_tasks_dir, assign_task_prefix
+    from .tasks import get_tasks_dir, assign_task_prefix, _root_ordinals
     from .discovery import get_scoped_project_settings
-    import re
 
     tasks_dir = get_tasks_dir(config, project_id)
     if not tasks_dir:
@@ -768,35 +767,10 @@ def _predict_parent_id(
         explicit_prefix=getattr(_settings, "task_prefix", None) if _settings else None,
     )
 
-    _dir_pat = re.compile(rf"^{re.escape(prefix)}-(\d+)$")
-    _file_pat = re.compile(rf"^{re.escape(prefix)}-(\d+)(?:\.progress)?$")
-    existing_nums = []
-
-    # CLAWP-085: include done/archive so this prediction stays in lockstep with
-    # add_task's (archive-aware) allocator — otherwise emit-tree could re-mint an
-    # archived root id and clobber archived history.
-    # CLAWP-127 (grok-4.6, PR #62): rejected/ too, for the same lockstep reason —
-    # add_task's scan already covers it; this predictor must match or a rejected
-    # root id can be silently re-minted via emit-tree even though direct add_task
-    # would refuse to reuse it.
-    for scan_dir in [
-        tasks_dir,
-        tasks_dir / "done",
-        tasks_dir / "blocked",
-        tasks_dir / "done" / "archive",
-        tasks_dir / "rejected",
-    ]:
-        if not scan_dir.exists():
-            continue
-        for f in scan_dir.glob(f"{prefix}-*.md"):
-            m = _file_pat.match(f.stem)
-            if m:
-                existing_nums.append(int(m.group(1)))
-        for entry in scan_dir.iterdir():
-            if entry.is_dir():
-                m = _dir_pat.match(entry.name)
-                if m:
-                    existing_nums.append(int(m.group(1)))
+    # CLAWP-113: one shared scan + separator rule with add_task, so the
+    # prediction cannot drift from what add_task mints (CLAWP-085/127: the
+    # archive and rejected dirs are included there).
+    existing_nums = _root_ordinals(tasks_dir, prefix)
 
     next_num = max(existing_nums, default=-1) + 1
     return f"{prefix}-{next_num:03d}"

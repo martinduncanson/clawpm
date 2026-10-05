@@ -130,6 +130,457 @@ class TestHyphenOnSliceBoundary:
         assert len({first, second}) == 2, (first, second)  # no literal id collision
 
 
+class TestLegacyDoubledSeparatorNormalization:
+    """CLAWP-113: CLAWP-096 stopped `assign_task_prefix` MINTING a doubled
+    separator, but did nothing for a project that already reproduced the
+    papercut on disk. ``_infer_prefix_from_tasks`` is anchored + non-greedy,
+    so it reads an existing ``CODE--000`` as prefix ``CODE-`` (trailing
+    hyphen) and ``assign_task_prefix`` returns that inferred value early,
+    before any normalization -- so such a project keeps minting
+    ``CODE--001``, ``CODE--002`` forever. The fix must recognise the legacy
+    spelling, mint the normalized form going forward, and derive the next
+    ordinal across BOTH spellings already on disk."""
+
+    def test_legacy_doubled_separator_mints_normalized_form(self, tmp_path, monkeypatch):
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        # Pre-existing on-disk tasks already reproduced the doubled-separator
+        # papercut (as if minted before CLAWP-096 shipped).
+        (tasks_dir / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE--001.md").write_text("---\nid: CODE--001\n---\n", encoding="utf-8")
+        next_id = _add("code-quorum", "next task")
+        assert next_id == "CODE-002", next_id
+        assert "--" not in next_id
+
+    def test_legacy_doubled_separator_numbering_continues_across_spellings(
+        self, tmp_path, monkeypatch
+    ):
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        for n in range(6):
+            (tasks_dir / f"CODE--{n:03d}.md").write_text(
+                f"---\nid: CODE--{n:03d}\n---\n", encoding="utf-8"
+            )
+        # The next mint must continue from 006, not restart at 001 and not
+        # collide with any of the six legacy-spelled ids already on disk.
+        assert _add("code-quorum", "next") == "CODE-006"
+
+    def test_mixed_spellings_merge_and_continue(self, tmp_path, monkeypatch):
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        # Legacy files outnumber normalized ones; the votes must merge, and
+        # the highest number across both spellings (and across dir-form,
+        # .progress, done/) drives the next mint.
+        (tasks_dir / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE--001.md").write_text("---\nid: CODE--001\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE-002.md").write_text("---\nid: CODE-002\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE--003.progress.md").write_text("---\nid: CODE--003\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE--004").mkdir()
+        (tasks_dir / "done" / "CODE--007.md").write_text("---\nid: CODE--007\n---\n", encoding="utf-8")
+        assert _add("code-quorum", "next") == "CODE-008"
+
+    def test_infer_prefix_merges_split_votes_directly(self, tmp_path):
+        from clawpm.tasks import _infer_prefix_from_tasks
+
+        # 2x legacy + 1x normalized CODE (3 merged votes) beats 2x OTHER.
+        for name in ("CODE--000", "CODE--001", "CODE-002", "OTHER-000", "OTHER-001"):
+            (tmp_path / f"{name}.md").write_text(f"---\nid: {name}\n---\n", encoding="utf-8")
+        assert _infer_prefix_from_tasks(tmp_path) == "CODE"
+
+    def test_infer_prefix_legacy_only_returns_normalized(self, tmp_path):
+        from clawpm.tasks import _infer_prefix_from_tasks
+
+        (tmp_path / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        assert _infer_prefix_from_tasks(tmp_path) == "CODE"
+
+    def test_infer_prefix_ignores_legacy_doubled_separator_subtasks(self, tmp_path):
+        from clawpm.tasks import _infer_prefix_from_tasks
+
+        # A legacy-spelled subtask (CODE--001--002 parses as prefix "CODE--001-")
+        # must be excluded like CODE-001-002, not stripped to "CODE--001" and
+        # counted as a top-level prefix vote. 2x OTHER must beat 1x CODE here.
+        for name in ("CODE--001--002", "CODE--001--003", "OTHER-000", "OTHER-001", "CODE-005"):
+            (tmp_path / f"{name}.md").write_text(f"---\nid: {name}\n---\n", encoding="utf-8")
+        assert _infer_prefix_from_tasks(tmp_path) == "OTHER"
+
+    @pytest.mark.parametrize(
+        "subdir", ["done", "done/archive", "blocked", "rejected"]
+    )
+    def test_legacy_ids_in_every_scan_location_count(self, tmp_path, monkeypatch, subdir):
+        from clawpm.tasks import _infer_prefix_from_tasks
+
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        loc = tasks_dir / subdir
+        loc.mkdir(parents=True, exist_ok=True)
+        (loc / "CODE--009.md").write_text("---\nid: CODE--009\n---\n", encoding="utf-8")
+        # Re-minting an archived/done/blocked/rejected id would clobber history.
+        assert _infer_prefix_from_tasks(tasks_dir) == "CODE"
+        assert _add("code-quorum", "next") == "CODE-010"
+
+    def test_hyphenated_legacy_prefix_keeps_inner_hyphen(self, tmp_path, monkeypatch):
+        from clawpm.tasks import _infer_prefix_from_tasks
+
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "arb-pipeline")
+        (tasks_dir / "ARB-P--000.md").write_text("---\nid: ARB-P--000\n---\n", encoding="utf-8")
+        assert _infer_prefix_from_tasks(tasks_dir) == "ARB-P"
+        assert _add("arb-pipeline", "next") == "ARB-P-001"
+
+    def test_subtask_shaped_name_excluded_from_ordinal_scan(self, tmp_path, monkeypatch):
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        (tasks_dir / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE-000-001.md").write_text("---\nid: CODE-000-001\n---\n", encoding="utf-8")
+        # The subtask must not be read as top-level ordinal 001 -> next is 001.
+        assert _add("code-quorum", "next") == "CODE-001"
+
+    def test_triple_hyphen_name_not_matched_by_ordinal_scan(self, tmp_path, monkeypatch):
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        (tasks_dir / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        # Locks in current behaviour: only a SINGLE legacy doubled separator
+        # (CLAWP-096's papercut) is recognised. ``CODE---050`` is not a shape
+        # any mint produced, so the -{1,2} scan must not count it.
+        (tasks_dir / "CODE---050.md").write_text("---\nid: CODE---050\n---\n", encoding="utf-8")
+        assert _add("code-quorum", "next") == "CODE-001"
+
+    def test_resolve_existing_prefix_legacy_only(self, tmp_path):
+        from types import SimpleNamespace
+
+        from clawpm.tasks import resolve_existing_prefix
+
+        tasks_dir = tmp_path / ".project" / "tasks"
+        tasks_dir.mkdir(parents=True)
+        (tasks_dir / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        settings = SimpleNamespace(task_prefix=None, project_dir=tmp_path)
+        assert resolve_existing_prefix(settings) == "CODE"
+
+    def test_neighbouring_prefix_is_not_counted(self, tmp_path, monkeypatch):
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        (tasks_dir / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE--001.md").write_text("---\nid: CODE--001\n---\n", encoding="utf-8")
+        # A different prefix that merely starts with CODE- must not bump the ordinal.
+        (tasks_dir / "CODE-X-005.md").write_text("---\nid: CODE-X-005\n---\n", encoding="utf-8")
+        assert _add("code-quorum", "next") == "CODE-002"
+
+    def test_emit_tree_prediction_matches_add_task_for_legacy_project(
+        self, tmp_path, monkeypatch
+    ):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.emit_tree import _predict_parent_id
+
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        for n in range(6):
+            (tasks_dir / f"CODE--{n:03d}.md").write_text(
+                f"---\nid: CODE--{n:03d}\n---\n", encoding="utf-8"
+            )
+        config = load_portfolio_config()
+        doc = type("Doc", (), {"root": type("Root", (), {"attach_to": None})()})()
+        assert _predict_parent_id(doc, config, "code-quorum") == "CODE-006"
+
+
+class TestLegacyNormalizationSiblingCollision:
+    """CLAWP-113 review round 4 (operator decision 2026-10-04). A legacy
+    ``CODE--000`` project used to claim ``CODE-`` while a sibling holding
+    ``CODE-001`` claimed ``CODE``: distinct. Naive normalisation merged them
+    and the legacy project minted a duplicate ``CODE-001``. Rule: normalise
+    only when no sibling claims the clean prefix; otherwise KEEP the legacy
+    spelling (``CODE--NNN``) exactly as before CLAWP-113."""
+
+    @staticmethod
+    def _seed(tasks_dir, *names):
+        for name in names:
+            (tasks_dir / f"{name}.md").write_text(f"---\nid: {name}\n---\n", encoding="utf-8")
+
+    def _collide(self, tmp_path, monkeypatch):
+        legacy_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        self._seed(legacy_dir, "CODE--000")
+        _add_project(tmp_path, "code-sibling")
+        sib_dir = tmp_path / "projects" / "code-sibling" / ".project" / "tasks"
+        self._seed(sib_dir, "CODE-001")
+        return legacy_dir, sib_dir
+
+    def test_collision_keeps_legacy_spelling_no_duplicate(self, tmp_path, monkeypatch):
+        legacy_dir, sib_dir = self._collide(tmp_path, monkeypatch)
+        legacy_next = _add("code-quorum", "legacy next")
+        assert legacy_next == "CODE--001", legacy_next
+        sib_next = _add("code-sibling", "sibling next")
+        assert sib_next == "CODE-002", sib_next
+        ids = {p.stem for d in (legacy_dir, sib_dir) for p in d.glob("CODE-*.md")}
+        assert len(ids) == 4  # CODE--000, CODE--001, CODE-001, CODE-002
+
+    def test_collision_with_explicit_sibling_prefix_keeps_legacy(self, tmp_path, monkeypatch):
+        legacy_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        self._seed(legacy_dir, "CODE--000")
+        _add_project(tmp_path, "other", task_prefix="CODE")
+        assert _add("code-quorum", "next") == "CODE--001"
+
+    def test_assign_all_prefixes_distinct_on_collision(self, tmp_path, monkeypatch):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_all_prefixes
+
+        self._collide(tmp_path, monkeypatch)
+        assignments, errors = assign_all_prefixes(load_portfolio_config())
+        assert not errors
+        assert assignments["code-quorum"] == "CODE-"
+        assert assignments["code-sibling"] == "CODE"
+
+    def test_no_collision_still_normalises(self, tmp_path, monkeypatch):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_all_prefixes
+
+        legacy_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        self._seed(legacy_dir, "CODE--000")
+        _add_project(tmp_path, "unrelated")
+        assignments, _ = assign_all_prefixes(load_portfolio_config())
+        assert assignments["code-quorum"] == "CODE"
+        assert _add("code-quorum", "next") == "CODE-001"
+
+    def test_emit_tree_prediction_agrees_when_kept(self, tmp_path, monkeypatch):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.emit_tree import _predict_parent_id
+
+        self._collide(tmp_path, monkeypatch)
+        doc = type("Doc", (), {"root": type("Root", (), {"attach_to": None})()})()
+        predicted = _predict_parent_id(doc, load_portfolio_config(), "code-quorum")
+        assert predicted == "CODE--001"
+        assert _add("code-quorum", "next") == predicted
+
+    def test_emit_tree_prediction_agrees_when_normalised(self, tmp_path, monkeypatch):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.emit_tree import _predict_parent_id
+
+        legacy_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        self._seed(legacy_dir, "CODE--000")
+        _add_project(tmp_path, "unrelated")
+        doc = type("Doc", (), {"root": type("Root", (), {"attach_to": None})()})()
+        predicted = _predict_parent_id(doc, load_portfolio_config(), "code-quorum")
+        assert predicted == "CODE-001"
+        assert _add("code-quorum", "next") == predicted
+
+    def test_other_project_cannot_explicitly_create_legacy_id_normalised(
+        self, tmp_path, monkeypatch
+    ):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import add_task
+
+        legacy_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        self._seed(legacy_dir, "CODE--000")
+        _add_project(tmp_path, "intruder")
+        with pytest.raises(ValueError, match="CODE"):
+            add_task(load_portfolio_config(), "intruder", "squat", task_id="CODE--000")
+
+    def test_other_project_cannot_explicitly_create_legacy_id_when_kept(
+        self, tmp_path, monkeypatch
+    ):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import add_task
+
+        self._collide(tmp_path, monkeypatch)
+        _add_project(tmp_path, "intruder")
+        with pytest.raises(ValueError, match="CODE"):
+            add_task(load_portfolio_config(), "intruder", "squat", task_id="CODE--000")
+
+    def test_kept_legacy_project_cannot_explicitly_take_sibling_namespace(
+        self, tmp_path, monkeypatch
+    ):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import add_task
+
+        self._collide(tmp_path, monkeypatch)
+        with pytest.raises(ValueError, match="code-sibling"):
+            add_task(load_portfolio_config(), "code-quorum", "x", task_id="CODE-005")
+
+    def test_doctor_reports_no_collision_when_kept(self, tmp_path, monkeypatch):
+        self._collide(tmp_path, monkeypatch)
+        res = CliRunner().invoke(main, ["--format", "json", "doctor"])
+        data = json.loads(res.output)
+        assert data["prefix_collisions"] == [], data
+
+
+class TestLegacyNormalizationRound4Codex:
+    """Codex round 4: mixed votes whose merged winner differs from the raw
+    winner must still honour sibling claims; short refs must expand to the
+    on-disk spelling of existing legacy ids."""
+
+    def test_mixed_votes_flip_falls_back_to_raw_winner_on_collision(self, tmp_path, monkeypatch):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_all_prefixes
+
+        d = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        for n in ("CODE--000", "CODE--001", "CODE-002", "CODE-003", "OTHER-001", "OTHER-002", "OTHER-003"):
+            (d / f"{n}.md").write_text(f"---\nid: {n}\n---\n", encoding="utf-8")
+        _add_project(tmp_path, "sib")
+        (tmp_path / "projects" / "sib" / ".project" / "tasks" / "CODE-004.md").write_text(
+            "---\nid: CODE-004\n---\n", encoding="utf-8"
+        )
+        assignments, _ = assign_all_prefixes(load_portfolio_config())
+        assert assignments["code-quorum"] == "OTHER"
+        assert assignments["sib"] == "CODE"
+        assert _add("code-quorum", "next") == "OTHER-004"
+
+    def test_short_ref_expands_to_legacy_on_disk_spelling(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+
+        from clawpm.context import expand_task_id
+        from clawpm.tasks import resolve_ref_prefix
+
+        d = tmp_path / ".project" / "tasks"
+        d.mkdir(parents=True)
+        (d / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        settings = SimpleNamespace(task_prefix=None, project_dir=tmp_path)
+        assert expand_task_id("0", "code-quorum", resolve_ref_prefix(settings)) == "CODE--000"
+
+
+class TestLegacyNormalizationRound7Codex:
+    """Codex round 7: sibling claims must keep BOTH raw and normalised
+    spellings (two migrations can converge), and short refs must resolve
+    against the ids actually on disk across both spellings."""
+
+    @staticmethod
+    def _seed(tasks_dir, *names):
+        for name in names:
+            (tasks_dir / f"{name}.md").write_text(f"---\nid: {name}\n---\n", encoding="utf-8")
+
+    def _converging(self, tmp_path, monkeypatch):
+        a_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        self._seed(a_dir, "CODE--013")
+        _add_project(tmp_path, "other")
+        b_dir = tmp_path / "projects" / "other" / ".project" / "tasks"
+        names = (
+            [f"OTHER-{n:03d}" for n in range(0, 5)]
+            + [f"CODE--{n:03d}" for n in range(7, 10)]
+            + [f"CODE-{n:03d}" for n in range(10, 14)]
+        )
+        self._seed(b_dir, *names)
+
+    def test_two_migrations_do_not_converge_on_one_namespace(self, tmp_path, monkeypatch):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_all_prefixes
+
+        self._converging(tmp_path, monkeypatch)
+        assignments, _ = assign_all_prefixes(load_portfolio_config())
+        assert assignments["code-quorum"] != assignments["other"], assignments
+        id_a = _add("code-quorum", "a")
+        id_b = _add("other", "b")
+        assert id_a != id_b
+        assert id_a == "CODE--014"
+
+    def test_doctor_agrees_with_allocation_on_converging_migrations(self, tmp_path, monkeypatch):
+        self._converging(tmp_path, monkeypatch)
+        res = CliRunner().invoke(main, ["--format", "json", "doctor"])
+        data = json.loads(res.output)
+        assert data["prefix_collisions"] == [], data
+
+    def _legacy_then_normalised(self, tmp_path, monkeypatch):
+        d = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        self._seed(d, *[f"CODE--{n:03d}" for n in range(7)])
+        assert _add("code-quorum", "new") == "CODE-007"
+        return d
+
+    def test_short_ref_resolves_across_both_spellings(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+
+        from clawpm.context import expand_task_id
+        from clawpm.tasks import resolve_ref_prefix
+
+        self._legacy_then_normalised(tmp_path, monkeypatch)
+        settings = SimpleNamespace(
+            task_prefix=None, project_dir=tmp_path / "projects" / "code-quorum"
+        )
+
+        def expand(ref):
+            return expand_task_id(ref, "code-quorum", resolve_ref_prefix(settings, task_ref=ref))
+
+        assert expand("7") == "CODE-007"
+        assert expand("3") == "CODE--003"
+        assert expand("3-001") == "CODE--003-001"
+
+    def test_short_ref_ambiguous_across_spellings_raises(self, tmp_path):
+        from types import SimpleNamespace
+
+        from clawpm.tasks import resolve_ref_prefix
+
+        d = tmp_path / ".project" / "tasks"
+        d.mkdir(parents=True)
+        self._seed(d, "CODE--005", "CODE-005", "CODE-006")
+        settings = SimpleNamespace(task_prefix=None, project_dir=tmp_path)
+        with pytest.raises(ValueError, match="ambiguous"):
+            resolve_ref_prefix(settings, task_ref="5")
+
+    def test_short_ref_without_match_falls_back(self, tmp_path):
+        from types import SimpleNamespace
+
+        from clawpm.tasks import resolve_ref_prefix
+
+        d = tmp_path / ".project" / "tasks"
+        d.mkdir(parents=True)
+        self._seed(d, "CODE--000")
+        settings = SimpleNamespace(task_prefix=None, project_dir=tmp_path)
+        assert resolve_ref_prefix(settings, task_ref="9") == resolve_ref_prefix(settings)
+
+    def test_shared_id_rule(self):
+        from clawpm.tasks import _task_id_regex
+
+        norm = _task_id_regex("CODE")
+        assert norm.match("CODE-007") and norm.match("CODE--007")
+        assert not norm.match("CODE---007")
+        assert not norm.match("CODE-007-001")
+        assert _task_id_regex("CODE", subtasks=True).match("CODE--001--002")
+        assert _task_id_regex("CODE", strict=True).match("CODE-007")
+        assert not _task_id_regex("CODE", strict=True).match("CODE--007")
+        kept = _task_id_regex("CODE-")
+        assert kept.match("CODE--007")
+        assert not kept.match("CODE-007")
+        assert not kept.match("CODE---007")
+
+
+class TestRound8Codex:
+    """Codex round 8: suffix test is case-insensitive on every platform, and
+    the portfolio fallback is lazy (an unreadable sibling store must not break
+    refs that resolve locally, nor full-id refs)."""
+
+    def test_uppercase_md_suffix_counts_toward_ordinals(self, tmp_path):
+        from clawpm.tasks import _root_ordinals
+
+        d = tmp_path / "tasks"
+        d.mkdir()
+        (d / "CODE-000.MD").write_text("---\nid: CODE-000\n---\n", encoding="utf-8")
+        assert _root_ordinals(d, "CODE") == [0]
+
+    def test_uppercase_md_suffix_is_not_reminted(self, tmp_path, monkeypatch):
+        d = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        (d / "CODE-000.MD").write_text("---\nid: CODE-000\n---\n", encoding="utf-8")
+        assert _add("code-quorum", "next") == "CODE-001"
+
+    def _legacy_with_broken_sibling(self, tmp_path, monkeypatch):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import PortfolioPrefixScanError
+
+        d = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        (d / "CODE--003.md").write_text("---\nid: CODE--003\n---\n", encoding="utf-8")
+        calls = []
+
+        def boom(*args, **kwargs):
+            calls.append(args)
+            raise PortfolioPrefixScanError("sib", RuntimeError("unreadable"))
+
+        monkeypatch.setattr("clawpm.tasks._other_projects_claims", boom)
+        return load_portfolio_config(), calls
+
+    def test_local_numeric_ref_survives_unreadable_sibling(self, tmp_path, monkeypatch):
+        from clawpm.discovery import get_project
+        from clawpm.tasks import resolve_ref_prefix
+
+        config, calls = self._legacy_with_broken_sibling(tmp_path, monkeypatch)
+        settings = get_project(config, "code-quorum")
+        assert resolve_ref_prefix(settings, config, "3") == "CODE-"
+        assert resolve_ref_prefix(settings, config, "3-001") == "CODE-"
+        assert calls == []
+
+    def test_full_id_parent_does_not_scan_portfolio(self, tmp_path, monkeypatch):
+        config, calls = self._legacy_with_broken_sibling(tmp_path, monkeypatch)
+        res = CliRunner().invoke(
+            main, ["--format", "json", "tasks", "list", "-p", "code-quorum", "--parent", "CODE--003"]
+        )
+        assert res.exit_code == 0, res.output
+        assert calls == []
+
+
 class TestDeterministicGlobalPrefixPass:
     """CLAWP-121: two task-less siblings assigned via INDEPENDENT calls to
     ``assign_task_prefix`` (exactly what ``clawpm doctor``'s per-project loop
@@ -1094,3 +1545,49 @@ class TestSessionScopedTaskPrefix:
                 "from worktree with foreign id",
             )
         assert not list(wt_tasks.glob("*.md"))
+
+
+class TestRefResolutionUsesSessionScopedStore:
+    """Round 9 (Codex): numeric short refs must resolve against the SAME
+    checkout ``list_tasks`` reads. ``get_project`` is the canonical checkout;
+    inside a registered worktree the task store is the worktree's."""
+
+    def _seed(self, d, ids, extra=""):
+        d.mkdir(parents=True, exist_ok=True)
+        for tid in ids:
+            (d / f"{tid}.md").write_text(f"---\nid: {tid}\n{extra}---\n", encoding="utf-8")
+
+    def test_parent_short_ref_resolves_against_worktree_spelling(
+        self, isolated_portfolio, tmp_path, monkeypatch
+    ):
+        from clawpm.sessions import register_session
+
+        # Canonical: legacy CODE--000..006 plus a normalised CODE-007.
+        self._seed(
+            isolated_portfolio.tasks_dir,
+            [f"CODE--{n:03d}" for n in range(7)] + ["CODE-007"],
+        )
+        # Worktree: its own store spells ordinal 7 the legacy way, with a child.
+        wt = tmp_path / "wt"
+        wt_tasks = wt / ".project" / "tasks"
+        for sub in ("progress", "done", "blocked"):
+            (wt_tasks / sub).mkdir(parents=True)
+        (wt / ".project" / "settings.toml").write_text(
+            'id = "test"\nname = "Test"\nstatus = "active"\npriority = 3\n',
+            encoding="utf-8",
+        )
+        self._seed(wt_tasks, ["CODE--007"])
+        self._seed(wt_tasks, ["CODE--007-001"], extra="parent: CODE--007\n")
+
+        register_session(
+            isolated_portfolio.root, "sess-1", "SEED",
+            isolated_portfolio.project_id, wt,
+        )
+        monkeypatch.chdir(wt)
+
+        res = CliRunner().invoke(
+            main, ["--format", "json", "tasks", "list", "-p", "test", "--parent", "7"]
+        )
+        assert res.exit_code == 0, res.output
+        ids = [t["id"] for t in json.loads(res.output)]
+        assert ids == ["CODE--007-001"], res.output
