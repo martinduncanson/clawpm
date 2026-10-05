@@ -8,7 +8,7 @@ predictions:
   duration_min: 120
   filled_by: agent
 priority: 4
-updated: '2026-09-02'
+updated: '2026-10-05'
 ---
 # Normalize legacy doubled-separator task prefixes already minted on disk
 
