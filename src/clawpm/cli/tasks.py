@@ -163,20 +163,27 @@ def _collect_project_tasks(
     # (Codex P2: --all-projects over a project with task_prefix="SAME" stored
     # children under SAME-001 but expanded --parent 1 to ALPHA-001 -> no match).
     # Also corrects the single-project path for divergent-prefix projects.
-    resolved_prefix = None
-    if parent or linked:
+    #
+    # CLAWP-113: resolved PER REF against the ids on disk, because a legacy
+    # project can hold both `CODE--003` and `CODE-007` (ValueError if one
+    # ordinal exists in both spellings).
+    def _ref_prefix(ref: str) -> str | None:
         from clawpm.tasks import resolve_ref_prefix
         _settings = get_project(config, project_id)
-        resolved_prefix = resolve_ref_prefix(_settings) if _settings else None
+        try:
+            return resolve_ref_prefix(_settings, config, ref) if _settings else None
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
+
     if parent:
-        filter_list.append(by_parent(expand_task_id(parent, project_id, resolved_prefix)))
+        filter_list.append(by_parent(expand_task_id(parent, project_id, _ref_prefix(parent))))
     if linked:
         from clawpm.links import build_link_index
         index = build_link_index(config, project_id)
         # Resolve both the expanded (task-style) id and the raw ref so --linked
         # works for research/mission ids that expand_task_id would leave alone.
         refs: set[str] = set()
-        for target in {expand_task_id(linked, project_id, resolved_prefix), linked}:
+        for target in {expand_task_id(linked, project_id, _ref_prefix(linked)), linked}:
             refs |= index.referencing_ids(target)
         filter_list.append(by_linked(refs))
 

@@ -426,6 +426,109 @@ class TestLegacyNormalizationRound4Codex:
         assert expand_task_id("0", "code-quorum", resolve_ref_prefix(settings)) == "CODE--000"
 
 
+class TestLegacyNormalizationRound7Codex:
+    """Codex round 7: sibling claims must keep BOTH raw and normalised
+    spellings (two migrations can converge), and short refs must resolve
+    against the ids actually on disk across both spellings."""
+
+    @staticmethod
+    def _seed(tasks_dir, *names):
+        for name in names:
+            (tasks_dir / f"{name}.md").write_text(f"---\nid: {name}\n---\n", encoding="utf-8")
+
+    def _converging(self, tmp_path, monkeypatch):
+        a_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        self._seed(a_dir, "CODE--013")
+        _add_project(tmp_path, "other")
+        b_dir = tmp_path / "projects" / "other" / ".project" / "tasks"
+        names = (
+            [f"OTHER-{n:03d}" for n in range(0, 5)]
+            + [f"CODE--{n:03d}" for n in range(7, 10)]
+            + [f"CODE-{n:03d}" for n in range(10, 14)]
+        )
+        self._seed(b_dir, *names)
+
+    def test_two_migrations_do_not_converge_on_one_namespace(self, tmp_path, monkeypatch):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_all_prefixes
+
+        self._converging(tmp_path, monkeypatch)
+        assignments, _ = assign_all_prefixes(load_portfolio_config())
+        assert assignments["code-quorum"] != assignments["other"], assignments
+        id_a = _add("code-quorum", "a")
+        id_b = _add("other", "b")
+        assert id_a != id_b
+        assert id_a == "CODE--014"
+
+    def test_doctor_agrees_with_allocation_on_converging_migrations(self, tmp_path, monkeypatch):
+        self._converging(tmp_path, monkeypatch)
+        res = CliRunner().invoke(main, ["--format", "json", "doctor"])
+        data = json.loads(res.output)
+        assert data["prefix_collisions"] == [], data
+
+    def _legacy_then_normalised(self, tmp_path, monkeypatch):
+        d = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        self._seed(d, *[f"CODE--{n:03d}" for n in range(7)])
+        assert _add("code-quorum", "new") == "CODE-007"
+        return d
+
+    def test_short_ref_resolves_across_both_spellings(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+
+        from clawpm.context import expand_task_id
+        from clawpm.tasks import resolve_ref_prefix
+
+        self._legacy_then_normalised(tmp_path, monkeypatch)
+        settings = SimpleNamespace(
+            task_prefix=None, project_dir=tmp_path / "projects" / "code-quorum"
+        )
+
+        def expand(ref):
+            return expand_task_id(ref, "code-quorum", resolve_ref_prefix(settings, task_ref=ref))
+
+        assert expand("7") == "CODE-007"
+        assert expand("3") == "CODE--003"
+        assert expand("3-001") == "CODE--003-001"
+
+    def test_short_ref_ambiguous_across_spellings_raises(self, tmp_path):
+        from types import SimpleNamespace
+
+        from clawpm.tasks import resolve_ref_prefix
+
+        d = tmp_path / ".project" / "tasks"
+        d.mkdir(parents=True)
+        self._seed(d, "CODE--005", "CODE-005", "CODE-006")
+        settings = SimpleNamespace(task_prefix=None, project_dir=tmp_path)
+        with pytest.raises(ValueError, match="ambiguous"):
+            resolve_ref_prefix(settings, task_ref="5")
+
+    def test_short_ref_without_match_falls_back(self, tmp_path):
+        from types import SimpleNamespace
+
+        from clawpm.tasks import resolve_ref_prefix
+
+        d = tmp_path / ".project" / "tasks"
+        d.mkdir(parents=True)
+        self._seed(d, "CODE--000")
+        settings = SimpleNamespace(task_prefix=None, project_dir=tmp_path)
+        assert resolve_ref_prefix(settings, task_ref="9") == resolve_ref_prefix(settings)
+
+    def test_shared_id_rule(self):
+        from clawpm.tasks import _task_id_regex
+
+        norm = _task_id_regex("CODE")
+        assert norm.match("CODE-007") and norm.match("CODE--007")
+        assert not norm.match("CODE---007")
+        assert not norm.match("CODE-007-001")
+        assert _task_id_regex("CODE", subtasks=True).match("CODE--001--002")
+        assert _task_id_regex("CODE", strict=True).match("CODE-007")
+        assert not _task_id_regex("CODE", strict=True).match("CODE--007")
+        kept = _task_id_regex("CODE-")
+        assert kept.match("CODE--007")
+        assert not kept.match("CODE-007")
+        assert not kept.match("CODE---007")
+
+
 class TestDeterministicGlobalPrefixPass:
     """CLAWP-121: two task-less siblings assigned via INDEPENDENT calls to
     ``assign_task_prefix`` (exactly what ``clawpm doctor``'s per-project loop
