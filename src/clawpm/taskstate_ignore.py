@@ -86,14 +86,20 @@ def find_ignored_task_state(project_dir: Path, *, require_tasks: bool = True) ->
             break
     return None
 
+
 def is_unversioned_ok(project_dir: Path) -> bool:
-    """True when settings.toml opts out via ``unversioned_ok = true``."""
+    """True when settings.toml opts out via ``unversioned_ok = true``.
+
+    An unreadable settings file fails toward showing the warning (loud), and
+    the cause is logged at debug level.
+    """
     from .models import ProjectSettings
 
     settings = project_dir / ".project" / "settings.toml"
     try:
         return ProjectSettings.load(settings).unversioned_ok
-    except Exception:
+    except Exception as exc:
+        logger.debug("could not read unversioned_ok from %s: %r", settings, exc)
         return False
 
 

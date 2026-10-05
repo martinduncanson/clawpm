@@ -186,3 +186,17 @@ def test_degraded_git_failure_is_logged_not_silent(tmp_path, caplog):
     with caplog.at_level(logging.DEBUG, logger="clawpm.taskstate_ignore"):
         assert ti.find_ignored_task_state(plain) is None
     assert any("check-ignore" in r.getMessage() for r in caplog.records)
+
+
+def test_malformed_settings_still_warns_and_is_logged(tmp_path, caplog, repo):
+    import logging
+
+    from clawpm import taskstate_ignore as ti
+
+    (repo / ".gitignore").write_text(".project/\n", encoding="utf-8")
+    _make_project(repo)
+    (repo / ".project" / "settings.toml").write_text("not = [valid toml\n", encoding="utf-8")
+    with caplog.at_level(logging.DEBUG, logger="clawpm.taskstate_ignore"):
+        assert ti.is_unversioned_ok(repo) is False
+        assert ti.ignored_task_state_warning(repo) is not None
+    assert any("unversioned_ok" in r.getMessage() for r in caplog.records)
