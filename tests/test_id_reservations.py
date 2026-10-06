@@ -266,3 +266,33 @@ class TestNestedEmitConsultsLedger:
         ids = {t["id"] for t in res.emitted}
         assert f"{parent.id}-001-001" not in ids, ids
         assert f"{parent.id}-001-002" in ids, ids
+
+
+class TestCaseFoldedKeys:
+    """Codex r2: the repo treats ids case-insensitively (``expand_task_id``
+    upper-cases, and Windows filenames collide), so keys must fold case."""
+
+    def test_lowercase_explicit_root_id_reserves_the_uppercase_prefix(self, two_trees):
+        tt = two_trees
+        tt.use("wt-a")
+        seed = add_task(tt.config, tt.project_id, "seed")
+        prefix = seed.id.rsplit("-", 1)[0]
+        explicit = f"{prefix.lower()}-{_ordinal(seed.id) + 1:03d}"
+        add_task(tt.config, tt.project_id, "explicit lower", task_id=explicit)
+        tt.use("wt-b")
+        auto = add_task(tt.config, tt.project_id, "auto")
+        assert auto.id == f"{prefix}-{_ordinal(seed.id) + 2:03d}"
+
+    def test_lowercase_explicit_subtask_id_reserves_the_uppercase_parent(
+        self, two_trees
+    ):
+        tt = two_trees
+        tt.use("wt-a")
+        parent = add_task(tt.config, tt.project_id, "parent")
+        shutil.copy(parent.file_path, tt.dirs["wt-b"] / parent.file_path.name)
+        first = add_subtask(tt.config, tt.project_id, parent.id, "child")
+        explicit = f"{parent.id.lower()}-{_ordinal(first.id) + 4:03d}"
+        add_task(tt.config, tt.project_id, "explicit sub", task_id=explicit)
+        tt.use("wt-b")
+        nxt = add_subtask(tt.config, tt.project_id, parent.id, "next child")
+        assert _ordinal(nxt.id) == _ordinal(explicit) + 1

@@ -48,9 +48,12 @@ def _ledger_path(portfolio_root: Path) -> Path:
 
 
 def normalize_key(key: str) -> str:
-    """Strip trailing separators so a kept-legacy ``CODE-`` prefix (CLAWP-113)
-    and the normalised ``CODE`` share one key."""
-    return key.rstrip("-")
+    """Canonical ledger key: trailing separators stripped (a kept-legacy ``CODE-``
+    prefix, CLAWP-113, shares ``CODE``'s key) and case folded to upper, the repo's
+    id convention (``expand_task_id``). Every write and lookup goes through here,
+    so ``clawp-007`` and ``CLAWP-007`` reserve the same slot (Windows filenames
+    collide, too)."""
+    return key.rstrip("-").upper()
 
 
 def split_task_id(task_id: str) -> tuple[str, int] | None:
