@@ -83,6 +83,14 @@ command, but by removing the implicit-redirect footgun structurally.
 - A decision (with the operator) on whether to migrate ALL existing call
   sites now, or make explicit-scope opt-in and migrate opportunistically.
 
+## Decision
+
+2026-10-06: explicit scope is OPT-IN, not a migrate-all-call-sites change.
+Existing callers stay unchanged and behave identically (`scope=None` is the
+ambient behaviour); callers migrate opportunistically. Rationale: backward
+compatibility, and operator preference for compat over churn. Design note:
+`docs/design/explicit-scope.md`. `log add` is the migrated exemplar.
+
 ## Out of scope
 Fixing any NEW worktree-scope leak discovered by future review rounds —
 patch those narrowly with the existing pattern; this task is about removing

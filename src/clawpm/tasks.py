@@ -31,12 +31,25 @@ from .frontmatter import (
 )
 from .models import Task, TaskState, TaskComplexity, Predictions, PortfolioConfig, normalize_tags
 from .discovery import get_project_dir, find_project_dir_fallback
+from .sessions import Scope
 from .id_reservations import record_reservation, record_task_id, reserved_high_water
 
 
-def get_tasks_dir(config: PortfolioConfig, project_id: str) -> Path | None:
-    """Get the tasks directory for a project."""
-    project_dir = get_project_dir(config, project_id)
+def get_tasks_dir(
+    config: PortfolioConfig, project_id: str, *, scope: Scope | None = None
+) -> Path | None:
+    """Get the tasks directory for a project.
+
+    CLAWP-122: ``scope=None`` is the ambient (cwd / contextvar) resolution; a
+    :class:`sessions.Scope` bypasses it. See ``get_project_dir``.
+    """
+    # `scope` is forwarded only when given, so callers/tests that wrap
+    # `get_project_dir` with the old two-argument signature keep working.
+    project_dir = (
+        get_project_dir(config, project_id)
+        if scope is None
+        else get_project_dir(config, project_id, scope=scope)
+    )
     if project_dir:
         tasks_dir = project_dir / "tasks"
         if tasks_dir.exists():
@@ -376,9 +389,15 @@ def _candidate_task_paths(tasks_dir: Path, task_id: str) -> list[Path]:
     return possible_paths
 
 
-def get_task(config: PortfolioConfig, project_id: str, task_id: str) -> Task | None:
-    """Get a specific task by ID."""
-    tasks_dir = get_tasks_dir(config, project_id)
+def get_task(
+    config: PortfolioConfig, project_id: str, task_id: str, *, scope: Scope | None = None
+) -> Task | None:
+    """Get a specific task by ID (``scope`` as for :func:`get_tasks_dir`)."""
+    tasks_dir = (
+        get_tasks_dir(config, project_id)
+        if scope is None
+        else get_tasks_dir(config, project_id, scope=scope)
+    )
     if not tasks_dir:
         return None
 
@@ -676,6 +695,8 @@ def touch_task_updated(
     project_id: str,
     task_id: str,
     when: str | None = None,
+    *,
+    scope: Scope | None = None,
 ) -> bool:
     """Bump a task's ``updated`` stamp without otherwise mutating it (CLAWP-086).
 
@@ -686,11 +707,19 @@ def touch_task_updated(
     a missing task, since the work-log entry is the primary artefact and must not
     be undone by a stamping failure.
     """
-    tasks_dir = get_tasks_dir(config, project_id)
+    tasks_dir = (
+        get_tasks_dir(config, project_id)
+        if scope is None
+        else get_tasks_dir(config, project_id, scope=scope)
+    )
     if not tasks_dir:
         return False
     with file_lock(tasks_dir / ".clawpm-tasks.lock"):
-        task = get_task(config, project_id, task_id)
+        task = (
+            get_task(config, project_id, task_id)
+            if scope is None
+            else get_task(config, project_id, task_id, scope=scope)
+        )
         if not task or not task.file_path or not task.file_path.exists():
             return False
         try:

@@ -11,8 +11,10 @@ from pathlib import Path
 
 from .models import PortfolioConfig, ProjectSettings, ProjectStatus
 from .sessions import (
+    Scope,
     _suppress_session_resolution,
     find_session_for_cwd,
+    resolve_path_or_none,
     scope_cwd,
     stat_is_dir,
 )
@@ -240,7 +242,45 @@ def get_project(config: PortfolioConfig, project_id: str) -> ProjectSettings | N
     return None
 
 
-def get_project_dir(config: PortfolioConfig, project_id: str) -> Path | None:
+def resolve_scope(
+    config: PortfolioConfig,
+    project_id: str,
+    target_dir: Path | None = None,
+) -> Scope:
+    """Freeze the scope ambient resolution would use right now (CLAWP-122).
+
+    Call ONCE at a command's entry point and pass the result down as
+    ``scope=``. With *target_dir* the scope is bound to that directory (the
+    ``tasks dispatch --target-dir`` shape, :func:`sessions.resolve_scope_from`);
+    otherwise it captures the ambient answer: CANONICAL inside
+    ``suppress_session_resolution()`` (or when cwd is unavailable — the same
+    fail-open the ambient path takes), else bound to the current cwd /
+    ``resolve_scope_from`` override. The session lookup itself stays lazy and
+    per-project, so the capture is project-independent; *project_id* is
+    accepted so a future resolver can key on it without an API change.
+    """
+    if target_dir is not None:
+        # Same logged fail-open as `find_session_for_cwd` / ambient resolution
+        # (Codex r1 P2, PR #75): an unavailable target must not crash the
+        # command, and must not fall back silently either.
+        resolved = resolve_path_or_none(
+            target_dir,
+            "Explicit scope falls back to canonical for this command.",
+        )
+        return Scope.canonical() if resolved is None else Scope.bound(resolved)
+    if _suppress_session_resolution.get():
+        return Scope.canonical()
+    try:
+        return Scope.bound(scope_cwd().resolve())
+    except OSError as exc:
+        logger.error("Failed to determine cwd: %s. Explicit scope falls back "
+                     "to canonical for this command.", exc)
+        return Scope.canonical()
+
+
+def get_project_dir(
+    config: PortfolioConfig, project_id: str, *, scope: Scope | None = None
+) -> Path | None:
     """Get the .project directory for a project.
 
     Returns the ``.project/`` directory path (not the repo root) when found,
@@ -258,8 +298,11 @@ def get_project_dir(config: PortfolioConfig, project_id: str) -> Path | None:
 
     Use :func:`find_project_dir_fallback` if you need a best-effort lookup
     that also checks the CWD walk when the registry lookup fails.
+
+    CLAWP-122: ``scope=None`` (the default) is the ambient behaviour above. A
+    :class:`sessions.Scope` bypasses the cwd/contextvar resolution entirely.
     """
-    session_dir = _session_scoped_project_dir(config, project_id)
+    session_dir = _session_scoped_project_dir(config, project_id, scope=scope)
     if session_dir is not None:
         return session_dir
 
@@ -293,7 +336,9 @@ def is_task_store_canonical(config: PortfolioConfig, project_id: str) -> bool:
     return _session_scoped_project_dir(config, project_id) is None
 
 
-def get_repo_path(config: PortfolioConfig, project_id: str) -> Path | None:
+def get_repo_path(
+    config: PortfolioConfig, project_id: str, *, scope: Scope | None = None
+) -> Path | None:
     """The checkout to run git in for *project_id* — session-scoped.
 
     CLAWP-098 (Codex review, PR #55): ``get_project_dir`` already redirects
@@ -318,9 +363,10 @@ def get_repo_path(config: PortfolioConfig, project_id: str) -> Path | None:
 
     Returns ``None`` when the project cannot be located at all, matching
     ``get_project_dir``'s contract. Never raises: every failure inside
-    session resolution falls through to the registry answer.
+    session resolution falls through to the registry answer. ``scope`` as for
+    :func:`get_project_dir` (CLAWP-122).
     """
-    session_root = _session_scoped_repo_path(config, project_id)
+    session_root = _session_scoped_repo_path(config, project_id, scope=scope)
     if session_root is not None:
         return session_root
     project = get_project(config, project_id)
@@ -337,7 +383,7 @@ class ScopedSettingsMismatchError(ValueError):
 
 
 def get_scoped_project_settings(
-    config: PortfolioConfig, project_id: str
+    config: PortfolioConfig, project_id: str, *, scope: Scope | None = None
 ) -> ProjectSettings | None:
     """Project settings from the SAME checkout the task store resolves to.
 
@@ -370,8 +416,10 @@ def get_scoped_project_settings(
       means the worktree's identity is inconsistent. Falling back to the
       canonical settings would keep working but silently mint IDs from a
       checkout the operation is not writing into.
+
+    ``scope`` as for :func:`get_project_dir` (CLAWP-122).
     """
-    session_dir = _session_scoped_project_dir(config, project_id)
+    session_dir = _session_scoped_project_dir(config, project_id, scope=scope)
     if session_dir is None:
         return get_project(config, project_id)
     settings_file = session_dir / "settings.toml"
@@ -413,7 +461,47 @@ def get_scoped_project_settings(
     return scoped
 
 
-def _session_scoped_repo_path(config: PortfolioConfig, project_id: str) -> Path | None:
+def _active_session(
+    config: PortfolioConfig,
+    project_id: str,
+    scope: Scope | None,
+    skipped: str,
+):
+    """The session the active scope resolves to, or ``None`` (fail-open).
+
+    ``scope is None`` -> ambient: ``None`` inside
+    ``suppress_session_resolution()``, else the session for
+    :func:`sessions.scope_cwd`. CANONICAL scope -> ``None``. BOUND scope ->
+    the session for its target, ignoring cwd and the contextvars (CLAWP-122).
+    """
+    if scope is None:
+        if _suppress_session_resolution.get():
+            return None
+    elif scope.is_canonical:
+        return None
+    portfolio_root = getattr(config, "portfolio_root", None)
+    if not portfolio_root:
+        return None
+    if scope is not None:
+        cwd = scope.target
+    else:
+        try:
+            cwd = scope_cwd()
+        except OSError as exc:
+            # antigravity review, PR #55 (round 4): Path.cwd() itself failing
+            # (the process's cwd deleted out from under it — rare, but the
+            # existing fail-open-needs-a-marker doctrine applies regardless of
+            # how rare) must fall open the same as every other miss, but not
+            # silently — logged at ERROR to match the severity of every other
+            # fail-open branch in this module and sessions.py.
+            logger.error("Failed to determine cwd: %s. %s", exc, skipped)
+            return None
+    return find_session_for_cwd(portfolio_root, cwd, project_id=project_id)
+
+
+def _session_scoped_repo_path(
+    config: PortfolioConfig, project_id: str, *, scope: Scope | None = None
+) -> Path | None:
     """Worktree root of the session registered for cwd, or ``None``.
 
     Same suppression and fail-open contract as
@@ -422,18 +510,10 @@ def _session_scoped_repo_path(config: PortfolioConfig, project_id: str) -> Path 
     portfolio-wide lease-fallback sweep never inherits the caller's
     worktree for a task the operator did not name.
     """
-    if _suppress_session_resolution.get():
-        return None
-    portfolio_root = getattr(config, "portfolio_root", None)
-    if not portfolio_root:
-        return None
-    try:
-        cwd = scope_cwd()
-    except OSError as exc:
-        logger.error("Failed to determine cwd: %s. Session-scoped repo "
-                     "resolution skipped for this call.", exc)
-        return None
-    session = find_session_for_cwd(portfolio_root, cwd, project_id=project_id)
+    session = _active_session(
+        config, project_id, scope,
+        "Session-scoped repo resolution skipped for this call.",
+    )
     if session is None:
         return None
     try:
@@ -460,7 +540,9 @@ def _session_scoped_repo_path(config: PortfolioConfig, project_id: str) -> Path 
     return root
 
 
-def _session_scoped_project_dir(config: PortfolioConfig, project_id: str) -> Path | None:
+def _session_scoped_project_dir(
+    config: PortfolioConfig, project_id: str, *, scope: Scope | None = None
+) -> Path | None:
     """Return the ``.project/`` dir of the worktree registered for cwd, if any.
 
     Returns ``None`` (never raises) when there is no portfolio root, no cwd,
@@ -492,24 +574,10 @@ def _session_scoped_project_dir(config: PortfolioConfig, project_id: str) -> Pat
 
     The caller treats ``None`` as "fall through to the registry lookup".
     """
-    if _suppress_session_resolution.get():
-        return None
-    portfolio_root = getattr(config, "portfolio_root", None)
-    if not portfolio_root:
-        return None
-    try:
-        cwd = scope_cwd()
-    except OSError as exc:
-        # antigravity review, PR #55 (round 4): Path.cwd() itself failing
-        # (the process's cwd deleted out from under it — rare, but the
-        # existing fail-open-needs-a-marker doctrine applies regardless of
-        # how rare) must fall open the same as every other miss, but not
-        # silently — logged at ERROR to match the severity of every other
-        # fail-open branch in this module and sessions.py.
-        logger.error("Failed to determine cwd: %s. Session-scoped "
-                      "resolution skipped for this call.", exc)
-        return None
-    session = find_session_for_cwd(portfolio_root, cwd, project_id=project_id)
+    session = _active_session(
+        config, project_id, scope,
+        "Session-scoped resolution skipped for this call.",
+    )
     if session is None:
         return None
     try:
