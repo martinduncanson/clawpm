@@ -5,13 +5,13 @@ Forward-looking notes. Captures ideas that came out of dogfooding but aren't on 
 - **Sketch** — rough shape
 - **Inspiration** — where to crib from
 
-This is a living document. Items that get built move to CHANGELOG; items that get explicitly rejected stay here with a `❌ Rejected` tag and the reason.
+This is a living document. Items that get built move to `CHANGELOG.md`; items that get explicitly rejected stay here with a `❌ Rejected` tag and the reason.
 
 ---
 
 ## Reflection layer Phase 2 — calibration analytics
 
-Already gated on data accumulation. Review fires **2026-06-05** (see `upskilling/skill-build-log.md`).
+Partly shipped. The calibration loop landed 2026-05-28 (CLAWP-040: `reflect summarize` / `reflect suggest`; see CHANGELOG 0.2.0). The 2026-06-05 review checkpoint has passed and is closed. The commands below are still unbuilt and stay trigger-gated on data volume, not on a date. A 2026-09 corpus analysis (CLAWP-112) found confidence has no discrimination on duration, so any new analytics need n>=20 gates.
 
 ### `clawpm reflect lookup <title>`
 **Trigger:** ≥20 task reflections in the corpus.
@@ -28,7 +28,7 @@ Already gated on data accumulation. Review fires **2026-06-05** (see `upskilling
 **Sketch:** aggregate process_lesson entries, dedupe near-duplicates (cosine sim or fuzzy match), output operator's evolving top-10 prediction rules. Feeds back into agent prompt for next task ("before estimating, consider these prior lessons:").
 
 ### `clawpm reflect field-usage`
-**Trigger:** **2026-06-05 review checkpoint** (mandatory).
+**Trigger:** next 4-week review checkpoint (the 2026-06-05 one has passed).
 **Sketch:** scan recent tasks + reflections, report per-field adoption rate. Auto-tag fields <20% as "candidate for removal". Drives the walk-back protocol committed to in skill-build-log.
 
 ### `clawpm project reflect`
@@ -162,11 +162,12 @@ These aren't features — they're constraints that should hold across all future
 | 1d (v1) | Calibration loop fixes: duration units, subtask isolation, files_changed filter, unblock action, re-start warning | 2026-05-08 |
 | 1.5 | Applied-science fields: success_criteria, approach, unknowns, confidence, reference_tasks, pre_mortem, process_lesson, surprise_taxonomy | 2026-05-08 |
 | Defacto-default | Global CLAUDE.md + SKILL.md doctrine | 2026-05-08 |
-| 1.6 (in flight) | `clawpm doctor` checks, `clawpm reflect void`, `filled_by` field | 2026-05-08 |
-| 1.7 (in flight) | `clawpm inbox` — inter-agent messaging | 2026-05-08 |
+| 1.6 | `clawpm doctor` checks, `clawpm reflect void`, `filled_by` field | 2026-05-08 |
+| 1.7 | `clawpm inbox` — inter-agent messaging | 2026-05-08 |
 | 1.8 | `clawpm project announce` + auto-run on init; doctor Check d (commit-vs-work_log drift) + Check e (missing clawpm-requirement marker in CLAUDE.md/AGENTS.md/README.md) | 2026-05-13 |
 | 1.8.1 | `clawpm issues add` accepts `observation` type + repeatable `--tag`; `issues list` filters by `--type` and `--tag` (matches the form already documented in global CLAUDE.md doctrine) | 2026-05-15 |
-| 2 (gated) | Calibration analytics (lookup/calibration/process-lessons/field-usage/project reflect) | After 2026-06-05 review |
+| 2 (partly shipped) | Calibration loop shipped 2026-05-28 (CLAWP-040: `reflect summarize` / `reflect suggest`). `lookup`, `calibration`, `process-lessons`, `field-usage`, `project reflect` remain trigger-gated | 2026-05-28 (partial) |
+| 0.2.0 release | Agentic layer, concurrency safety, `cli/` package, MCP server; first versioned release, 1857 tests. See `CHANGELOG.md` | 2026-10-05 |
 
 ---
 
