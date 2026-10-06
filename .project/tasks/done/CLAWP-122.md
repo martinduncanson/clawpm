@@ -13,7 +13,7 @@ priority: 4
 tags:
 - concurrency
 - architecture
-updated: '2026-09-22'
+updated: '2026-10-06'
 ---
 # Explicit scope-at-entry-point refactor (replace implicit worktree redirect)
 
