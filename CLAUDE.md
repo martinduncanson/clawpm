@@ -48,5 +48,5 @@ When a new recurring iteration pattern emerges (e.g. encoding-scan zero-finding 
 ## Release discipline
 
 - Every merged feature or fix PR adds one line under `## [Unreleased]` in `CHANGELOG.md` (Added / Changed / Fixed, cite `(#NN)` and the task id). Add it in the same PR.
-- To cut a release: rename `[Unreleased]` to the new version and date, bump `version` in `pyproject.toml` and `__version__` in `src/clawpm/__init__.py`, then tag `vX.Y.Z` on the `fork` remote.
+- To cut a release: rename `[Unreleased]` to the new version and date, then add a fresh empty `## [Unreleased]` heading above it. Update the link definitions at the bottom of `CHANGELOG.md`: point `[Unreleased]` at `compare/vX.Y.Z...HEAD` and add `[X.Y.Z]: .../compare/v<previous>...vX.Y.Z`. Bump `version` in `pyproject.toml` and `__version__` in `src/clawpm/__init__.py`, merge, then tag the merge commit and push the tag: `git tag vX.Y.Z <sha> && git push fork vX.Y.Z`.
 - Include "CHANGELOG line added" in the review briefing checklist for this repo.

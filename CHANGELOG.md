@@ -12,6 +12,7 @@ Everything since the 0.1.0 baseline: the agentic layer (goal rubrics, Stop-hook 
 
 ### Added
 
+- `clawpm-cowork` skill bundled under `skills/` and mirrored on sync (38630fa).
 - Goal integration: rubrics, Stop-hook evaluator, hook-based dispatch (#6, CLAWP-016..021).
 - Leverage suite: Mission Control, reference-task surfacing, agent bridge, resume, `doctor --apply` (#7, CLAWP-022..026).
 - CodeGraph integrations: scope auto-suggest, resume enrichment, agent worktree init, semantic reference scoring, doctor advisory (#9, CLAWP-027..031).
@@ -62,7 +63,7 @@ Initial baseline: the upstream `malphas-gh/clawpm` original (2026-02-20) plus th
 
 ### Added
 
-- Fork init: AGENTS.md template and Cowork skill; `scope` field and `clawpm conflicts` (Phases 1, 1a).
+- Fork init: AGENTS.md template; `scope` field and `clawpm conflicts` (Phases 1, 1a).
 - Reflection layer Phase 1: predictions, actuals, deltas, notes (Phase 1b).
 - Applied-science fields: success_criteria, approach, unknowns, confidence, reference_tasks, pre_mortem, process_lesson, surprise_taxonomy (Phase 1.5).
 - `clawpm doctor` checks, `clawpm reflect void`, `filled_by` field (Phase 1.6); `clawpm inbox` inter-agent messaging (Phase 1.7).
