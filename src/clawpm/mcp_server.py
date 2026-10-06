@@ -163,11 +163,10 @@ def _build_predictions(
     # sees an otherwise-empty object and `edit_task` POPS the entire
     # predictions block — replacing "silently ignored" with "silently wipes
     # every existing prediction field" for a caller who likely only meant to
-    # touch scope. Neither behavior is clearly correct for this atomic-
-    # replace-only-supplied-fields design (already true for scalar fields
-    # too — see this function's own "resupply everything" contract note on
-    # tasks_edit); flagged in the PR thread as a design call rather than
-    # auto-fixed either way.
+    # touch scope. Neither behavior is clearly correct (an empty list can't
+    # mean "clear this one list" through the merge overlay either, since the
+    # overlay treats [] as "not passed"); flagged in the PR thread as a
+    # design call rather than auto-fixed either way.
     has_predictions = any([
         predict_duration is not None,
         predict_complexity is not None,
@@ -611,11 +610,10 @@ def tasks_edit(
     an explicit empty list `[]` clears the field (matches `edit_task`'s own
     contract) while omitting the argument entirely leaves it unchanged; `tags`
     clearing is exclusively via `clear_tags` (an empty `tags` list is a no-op,
-    never a silent wipe). `edit_task` REPLACES the whole predictions block
-    whenever ANY predict_*/success_criteria/confidence/pre_mortem argument is
-    supplied — so to change one prediction field without erasing the others
-    (pitfalls, unknowns, scope, frameworks, iterations), pass the existing
-    values for the rest too (fetch them via `tasks_get` first). `filled_by`
+    never a silent wipe). Predictions MERGE (CLAWP-108): only the
+    predict_*/success_criteria/confidence/pre_mortem fields you pass are
+    overwritten, every other existing prediction field is kept (a list field
+    you pass replaces just that list). `filled_by`
     is preserved from the task's existing predictions unless `predicted_by`
     is supplied (falls back to `"agent"` only if the task had none). Returns
     the updated task."""
@@ -637,10 +635,9 @@ def tasks_edit(
                 "message": f"invalid delegability '{delegability}' (agent|human|either)"}
 
     # Preserve the existing filled_by unless the caller overrides it —
-    # _build_predictions REPLACES the whole predictions block, and its own
-    # default ("agent" when predicted_by is omitted) would otherwise silently
-    # overwrite e.g. an "operator-edited" attribution just because a caller
-    # only meant to bump `confidence` (grok-4.5 round 5).
+    # _build_predictions' own default ("agent" when predicted_by is omitted)
+    # would otherwise overwrite e.g. an "operator-edited" attribution just
+    # because a caller only meant to bump `confidence` (grok-4.5 round 5).
     effective_predicted_by = predicted_by
     if effective_predicted_by is None:
         existing_task = get_task(config, project_id, full_id)

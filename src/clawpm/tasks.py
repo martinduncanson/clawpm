@@ -2711,11 +2711,21 @@ def edit_task(
             if predictions.is_empty():
                 frontmatter.pop("predictions", None)
             else:
-                pred_dict = predictions.to_dict()
-                frontmatter["predictions"] = {
-                    k: v for k, v in pred_dict.items()
+                # CLAWP-108 — MERGE, don't replace. The caller's Predictions
+                # carries only the fields it set (None / [] = "not passed"),
+                # so overlay those onto the existing block. Replacing it
+                # wholesale silently nulled every field the edit didn't name
+                # (duration, confidence, pre_mortem, filled_by, ...). Working
+                # on the raw mapping also keeps keys the dataclass doesn't
+                # model. A list field that IS passed still replaces just
+                # that one list.
+                existing = frontmatter.get("predictions")
+                merged = dict(existing) if isinstance(existing, dict) else {}
+                merged.update({
+                    k: v for k, v in predictions.to_dict().items()
                     if v is not None and v != []
-                }
+                })
+                frontmatter["predictions"] = merged
         # CLAWP-054 — contract fields
         if out_of_scope is not None:
             if out_of_scope:
