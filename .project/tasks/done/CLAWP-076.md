@@ -19,6 +19,7 @@ scope:
 - CHANGELOG.md
 - ROADMAP.md
 - pyproject.toml
+updated: '2026-10-06'
 ---
 # Release discipline: CHANGELOG, version tag, ROADMAP refresh
 
