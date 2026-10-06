@@ -6,6 +6,10 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 
 ## [Unreleased]
 
+### Fixed
+
+- Task-id allocation now consults a portfolio-level reservation ledger (`id_reservations.jsonl`), so two worktrees of one project no longer mint the same id (CLAWP-092).
+
 ## [0.2.0] - 2026-10-05
 
 Everything since the 0.1.0 baseline: the agentic layer (goal rubrics, Stop-hook judge, dispatch, leases), calibration analytics, concurrency safety, a CLI/service-layer refactor, an MCP server, and a long tail of task-ID and Windows-encoding fixes. PR numbers refer to `martinduncanson/clawpm`.

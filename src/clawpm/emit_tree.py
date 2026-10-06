@@ -25,6 +25,7 @@ from typing import Any
 
 import yaml
 
+from .id_reservations import record_task_id
 from .frontmatter import (
     FrontmatterError,
     parse_frontmatter,
@@ -453,7 +454,12 @@ def _check_constitution(
         return []
 
 
-def _existing_child_nums(tasks_dir: Path, parent_id: str) -> set[int]:
+def _existing_child_nums(
+    tasks_dir: Path,
+    parent_id: str,
+    portfolio_root: Path | None = None,
+    project_id: str | None = None,
+) -> set[int]:
     """Union-scan the existing child ordinals for ``parent_id``.
 
     Delegates to the single shared allocator (:func:`tasks._existing_child_ordinals`)
@@ -468,7 +474,10 @@ def _existing_child_nums(tasks_dir: Path, parent_id: str) -> set[int]:
     # CLAWP-085 child-ordinal archive-awareness now lives in the shared
     # allocator (_existing_child_ordinals) so emit-tree and add_subtask can't
     # disagree — see that function.
-    return _existing_child_ordinals(tasks_dir, tasks_dir / parent_id, parent_id)
+    # CLAWP-092: ``portfolio_root`` adds the cross-worktree reservation ledger.
+    return _existing_child_ordinals(
+        tasks_dir, tasks_dir / parent_id, parent_id, portfolio_root, project_id
+    )
 
 
 def _check_id_collisions(
@@ -488,7 +497,9 @@ def _check_id_collisions(
     if not tasks_dir:
         return []
 
-    existing_nums = _existing_child_nums(tasks_dir, parent_id)
+    existing_nums = _existing_child_nums(
+        tasks_dir, parent_id, config.portfolio_root, project_id
+    )
 
     # Predict IDs for leaves in order
     collisions: list[dict] = []
@@ -747,7 +758,7 @@ def _predict_parent_id(
         return doc.root.attach_to
 
     # New root — predict the next ID add_task would generate
-    from .tasks import get_tasks_dir, assign_task_prefix, _root_ordinals
+    from .tasks import get_tasks_dir, assign_task_prefix, _next_root_ordinal
     from .discovery import get_scoped_project_settings
 
     tasks_dir = get_tasks_dir(config, project_id)
@@ -769,10 +780,9 @@ def _predict_parent_id(
 
     # CLAWP-113: one shared scan + separator rule with add_task, so the
     # prediction cannot drift from what add_task mints (CLAWP-085/127: the
-    # archive and rejected dirs are included there).
-    existing_nums = _root_ordinals(tasks_dir, prefix)
-
-    next_num = max(existing_nums, default=-1) + 1
+    # archive and rejected dirs are included there; CLAWP-092: so is the
+    # cross-worktree reservation ledger).
+    next_num = _next_root_ordinal(config, tasks_dir, prefix, project_id)
     return f"{prefix}-{next_num:03d}"
 
 
@@ -782,6 +792,26 @@ def _predict_parent_id(
 
 
 def emit_tree(
+    config: PortfolioConfig,
+    project_id: str,
+    doc: EmitTreeDocument,
+    dry_run: bool = False,
+    strict: bool = False,
+) -> EmitResult:
+    """Persist a fully-contracted task-tree atomically (see ``_emit_tree_locked``).
+
+    CLAWP-092: runs under the portfolio prefix lock, like ``add_task``, so the
+    id prediction and the reservation-ledger writes are atomic across
+    worktrees. The lock is OUTER; ``split_task`` takes the per-project lock
+    inside, matching the ordering invariant on ``portfolio_prefix_lock``.
+    """
+    from .tasks import portfolio_prefix_lock
+
+    with portfolio_prefix_lock(config.portfolio_root):
+        return _emit_tree_locked(config, project_id, doc, dry_run, strict)
+
+
+def _emit_tree_locked(
     config: PortfolioConfig,
     project_id: str,
     doc: EmitTreeDocument,
@@ -967,7 +997,9 @@ def emit_tree(
     next_ordinal: dict[str, int] = {}  # minted-parent-id -> next ordinal
 
     # Seed root-level ordinal from existing children on disk.
-    existing_nums = _existing_child_nums(tasks_dir, parent_id)
+    existing_nums = _existing_child_nums(
+        tasks_dir, parent_id, config.portfolio_root, project_id
+    )
     next_ordinal[parent_id] = (max(existing_nums) if existing_nums else 0) + 1
 
     for ref in topo_order:
@@ -983,6 +1015,14 @@ def emit_tree(
         ordinal = next_ordinal[effective_parent_id]
         next_ordinal[effective_parent_id] = ordinal + 1
         leaf_id_map[ref] = f"{effective_parent_id}-{ordinal:03d}"
+
+    # CLAWP-092: reserve every id this call minted (the new root, if any, plus
+    # each leaf at every depth) in the portfolio ledger while still inside the
+    # portfolio lock held by emit_tree(), so a sibling worktree skips them.
+    if not doc.root.attach_to:
+        record_task_id(config.portfolio_root, parent_id, project_id)
+    for minted_id in leaf_id_map.values():
+        record_task_id(config.portfolio_root, minted_id, project_id)
 
     # Direct children of parent_id (for root's children list + attach_to update)
     child_ids: list[str] = [

@@ -31,6 +31,7 @@ from .frontmatter import (
 )
 from .models import Task, TaskState, TaskComplexity, Predictions, PortfolioConfig, normalize_tags
 from .discovery import get_project_dir, find_project_dir_fallback
+from .id_reservations import record_reservation, record_task_id, reserved_high_water
 
 
 def get_tasks_dir(config: PortfolioConfig, project_id: str) -> Path | None:
@@ -1453,6 +1454,22 @@ def _root_ordinals(tasks_dir: Path, prefix: str, *, strict: bool = False) -> lis
     return nums
 
 
+def _next_root_ordinal(
+    config: PortfolioConfig, tasks_dir: Path, prefix: str, project_id: str
+) -> int:
+    """Next free root ordinal under ``prefix``: one past the higher of the
+    on-disk scan and the portfolio reservation ledger's high-water mark.
+
+    CLAWP-092: the scan alone cannot see a sibling worktree's uncommitted task
+    files, so two worktrees minted the same id. The ledger lives outside every
+    checkout. Shared by ``add_task`` and emit-tree's predictor so the two
+    cannot disagree.
+    """
+    scan_max = max(_root_ordinals(tasks_dir, prefix), default=-1)
+    reserved = reserved_high_water(config.portfolio_root, prefix, project_id)
+    return max(scan_max, -1 if reserved is None else reserved) + 1
+
+
 def _infer_prefix_from_tasks(tasks_dir: Path, *, keep_legacy: bool = False) -> str | None:
     """Most common task-ID prefix among existing task files/dirs, or None.
 
@@ -2433,10 +2450,14 @@ def add_task(
             # CLAWP-113: the separator rule (a legacy ``CODE--006`` still counts
             # toward the next ordinal) lives in `_task_id_regex`, shared with
             # emit-tree's predictor so the two scans cannot disagree.
-            existing_nums = _root_ordinals(tasks_dir, prefix)
-
-            next_num = max(existing_nums, default=-1) + 1
+            # CLAWP-092: the ledger high-water mark joins the scan so a sibling
+            # worktree's id (invisible on this disk) is never re-minted; the
+            # reservation is recorded here, inside the portfolio lock.
+            next_num = _next_root_ordinal(config, tasks_dir, prefix, project_id)
             task_id = f"{prefix}-{next_num:03d}"
+            record_reservation(
+                config.portfolio_root, prefix, next_num, task_id, project_id
+            )
         else:
             # CLAWP-129 — an explicit id was never checked against the
             # portfolio's real prefix claims at all (only the same-project
@@ -2445,6 +2466,9 @@ def add_task(
             check_explicit_id_prefix_collision(
                 task_id, project_id, tasks_dir, config, _explicit_prefix
             )
+            # CLAWP-092: reserve an explicit id too, so a later auto-mint in
+            # ANY worktree skips past it.
+            record_task_id(config.portfolio_root, task_id, project_id)
 
         # Build frontmatter. CLAWP-086 — `updated` equals `created` at add time.
         # CLAWP-126: UTC calendar day, not local — see today_utc_iso().
@@ -2890,7 +2914,11 @@ def _child_state_dirs(tasks_dir: Path, parent_dir: Path) -> list[Path]:
 
 
 def _existing_child_ordinals(
-    tasks_dir: Path, parent_dir: Path, parent_id: str,
+    tasks_dir: Path,
+    parent_dir: Path,
+    parent_id: str,
+    portfolio_root: Path | None = None,
+    project_id: str | None = None,
 ) -> set[int]:
     """Union of every ordinal already used by a child of ``parent_id``.
 
@@ -2903,6 +2931,10 @@ def _existing_child_ordinals(
     outright after creation, invisible to any dir scan). Reading the max of this
     set and adding 1 guarantees a fresh ordinal even when earlier children have
     migrated, reopened, been rejected, or crash-orphaned.
+
+    CLAWP-092: with ``portfolio_root``, the reservation ledger's high-water mark
+    for ``parent_id`` joins the set, so a child minted by a sibling worktree
+    (invisible to every scan above) is skipped too.
     """
     nums: set[int] = set()
 
@@ -2941,6 +2973,11 @@ def _existing_child_ordinals(
         for cid in (children or []):
             if isinstance(cid, str) and cid.startswith(parent_id + "-"):
                 _record(cid)
+
+    if portfolio_root is not None:
+        reserved = reserved_high_water(portfolio_root, parent_id, project_id)
+        if reserved is not None:
+            nums.add(reserved)
 
     return nums
 
@@ -2995,7 +3032,11 @@ def add_subtask(
     # self-deadlocking. get_task (fs scan) and _append_child_to_parent_frontmatter
     # (plain read/write) take no lock.
     _lock_path = tasks_dir / ".clawpm-tasks.lock"
-    with file_lock(_lock_path):
+    # CLAWP-092: portfolio lock OUTER, per-project lock INNER (the ordering
+    # invariant on portfolio_prefix_lock) so allocate-and-record against the
+    # reservation ledger is atomic across worktrees. Both are reentrant per
+    # thread, and nothing calls add_subtask while holding a project lock.
+    with portfolio_prefix_lock(config.portfolio_root), file_lock(_lock_path):
         # Resolve the parent as a directory INSIDE the lock (read + optional split).
         parent = get_task(config, project_id, parent_id)
         if not parent:
@@ -3025,9 +3066,14 @@ def add_subtask(
         # can't have its number silently reused (CLAWP-071 Codex r1-3).
         # emit_tree's attach path routes through the same helper so the two
         # allocators can't drift.
-        existing_nums = _existing_child_ordinals(tasks_dir, parent_dir, parent_id)
+        existing_nums = _existing_child_ordinals(
+            tasks_dir, parent_dir, parent_id, config.portfolio_root, project_id
+        )
         next_num = (max(existing_nums) if existing_nums else 0) + 1
         subtask_id = f"{parent_id}-{next_num:03d}"
+        record_reservation(
+            config.portfolio_root, parent_id, next_num, subtask_id, project_id
+        )
 
         # Build frontmatter. CLAWP-086 — `updated` equals `created` at add time.
         # CLAWP-126: UTC calendar day, not local — see today_utc_iso().
