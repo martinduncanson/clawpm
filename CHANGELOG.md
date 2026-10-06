@@ -8,7 +8,7 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 
 ### Fixed
 
-- Task-id allocation now consults a portfolio-level reservation ledger (`id_reservations.jsonl`), so two worktrees of one project no longer mint the same id (CLAWP-092).
+- Task-id allocation now consults a portfolio-level reservation ledger (`id_reservations.jsonl`), so two worktrees of one project no longer mint the same id (#74, CLAWP-092).
 
 ## [0.2.0] - 2026-10-05
 
