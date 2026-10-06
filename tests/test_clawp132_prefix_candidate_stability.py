@@ -361,6 +361,11 @@ class TestLegacySubtaskShapedPrefixFiles:
             text = src.read_text(encoding="utf-8").replace(f"id: {old}", f"id: {new}")
             (tasks_dir / f"{new}.md").write_text(text, encoding="utf-8")
             src.unlink()
+        # CLAWP-092: these legacy files stand in for ids an OLDER allocator
+        # minted, which never reached the reservation ledger. Drop the entries
+        # the seeding add_task calls above wrote, or the ledger would
+        # (correctly) keep WEB2-000/001 reserved and this mint would start at 002.
+        (config.portfolio_root / "id_reservations.jsonl").unlink(missing_ok=True)
 
         assert get_task(config, "web-2", "WEB-2-000") is not None
         assert get_task(config, "web-2", "WEB-2-001") is not None
