@@ -12,7 +12,7 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 
 ### Fixed
 
-- `tasks edit` (CLI and MCP `tasks_edit`) now merges predictions: passing one prediction flag overwrites only that field instead of nulling duration, confidence, pre-mortem, scope, `filled_by` and the rest (CLAWP-108).
+- `tasks edit` (CLI and MCP `tasks_edit`) now merges predictions: passing one prediction flag overwrites only that field instead of nulling duration, confidence, pre-mortem, scope, `filled_by` and the rest (#76, CLAWP-108).
 - Task-id allocation now consults a portfolio-level reservation ledger (`id_reservations.jsonl`), so two worktrees of one project no longer mint the same id (#74, CLAWP-092).
 
 ## [0.2.0] - 2026-10-05

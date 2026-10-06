@@ -19,7 +19,7 @@ predictions:
 priority: 6
 tags:
 - cli-ergonomics
-updated: '2026-09-02'
+updated: '2026-10-06'
 ---
 # tasks edit wholesale-replaces predictions block, silently nulling unrelated fields
 
