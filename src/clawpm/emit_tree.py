@@ -491,14 +491,13 @@ def _check_id_collisions(
     Returns list of collision dicts. Empty = no collisions.
     Read-only — mirrors add_subtask's union-scan logic but does not write.
     """
-    from .tasks import get_tasks_dir
-
+    from .tasks import get_tasks_dir, _ledger_project_id
     tasks_dir = get_tasks_dir(config, project_id)
     if not tasks_dir:
         return []
 
     existing_nums = _existing_child_nums(
-        tasks_dir, parent_id, config.portfolio_root, project_id
+        tasks_dir, parent_id, config.portfolio_root, _ledger_project_id(config, project_id)
     )
 
     # Predict IDs for leaves in order
@@ -758,7 +757,9 @@ def _predict_parent_id(
         return doc.root.attach_to
 
     # New root — predict the next ID add_task would generate
-    from .tasks import get_tasks_dir, assign_task_prefix, _next_root_ordinal
+    from .tasks import (
+        get_tasks_dir, assign_task_prefix, _next_root_ordinal, _ledger_project_id,
+    )
     from .discovery import get_scoped_project_settings
 
     tasks_dir = get_tasks_dir(config, project_id)
@@ -782,7 +783,9 @@ def _predict_parent_id(
     # prediction cannot drift from what add_task mints (CLAWP-085/127: the
     # archive and rejected dirs are included there; CLAWP-092: so is the
     # cross-worktree reservation ledger).
-    next_num = _next_root_ordinal(config, tasks_dir, prefix, project_id)
+    next_num = _next_root_ordinal(
+        config, tasks_dir, prefix, _ledger_project_id(config, project_id, _settings)
+    )
     return f"{prefix}-{next_num:03d}"
 
 
@@ -832,7 +835,7 @@ def _emit_tree_locked(
 
     Returns EmitResult — the caller is responsible for logging.
     """
-    from .tasks import get_tasks_dir, add_task, split_task, get_task
+    from .tasks import get_tasks_dir, add_task, split_task, get_task, _ledger_project_id
     from .tasks import _append_child_to_parent_frontmatter
     from .baseline import resolve_baseline_ref
     from .discovery import get_repo_path, get_scoped_project_settings
@@ -847,7 +850,9 @@ def _emit_tree_locked(
     # EVERY emit — `attach_to` roots included, which return before
     # `_predict_parent_id` would otherwise resolve settings (CLAWP-098, PR #55
     # round 14). Fail closed (ValueError) on a worktree naming another project.
-    get_scoped_project_settings(config, project_id)
+    _ledger_pid = _ledger_project_id(
+        config, project_id, get_scoped_project_settings(config, project_id)
+    )
 
     # -----------------------------------------------------------------------
     # Phase 2 — Gate barrier (all read-only)
@@ -998,7 +1003,7 @@ def _emit_tree_locked(
 
     # Seed root-level ordinal from existing children on disk.
     existing_nums = _existing_child_nums(
-        tasks_dir, parent_id, config.portfolio_root, project_id
+        tasks_dir, parent_id, config.portfolio_root, _ledger_pid
     )
     next_ordinal[parent_id] = (max(existing_nums) if existing_nums else 0) + 1
 
@@ -1010,8 +1015,15 @@ def _emit_tree_locked(
             else parent_id
         )
         if effective_parent_id not in next_ordinal:
-            # Newly-created inner node: ordinal starts at 1 (no existing children)
-            next_ordinal[effective_parent_id] = 1
+            # Newly-created inner node: no children on disk, but CLAWP-092 --
+            # another worktree may have reserved ordinals under this id, so
+            # seed it through the same allocator as the root level.
+            inner_nums = _existing_child_nums(
+                tasks_dir, effective_parent_id, config.portfolio_root, _ledger_pid
+            )
+            next_ordinal[effective_parent_id] = (
+                max(inner_nums) if inner_nums else 0
+            ) + 1
         ordinal = next_ordinal[effective_parent_id]
         next_ordinal[effective_parent_id] = ordinal + 1
         leaf_id_map[ref] = f"{effective_parent_id}-{ordinal:03d}"
@@ -1020,9 +1032,9 @@ def _emit_tree_locked(
     # each leaf at every depth) in the portfolio ledger while still inside the
     # portfolio lock held by emit_tree(), so a sibling worktree skips them.
     if not doc.root.attach_to:
-        record_task_id(config.portfolio_root, parent_id, project_id)
+        record_task_id(config.portfolio_root, parent_id, _ledger_pid)
     for minted_id in leaf_id_map.values():
-        record_task_id(config.portfolio_root, minted_id, project_id)
+        record_task_id(config.portfolio_root, minted_id, _ledger_pid)
 
     # Direct children of parent_id (for root's children list + attach_to update)
     child_ids: list[str] = [

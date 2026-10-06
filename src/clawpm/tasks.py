@@ -1454,6 +1454,21 @@ def _root_ordinals(tasks_dir: Path, prefix: str, *, strict: bool = False) -> lis
     return nums
 
 
+def _ledger_project_id(config: PortfolioConfig, project_id: str, settings=None) -> str:
+    """The id the project's own settings declare, for reservation-ledger keys.
+
+    CLAWP-092 (Codex r1): ``--project clawpm`` and ``--project CLAWPM`` resolve
+    to one project on a case-insensitive filesystem, so the caller's spelling
+    must not scope a reservation. ``settings`` may be passed to skip a re-read;
+    an unresolvable project falls back to the spelling given.
+    """
+    from .discovery import get_scoped_project_settings
+
+    if settings is None:
+        settings = get_scoped_project_settings(config, project_id)
+    return getattr(settings, "id", None) or project_id
+
+
 def _next_root_ordinal(
     config: PortfolioConfig, tasks_dir: Path, prefix: str, project_id: str
 ) -> int:
@@ -2378,6 +2393,7 @@ def add_task(
     from .discovery import get_scoped_project_settings
 
     _settings = get_scoped_project_settings(config, project_id)
+    _ledger_pid = _ledger_project_id(config, project_id, _settings)
 
     # CLAWP-051 — per-project file lock serialises ID allocation (scan→write)
     # and explicit-ID creates so two concurrent sessions in the same project
@@ -2453,10 +2469,10 @@ def add_task(
             # CLAWP-092: the ledger high-water mark joins the scan so a sibling
             # worktree's id (invisible on this disk) is never re-minted; the
             # reservation is recorded here, inside the portfolio lock.
-            next_num = _next_root_ordinal(config, tasks_dir, prefix, project_id)
+            next_num = _next_root_ordinal(config, tasks_dir, prefix, _ledger_pid)
             task_id = f"{prefix}-{next_num:03d}"
             record_reservation(
-                config.portfolio_root, prefix, next_num, task_id, project_id
+                config.portfolio_root, prefix, next_num, task_id, _ledger_pid
             )
         else:
             # CLAWP-129 — an explicit id was never checked against the
@@ -2468,7 +2484,7 @@ def add_task(
             )
             # CLAWP-092: reserve an explicit id too, so a later auto-mint in
             # ANY worktree skips past it.
-            record_task_id(config.portfolio_root, task_id, project_id)
+            record_task_id(config.portfolio_root, task_id, _ledger_pid)
 
         # Build frontmatter. CLAWP-086 — `updated` equals `created` at add time.
         # CLAWP-126: UTC calendar day, not local — see today_utc_iso().
@@ -3015,7 +3031,9 @@ def add_subtask(
     # ScopedSettingsMismatchError instead of taking new IDs.
     from .discovery import get_scoped_project_settings
 
-    get_scoped_project_settings(config, project_id)
+    _ledger_pid = _ledger_project_id(
+        config, project_id, get_scoped_project_settings(config, project_id)
+    )
 
     # CLAWP-051 Finding 6 — wrap the ENTIRE parent-resolution + allocate-and-create
     # in file_lock so concurrent sessions decomposing the same parent can't mint
@@ -3067,12 +3085,12 @@ def add_subtask(
         # emit_tree's attach path routes through the same helper so the two
         # allocators can't drift.
         existing_nums = _existing_child_ordinals(
-            tasks_dir, parent_dir, parent_id, config.portfolio_root, project_id
+            tasks_dir, parent_dir, parent_id, config.portfolio_root, _ledger_pid
         )
         next_num = (max(existing_nums) if existing_nums else 0) + 1
         subtask_id = f"{parent_id}-{next_num:03d}"
         record_reservation(
-            config.portfolio_root, parent_id, next_num, subtask_id, project_id
+            config.portfolio_root, parent_id, next_num, subtask_id, _ledger_pid
         )
 
         # Build frontmatter. CLAWP-086 — `updated` equals `created` at add time.

@@ -204,3 +204,65 @@ class TestProjectsSharingAPrefix:
         record_reservation(tmp_path, "SAME", 4, "SAME-004", "alpha")
         assert reserved_high_water(tmp_path, "SAME", "alpha") == 4
         assert reserved_high_water(tmp_path, "SAME", "beta") is None
+
+
+class TestCanonicalProjectId:
+    """Codex r1 #1: case-insensitive filesystems resolve ``--project TPROJ`` and
+    ``--project tproj`` to one project, so reservations must key on the id its
+    settings declare, not the caller's spelling."""
+
+    def test_two_spellings_share_one_reservation_scope(self, two_trees):
+        from clawpm.discovery import get_project
+
+        tt = two_trees
+        meta = tt.root / "projects" / "tproj" / ".project"
+        meta.mkdir(parents=True)
+        (meta / "settings.toml").write_text(
+            'id = "tproj"\nname = "T"\nstatus = "active"\npriority = 3\n'
+            'task_prefix = "TPRJ"\n',
+            encoding="utf-8",
+        )
+        if get_project(tt.config, "TPROJ") is None:
+            pytest.skip("filesystem is case-sensitive: TPROJ does not resolve")
+        tt.use("wt-a")
+        first = add_task(tt.config, "TPROJ", "upper spelling")
+        tt.use("wt-b")
+        second = add_task(tt.config, "tproj", "lower spelling")
+        assert first.id != second.id
+        assert _ordinal(second.id) == _ordinal(first.id) + 1
+
+
+class TestNestedEmitConsultsLedger:
+    """Codex r1 #2: every parent at every depth applies its own ledger
+    high-water mark, not just the emit root."""
+
+    def test_inner_parent_skips_reserved_nested_ordinal(self, two_trees):
+        from clawpm.id_reservations import record_task_id
+
+        tt = two_trees
+        tt.use("wt-a")
+        parent = add_task(tt.config, tt.project_id, "shared parent")
+        # Another worktree already minted the first grandchild under the
+        # not-yet-existing child <parent>-001.
+        record_task_id(tt.root, f"{parent.id}-001-001", tt.project_id)
+        crit = [{
+            "criterion": "Tests pass",
+            "gradeable_signal": "pytest exit 0",
+            "comparator": "eq:0",
+        }]
+        doc = parse_emit_document({
+            "schema_version": 1,
+            "root": {"attach_to": parent.id},
+            "leaves": [
+                {"ref": "L0", "parent_ref": None, "title": "inner",
+                 "leaf_key": "n-0", "success_criteria": crit,
+                 "delegability": "agent"},
+                {"ref": "L1", "parent_ref": "L0", "title": "grandchild",
+                 "leaf_key": "n-1", "success_criteria": crit,
+                 "delegability": "agent"},
+            ],
+        })
+        res = emit_tree(tt.config, tt.project_id, doc)
+        ids = {t["id"] for t in res.emitted}
+        assert f"{parent.id}-001-001" not in ids, ids
+        assert f"{parent.id}-001-002" in ids, ids
