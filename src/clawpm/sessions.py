@@ -153,6 +153,38 @@ def scope_cwd() -> Path:
     return override if override is not None else Path.cwd()
 
 
+# CLAWP-122: the two ambient mechanisms above (``suppress_session_resolution``
+# = "canonical", ``resolve_scope_from`` = "as if cwd were X") as an explicit
+# VALUE a command resolves once at its entry point and passes down, instead of
+# every callee re-deriving it from cwd/contextvars. Opt-in: every resolver that
+# accepts ``scope=`` treats ``None`` as today's ambient behaviour. See
+# docs/design/explicit-scope.md.
+@dataclass(frozen=True)
+class Scope:
+    """Where session-scoped resolution should look.
+
+    ``target is None`` -> CANONICAL: never redirect to a worktree (same answer
+    as inside ``suppress_session_resolution()``). Otherwise BOUND: look up the
+    session for ``target`` rather than for the process cwd (same answer as
+    inside ``resolve_scope_from(target)``). Neither mode consults the cwd or
+    the contextvars, so a bound scope stays put if cwd changes mid-command.
+    """
+
+    target: Optional[Path] = None
+
+    @property
+    def is_canonical(self) -> bool:
+        return self.target is None
+
+    @classmethod
+    def canonical(cls) -> "Scope":
+        return cls(None)
+
+    @classmethod
+    def bound(cls, target: Path) -> "Scope":
+        return cls(Path(target))
+
+
 _REGISTERED = "registered"
 _RELEASED = "released"
 

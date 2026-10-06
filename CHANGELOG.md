@@ -6,6 +6,10 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in explicit scope: `sessions.Scope` plus `discovery.resolve_scope`, and a keyword-only `scope=` on `get_project_dir`, `get_repo_path`, `get_scoped_project_settings`, `get_tasks_dir`, `get_task` and `touch_task_updated`; `log add` migrated as the exemplar (CLAWP-122).
+
 ### Fixed
 
 - Task-id allocation now consults a portfolio-level reservation ledger (`id_reservations.jsonl`), so two worktrees of one project no longer mint the same id (#74, CLAWP-092).
