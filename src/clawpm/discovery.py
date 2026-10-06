@@ -14,6 +14,7 @@ from .sessions import (
     Scope,
     _suppress_session_resolution,
     find_session_for_cwd,
+    resolve_path_or_none,
     scope_cwd,
     stat_is_dir,
 )
@@ -259,7 +260,14 @@ def resolve_scope(
     accepted so a future resolver can key on it without an API change.
     """
     if target_dir is not None:
-        return Scope.bound(Path(target_dir).resolve())
+        # Same logged fail-open as `find_session_for_cwd` / ambient resolution
+        # (Codex r1 P2, PR #75): an unavailable target must not crash the
+        # command, and must not fall back silently either.
+        resolved = resolve_path_or_none(
+            target_dir,
+            "Explicit scope falls back to canonical for this command.",
+        )
+        return Scope.canonical() if resolved is None else Scope.bound(resolved)
     if _suppress_session_resolution.get():
         return Scope.canonical()
     try:

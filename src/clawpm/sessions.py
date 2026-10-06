@@ -172,6 +172,16 @@ class Scope:
 
     target: Optional[Path] = None
 
+    def __post_init__(self) -> None:
+        # Codex r1 P2 (PR #75): a relative target would be re-resolved against
+        # whatever cwd is current at each lookup, so the "frozen" scope would
+        # move with cwd. Capture an absolute path once, for every construction
+        # path (factory or direct). Raises OSError only if cwd is unavailable
+        # AND the target is relative; callers that must fail open
+        # (``discovery.resolve_scope``) pass an already-resolved path.
+        if self.target is not None:
+            object.__setattr__(self, "target", Path(self.target).absolute())
+
     @property
     def is_canonical(self) -> bool:
         return self.target is None
@@ -183,6 +193,29 @@ class Scope:
     @classmethod
     def bound(cls, target: Path) -> "Scope":
         return cls(Path(target))
+
+
+def resolve_path_or_none(
+    path: Path,
+    fallback: str = "Session-scoped resolution skipped for this call.",
+) -> Optional[Path]:
+    """``Path(path).resolve()`` that logs and returns ``None`` on ``OSError``.
+
+    antigravity review, PR #55 (round 4: log level, not just the fallback
+    itself): an unresolvable cwd (permission error, a network drive that
+    dropped mid-call) must fall open to "no session matched" like every other
+    miss, not crash every caller of get_project_dir — including read-only
+    commands (tasks list/next/reflect) that share this chokepoint. Logged at
+    ERROR for the same reason every other fail-open branch in this module is:
+    CLAWP-039/041's fail-open-needs-a-marker doctrine. Shared with
+    ``discovery.resolve_scope`` (Codex r1 P2, PR #75) so an explicit target
+    gets the identical logged fallback; *fallback* names the consequence.
+    """
+    try:
+        return Path(path).resolve()
+    except OSError as exc:
+        logger.error("Failed to resolve cwd %s: %s. %s", path, exc, fallback)
+        return None
 
 
 _REGISTERED = "registered"
@@ -510,19 +543,8 @@ def find_session_for_cwd(
     double up separators and silently miss every path nested under a
     worktree that happened to sit at a drive root.
     """
-    try:
-        resolved_cwd = Path(cwd).resolve()
-    except OSError as exc:
-        # antigravity review, PR #55 (round 4: log level, not just the
-        # fallback itself): an unresolvable cwd (permission error, a
-        # network drive that dropped mid-call) must fall open to "no
-        # session matched" like every other miss, not crash every caller
-        # of get_project_dir — including read-only commands (tasks list/
-        # next/reflect) that share this chokepoint. Logged at ERROR for the
-        # same reason every other fail-open branch in this module is:
-        # CLAWP-039/041's fail-open-needs-a-marker doctrine.
-        logger.error("Failed to resolve cwd %s: %s. Session-scoped "
-                      "resolution skipped for this call.", cwd, exc)
+    resolved_cwd = resolve_path_or_none(cwd)
+    if resolved_cwd is None:
         return None
     cwd_norm = Path(os.path.normcase(str(resolved_cwd)))
     best: Optional[SessionRecord] = None

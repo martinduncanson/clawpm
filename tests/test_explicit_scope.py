@@ -124,6 +124,23 @@ class TestBoundScope:
         with pytest.raises(Exception):
             Scope.canonical().target = fx["wt"]  # type: ignore[misc]
 
+    def test_relative_target_is_absolutised_at_bind_time(self, fx, monkeypatch):
+        # Codex r1 P2: Scope.bound(Path(".")) kept "." and re-resolved it
+        # against whatever cwd was current at each lookup, so moving cwd
+        # changed the same scope's answer.
+        monkeypatch.chdir(fx["wt"])
+        scope = Scope.bound(Path("."))
+        monkeypatch.chdir(fx["repo"])
+        assert scope.target.is_absolute()
+        assert _same(get_project_dir(fx["config"], "test", scope=scope), fx["wt_meta"])
+
+    def test_direct_construction_is_absolutised_too(self, fx, monkeypatch):
+        monkeypatch.chdir(fx["wt"])
+        scope = Scope(Path("."))
+        monkeypatch.chdir(fx["repo"])
+        assert scope.target.is_absolute()
+        assert _same(get_project_dir(fx["config"], "test", scope=scope), fx["wt_meta"])
+
 
 class TestResolveScope:
     def test_freezes_the_ambient_answer(self, fx, monkeypatch):
@@ -146,6 +163,28 @@ class TestResolveScope:
     def test_explicit_target_dir_wins_over_cwd(self, fx):
         scope = resolve_scope(fx["config"], "test", target_dir=fx["wt"])
         assert _same(get_project_dir(fx["config"], "test", scope=scope), fx["wt_meta"])
+
+    def test_unresolvable_target_dir_falls_back_to_canonical_loudly(
+        self, fx, monkeypatch, caplog
+    ):
+        # Codex r1 P2: an unavailable explicit target raised out of
+        # resolve_scope; ambient resolution logs and falls open to canonical.
+        bad = fx["elsewhere"] / "unavailable-volume"
+        real_resolve = Path.resolve
+
+        def flaky(self, *a, **kw):
+            if self.name == "unavailable-volume":
+                raise OSError("simulated unavailable volume")
+            return real_resolve(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "resolve", flaky)
+        with caplog.at_level("WARNING"):
+            scope = resolve_scope(fx["config"], "test", target_dir=bad)
+        assert scope.is_canonical
+        assert any(
+            r.levelno >= 30 and "simulated unavailable volume" in r.getMessage()
+            for r in caplog.records
+        )
 
 
 class TestScopeThreadsThroughTasks:
