@@ -8,7 +8,7 @@ import click
 from clawpm.models import Task
 from clawpm.output import output_error, output_success
 from clawpm.context import expand_task_id
-from clawpm.cli.base import main, get_format, require_portfolio, require_project, _FALLBACK_POLICIES
+from clawpm.cli.base import main, get_format, require_portfolio, require_project, _FALLBACK_POLICIES, ExpandedPath
 
 # ============================================================================
 # Lease commands (CLAWP-039) — crash-safe dispatch
@@ -34,7 +34,7 @@ def lease_group() -> None:
 @click.option("--ttl", "ttl", type=int, required=True, help="Lease TTL in seconds (no heartbeat within → expired)")
 @click.option("--fallback-policy", "fallback_policy", type=click.Choice(_FALLBACK_POLICIES), default="requeue", show_default=True)
 @click.option("--holder", "holder_id", default=None, help="Optional holder identifier (e.g. worktree path / session id)")
-@click.option("--target-dir", "target_dir", default=None, help="Dispatch target dir (torn down on requeue fallback)")
+@click.option("--target-dir", "target_dir", type=ExpandedPath(), default=None, help="Dispatch target dir (torn down on requeue fallback)")
 @click.pass_context
 def lease_grant(ctx, project_id, task_id, ttl, fallback_policy, holder_id, target_dir):
     """Grant a lease on a dispatched task."""

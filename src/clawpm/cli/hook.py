@@ -11,7 +11,7 @@ import click
 from clawpm.models import Task
 from clawpm.tasks import get_task
 from clawpm.context import expand_task_id
-from clawpm.cli.base import main, get_format, require_portfolio, require_project
+from clawpm.cli.base import main, get_format, require_portfolio, require_project, ExpandedPath
 
 # ============================================================================
 # Hook subcommands (called by Claude Code hooks; not for direct human use)
@@ -83,9 +83,9 @@ def hook_session_start(
 @hook.command("eval-stop")
 @click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
 @click.option("--task", "task_id", required=True, help="Task ID whose rubric to evaluate against")
-@click.option("--transcript-file", "transcript_file", type=click.Path(), default=None,
+@click.option("--transcript-file", "transcript_file", type=ExpandedPath(), default=None,
               help="Path to the transcript file. Overrides hook stdin's transcript_path.")
-@click.option("--rubric-file", "rubric_file", type=click.Path(), default=None,
+@click.option("--rubric-file", "rubric_file", type=ExpandedPath(), default=None,
               help="Path to a pre-rendered rubric markdown file. Default: render from the task.")
 @click.option("--confirm-close/--no-confirm-close", "confirm_close", default=None,
               help="CLAWP-041: run an adversarial refutation pass before letting the "

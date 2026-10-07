@@ -36,7 +36,12 @@ Issue tracker entries .agent/issues.jsonl 2026-07-07T11:13:23Z (bug/medium, laun
 
 ## Acceptance Criteria
 
-- [ ] (Add criteria here)
+- [x] Root cause established by experiment: Click's `windows_expand_args` (default True) expands argv on Windows, not the MSVCRT launcher. Reproduced through the exe, `python -m clawpm` and `main()` with patched `sys.argv`.
+- [x] `main()` in `src/clawpm/cli/base.py` is a `_VerbatimArgsGroup` that defaults `windows_expand_args=False`; this covers the console script, `python -m clawpm`, and `clawpm.cli.mcp`/`serve`, which all call the same group.
+- [x] `tests/test_clawp109_no_glob_expansion.py`: a platform-independent test asserts the entry point passes `windows_expand_args=False`; Windows-only tests prove `--scope "src/<double-star>"` and double-star free text reach `tasks add` verbatim. All three failed before the fix.
+- [x] SKILL.md Tips documents the gotcha, the fixed range, what still expands (path options expand `~`/env vars; POSIX shells glob unquoted wildcards), and the workaround for older installs.
+- [x] CHANGELOG line added under Unreleased / Fixed.
+- [x] Full suite green.
 
 ## Notes
 
