@@ -529,3 +529,90 @@ class TestLinkedPathsBeneathTheWorktreeStore:
         with pytest.raises(RuntimeError) as exc:
             agmod._pin_worktree_scope(fx["config"], "test", sid, wt)
         assert "done" in str(exc.value)
+
+
+class TestAnyLinkUnderTheWorktreeStoreRefusesTheSync:
+    """Codex r4 P2 (PR #79): a pre-existing ``<dest>.md.tmp`` symlink (the
+    atomic-write sibling of the destination) passed a per-path enumeration and
+    let the sync rewrite the canonical task through it. Containment is now
+    structural: ANY symlink or junction anywhere under ``.project/`` refuses
+    the sync, whichever path the mutator would have touched."""
+
+    @pytest.fixture(autouse=True)
+    def _require_symlink(self, tmp_path):
+        reason = _link_unavailable("symlink", tmp_path)
+        if reason:
+            pytest.skip(reason)
+
+    def _run(self, fx, monkeypatch, caplog, verdict_json, plant, want_in_log):
+        canonical_meta = fx["repo"] / ".project"
+        helper = TestVerdictSyncIsPinnedToTheWorktree
+
+        def _hook(fx_, sid, sessions, seen):
+            plant(fx_, sid, seen["target"] / ".project", canonical_meta)
+            seen["canonical"] = _tree(canonical_meta)
+
+        wrapped, calls, seen = helper._race(fx, _hook)
+        monkeypatch.setattr(agmod, "change_task_state", wrapped)
+        with caplog.at_level(logging.ERROR, logger="clawpm.agent"):
+            _dispatch_with(fx, verdict_json)
+        assert "canonical" in seen, "the race hook never ran"
+        assert _tree(canonical_meta) == seen["canonical"], (
+            "the verdict sync wrote through a link into the canonical store"
+        )
+        assert len(calls) == 1, "the mutator ran for the sync despite the link"
+        msgs = " ".join(r.getMessage() for r in caplog.records)
+        assert "CLAWP-115" in msgs
+        for needle in want_in_log:
+            assert needle in msgs
+
+    @pytest.mark.parametrize(
+        "verdict_json, state_dir",
+        [
+            ('{"ok": true, "reason": "done"}', "done"),
+            ('{"ok": false, "reason": "nope", "impossible": false}', "blocked"),
+        ],
+    )
+    def test_symlinked_atomic_write_temp_file_is_refused(
+        self, tracked, monkeypatch, caplog, verdict_json, state_dir
+    ):
+        def _plant(fx, sid, wt_meta, canonical_meta):
+            canonical_file = canonical_meta / "tasks" / state_dir / f"{sid}.md"
+            assert canonical_file.exists(), "canonical verdict file missing"
+            tmp = wt_meta / "tasks" / state_dir / f"{sid}.md.tmp"
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(canonical_file, tmp)
+
+        self._run(
+            tracked, monkeypatch, caplog, verdict_json, _plant,
+            want_in_log=[f"{state_dir}", ".md.tmp"],
+        )
+
+    def test_symlink_in_a_directory_the_mutator_never_names_is_refused(
+        self, tracked, monkeypatch, caplog
+    ):
+        def _plant(fx, sid, wt_meta, canonical_meta):
+            (wt_meta / "notes").mkdir(exist_ok=True)
+            os.symlink(
+                canonical_meta / "tasks" / "done" / f"{sid}.md",
+                wt_meta / "notes" / "elsewhere.md",
+            )
+
+        self._run(
+            tracked, monkeypatch, caplog, '{"ok": true, "reason": "done"}',
+            _plant, want_in_log=["elsewhere.md"],
+        )
+
+    def test_walk_names_a_link_and_clean_store_passes(self, tracked, tmp_path):
+        wt = tmp_path / "wt"
+        meta = wt / ".project"
+        (meta / "tasks" / "done").mkdir(parents=True)
+        (meta / "tasks" / "TEST-001.md").write_text(
+            "---\nid: TEST-001\ntitle: t\nstate: open\n---\n# t\n", encoding="utf-8"
+        )
+        cfg = tracked["config"]
+        # A real tree with no links is accepted.
+        agmod._pin_worktree_scope(cfg, "test", "TEST-001", wt)
+        os.symlink(tracked["repo"] / "README.md", meta / "tasks" / "done" / "x.md.tmp")
+        with pytest.raises(RuntimeError, match=r"x\.md\.tmp"):
+            agmod._pin_worktree_scope(cfg, "test", "TEST-001", wt)

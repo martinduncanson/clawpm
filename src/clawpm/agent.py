@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 import shutil
 import subprocess
 import uuid
@@ -158,41 +159,59 @@ def _within(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
-def _check_transition_paths(
-    project_dir: Path, canonical: Optional[Path], subtask_id: str
-) -> None:
-    """Refuse a store whose links lead a transition out of it (CLAWP-115).
+def _is_link(path: Path) -> bool:
+    """Whether *path* itself is a symlink or Windows junction (never followed)."""
+    return path.is_symlink() or path.is_junction()
 
-    Resolves (``strict=False``: follows symlinks and Windows junctions, and
-    works for paths that do not exist yet) every path ``change_task_state``
-    can read, create or write for *subtask_id*: the tasks dir, its lock file,
-    each state subdir it may ``mkdir``, every location the task or its
-    destination can occupy, and the directory-task folders. Each must resolve
-    inside *project_dir* and outside the canonical store, else ``RuntimeError``
-    naming the offending path. Nothing is created or written here.
+
+def _find_link_under(root: Path) -> Optional[Path]:
+    """First symlink or junction at or beneath *root*, else ``None``.
+
+    Walks with ``os.scandir`` and never descends into a link (``os.walk``
+    would walk into a junction, which it does not report as a symlink).
     """
-    tasks_dir = project_dir / "tasks"
-    state_dirs = [tasks_dir / name for name in ("done", "blocked", "rejected")]
-    paths = [
-        tasks_dir,
-        tasks_dir / ".clawpm-tasks.lock",
-        *state_dirs,
-        *_candidate_task_paths(tasks_dir, subtask_id),
-        *(base / subtask_id for base in [tasks_dir, *state_dirs]),
-    ]
-    canonical_root = canonical.resolve() if canonical is not None else None
-    for path in paths:
-        resolved = path.resolve(strict=False)
-        if not _within(resolved, project_dir):
-            raise RuntimeError(
-                f"{path} resolves to {resolved}, outside the worktree store "
-                f"{project_dir} (a link leaves the store)"
-            )
-        if canonical_root is not None and _within(resolved, canonical_root):
-            raise RuntimeError(
-                f"{path} resolves to {resolved}, inside the canonical store "
-                f"{canonical_root}"
-            )
+    if _is_link(root):
+        return root
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        with os.scandir(current) as entries:
+            for entry in entries:
+                child = Path(entry.path)
+                if _is_link(child):
+                    return child
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(child)
+    return None
+
+
+def _refuse_links_under_store(project_dir: Path, canonical: Optional[Path]) -> None:
+    """Refuse a worktree store that contains any link (CLAWP-115).
+
+    Structural, not an enumeration of what ``change_task_state`` touches:
+    rounds 3 and 4 each found a path (a linked state dir, then a ``.md.tmp``
+    atomic-write sibling) the list missed. Any symlink or junction at or under
+    ``.project/`` refuses the sync, whatever the mutator would have written.
+    The tasks dir must also resolve inside *project_dir* and outside the
+    canonical store. Nothing is created or written here. The threat is links
+    already present in a freshly created worktree; a link planted after this
+    check (TOCTOU) is accepted residual.
+    """
+    link = _find_link_under(project_dir)
+    if link is not None:
+        raise RuntimeError(
+            f"{link} is a symlink or junction under the worktree store "
+            f"{project_dir}; refusing to write through links"
+        )
+    tasks_dir = (project_dir / "tasks").resolve(strict=False)
+    if not _within(tasks_dir, project_dir):
+        raise RuntimeError(
+            f"{tasks_dir} is outside the worktree store {project_dir}"
+        )
+    if canonical is not None and _within(tasks_dir, canonical.resolve()):
+        raise RuntimeError(
+            f"{tasks_dir} is inside the canonical store {canonical.resolve()}"
+        )
 
 
 def _pin_worktree_scope(
@@ -203,9 +222,8 @@ def _pin_worktree_scope(
     Built straight from ``target_dir/.project`` — no session lookup, no
     registry fallback — and checked BEFORE any mutation: the store must sit
     inside the worktree (symlink/junction escapes resolve out and are
-    refused), must not be the canonical store, every path the transition will
-    touch must resolve inside it too (``_check_transition_paths``: a linked
-    ``tasks/`` or ``done/`` into the canonical store is refused), and it must
+    refused), must not be the canonical store, must hold no symlink or
+    junction anywhere beneath it (``_refuse_links_under_store``), and it must
     hold the copy we materialized. Raises ``RuntimeError`` (or ``OSError`` on a
     stat fault) when any check fails; the caller then writes nothing anywhere.
     """
@@ -216,7 +234,7 @@ def _pin_worktree_scope(
     canonical = get_project_dir(config, project_id, scope=Scope.canonical())
     if canonical is not None and canonical.resolve() == project_dir:
         raise RuntimeError(f"{project_dir} is the canonical store, not a worktree's")
-    _check_transition_paths(project_dir, canonical, subtask_id)
+    _refuse_links_under_store(project_dir, canonical)
     tasks_dir = project_dir / "tasks"
     if not stat_is_dir(tasks_dir):
         raise RuntimeError(f"{tasks_dir} is not a directory")
