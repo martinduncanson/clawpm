@@ -20,6 +20,7 @@ predictions:
   - from_file no longer swallows yaml.YAMLError into empty-frontmatter+raw-content
     silently; parse failure is surfaced not hidden
 priority: 5
+updated: '2026-10-07'
 ---
 # Research read-path hardening (deferred from CLAWP-087 review)
 
