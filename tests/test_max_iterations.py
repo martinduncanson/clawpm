@@ -205,3 +205,127 @@ class TestTerminationPaths:
         _invoke_eval_stop(task.id, transcript, "--max-iterations", "9")
         final = _invoke_eval_stop(task.id, transcript, "--max-iterations", "9")
         assert "THRASHING" in final.get("systemMessage", "")
+
+
+class TestCapFailsClosedOnLogIOErrors:
+    """Codex P2 (PR #87): a cap that cannot be enforced must not keep the
+    agent looping. Blocking Stop is what keeps the agent running, so with
+    --max-iterations set, an I/O failure lets Stop proceed (tripped path)
+    with an enforcement-error message. Without the flag, behaviour is
+    unchanged (fail-open: the rubric block stands)."""
+
+    @staticmethod
+    def _task(temp_portfolio, title):
+        return add_task(
+            temp_portfolio["config"], "test", title=title,
+            predictions=Predictions(success_criteria=["c"], thrash_threshold=50),
+        )
+
+    @staticmethod
+    def _break_count(monkeypatch):
+        import clawpm.reflect as reflect_mod
+
+        def boom(*a, **k):
+            raise OSError("simulated read failure")
+
+        monkeypatch.setattr(reflect_mod, "count_iterations_for_task", boom)
+
+    @staticmethod
+    def _break_write(monkeypatch):
+        import clawpm.reflect as reflect_mod
+
+        def boom(*a, **k):
+            raise OSError("simulated write failure")
+
+        monkeypatch.setattr(reflect_mod, "write_iteration_event", boom)
+
+    def _assert_tripped_enforcement_error(self, out, needle):
+        assert out.get("decision") != "block"
+        assert out.get("continue") is True
+        msg = out.get("systemMessage", "")
+        assert "STOP_CONDITION_TRIPPED" in msg
+        assert "enforcement error" in msg.lower()
+        assert "MAX_ITERATIONS" in msg
+        assert needle in msg
+
+    def test_count_read_failure_with_cap_allows_stop(
+        self, temp_portfolio, transcript, monkeypatch
+    ):
+        task = self._task(temp_portfolio, "count read fail")
+        _patch_judge(monkeypatch, [JudgeVerdict(ok=False, reason="still failing")])
+        self._break_count(monkeypatch)
+        out = _invoke_eval_stop(task.id, transcript, "--max-iterations", "3")
+        self._assert_tripped_enforcement_error(out, "simulated read failure")
+
+    def test_write_failure_with_cap_allows_stop(
+        self, temp_portfolio, transcript, monkeypatch
+    ):
+        task = self._task(temp_portfolio, "write fail")
+        _patch_judge(monkeypatch, [JudgeVerdict(ok=False, reason="still failing")])
+        self._break_write(monkeypatch)
+        out = _invoke_eval_stop(task.id, transcript, "--max-iterations", "3")
+        self._assert_tripped_enforcement_error(out, "simulated write failure")
+
+    def test_write_failure_ok_verdict_unchanged_with_cap(
+        self, temp_portfolio, transcript, monkeypatch
+    ):
+        task = self._task(temp_portfolio, "write fail ok")
+        _patch_judge(monkeypatch, [JudgeVerdict(ok=True, reason="done")])
+        self._break_write(monkeypatch)
+        out = _invoke_eval_stop(task.id, transcript, "--max-iterations", "3")
+        msg = out.get("systemMessage", "")
+        assert out.get("continue") is True
+        assert "rubric satisfied" in msg
+        assert "WRITE FAILED" in msg
+        assert "MAX_ITERATIONS" not in msg
+
+    def test_write_failure_impossible_verdict_unchanged_with_cap(
+        self, temp_portfolio, transcript, monkeypatch
+    ):
+        task = self._task(temp_portfolio, "write fail impossible")
+        _patch_judge(
+            monkeypatch,
+            [JudgeVerdict(ok=False, impossible=True, reason="cannot be done")],
+        )
+        self._break_write(monkeypatch)
+        out = _invoke_eval_stop(task.id, transcript, "--max-iterations", "3")
+        msg = out.get("systemMessage", "")
+        assert out.get("continue") is True
+        assert "IMPOSSIBLE" in msg
+        assert "MAX_ITERATIONS" not in msg
+
+    def test_count_failure_ok_and_impossible_unchanged(
+        self, temp_portfolio, transcript, monkeypatch
+    ):
+        task = self._task(temp_portfolio, "count fail ok")
+        self._break_count(monkeypatch)
+        _patch_judge(monkeypatch, [JudgeVerdict(ok=True, reason="done")])
+        ok_out = _invoke_eval_stop(task.id, transcript, "--max-iterations", "3")
+        assert "rubric satisfied" in ok_out.get("systemMessage", "")
+        assert "MAX_ITERATIONS" not in ok_out.get("systemMessage", "")
+        _patch_judge(
+            monkeypatch,
+            [JudgeVerdict(ok=False, impossible=True, reason="cannot be done")],
+        )
+        imp_out = _invoke_eval_stop(task.id, transcript, "--max-iterations", "3")
+        assert "IMPOSSIBLE" in imp_out.get("systemMessage", "")
+        assert "MAX_ITERATIONS" not in imp_out.get("systemMessage", "")
+
+    def test_write_failure_without_cap_still_blocks(
+        self, temp_portfolio, transcript, monkeypatch
+    ):
+        task = self._task(temp_portfolio, "write fail no cap")
+        _patch_judge(monkeypatch, [JudgeVerdict(ok=False, reason="still failing")])
+        self._break_write(monkeypatch)
+        out = _invoke_eval_stop(task.id, transcript)
+        assert out.get("decision") == "block"
+        assert "MAX_ITERATIONS" not in json.dumps(out)
+
+    def test_count_failure_without_cap_still_blocks(
+        self, temp_portfolio, transcript, monkeypatch
+    ):
+        task = self._task(temp_portfolio, "count fail no cap")
+        _patch_judge(monkeypatch, [JudgeVerdict(ok=False, reason="still failing")])
+        self._break_count(monkeypatch)
+        out = _invoke_eval_stop(task.id, transcript)
+        assert out.get("decision") == "block"

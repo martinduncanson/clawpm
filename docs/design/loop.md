@@ -51,8 +51,14 @@ not bound total spend. So the real gap is an **absolute iteration cap**.
   sees the same "stopped, triage" surface as thrashing.
 - An `ok` or `impossible` verdict is never converted. A rubric satisfied on
   the cap iteration still closes as satisfied.
-- If the cap cannot be evaluated (I/O error reading the log) the hook fails
-  open and writes a warning to stderr. Wedging the agent would be worse.
+- If the cap cannot be enforced (I/O error reading the iteration log, or
+  writing the iteration event that the cap counts) the hook fails **closed**:
+  a not-ok verdict becomes a `stop_condition_tripped` stop with a
+  `MAX_ITERATIONS enforcement error` message, and the operator triages.
+  Blocking Stop is what keeps the agent running, so leaving the block in place
+  would silently remove the bound. `ok` and `impossible` verdicts are
+  unchanged. Without `--max-iterations` the hook behaves as before (the rubric
+  block stands on a log I/O failure).
 - Per-iteration progress log: unchanged. The existing iteration events are it.
 
 ## Deferred: `--max-budget`

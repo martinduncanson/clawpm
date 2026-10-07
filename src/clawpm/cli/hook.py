@@ -80,6 +80,33 @@ def hook_session_start(
         }))
 
 
+def _cap_enforcement_failure(verdict, task_id, max_iterations, what, exc):
+    """CLAWP-070: fail CLOSED when --max-iterations cannot be enforced.
+
+    Blocking the Stop event is what keeps the agent running, so a log I/O
+    failure that left a not-ok verdict as a block would remove the hard cap.
+    Convert it into a ``stop_condition_tripped`` verdict (Stop proceeds, the
+    operator triages) with an enforcement-error message. ``ok``,
+    ``impossible`` and already-tripped verdicts already let Stop through and
+    are returned unchanged.
+    """
+    from clawpm.judges.stop_condition import JudgeVerdict
+
+    if verdict.ok or verdict.impossible or verdict.stop_condition_tripped:
+        return verdict
+    return JudgeVerdict(
+        ok=False,
+        reason=(
+            "MAX_ITERATIONS enforcement error on task " + task_id + ": "
+            + what + " (" + str(exc) + "), so the " + str(max_iterations)
+            + "-iteration cap cannot be enforced. Agent stopped rather than "
+            + "left looping unbounded; operator should triage. "
+            + "Last verdict: " + verdict.reason[:200]
+        ),
+        stop_condition_tripped=True,
+    )
+
+
 @hook.command("eval-stop")
 @click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
 @click.option("--task", "task_id", required=True, help="Task ID whose rubric to evaluate against")
@@ -280,6 +307,15 @@ def hook_eval_stop(
         # Disk full / permission / encoding errors. Surface in the
         # hook output's systemMessage so the operator sees it in the
         # next transcript update.
+        # CLAWP-070: with --max-iterations set, the iteration log is the cap's
+        # counter. If it cannot be written the cap cannot be enforced, and
+        # blocking Stop is exactly what keeps the agent looping -- so fail
+        # closed: let Stop proceed via the tripped path. ok/impossible
+        # verdicts already allow Stop and are left untouched.
+        if max_iterations is not None:
+            verdict = _cap_enforcement_failure(
+                verdict, task_id, max_iterations, "iteration event write failed", exc
+            )
         output = map_verdict_to_hook_output(verdict)
         # Preserve continue/block decision; just decorate systemMessage.
         existing_msg = output.get("systemMessage", "")
@@ -336,8 +372,10 @@ def hook_eval_stop(
 
     # CLAWP-070: absolute iteration cap. A satisfied (ok) or impossible verdict
     # has already ended the loop; the cap only converts a would-be "block" into
-    # a stop once this dispatch has burned its budget. Fail-open on a read error
-    # (a cap that cannot be evaluated must not wedge the agent), but say so.
+    # a stop once this dispatch has burned its budget. Fail CLOSED on a read
+    # error: blocking Stop is what keeps the agent running, so a cap that
+    # cannot be evaluated must let Stop proceed (tripped path, with an
+    # enforcement-error message) rather than silently remove the bound.
     if (
         max_iterations is not None
         and not verdict.ok
@@ -362,10 +400,9 @@ def hook_eval_stop(
                     ),
                     stop_condition_tripped=True,
                 )
-        except OSError as exc:
-            click.echo(
-                f"clawpm eval-stop: max-iterations cap not enforced ({exc})",
-                err=True,
+        except Exception as exc:
+            verdict = _cap_enforcement_failure(
+                verdict, task_id, max_iterations, "iteration log read failed", exc
             )
 
     output = map_verdict_to_hook_output(verdict)
