@@ -696,6 +696,46 @@ def _stamp_updated_file(file_path: Path, when: str | None = None) -> None:
         raise
 
 
+_STATE_LINE_RE = re.compile(r"^state\s*:")
+
+
+def _sync_state_line(file_path: Path, new_state: str) -> bool:
+    """Rewrite an EXISTING top-level ``state:`` frontmatter line, in place (CLAWP-094).
+
+    Surgical like :func:`_stamp_updated_file`: only that one line changes, so
+    comments / key order / body are preserved. Returns ``True`` if a line was
+    rewritten. A file with no well-formed fence, or with no ``state:`` key, is
+    left untouched (``False``) -- we never ADD a state key tasks don't carry.
+    """
+    text = retry_transient(lambda: file_path.read_text(encoding="utf-8"))
+    if not text.startswith("---"):
+        return False
+    lines = text.split("\n")
+    if lines[0].strip() != "---":
+        return False
+    close_idx = next(
+        (i for i in range(1, len(lines)) if lines[i].strip() == "---"), None
+    )
+    if close_idx is None:
+        return False
+    for i in range(1, close_idx):
+        if _STATE_LINE_RE.match(lines[i]):
+            if lines[i] == f"state: {new_state}":
+                return False
+            lines[i] = f"state: {new_state}"
+            break
+    else:
+        return False
+    tmp = file_path.with_suffix(file_path.suffix + ".tmp")
+    try:
+        tmp.write_text("\n".join(lines), encoding="utf-8")
+        retry_transient(tmp.replace, file_path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    return True
+
+
 def touch_task_updated(
     config: PortfolioConfig,
     project_id: str,
@@ -1249,12 +1289,22 @@ def cascade_unblock_dependents(
             config, project_id, task.id, TaskState.OPEN
         )
         if moved is not None:
-            transitions.append({
+            record = {
                 "task_id": task.id,
                 "from_state": "blocked",
                 "to_state": "open",
                 "trigger": completed_task_id,
-            })
+            }
+            # CLAWP-094: the move alone left a stale `state: blocked` line in
+            # frontmatter (doctor then reported it as drift). The move has
+            # already committed, so a failure here must not abort the cascade
+            # for the remaining dependents -- but it is recorded, not swallowed.
+            if moved.file_path is not None:
+                try:
+                    _sync_state_line(moved.file_path, TaskState.OPEN.value)
+                except Exception as exc:
+                    record["state_sync_error"] = f"{type(exc).__name__}: {exc}"
+            transitions.append(record)
 
     return transitions
 

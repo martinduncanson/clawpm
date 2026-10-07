@@ -258,10 +258,14 @@ def apply_stale_blocked(stale_entry: dict, config: Any, *, dry_run: bool = False
 
     promoted_ids = [t["task_id"] for t in transitions]
     if task_id in promoted_ids:
+        note = ""
+        for t in transitions:
+            if t["task_id"] == task_id and t.get("state_sync_error"):
+                note = f"; WARNING frontmatter state not synced: {t['state_sync_error']}"
         return {
             "class": "stale_blocked",
             "target": task_id,
-            "result": f"promoted blocked -> open (trigger deps={deps})",
+            "result": f"promoted blocked -> open (trigger deps={deps}){note}",
         }
     if transitions:
         return {
@@ -277,6 +281,36 @@ def apply_stale_blocked(stale_entry: dict, config: Any, *, dry_run: bool = False
         "target": task_id,
         "result": "no-op: cascade found no eligible promotions (deps still unsatisfied?)",
     }
+
+
+def _classify_outcome(result: str) -> str:
+    """Classify an arm's ``result`` string: ``applied`` | ``skipped`` | ``error``.
+
+    Arms report via free-text ``result``. Only a genuine (or dry-run ``would-``)
+    remediation counts as ``applied``; ``error:``, ``skipped:``, ``no-op:`` and a
+    cascade that ran without promoting the target do not (CLAWP-094).
+    """
+    r = (result or "").lstrip().lower()
+    if r.startswith("error:"):
+        return "error"
+    if r.startswith(("skipped:", "no-op:", "cascade ran but did not promote")):
+        return "skipped"
+    return "applied"
+
+
+def _route(entry: dict, applied: list[dict], apply_skipped: list[dict]) -> None:
+    """Append ``entry`` to ``applied`` only if genuinely applied; otherwise to
+    ``apply_skipped`` as ``{class, target, reason, outcome}``."""
+    outcome = _classify_outcome(entry.get("result", ""))
+    if outcome == "applied":
+        applied.append(entry)
+        return
+    apply_skipped.append({
+        "class": entry.get("class"),
+        "target": entry.get("target"),
+        "reason": entry.get("result"),
+        "outcome": outcome,
+    })
 
 
 def run_apply_phase(
@@ -300,13 +334,16 @@ def run_apply_phase(
 
     Returns ``(applied, apply_skipped)``:
 
-    - ``applied`` — one entry per remediation actually attempted, with the
+    - ``applied`` — one entry per remediation genuinely applied, with the
       shape ``{class, target, result}``. Populated identically in dry-run mode
       except the filesystem is not touched and ``result`` is prefixed with
-      ``would-``.
+      ``would-``. Attempts that errored, were skipped or were no-ops are NOT
+      here (CLAWP-094).
     - ``apply_skipped`` — one entry per warning that is **not** auto-applyable,
-      with ``{class, target, reason}``. Surface so the operator can see what
-      ``--apply`` consciously left untouched.
+      or whose attempt errored / was skipped / no-op'd, with
+      ``{class, target, reason}``. Attempt-derived entries additionally carry
+      ``outcome`` (``"error"`` | ``"skipped"``). Surface so the operator can
+      see what ``--apply`` left untouched.
 
     The ``--no-apply-*`` flags map to the boolean kwargs above. Disabling
     ``apply_half_rename_flag`` filters half_rename drift entries but leaves
@@ -329,7 +366,7 @@ def run_apply_phase(
                     "reason": "disabled by --no-apply-half-rename",
                 })
                 continue
-            applied.append(apply_drift(d, dry_run=dry_run))
+            _route(apply_drift(d, dry_run=dry_run), applied, apply_skipped)
         elif issue == "state_mismatch":
             if not apply_drift_flag:
                 apply_skipped.append({
@@ -338,7 +375,7 @@ def run_apply_phase(
                     "reason": "disabled by --no-apply-drift",
                 })
                 continue
-            applied.append(apply_drift(d, dry_run=dry_run))
+            _route(apply_drift(d, dry_run=dry_run), applied, apply_skipped)
         else:
             apply_skipped.append({
                 "class": "drift_tasks",
@@ -355,7 +392,7 @@ def run_apply_phase(
                 "reason": "disabled by --no-apply-cascade or --no-apply-stale-blocked",
             })
             continue
-        applied.append(apply_stale_blocked(sb, config, dry_run=dry_run))
+        _route(apply_stale_blocked(sb, config, dry_run=dry_run), applied, apply_skipped)
 
     # --- non-applyable classes ---
     for st in stale_tasks:

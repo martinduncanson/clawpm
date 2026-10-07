@@ -260,3 +260,130 @@ class TestRunApplyPhase:
         assert by_class["commit_drift"]["reason"] == SKIP_REASONS["commit_drift"]
         assert by_class["missing_markers"]["reason"] == SKIP_REASONS["missing_markers"]
         assert by_class["codex_availability"]["reason"] == SKIP_REASONS["codex_availability"]
+
+
+class TestApplyPhaseOutcomeSeparation:
+    """CLAWP-094 — applied[] holds only genuinely applied items."""
+
+    @staticmethod
+    def _phase(**kw):
+        return TestRunApplyPhase._phase(**kw)
+
+    def test_skipped_result_routed_to_apply_skipped(self):
+        applied, skipped = self._phase(
+            drift_tasks=[
+                {"file": "", "issue": "state_mismatch", "location_state": "open"}
+            ]
+        )
+        assert applied == []
+        assert len(skipped) == 1
+        assert skipped[0]["class"] == "drift_tasks"
+        assert skipped[0]["reason"].startswith("skipped:")
+        assert skipped[0]["outcome"] == "skipped"
+
+    def test_error_result_routed_to_apply_skipped_flagged_error(self, tmp_path):
+        f = tmp_path / "bad.md"
+        f.write_text("---\nstate: blocked\nno close fence\n", encoding="utf-8")
+        applied, skipped = self._phase(
+            drift_tasks=[
+                {"file": str(f), "issue": "state_mismatch", "location_state": "open"}
+            ]
+        )
+        assert applied == []
+        assert skipped[0]["outcome"] == "error"
+        assert "error" in skipped[0]["reason"]
+
+    def test_noop_cascade_not_reported_as_applied(self, isolated_portfolio):
+        tasks = isolated_portfolio.tasks_dir
+        _write(
+            tasks / "blocked" / "TEST-021.md",
+            "blocked",
+            task_id="TEST-021",
+            extra="depends:\n  - TEST-020\n",
+        )
+        applied, skipped = self._phase(
+            config=isolated_portfolio.config,
+            stale_blocked=[
+                {"task_id": "TEST-021", "project_id": "test", "deps": ["TEST-020"]}
+            ],
+        )
+        assert applied == []
+        assert skipped[0]["class"] == "stale_blocked"
+        assert skipped[0]["outcome"] == "skipped"
+
+    def test_real_apply_stays_in_applied(self, tmp_path):
+        f = tmp_path / "TEST-001.md"
+        _write(f, "open")
+        applied, skipped = self._phase(
+            drift_tasks=[{"file": str(f), "issue": "half_rename"}]
+        )
+        assert len(applied) == 1 and skipped == []
+
+    def test_dry_run_would_entries_stay_in_applied(self, tmp_path):
+        f = tmp_path / "TEST-001.md"
+        _write(f, "open")
+        applied, _ = self._phase(
+            drift_tasks=[{"file": str(f), "issue": "half_rename"}], dry_run=True
+        )
+        assert applied[0]["result"].startswith("would-")
+
+
+class TestStaleBlockedFrontmatterConsistency:
+    """CLAWP-094 — promoting via cascade must not leave `state: blocked` behind."""
+
+    def test_cascade_rewrites_state_line(self, isolated_portfolio):
+        tasks = isolated_portfolio.tasks_dir
+        _write(tasks / "done" / "TEST-030.md", "done", task_id="TEST-030")
+        _write(
+            tasks / "blocked" / "TEST-031.md",
+            "blocked",
+            task_id="TEST-031",
+            extra="depends:\n  - TEST-030\n# keep me\n",
+        )
+        res = apply_stale_blocked(
+            {"task_id": "TEST-031", "project_id": "test", "deps": ["TEST-030"]},
+            config=isolated_portfolio.config,
+        )
+        assert "promoted" in res["result"]
+        text = (tasks / "TEST-031.md").read_text(encoding="utf-8")
+        fm = yaml.safe_load(text.split("---", 2)[1])
+        assert fm["state"] == "open"
+        assert "# keep me" in text  # surgical, not a reserialise
+
+    def test_cascade_without_state_key_adds_none(self, isolated_portfolio):
+        tasks = isolated_portfolio.tasks_dir
+        _write(tasks / "done" / "TEST-040.md", "done", task_id="TEST-040")
+        (tasks / "blocked" / "TEST-041.md").write_text(
+            "---\nid: TEST-041\ntitle: T\ndepends:\n  - TEST-040\n---\n\nbody\n",
+            encoding="utf-8",
+        )
+        apply_stale_blocked(
+            {"task_id": "TEST-041", "project_id": "test", "deps": ["TEST-040"]},
+            config=isolated_portfolio.config,
+        )
+        fm = yaml.safe_load(
+            (tasks / "TEST-041.md").read_text(encoding="utf-8").split("---", 2)[1]
+        )
+        assert "state" not in fm
+
+    def test_sync_state_failure_is_marked_not_silent(self, isolated_portfolio, monkeypatch):
+        from clawpm import tasks as tasks_mod
+
+        tasks = isolated_portfolio.tasks_dir
+        _write(tasks / "done" / "TEST-050.md", "done", task_id="TEST-050")
+        _write(
+            tasks / "blocked" / "TEST-051.md",
+            "blocked",
+            task_id="TEST-051",
+            extra="depends:\n  - TEST-050\n",
+        )
+
+        def boom(*a, **k):
+            raise OSError("disk says no")
+
+        monkeypatch.setattr(tasks_mod, "_sync_state_line", boom)
+        transitions = tasks_mod.cascade_unblock_dependents(
+            isolated_portfolio.config, "test", "TEST-050"
+        )
+        assert [t["task_id"] for t in transitions] == ["TEST-051"]
+        assert "disk says no" in transitions[0]["state_sync_error"]

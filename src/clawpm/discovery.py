@@ -64,6 +64,12 @@ def get_portfolio_path() -> Path | None:
         path = Path(env_path).expanduser()
         if path.exists():
             return path
+        # CLAWP-094: an explicit operator pointer that resolves to nothing is
+        # a degraded path (falls through to the default location) -- mark it.
+        _warn_portfolio_fallback(
+            f"CLAWPM_PORTFOLIO={env_path!r} does not exist; "
+            "falling back to the default portfolio location"
+        )
 
     # Default location: ~/clawpm
     default = Path.home() / "clawpm"
@@ -73,17 +79,38 @@ def get_portfolio_path() -> Path | None:
     return None
 
 
+_PORTFOLIO_FALLBACK_WARNED: set[str] = set()
+
+
+def _warn_portfolio_fallback(message: str) -> None:
+    """Log a portfolio fail-open marker once per distinct message per process."""
+    if message in _PORTFOLIO_FALLBACK_WARNED:
+        return
+    _PORTFOLIO_FALLBACK_WARNED.add(message)
+    logger.warning("clawpm: %s", message)
+
+
 def load_portfolio_config(portfolio_path: Path | None = None) -> PortfolioConfig | None:
     """Load portfolio configuration.
 
     If portfolio.toml exists, loads it. Otherwise creates a default config
     with sensible defaults (~/clawpm/projects as project root).
 
+    Fail-open contract (CLAWP-094): this NEVER returns None -- the ``| None``
+    in the signature is legacy; callers' ``if not config`` guards are dead
+    code. Absence of any portfolio is a legitimate fresh-install state and
+    yields defaults silently. An EXPLICIT pointer that does not resolve to a
+    portfolio.toml (``CLAWPM_PORTFOLIO`` set to a missing dir, or a
+    ``portfolio_path`` argument lacking portfolio.toml) also yields defaults
+    but logs a one-time warning. A portfolio.toml that EXISTS but is malformed
+    raises (loud) -- it is never papered over with defaults.
+
     Environment variables:
       CLAWPM_PORTFOLIO: Override portfolio root directory
       CLAWPM_PROJECT_ROOTS: Colon-separated list of additional project roots
       CLAWPM_WORKSPACE: Override OpenClaw workspace path
     """
+    explicit = portfolio_path is not None
     if portfolio_path is None:
         portfolio_path = get_portfolio_path()
 
@@ -95,6 +122,10 @@ def load_portfolio_config(portfolio_path: Path | None = None) -> PortfolioConfig
             # Merge in env var project roots
             config = _merge_env_project_roots(config)
             return config
+        if explicit or os.environ.get("CLAWPM_PORTFOLIO"):
+            _warn_portfolio_fallback(
+                f"no portfolio.toml in {portfolio_path}; using default portfolio config"
+            )
 
     # No portfolio.toml - use defaults
     return _default_portfolio_config()
