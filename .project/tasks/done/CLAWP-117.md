@@ -34,7 +34,7 @@ priority: 5
 tags:
 - concurrency
 - dispatch
-updated: '2026-09-03'
+updated: '2026-10-07'
 ---
 # Worktree identity: relocation recovery + dispatch source-repo scoping (split from CLAWP-098)
 
