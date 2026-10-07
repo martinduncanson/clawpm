@@ -624,19 +624,63 @@ def find_session_for_cwd(
         if depth > best_depth:
             best = record
             best_depth = depth
-    if best is None and degraded:
-        best = _marker_fallback_session(resolved_cwd, project_id)
+    if best is None:
+        # Degraded ledger (CLAWP-114): the marker stands in for it. Healthy
+        # ledger (CLAWP-117): the marker still identifies a RELOCATED
+        # worktree, but only when the ledger's record of it has gone stale.
+        best = _marker_fallback_session(
+            resolved_cwd, project_id, None if degraded else sessions
+        )
     return best
 
 
+def _task_has_stale_session_only(
+    sessions: dict[str, SessionRecord], task_id: str, project_id: str
+) -> bool:
+    """CLAWP-117: True when *task_id* has at least one ACTIVE ledger session
+    for *project_id* and none of them records a live (or unverifiable)
+    worktree directory.
+
+    A recorded path that is still a live directory means the session is
+    legitimately active there, so a marker elsewhere must never rebind it.
+    A stat fault is "unknown", which is also treated as not stale. Never
+    raises.
+    """
+    found = False
+    for s in sessions.values():
+        if not s.active or s.task_id != task_id or s.project_id != project_id:
+            continue
+        found = True
+        try:
+            if stat_is_dir(s.worktree_path):
+                return False
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            logger.error(
+                "Failed to stat session worktree %s: %s. Not treating session "
+                "%s as stale (no relocation rebind).",
+                s.worktree_path, exc, s.session_id,
+            )
+            return False
+    return found
+
+
 def _marker_fallback_session(
-    cwd: Path, project_id: Optional[str]
+    cwd: Path,
+    project_id: Optional[str],
+    sessions: Optional[dict[str, SessionRecord]] = None,
 ) -> Optional[SessionRecord]:
     """CLAWP-114: scope to the dispatched worktree *cwd* sits in, using the
     dispatch marker (``.claude/settings.local.json``) instead of the unusable
     ledger. The marker travels with the checkout, so it needs no ledger.
 
-    Only called when the ledger is degraded. Walks cwd and its ancestors; the
+    Called when no live session matches cwd. With *sessions* ``None`` the
+    ledger is degraded and the marker is trusted outright; with the healthy
+    ledger passed in (CLAWP-117) the marker is trusted only when its
+    (task, project) has active records and every recorded path is gone, i.e.
+    the worktree was relocated (never while a recorded path is still live).
+    Walks cwd and its ancestors; the
     nearest marker whose ``project_id`` equals *project_id* wins. A marker for
     another project is skipped, never matched (a worktree of project B is not
     a scope for resolving project A — cross-project isolation), and with no
@@ -676,12 +720,24 @@ def _marker_fallback_session(
         task_id = marker.get("task_id")
         if not isinstance(task_id, str) or not task_id:
             continue
-        logger.warning(
-            "Session registry unavailable: scoping to the dispatched worktree "
-            "%s via its dispatch marker (task %s, project %s) instead of the "
-            "portfolio registry.",
-            candidate, task_id, project_id,
-        )
+        if sessions is None:
+            logger.warning(
+                "Session registry unavailable: scoping to the dispatched "
+                "worktree %s via its dispatch marker (task %s, project %s) "
+                "instead of the portfolio registry.",
+                candidate, task_id, project_id,
+            )
+        elif _task_has_stale_session_only(sessions, task_id, project_id):
+            logger.warning(
+                "Dispatched worktree %s was relocated (the ledger's recorded "
+                "path for task %s, project %s is gone): scoping to it via its "
+                "dispatch marker. The ledger is not rewritten.",
+                candidate, task_id, project_id,
+            )
+        else:
+            # Nearest matching marker decides: no session to recover (or the
+            # recorded path is live), so keep today's registry behaviour.
+            return None
         return SessionRecord(
             session_id=f"marker:{task_id}",
             task_id=task_id,

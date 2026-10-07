@@ -94,7 +94,12 @@ being solved inside a PR about something else.
 
 ## Acceptance Criteria
 
-- [ ] (Add criteria here)
+- [x] After `git worktree move` of a dispatched worktree, resolution and an ID-based mutator run from inside it hit the worktree, never the main checkout, and the ledger is not written (test_moved_worktree_*).
+- [x] Rebind happens only when the marker's (task, project) has active ledger records and none records a live directory; live record, released record, other task, other project and other-project marker never rebind (tests b, c).
+- [x] A damaged or unreadable marker never raises out of project resolution and is logged (test f).
+- [x] The HEAD probe, repo-prefix probe and `create_worktree` receive the identical repo path (test d).
+- [x] Re-dispatch with `clawpm/<task>` checked out at another path fails with `branch_checked_out_elsewhere` naming that path and remedies; re-dispatch into the same worktree still succeeds (test e).
+- [x] Full suite green. Design: recorded identity via marker, no persisted rewrite (supersedes the persistence note above, which only applied to path rebinding).
 
 ## Notes
 

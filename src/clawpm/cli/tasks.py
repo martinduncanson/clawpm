@@ -1618,7 +1618,9 @@ def _tasks_dispatch_impl(
         # another is the mismatch that motivated the change in the first
         # place, so the two halves cannot be separated — and getting the
         # scoping right is a distributed-state problem in its own right.
-        # Split out with moved-worktree rediscovery; see the follow-up task.
+        # CLAWP-117 settled it: one value, used by every git call below, and
+        # a branch already checked out elsewhere is detected explicitly
+        # before `create_worktree`.
         _source_repo = project.repo_path
         _existing_wt = _source_repo / ".clawpm-worktrees" / task_id
         try:
@@ -1808,6 +1810,47 @@ def _tasks_dispatch_impl(
                         f"dispatch in-place.{_extra}",
                         fmt=fmt,
                     )
+                sys.exit(1)
+        # CLAWP-117: `_source_repo` is computed ONCE above and is the only
+        # checkout the HEAD probe, this branch check and `create_worktree`
+        # use. If `clawpm/<task>` is already checked out somewhere other than
+        # the canonical worktree path (e.g. a dispatched worktree that was
+        # `git worktree move`d), `git worktree add` would fail with a raw git
+        # error; fail closed here and name the path instead. We do not reuse
+        # the other checkout: it carries a session/marker registered under
+        # its own path, and adopting it here would be a second, silent
+        # identity decision.
+        import os as _os
+
+        from clawpm.dispatch import worktree_path_for_branch
+
+        if not _existing_wt.exists():
+            try:
+                _branch_wt = worktree_path_for_branch(
+                    _source_repo, f"clawpm/{task_id}"
+                )
+            except GitProbeError as exc:
+                output_error(
+                    "git_probe_failed",
+                    f"Could not list worktrees of {_source_repo}: {exc}. "
+                    f"Refusing to dispatch --worktree.",
+                    fmt=fmt,
+                )
+                sys.exit(1)
+            if _branch_wt is not None and _os.path.normcase(
+                str(_branch_wt.resolve())
+            ) != _os.path.normcase(str(_existing_wt.resolve())):
+                output_error(
+                    "branch_checked_out_elsewhere",
+                    f"Branch clawpm/{task_id} is already checked out at "
+                    f"{_branch_wt}, not at {_existing_wt}. Dispatching would "
+                    f"fail (or branch from the wrong checkout). Either work "
+                    f"in {_branch_wt} (it is still the dispatched worktree "
+                    f"for this task), move it back with `git worktree move "
+                    f"{_branch_wt} {_existing_wt}`, or remove it with `git "
+                    f"worktree remove {_branch_wt}` and re-run dispatch.",
+                    fmt=fmt,
+                )
                 sys.exit(1)
         try:
             resolved_dir = create_worktree(_source_repo, task_id)

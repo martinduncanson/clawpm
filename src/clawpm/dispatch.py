@@ -1019,6 +1019,37 @@ def working_tree_blob_sha(path: Path) -> Optional[str]:
     return result.stdout.strip() or None
 
 
+def worktree_path_for_branch(repo_path: Path, branch: str) -> Optional[Path]:
+    """CLAWP-117: path of the worktree that has *branch* checked out, or None.
+
+    Reads ``git worktree list --porcelain`` from *repo_path* (the same
+    checkout ``create_worktree`` will use). Raises :class:`GitProbeError` when
+    the listing itself fails.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "worktree", "list", "--porcelain"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except OSError as exc:
+        raise GitProbeError(
+            f"could not run git worktree list in {repo_path}: {exc}"
+        ) from exc
+    if result.returncode != 0:
+        raise GitProbeError(
+            f"git worktree list in {repo_path} failed (exit {result.returncode}): "
+            f"{(result.stderr or '').strip() or '<no stderr>'}"
+        )
+    current: Optional[Path] = None
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            current = Path(line[len("worktree "):])
+        elif line.startswith("branch ") and current is not None:
+            if line[len("branch "):].strip() == f"refs/heads/{branch}":
+                return current
+    return None
+
+
 def create_worktree(repo_path: Path, task_id: str) -> Path:
     """Create a git worktree under ``<repo_path>/.clawpm-worktrees/<task_id>/``.
 
