@@ -11,6 +11,10 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 - `tasks dispatch --worktree` and `agent dispatch` now support a project that lives in a repository subdirectory: the session record carries an optional repo-relative `project_prefix` (absent for root-level projects, so existing records resolve unchanged), the agent runs in the project root inside the worktree, and session-scoped resolution maps any cwd under the worktree to `<worktree>/<prefix>/.project`; the `monorepo_worktree_unsupported` refusal is removed. `agent dispatch` fails closed (nothing created) when it cannot determine the project's repo prefix, and a session prefix containing control characters is rejected (#81, CLAWP-118).
 - Opt-in explicit scope: `sessions.Scope` plus `discovery.resolve_scope`, and a keyword-only `scope=` on `get_project_dir`, `get_repo_path`, `get_scoped_project_settings`, `get_tasks_dir`, `get_task` and `touch_task_updated`; `log add` migrated as the exemplar (#75, CLAWP-122).
 
+### Changed
+
+- SKILL.md doc cleanup: document `-f/--format` as the only output control (no `--json`), the `uv tool install`/`pipx` shim-only install, `doctor -p/--project`, the post-batch `tasks list` check, and the CLAWP-109 Windows glob fix state (CLAWP-110).
+
 ### Fixed
 
 - A `git worktree move`d dispatched worktree now resolves to itself via its dispatch marker (only when the ledger's recorded path for that task/project is gone; the read path writes nothing, and teardown first persists the moved path into the ledger, aborting loudly if it cannot), and `tasks dispatch --worktree` fails closed with an actionable `branch_checked_out_elsewhere` error when `clawpm/<task>` is checked out at another path; the HEAD probe and `create_worktree` share one source repo (#80, CLAWP-117).
