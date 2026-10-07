@@ -315,6 +315,10 @@ def normalise_project_prefix(value: object) -> Optional[str]:
     Pure; never raises."""
     if not isinstance(value, str):
         return None
+    # Control characters (NUL included) make later Path operations raise
+    # ValueError, which the OSError-only guards downstream do not catch.
+    if any(ord(c) < 32 or ord(c) == 127 for c in value):
+        return None
     text = value.replace("\\", "/")
     if text.startswith("/") or (len(text) >= 2 and text[1] == ":"):
         return None

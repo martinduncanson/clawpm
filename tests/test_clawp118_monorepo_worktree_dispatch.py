@@ -286,3 +286,127 @@ def test_root_level_project_unchanged(flat, monkeypatch):
     assert "project_prefix" not in ev
     monkeypatch.chdir(wt)
     assert get_project_dir(flat["config"], "foo") == (wt / ".project").resolve()
+
+
+# ---------------------------------------------------------------------------
+# Codex r1 (PR #81): agent dispatch, fail-closed probe, control characters
+# ---------------------------------------------------------------------------
+
+
+def _stub(verdict_json='{"ok": true, "reason": "done"}'):
+    return lambda prompt: verdict_json
+
+
+def test_agent_dispatch_prefixed_project_targets_the_project_store(mono):
+    """`agent dispatch` for <repo>/packages/foo: the subtask is copied into
+    <wt>/packages/foo/.project/tasks, the session carries the prefix, and the
+    CLAWP-115 verdict sync lands in THAT store (never <wt>/.project)."""
+    from clawpm.agent import dispatch_agent
+    from clawpm.sessions import active_sessions
+
+    result = dispatch_agent(
+        config=mono["config"], project_id="foo", prompt="Do a thing",
+        success_criteria=["c1"], judge_invoker=_stub(), init_codegraph=False,
+    )
+    sid = result["subtask_id"]
+    wt = mono["foo_root"] / ".clawpm-worktrees" / sid
+    proj = wt / "packages" / "foo"
+    assert Path(result["target_dir"]).resolve() == proj.resolve()
+
+    sessions = active_sessions(mono["root"])
+    assert [(s.task_id, s.project_prefix) for s in sessions] == [(sid, "packages/foo")]
+    assert sessions[0].worktree_path.resolve() == wt.resolve()
+
+    tasks = proj / ".project" / "tasks"
+    # verdict ok -> the worktree copy was synced to done, in the project store
+    assert (tasks / "done" / f"{sid}.md").exists()
+    assert not (tasks / f"{sid}.md").exists()
+    # the checkout-root .project (not the project's) was never written to
+    assert not (wt / ".project" / "tasks" / f"{sid}.md").exists()
+    assert not (wt / ".project" / "tasks" / "done" / f"{sid}.md").exists()
+
+
+def test_agent_dispatch_prefix_probe_failure_fails_closed(
+    tmp_path, monkeypatch, caplog
+):
+    """A failed prefix probe must abort BEFORE anything is created, even when
+    the repo root holds its own (different) project: the old fallback to prefix
+    "" would copy foo's task into the ROOT project's store."""
+    import clawpm.agent as agmod
+    from clawpm.agent import AgentDispatchError, dispatch_agent
+    from clawpm.dispatch import GitProbeError
+    from clawpm.sessions import active_sessions
+
+    root = tmp_path / "portfolio"
+    root.mkdir()
+    repo = root / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    (repo / "README.md").write_text("hi", encoding="utf-8")
+    _make_project(repo, "rootp")
+    foo_root = repo / "packages" / "foo"
+    foo_root.mkdir(parents=True)
+    foo_tasks = _make_project(foo_root, "foo")
+    (root / "portfolio.toml").write_text(
+        f'portfolio_root = "{root.as_posix()}"\n'
+        f'project_roots = ["{repo.as_posix()}", "{(repo / "packages").as_posix()}"]\n'
+        '[defaults]\nstatus = "active"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("CLAWPM_PROJECT_ROOTS", raising=False)
+    monkeypatch.delenv("CLAWPM_WORKSPACE", raising=False)
+    monkeypatch.setenv("CLAWPM_PORTFOLIO", str(root))
+    config = load_portfolio_config(root)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "init")
+
+    def _boom(_path):
+        raise GitProbeError("simulated probe failure")
+
+    monkeypatch.setattr(agmod, "repo_prefix", _boom)
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(AgentDispatchError):
+            dispatch_agent(
+                config=config, project_id="foo", prompt="Do a thing",
+                success_criteria=["c1"], judge_invoker=_stub(),
+                init_codegraph=False,
+            )
+    assert any("simulated probe failure" in m for m in caplog.messages)
+    assert active_sessions(root) == []
+    assert list(foo_tasks.glob("*.md")) == []  # no orphan subtask created
+    assert list((repo / ".project" / "tasks").rglob("*.md")) == []
+    assert not (foo_root / ".clawpm-worktrees").exists()
+    assert not (repo / ".clawpm-worktrees").exists()
+
+
+def test_prefix_with_control_character_skips_event_and_logs_error(
+    flat, tmp_path, caplog
+):
+    wt = tmp_path / "w"
+    wt.mkdir()
+    ledger = flat["root"] / SESSION_REGISTRY_FILENAME
+    base = {
+        "action": "registered", "task_id": "T", "project_id": "foo",
+        "worktree_path": str(wt.resolve()), "ts": "2026-01-01T00:00:00Z",
+    }
+    lines = [
+        {**base, "session_id": "s-nul", "project_prefix": "a\u0000b"},
+        {**base, "session_id": "s-nl", "project_prefix": "a\nb"},
+        {**base, "session_id": "s-ok", "project_prefix": "packages/foo"},
+    ]
+    ledger.write_text("".join(json.dumps(x) + "\n" for x in lines), encoding="utf-8")
+    with caplog.at_level(logging.ERROR):
+        rec = find_session_for_cwd(flat["root"], wt, "foo")
+    assert rec is not None and rec.session_id == "s-ok"
+    assert sum("unsafe project_prefix" in m for m in caplog.messages) == 2
+
+
+def test_register_session_rejects_control_character_prefix(flat, tmp_path):
+    ledger = flat["root"] / SESSION_REGISTRY_FILENAME
+    before = ledger.read_bytes() if ledger.exists() else b""
+    for bad in ("a\u0000b", "a\tb", "a\x7fb"):
+        with pytest.raises(ValueError):
+            register_session(
+                flat["root"], "s1", "T", "foo", tmp_path, project_prefix=bad
+            )
+    assert (ledger.read_bytes() if ledger.exists() else b"") == before

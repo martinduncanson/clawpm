@@ -446,6 +446,28 @@ def _dispatch_agent(
             "human-only tasks must be executed by an operator, not auto-dispatched."
         )
 
+    # CLAWP-118: where the project sits inside its repository decides which
+    # store the dispatch writes to (`<worktree>/<prefix>/.project`). Probe it
+    # BEFORE anything is created, and fail CLOSED: assuming "repo root" after a
+    # failed probe could, in a repo holding a root project AND a subdirectory
+    # project, copy the subdirectory project's task into the ROOT project's
+    # store and register the session against the wrong root. Probing first
+    # means a refusal leaves no orphan subtask, worktree or session behind.
+    try:
+        worktree_prefix = repo_prefix(project.repo_path).rstrip("/")
+    except GitProbeError as exc:
+        _log.error(
+            "clawpm agent dispatch (CLAWP-118): could not determine %s's "
+            "location inside its repository: %s. Dispatch aborted; nothing "
+            "was created.",
+            project_id, exc,
+        )
+        raise AgentDispatchError(
+            f"could not determine where project {project_id!r} sits inside "
+            f"its repository ({exc}); refusing to dispatch rather than risk "
+            f"isolating it against the wrong project store."
+        ) from exc
+
     # 1. Auto-create the subtask. Prompt becomes the body; criteria flow
     # into predictions.success_criteria via SuccessCriterion.from_cli so
     # structured-JSON criteria (`{"criterion":"...","gradeable_signal":"..."}`)
@@ -512,17 +534,8 @@ def _dispatch_agent(
     # CLAWP-118: the worktree is a checkout of the whole repository; a project
     # in a repo subdirectory lives at `<worktree>/<prefix>`, and that is where
     # the settings, the subtask copy and the subagent's cwd belong.
+    # `worktree_prefix` was probed (fail closed) before anything was created.
     worktree_root = target_dir
-    worktree_prefix = ""
-    try:
-        worktree_prefix = repo_prefix(project.repo_path).rstrip("/")
-    except GitProbeError as exc:
-        _log.error(
-            "clawpm agent dispatch (CLAWP-118): could not determine %s's "
-            "location inside its repository: %s. Treating it as a repo-root "
-            "project; a project in a subdirectory would not be isolated.",
-            project_id, exc,
-        )
     if worktree_prefix:
         target_dir = worktree_root / worktree_prefix
 
