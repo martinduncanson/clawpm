@@ -11,6 +11,7 @@ registration side effect.
 
 from __future__ import annotations
 
+import os
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -93,6 +94,25 @@ class _VerbatimArgsGroup(click.Group):
         return super().main(*args, **kwargs)
 
 
+class ExpandedPath(click.Path):
+    """``click.Path`` that expands ``~`` and environment references first.
+
+    CLAWP-109: with Click's Windows argv expansion off (see ``_VerbatimArgsGroup``),
+    a quoted ``"~/repo"`` or ``"%USERPROFILE%/x"`` would otherwise reach a path
+    option literally. Used for every option or argument that names a filesystem
+    path; scopes, globs and free text keep the plain ``str`` type and stay
+    verbatim. ``*``/``?`` are never expanded. An unset variable is left as written
+    (``os.path.expandvars``), so ``%VAR%`` expands on Windows only and ``$VAR`` on
+    every platform. Expansion runs before ``exists=``/``dir_okay=`` checks, so those
+    validate the expanded path.
+    """
+
+    def convert(self, value, param, ctx):
+        if isinstance(value, (str, os.PathLike)):
+            value = os.path.expandvars(os.path.expanduser(os.fspath(value)))
+        return super().convert(value, param, ctx)
+
+
 @click.group(cls=_VerbatimArgsGroup)
 @click.option(
     "--format", "-f",
@@ -144,9 +164,9 @@ def _read_patterns_file(path: str, option_name: str, fmt) -> list[str]:
     Blank lines and lines starting with '#' are skipped.  Patterns are
     returned VERBATIM -- no shell or CRT glob-expansion is performed.
 
-    This is the Windows-safe filing path for --scope, --predict-scope,
+    This is the shell-glob-proof filing path for --scope, --predict-scope,
     and --out-of-scope: the file argument is a plain filesystem path, so
-    it never becomes a glob token in argv and cannot be CRT-expanded.
+    it never becomes a glob token in argv.
 
     emit-tree JSON via stdin is already immune (the JSON blob is a single
     quoted argument, not a glob-valued token).

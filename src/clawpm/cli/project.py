@@ -15,7 +15,7 @@ from clawpm.announce import AnnounceEncodingError, find_existing_marker_file, wr
 from clawpm.tasks import list_tasks
 from clawpm.worklog import get_last_entry
 from clawpm.cli.shortcuts import agent_context
-from clawpm.cli.base import main, get_format, require_portfolio, require_project
+from clawpm.cli.base import main, get_format, require_portfolio, require_project, ExpandedPath
 
 # ============================================================================
 # Project commands (singular)
@@ -37,7 +37,7 @@ def project_context(ctx: click.Context, project_id: str | None) -> None:
 
 
 @project.command("init")
-@click.option("--in-repo", "-r", "repo_path", type=click.Path(exists=True), default=".", help="Repository path")
+@click.option("--in-repo", "-r", "repo_path", type=ExpandedPath(exists=True), default=".", help="Repository path")
 @click.option("--id", "project_id", help="Project ID (defaults to directory name)")
 @click.option("--name", "project_name", help="Project name")
 @click.pass_context

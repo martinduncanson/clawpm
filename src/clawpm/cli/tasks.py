@@ -18,7 +18,7 @@ from clawpm.discovery import (
 from clawpm.tasks import add_subtask, add_task, archive_done_tasks, change_task_state, distinct_tags, edit_task, get_task, list_tasks, split_task
 from clawpm.worklog import add_entry, filter_files_changed, read_entries
 from clawpm.context import expand_task_id
-from clawpm.cli.base import main, _mutation_errors, get_format, require_portfolio, require_project, _read_patterns_file, _FALLBACK_POLICIES
+from clawpm.cli.base import main, _mutation_errors, get_format, require_portfolio, require_project, _read_patterns_file, _FALLBACK_POLICIES, ExpandedPath
 from clawpm.services.tasks import transition_isolated
 from clawpm.sessions import stat_exists as _stat_exists
 
@@ -388,8 +388,8 @@ def tasks_archive(ctx: click.Context, project_id: str | None, older_than: str, d
 @click.option("--priority", type=int, help="New priority (1-10)")
 @click.option("--complexity", "-c", type=click.Choice(["s", "m", "l", "xl"]), help="New complexity")
 @click.option("--body", "-b", help="New body content (replaces description before ## sections)")
-@click.option("--scope", "-s", "scope", multiple=True, help="File glob patterns claimed by this task (can specify multiple). On Windows, a pattern containing wildcards (e.g. 'scripts/**') can be expanded by your shell (e.g. PowerShell for native exes) before clawpm sees it — use --scope-file if that happens.")
-@click.option("--scope-file", "scope_file", default=None, type=click.Path(), help="Read scope glob patterns from file (one per line). Windows-safe: bypasses shell glob-expansion. Use instead of --scope when patterns contain wildcards.")
+@click.option("--scope", "-s", "scope", multiple=True, help="File glob patterns claimed by this task (can specify multiple). Quote wildcard patterns (e.g. 'scripts/**'): an unquoted one can be expanded by a POSIX shell (or PowerShell on Linux/macOS) before clawpm runs. Windows shells pass arguments through verbatim. Or use --scope-file.")
+@click.option("--scope-file", "scope_file", default=None, type=ExpandedPath(), help="Read scope glob patterns from file (one per line). Immune to shell glob-expansion. Use instead of --scope when patterns contain wildcards.")
 @click.option("--parallel-group", "parallel_group", type=int, default=None, help="Batch ordinal for parallel dispatch (CLAWP-021). Use --clear-parallel-group to remove.")
 @click.option("--clear-parallel-group", "clear_parallel_group", is_flag=True, default=False, help="Remove parallel_group from the task — opts out of batch dispatch.")
 @click.option("--tag", "tags", multiple=True, help="Workstream tags (CLAWP-069, repeatable). REPLACES the task's tag set (mirrors --scope). Use --clear-tags to remove all.")
@@ -398,8 +398,8 @@ def tasks_archive(ctx: click.Context, project_id: str | None, older_than: str, d
 @click.option("--predict-duration", "predict_duration", default=None, help="Predicted duration: 90, 90m, 2h, 3d, 1w, or combined units like 2h30m")
 @click.option("--predict-complexity", "predict_complexity", type=click.Choice(["s", "m", "l", "xl"]), default=None, help="Predicted complexity")
 @click.option("--predict-files-changed", "predict_files_changed", type=int, default=None, help="Predicted number of files changed")
-@click.option("--predict-scope", "predict_scope", multiple=True, help="Predicted file glob scope (can specify multiple). On Windows, a pattern containing wildcards (e.g. 'scripts/**') can be expanded by your shell (e.g. PowerShell for native exes) before clawpm sees it — use --predict-scope-file if that happens.")
-@click.option("--predict-scope-file", "predict_scope_file", default=None, type=click.Path(), help="Read predicted-scope patterns from file (one per line). Windows-safe alternative to --predict-scope for glob patterns.")
+@click.option("--predict-scope", "predict_scope", multiple=True, help="Predicted file glob scope (can specify multiple). Quote wildcard patterns (e.g. 'scripts/**'): an unquoted one can be expanded by a POSIX shell (or PowerShell on Linux/macOS) before clawpm runs. Windows shells pass arguments through verbatim. Or use --predict-scope-file.")
+@click.option("--predict-scope-file", "predict_scope_file", default=None, type=ExpandedPath(), help="Read predicted-scope patterns from file (one per line). Alternative (immune to shell glob-expansion) to --predict-scope for glob patterns.")
 @click.option("--predict-frameworks", "predict_frameworks", multiple=True, help="Predicted frameworks/libraries to touch (can specify multiple)")
 @click.option("--predict-pitfalls", "predict_pitfalls", default=None, help="Anticipated problematic areas (free text)")
 @click.option("--hypothesis", "hypothesis", default=None, help="Goal/hypothesis: 'if I do X, then Y will improve'")
@@ -413,7 +413,7 @@ def tasks_archive(ctx: click.Context, project_id: str | None, older_than: str, d
 @click.option("--predict-iterations", "predict_iterations", type=int, default=None, help="Predicted iterate->grade->revise cycles (CLAWP-019). Default None; 1 means 'expected to land in one pass'.")
 # --- CLAWP-054 dispatch contract fields ---
 @click.option("--out-of-scope", "out_of_scope", multiple=True, help="Boundary items the executor MUST NOT touch (repeatable).")
-@click.option("--out-of-scope-file", "out_of_scope_file", default=None, type=click.Path(), help="Read out-of-scope patterns from file (one per line). Windows-safe alternative to --out-of-scope for glob patterns.")
+@click.option("--out-of-scope-file", "out_of_scope_file", default=None, type=ExpandedPath(), help="Read out-of-scope patterns from file (one per line). Alternative (immune to shell glob-expansion) to --out-of-scope for glob patterns.")
 @click.option("--stop-condition", "stop_conditions", multiple=True, help="Escape-hatch conditions (repeatable).")
 @click.option(
     "--delegability", "delegability",
@@ -849,22 +849,22 @@ def tasks_decompose(
 @click.option("--priority", type=int, default=5, help="Priority (1-10, lower is higher)")
 @click.option("--complexity", "-c", type=click.Choice(["s", "m", "l", "xl"]), help="Complexity")
 @click.option("--depends", "-d", multiple=True, help="Dependencies (can specify multiple)")
-@click.option("--scope", multiple=True, help="File glob patterns claimed by this task (can specify multiple). On Windows, a pattern containing wildcards (e.g. 'scripts/**') can be expanded by your shell (e.g. PowerShell for native exes) before clawpm sees it — use --scope-file if that happens.")
-@click.option("--scope-file", "scope_file", default=None, type=click.Path(), help="Read scope glob patterns from file (one per line). Windows-safe: bypasses shell glob-expansion. Use instead of --scope when patterns contain wildcards.")
+@click.option("--scope", multiple=True, help="File glob patterns claimed by this task (can specify multiple). Quote wildcard patterns (e.g. 'scripts/**'): an unquoted one can be expanded by a POSIX shell (or PowerShell on Linux/macOS) before clawpm runs. Windows shells pass arguments through verbatim. Or use --scope-file.")
+@click.option("--scope-file", "scope_file", default=None, type=ExpandedPath(), help="Read scope glob patterns from file (one per line). Immune to shell glob-expansion. Use instead of --scope when patterns contain wildcards.")
 @click.option("--parallel-group", "parallel_group", type=int, default=None, help="Batch ordinal for parallel dispatch (CLAWP-021). Tasks sharing a group dispatch together; group N+1 waits for group N.")
 @click.option("--agent-profile", "agent_profile", default=None, help="Capability/skill profile (CLAWP-038). Recorded on the task and propagated to reflection/iteration events so calibration can segment predicted-vs-actual by profile.")
 @click.option("--tag", "tags", multiple=True, help="Cross-cutting workstream tag (CLAWP-069, repeatable, e.g. --tag concurrency --tag mcp). Normalised to lowercase.")
 @click.option("--parent", "parent_id", help="Parent task ID (creates subtask)")
 @click.option("--description", help="Task description (deprecated, use --body)")
 @click.option("--body", "-b", help="Task body content")
-@click.option("--body-file", type=click.Path(exists=True), help="Read body from file")
+@click.option("--body-file", type=ExpandedPath(exists=True), help="Read body from file")
 @click.option("--stdin", "read_stdin", is_flag=True, help="Read body from stdin")
 # --- Prediction flags (all optional) ---
 @click.option("--predict-duration", "predict_duration", default=None, help="Predicted duration: 90, 90m, 2h, 3d, 1w, or combined units like 2h30m")
 @click.option("--predict-complexity", "predict_complexity", type=click.Choice(["s", "m", "l", "xl"]), default=None, help="Predicted complexity")
 @click.option("--predict-files-changed", "predict_files_changed", type=int, default=None, help="Predicted number of files changed")
-@click.option("--predict-scope", "predict_scope", multiple=True, help="Predicted file glob scope (can specify multiple). On Windows, a pattern containing wildcards (e.g. 'scripts/**') can be expanded by your shell (e.g. PowerShell for native exes) before clawpm sees it — use --predict-scope-file if that happens.")
-@click.option("--predict-scope-file", "predict_scope_file", default=None, type=click.Path(), help="Read predicted-scope patterns from file (one per line). Windows-safe alternative to --predict-scope for glob patterns.")
+@click.option("--predict-scope", "predict_scope", multiple=True, help="Predicted file glob scope (can specify multiple). Quote wildcard patterns (e.g. 'scripts/**'): an unquoted one can be expanded by a POSIX shell (or PowerShell on Linux/macOS) before clawpm runs. Windows shells pass arguments through verbatim. Or use --predict-scope-file.")
+@click.option("--predict-scope-file", "predict_scope_file", default=None, type=ExpandedPath(), help="Read predicted-scope patterns from file (one per line). Alternative (immune to shell glob-expansion) to --predict-scope for glob patterns.")
 @click.option("--predict-frameworks", "predict_frameworks", multiple=True, help="Predicted frameworks/libraries to touch (can specify multiple)")
 @click.option("--predict-pitfalls", "predict_pitfalls", default=None, help="Anticipated problematic areas (free text)")
 @click.option("--hypothesis", "hypothesis", default=None, help="Goal/hypothesis: 'if I do X, then Y will improve'")
@@ -885,7 +885,7 @@ def tasks_decompose(
 )
 # --- CLAWP-054 dispatch contract fields ---
 @click.option("--out-of-scope", "out_of_scope", multiple=True, help="Boundary items the executor MUST NOT touch (repeatable; file globs or named topics). Rendered verbatim in the agent preamble.")
-@click.option("--out-of-scope-file", "out_of_scope_file", default=None, type=click.Path(), help="Read out-of-scope patterns from file (one per line). Windows-safe alternative to --out-of-scope for glob patterns.")
+@click.option("--out-of-scope-file", "out_of_scope_file", default=None, type=ExpandedPath(), help="Read out-of-scope patterns from file (one per line). Alternative (immune to shell glob-expansion) to --out-of-scope for glob patterns.")
 @click.option("--stop-condition", "stop_conditions", multiple=True, help="Escape-hatch condition: if triggered, executor must STOP and report back (repeatable, free text).")
 @click.option(
     "--delegability", "delegability",
@@ -1300,7 +1300,7 @@ def _read_bytes_or_none(path: Path):
 @click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
 @click.argument("task_id")
 @click.option(
-    "--target-dir", "target_dir", type=click.Path(), default=None,
+    "--target-dir", "target_dir", type=ExpandedPath(), default=None,
     help="Directory to write .claude/settings.local.json into. Default: current directory."
 )
 @click.option(
@@ -2327,7 +2327,7 @@ def _tasks_dispatch_impl(
 @click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
 @click.argument("task_id", required=False)
 @click.option(
-    "--target-dir", "target_dir", type=click.Path(), default=None,
+    "--target-dir", "target_dir", type=ExpandedPath(), default=None,
     help="Directory containing .claude/settings.local.json. Default: current directory."
 )
 @click.option(

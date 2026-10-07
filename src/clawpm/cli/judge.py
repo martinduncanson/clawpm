@@ -7,7 +7,7 @@ from pathlib import Path
 import click
 
 from clawpm.output import OutputFormat, output_error, output_success
-from clawpm.cli.base import main, get_format
+from clawpm.cli.base import main, get_format, ExpandedPath
 
 # ============================================================================
 # Judge subcommands — standalone judge primitives (CLAWP-044)
@@ -28,12 +28,12 @@ def judge() -> None:
 @judge.command("tournament")
 @click.option(
     "--rubric-file", "rubric_file",
-    type=click.Path(exists=True, dir_okay=False), required=True,
+    type=ExpandedPath(exists=True, dir_okay=False), required=True,
     help="Path to the rubric / success-criteria file the candidates are judged against.",
 )
 @click.option(
     "--candidate", "candidate_files",
-    type=click.Path(exists=True, dir_okay=False), multiple=True,
+    type=ExpandedPath(exists=True, dir_okay=False), multiple=True,
     help="Path to a candidate deliverable/transcript file. Repeat for each candidate. "
          "ORDER IS SEED ORDER — pass the strongest-prior candidate first; it wins ambiguous pairs.",
 )
