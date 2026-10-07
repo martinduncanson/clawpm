@@ -123,6 +123,19 @@ def suppress_session_resolution():
     finally:
         _suppress_session_resolution.reset(token)
 
+
+@contextlib.contextmanager
+def allow_session_resolution():
+    """Re-enable session-scoped resolution inside an enclosing
+    :func:`suppress_session_resolution` block (CLAWP-115). For the one case
+    where a canonical-pinned operation must ALSO act on a registered worktree's
+    own store, paired with :func:`resolve_scope_from` to name that worktree."""
+    token = _suppress_session_resolution.set(False)
+    try:
+        yield
+    finally:
+        _suppress_session_resolution.reset(token)
+
 # CLAWP-098 (Codex P1, PR #55 round 15): a command that will RUN somewhere
 # other than its own cwd — `tasks dispatch --target-dir X` — must resolve its
 # task in the scope of THAT place, because the process it launches there will.

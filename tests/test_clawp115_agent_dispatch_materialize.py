@@ -17,9 +17,9 @@ import pytest
 
 import clawpm.agent as agmod
 from clawpm.discovery import load_portfolio_config
-from clawpm.models import Task
+from clawpm.models import Task, TaskState
 from clawpm.sessions import active_sessions
-from clawpm.tasks import get_task, get_tasks_dir
+from clawpm.tasks import get_next_task, get_task, get_tasks_dir
 
 
 def _git(repo: Path, *args: str) -> None:
@@ -109,7 +109,8 @@ class TestMaterializeAndRegister:
         result = _dispatch(tracked)
         sid, target = result["subtask_id"], Path(result["target_dir"])
 
-        wt_file = target / ".project" / "tasks" / f"{sid}.md"
+        # The verdict is DONE, and the worktree copy follows it into done/.
+        wt_file = target / ".project" / "tasks" / "done" / f"{sid}.md"
         assert wt_file.exists(), "subtask was not copied into the worktree"
         assert Task.from_file(wt_file).id == sid
 
@@ -132,6 +133,90 @@ class TestMaterializeAndRegister:
         assert tasks_dir.resolve() == (target / ".project" / "tasks").resolve()
         task = get_task(tracked["config"], "test", sid)
         assert task is not None and task.id == sid
+
+
+def _dispatch_with(fx, verdict_json):
+    return agmod.dispatch_agent(
+        config=fx["config"],
+        project_id="test",
+        prompt="Do a thing",
+        success_criteria=["c1"],
+        judge_invoker=lambda prompt: verdict_json,
+        init_codegraph=False,
+    )
+
+
+class TestWorktreeCopyFollowsTheVerdict:
+    """Codex r1 P2 (PR #79): the verdict transitions only the canonical store;
+    the worktree copy must agree, else `get_next_task` from the worktree picks
+    the finished/blocked subtask up again as OPEN."""
+
+    @pytest.mark.parametrize(
+        "verdict_json, want",
+        [
+            ('{"ok": true, "reason": "done"}', TaskState.DONE),
+            ('{"ok": false, "reason": "nope", "impossible": false}', TaskState.BLOCKED),
+        ],
+    )
+    def test_worktree_view_matches_canonical(
+        self, tracked, monkeypatch, verdict_json, want
+    ):
+        result = _dispatch_with(tracked, verdict_json)
+        sid, target = result["subtask_id"], Path(result["target_dir"])
+        assert result["session_id"] is not None
+
+        monkeypatch.chdir(target)
+        wt_task = get_task(tracked["config"], "test", sid)
+        assert wt_task is not None and wt_task.state == want
+        assert target.resolve() in wt_task.file_path.resolve().parents
+        nxt = get_next_task(tracked["config"], "test")
+        assert nxt is None or nxt.id != sid
+
+    def test_sync_failure_is_logged_and_never_aborts(
+        self, tracked, monkeypatch, caplog
+    ):
+        real = agmod.change_task_state
+        calls = []
+
+        def _flaky(config, project_id, task_id, new_state, **kw):
+            calls.append(new_state)
+            if len(calls) == 2:  # the worktree-scoped sync, not the canonical one
+                raise OSError("simulated sync failure")
+            return real(config, project_id, task_id, new_state, **kw)
+
+        monkeypatch.setattr(agmod, "change_task_state", _flaky)
+        with caplog.at_level(logging.ERROR, logger="clawpm.agent"):
+            result = _dispatch(tracked)
+        assert result["verdict"]["ok"] is True
+        msgs = " ".join(r.getMessage() for r in caplog.records)
+        assert "CLAWP-115" in msgs and "simulated sync failure" in msgs
+
+    def test_no_session_means_no_worktree_sync(self, untracked):
+        # Nothing was materialized, so the sync must not touch anything.
+        result = _dispatch(untracked)
+        assert result["session_id"] is None
+        assert result["verdict"]["ok"] is True
+
+
+class TestProjectGateFilesystemError:
+    def test_gate_oserror_is_graceful(self, tracked, monkeypatch, caplog):
+        real = agmod.stat_is_dir
+
+        def _deny(path):
+            if Path(path).name == ".project":
+                raise PermissionError("simulated EACCES")
+            return real(path)
+
+        monkeypatch.setattr(agmod, "stat_is_dir", _deny)
+        with caplog.at_level(logging.ERROR, logger="clawpm.agent"):
+            result = _dispatch(tracked)
+        target = Path(result["target_dir"])
+        assert _worktree_sessions(tracked, target) == []
+        assert result["session_id"] is None
+        assert "simulated EACCES" in result["materialize_error"]
+        msgs = " ".join(r.getMessage() for r in caplog.records)
+        assert "CLAWP-115" in msgs and "simulated EACCES" in msgs
+        assert result["verdict"]["ok"] is True
 
 
 class TestNoProjectDirKeepsOldBehaviour:

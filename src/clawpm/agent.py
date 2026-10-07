@@ -81,7 +81,13 @@ from .models import (
 )
 from .reflect import write_iteration_event, write_reflection_event
 from .rubric import render_rubric_markdown
-from .sessions import register_session, suppress_session_resolution
+from .sessions import (
+    allow_session_resolution,
+    register_session,
+    resolve_scope_from,
+    stat_is_dir,
+    suppress_session_resolution,
+)
 from .tasks import (
     _candidate_task_paths,
     add_task,
@@ -145,6 +151,51 @@ def _materialize_subtask(
     except Exception as exc:
         return f"{type(exc).__name__}: {exc}"
     return None
+
+
+def _sync_worktree_copy(
+    config,
+    project_id: str,
+    subtask_id: str,
+    target_dir: Path,
+    new_state: TaskState,
+    note: str,
+) -> None:
+    """Apply the verdict transition to the worktree's own copy (CLAWP-115).
+
+    The verdict moves only the canonical task; the copy we materialized would
+    otherwise stay OPEN and `get_next_task` from the worktree would hand the
+    finished/blocked subtask out again. The SAME ``change_task_state`` runs,
+    resolved against the worktree's registered session instead of the
+    canonical pin, so file placement (``done/``, ``blocked/``) matches the
+    canonical store. Never raises: a sync failure is logged and the dispatch
+    carries on (the canonical store, which the Stop hook falls back to, is
+    already correct).
+    """
+    try:
+        with allow_session_resolution(), resolve_scope_from(target_dir):
+            synced = change_task_state(
+                config, project_id, subtask_id, new_state, note=note
+            )
+        if synced is None or synced.state != new_state:
+            raise RuntimeError(
+                "worktree transition returned "
+                f"{None if synced is None else synced.state.value!r}"
+            )
+        if (
+            synced.file_path is None
+            or target_dir.resolve() not in synced.file_path.resolve().parents
+        ):
+            raise RuntimeError(
+                f"transition resolved to {synced.file_path}, outside the worktree"
+            )
+    except Exception as exc:
+        _log.error(
+            "clawpm agent dispatch (CLAWP-115): could not sync %s to %s in the "
+            "worktree %s: %s: %s. The canonical store is correct; the "
+            "worktree copy may still read as OPEN. The dispatch continues.",
+            subtask_id, new_state.value, target_dir, type(exc).__name__, exc,
+        )
 
 
 class AgentDispatchError(Exception):
@@ -435,10 +486,24 @@ def _dispatch_agent(
     # session.
     session_id: Optional[str] = None
     materialize_error: Optional[str] = None
-    if (target_dir / ".project").is_dir():
-        materialize_error = _materialize_subtask(
-            config, project_id, subtask_id, target_dir
+    # stat_is_dir, not Path.is_dir(): on Python 3.12 is_dir() propagates some
+    # OSErrors (PermissionError ...), which would escape this block and abort
+    # the dispatch with no log. Any fault here is a materialize failure.
+    try:
+        has_project_dir = stat_is_dir(target_dir / ".project")
+    except (FileNotFoundError, NotADirectoryError):
+        has_project_dir = False
+    except OSError as exc:
+        has_project_dir = False
+        materialize_error = (
+            f"stat of {target_dir / '.project'} failed: "
+            f"{type(exc).__name__}: {exc}"
         )
+    if has_project_dir or materialize_error is not None:
+        if materialize_error is None:
+            materialize_error = _materialize_subtask(
+                config, project_id, subtask_id, target_dir
+            )
         if materialize_error is None:
             candidate_session = str(uuid.uuid4())
             try:
@@ -527,13 +592,15 @@ def _dispatch_agent(
         # DONE path: terminal reflection event captures the (empty for
         # now) deltas. Iterations counter rolls up via
         # count_iterations_for_task on the reflection-event read path.
+        done_note = f"agent dispatch verdict ok: {verdict.reason[:200]}"
         change_task_state(
-            config,
-            project_id,
-            subtask_id,
-            TaskState.DONE,
-            note=f"agent dispatch verdict ok: {verdict.reason[:200]}",
+            config, project_id, subtask_id, TaskState.DONE, note=done_note
         )
+        if session_id is not None:
+            _sync_worktree_copy(
+                config, project_id, subtask_id, target_dir,
+                TaskState.DONE, done_note,
+            )
         # Build minimal Actuals — no git diff or duration tracking here;
         # this is a single-shot subagent dispatch, not a long task. The
         # reflection event still captures the success_criteria predictions
@@ -557,16 +624,18 @@ def _dispatch_agent(
         # failure mode. The subtask sits in `tasks/blocked/<id>.md` for
         # the operator to triage — `clawpm tasks list --state blocked`
         # will surface it.
-        change_task_state(
-            config,
-            project_id,
-            subtask_id,
-            TaskState.BLOCKED,
-            note=(
-                f"agent dispatch verdict not-ok: {verdict.reason[:200]} "
-                f"(impossible={verdict.impossible})"
-            ),
+        blocked_note = (
+            f"agent dispatch verdict not-ok: {verdict.reason[:200]} "
+            f"(impossible={verdict.impossible})"
         )
+        change_task_state(
+            config, project_id, subtask_id, TaskState.BLOCKED, note=blocked_note
+        )
+        if session_id is not None:
+            _sync_worktree_copy(
+                config, project_id, subtask_id, target_dir,
+                TaskState.BLOCKED, blocked_note,
+            )
         reflection_event_path = write_iteration_event(
             portfolio_root=config.portfolio_root,
             task_id=subtask_id,
@@ -612,11 +681,14 @@ def dispatch_agent(*args, **kwargs) -> dict:
 
     Runs the whole dispatch with session-scoped resolution suppressed
     (CLAWP-098, Codex P1 on PR #55 round 13). The nested worktree this
-    creates is deliberately unregistered, so its hooks resolve the task from
-    the portfolio registry — the canonical checkout. Every task read/write in
-    this function (the new subtask, its state transitions) therefore has to
-    use that same canonical store, regardless of whether the CALLER happens to
-    be sitting inside some other registered worktree.
+    creates is unregistered unless CLAWP-115 materialized the subtask into it,
+    so its hooks may resolve the task from the portfolio registry — the
+    canonical checkout. Every task read/write in this function (the new
+    subtask, its state transitions) therefore has to use that same canonical
+    store, regardless of whether the CALLER happens to be sitting inside some
+    other registered worktree. The one deliberate exception is
+    ``_sync_worktree_copy``, which re-enables resolution to mirror the verdict
+    into the worktree's own copy.
     """
     with suppress_session_resolution():
         return _dispatch_agent(*args, **kwargs)
