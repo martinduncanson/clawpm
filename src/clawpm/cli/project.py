@@ -1127,9 +1127,10 @@ def _project_doctor_impl(
             for a in applied:
                 click.echo(f"{prefix} [{a['class']}] {a.get('target')} -> {a['result']}")
             for s in apply_skipped:
-                click.echo(
-                    f"[SKIPPED] [{s['class']}] {s.get('target')} -> {s['reason']}"
-                )
+                # CLAWP-094: attempts that errored are no longer in applied[];
+                # keep them loud in text mode.
+                tag = "[ERROR]" if s.get("outcome") == "error" else "[SKIPPED]"
+                click.echo(f"{tag} [{s['class']}] {s.get('target')} -> {s['reason']}")
 
     if strict and has_warnings:
         sys.exit(1)

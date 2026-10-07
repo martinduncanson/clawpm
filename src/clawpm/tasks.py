@@ -650,7 +650,9 @@ def _set_updated_line(text: str, stamp: str) -> str | None:
         _parsed = None
     if _parsed is not None and not isinstance(_parsed, dict):
         return None
-    new_line = f"updated: '{stamp}'"
+    # CRLF file: split("\n") leaves a trailing "\r" on every line, so the
+    # spliced line must carry one too or the file ends up with mixed endings.
+    new_line = f"updated: '{stamp}'" + ("\r" if lines[0].endswith("\r") else "")
     for i in range(1, close_idx):
         if _UPDATED_LINE_RE.match(lines[i]):
             lines[i] = new_line
@@ -681,19 +683,97 @@ def _stamp_updated_file(file_path: Path, when: str | None = None) -> None:
     move/reload path already retries — raising after the move had committed and
     leaving state + work-log inconsistent.
     """
-    text = retry_transient(lambda: file_path.read_text(encoding="utf-8"))
+    # Bytes in, bytes out: text-mode read_text() folds CRLF to LF on every
+    # platform, while text-mode write_text() re-expands LF to CRLF on Windows
+    # only -- so CRLF files were silently converted to LF on Linux and LF files
+    # to CRLF on Windows. Binary I/O keeps the line endings verbatim.
+    text = retry_transient(lambda: file_path.read_bytes()).decode("utf-8")
     new_text = _set_updated_line(text, when or today_utc_iso())
     if new_text is None:
         return  # no well-formed frontmatter fence — leave the file untouched
     tmp = file_path.with_suffix(file_path.suffix + ".tmp")
     try:
-        tmp.write_text(new_text, encoding="utf-8")
+        tmp.write_bytes(new_text.encode("utf-8"))
         # Retry transient Windows sharing/access faults on the rename — this
         # runs under the per-project lock alongside concurrent scanners (CLAWP-051).
         retry_transient(tmp.replace, file_path)
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
+
+
+_STATE_LINE_RE = re.compile(r"^state\s*:")
+
+
+def _sync_state_line(file_path: Path, new_state: str) -> bool:
+    """Rewrite an EXISTING top-level ``state:`` frontmatter value, in place (CLAWP-094).
+
+    Surgical like :func:`_stamp_updated_file`: only the ``state`` entry changes,
+    so comments / key order / body / line endings are preserved. Returns ``True``
+    if the value was rewritten. A file with no well-formed fence, or with no
+    ``state:`` key, is left untouched (``False``) -- we never ADD a state key
+    tasks don't carry.
+
+    The COMPLETE value is rewritten: a multi-line scalar (``state: >-`` /
+    ``state: |`` / a folded plain or quoted scalar) has its indented
+    continuation lines consumed, never left stale. A non-scalar value (sequence,
+    mapping) is REFUSED with ``ValueError`` and the file is untouched, and the
+    result is re-parsed so a rewrite that does not read back as ``new_state``
+    raises rather than reporting success (Codex r1, fail loud not silent).
+
+    Callers must hold the project's ``.clawpm-tasks.lock`` (the read-modify-write
+    here is not itself atomic against concurrent mutators).
+    """
+    raw = retry_transient(lambda: file_path.read_bytes()).decode("utf-8")
+    if not raw.startswith("---"):
+        return False
+    crlf = "\r\n" in raw
+    lines = raw.split("\n")  # a CRLF file keeps a trailing "\r" on each line
+    if lines[0].strip() != "---":
+        return False
+    close_idx = next(
+        (i for i in range(1, len(lines)) if lines[i].strip() == "---"), None
+    )
+    if close_idx is None:
+        return False
+    for i in range(1, close_idx):
+        if _STATE_LINE_RE.match(lines[i]):
+            break
+    else:
+        return False
+    # Value region: the key line plus indented / blank continuation lines. Blank
+    # lines at the tail belong to the gap before the next key, so keep them out.
+    end = i + 1
+    while end < close_idx and (
+        not lines[end].strip() or lines[end][:1] in (" ", "\t")
+    ):
+        end += 1
+    while end > i + 1 and not lines[end - 1].strip():
+        end -= 1
+    fragment = "\n".join(ln.rstrip("\r") for ln in lines[i:end])
+    try:
+        parsed = yaml.safe_load(fragment)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"unparseable 'state' value: {exc}") from exc
+    value = parsed.get("state") if isinstance(parsed, dict) else None
+    if not (value is None and end == i + 1) and not isinstance(value, str):
+        raise ValueError("unsupported 'state' frontmatter form (not a scalar string)")
+    if end == i + 1 and lines[i].rstrip("\r") == f"state: {new_state}":
+        return False
+    lines[i:end] = [f"state: {new_state}" + ("\r" if crlf else "")]
+    out = "\n".join(lines)
+    # Verify the rewrite reads back before committing it to disk.
+    check = yaml.safe_load(out.replace("\r\n", "\n").split("---", 2)[1])
+    if not isinstance(check, dict) or check.get("state") != new_state:
+        raise ValueError("state rewrite did not read back as the new state")
+    tmp = file_path.with_suffix(file_path.suffix + ".tmp")
+    try:
+        tmp.write_bytes(out.encode("utf-8"))
+        retry_transient(tmp.replace, file_path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    return True
 
 
 def touch_task_updated(
@@ -1245,16 +1325,33 @@ def cascade_unblock_dependents(
         if not all_deps_done:
             continue
 
-        moved = change_task_state(
-            config, project_id, task.id, TaskState.OPEN
-        )
-        if moved is not None:
-            transitions.append({
+        # CLAWP-094: the move AND the frontmatter state sync run in ONE locked
+        # transaction (file_lock is reentrant per-thread, CLAWP-066), so a
+        # concurrent edit/move cannot interleave between them -- the sync would
+        # otherwise overwrite the edit or recreate the old path.
+        with file_lock(tasks_dir / ".clawpm-tasks.lock"):
+            moved = change_task_state(
+                config, project_id, task.id, TaskState.OPEN
+            )
+            if moved is None:
+                continue
+            record = {
                 "task_id": task.id,
                 "from_state": "blocked",
                 "to_state": "open",
                 "trigger": completed_task_id,
-            })
+            }
+            # The move alone left a stale `state: blocked` line in frontmatter
+            # (doctor then reported it as drift). The move has already
+            # committed, so a failure here must not abort the cascade for the
+            # remaining dependents -- it is recorded (and surfaced by the
+            # service as a cascade_errors marker), not swallowed.
+            if moved.file_path is not None:
+                try:
+                    _sync_state_line(moved.file_path, TaskState.OPEN.value)
+                except Exception as exc:
+                    record["state_sync_error"] = f"{type(exc).__name__}: {exc}"
+        transitions.append(record)
 
     return transitions
 

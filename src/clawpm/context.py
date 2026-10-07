@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -11,6 +12,7 @@ from pathlib import Path
 from .discovery import load_portfolio_config, get_project, is_git_repo, init_project_from_repo
 from .models import ProjectSettings
 
+logger = logging.getLogger(__name__)
 
 CONTEXT_FILE = Path.home() / ".clawpm-context"
 
@@ -34,8 +36,16 @@ def detect_project_from_cwd() -> ProjectSettings | None:
         if settings_file.exists():
             try:
                 return ProjectSettings.load(settings_file)
-            except Exception:
-                pass
+            except Exception as exc:
+                # CLAWP-094: stays fail-open by design (a corrupt settings.toml
+                # must not make every command in that tree unusable, and the
+                # walk may still find a valid parent project) -- but it is no
+                # longer fail-SILENT: leave a degraded-path marker.
+                logger.warning(
+                    "clawpm: ignoring unreadable project settings %s (%s: %s); "
+                    "continuing project detection in parent directories",
+                    settings_file, type(exc).__name__, exc,
+                )
         current = current.parent
     
     return None
@@ -88,9 +98,15 @@ def get_context_project() -> str | None:
         content = CONTEXT_FILE.read_text(encoding="utf-8").strip()
         if content:
             return content
-    except Exception:
-        pass
-    
+    except (OSError, UnicodeDecodeError) as exc:
+        # CLAWP-094: fail-open (a damaged context file just means "no sticky
+        # project") but marked, not silent. Only I/O/decoding errors are
+        # expected from read_text; anything else is a bug and propagates.
+        logger.warning(
+            "clawpm: ignoring unreadable context file %s (%s: %s)",
+            CONTEXT_FILE, type(exc).__name__, exc,
+        )
+
     return None
 
 
