@@ -686,13 +686,25 @@ def write_dispatch_settings(
 
 def read_dispatch_marker(target_dir: Path) -> Optional[dict]:
     """Return the clawpm dispatch marker block from settings.local.json, or None."""
+    return inspect_dispatch_marker(target_dir)[0]
+
+
+def inspect_dispatch_marker(target_dir: Path) -> tuple[Optional[dict], Optional[str]]:
+    """Like :func:`read_dispatch_marker`, but also say WHY there is no marker.
+
+    Returns ``(marker, problem)``. ``problem`` is None for a marker, a missing
+    file, or a valid settings file with no clawpm block (all ordinary). It is a
+    short description when the file is present but damaged: unparseable JSON,
+    a non-object top level, or a clawpm key whose value is not an object.
+    Never raises on bad content; OS errors propagate as in the plain reader.
+    """
     path = settings_path(target_dir)
     if not stat_exists(path):
-        return None
+        return None, None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return None
+    except json.JSONDecodeError as exc:
+        return None, f"malformed JSON ({exc})"
     # Shape guards (Codex P2, PR #55 round 7). A settings file whose top
     # level is valid JSON but not an object (a bare list/string/number) made
     # `data.get` raise AttributeError, and a truthy non-object marker value
@@ -703,9 +715,13 @@ def read_dispatch_marker(target_dir: Path) -> Optional[dict]:
     # invariant. Teardown must report "no clawpm marker here" and leave the
     # file alone, which is exactly what returning None does.
     if not isinstance(data, dict):
-        return None
+        return None, "top level is not a JSON object"
     marker = data.get(CLAWPM_MARKER_KEY)
-    return marker if isinstance(marker, dict) else None
+    if marker is None:
+        return None, None
+    if not isinstance(marker, dict):
+        return None, f"{CLAWPM_MARKER_KEY!r} is not a JSON object"
+    return marker, None
 
 
 def teardown_dispatch_settings(

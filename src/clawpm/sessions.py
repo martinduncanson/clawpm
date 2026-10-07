@@ -344,7 +344,18 @@ def release_sessions_for_task(portfolio_root: Path, task_id: str, project_id: st
 
 
 def _replay(portfolio_root: Path) -> dict[str, SessionRecord]:
+    """Session state per session_id; see :func:`_load_ledger`."""
+    return _load_ledger(portfolio_root)[0]
+
+
+def _load_ledger(portfolio_root: Path) -> tuple[dict[str, SessionRecord], bool]:
     """Reconstruct current session state per session_id from the log.
+
+    Returns ``(sessions, degraded)``. ``degraded`` is True when the ledger
+    EXISTS but could not be trusted (stat/read fault, or non-blank content
+    with not one valid event) as opposed to merely absent or empty. CLAWP-114:
+    callers use it to try the local dispatch-marker fallback instead of
+    silently resolving through the main-checkout registry.
 
     Corrupted lines are skipped (defensive — a half-written line must not
     nuke resolution for every other registered session). A whole-file read
@@ -361,7 +372,7 @@ def _replay(portfolio_root: Path) -> dict[str, SessionRecord]:
     try:
         path.stat()
     except FileNotFoundError:
-        return {}
+        return {}, False
     except OSError as exc:
         # Codex P1, PR #55 (round 6): Path.exists() catches OSError
         # internally and returns False (same dead-code shape already fixed
@@ -378,8 +389,9 @@ def _replay(portfolio_root: Path) -> dict[str, SessionRecord]:
             "through to the portfolio registry (main-checkout) lookup.",
             path, exc,
         )
-        return {}
+        return {}, True
     sessions: dict[str, SessionRecord] = {}
+    valid_events = 0
     try:
         # errors="replace" (antigravity review, PR #55), not "strict": a
         # single invalid byte ANYWHERE in the file must not take down every
@@ -418,7 +430,7 @@ def _replay(portfolio_root: Path) -> dict[str, SessionRecord]:
             "through to the portfolio registry (main-checkout) lookup.",
             path, exc,
         )
-        return {}
+        return {}, True
     for line in raw.splitlines():
         line = line.strip()
         if not line:
@@ -458,6 +470,10 @@ def _replay(portfolio_root: Path) -> dict[str, SessionRecord]:
                 or not isinstance(worktree_path, str) or not worktree_path
             ):
                 continue
+            # Count an event only once it fully validates (Codex r1, PR #78):
+            # a registration with bad fields yields no usable session, so it
+            # must not mask a degraded ledger.
+            valid_events += 1
             sessions[session_id] = SessionRecord(
                 session_id=session_id,
                 task_id=task_id,
@@ -466,10 +482,22 @@ def _replay(portfolio_root: Path) -> dict[str, SessionRecord]:
                 active=True,
             )
         elif action == _RELEASED:
+            valid_events += 1
             record = sessions.get(session_id)
             if record:
                 record.active = False
-    return sessions
+    if valid_events == 0 and raw.strip():
+        # CLAWP-114: every line was corrupt, so the "empty" set is a parse
+        # failure, not an empty ledger. Same fail-open-with-a-marker contract
+        # as the read faults above.
+        logger.error(
+            "Session registry %s has content but no valid session events. "
+            "Treating it as unavailable: session-scoped resolution falls back "
+            "to the local dispatch marker, else the portfolio registry.",
+            path,
+        )
+        return sessions, True
+    return sessions, False
 
 
 def active_sessions(portfolio_root: Path) -> list[SessionRecord]:
@@ -484,8 +512,12 @@ def active_sessions(portfolio_root: Path) -> list[SessionRecord]:
     a crashed dispatch's directory manually cleaned up, ...) naturally stops
     being returned here — no explicit ``released`` event needed.
     """
+    return _live_sessions(_replay(portfolio_root))
+
+
+def _live_sessions(sessions: dict[str, SessionRecord]) -> list[SessionRecord]:
     result: list[SessionRecord] = []
-    for s in _replay(portfolio_root).values():
+    for s in sessions.values():
         if not s.active:
             continue
         try:
@@ -549,7 +581,8 @@ def find_session_for_cwd(
     cwd_norm = Path(os.path.normcase(str(resolved_cwd)))
     best: Optional[SessionRecord] = None
     best_depth = -1
-    for record in active_sessions(portfolio_root):
+    sessions, degraded = _load_ledger(portfolio_root)
+    for record in _live_sessions(sessions):
         if project_id is not None and record.project_id != project_id:
             continue
         try:
@@ -572,4 +605,69 @@ def find_session_for_cwd(
         if depth > best_depth:
             best = record
             best_depth = depth
+    if best is None and degraded:
+        best = _marker_fallback_session(resolved_cwd, project_id)
     return best
+
+
+def _marker_fallback_session(
+    cwd: Path, project_id: Optional[str]
+) -> Optional[SessionRecord]:
+    """CLAWP-114: scope to the dispatched worktree *cwd* sits in, using the
+    dispatch marker (``.claude/settings.local.json``) instead of the unusable
+    ledger. The marker travels with the checkout, so it needs no ledger.
+
+    Only called when the ledger is degraded. Walks cwd and its ancestors; the
+    nearest marker whose ``project_id`` equals *project_id* wins. A marker for
+    another project is skipped, never matched (a worktree of project B is not
+    a scope for resolving project A — cross-project isolation), and with no
+    *project_id* nothing is matched at all. No marker -> ``None``: today's
+    registry behaviour, so read-only commands in the main checkout still work.
+    A marker file that cannot be read is logged and skipped (fail-open WITH a
+    marker). Never raises.
+
+    The result is a synthetic record (session id ``marker:<task_id>``); it is
+    never written to the ledger.
+    """
+    if project_id is None:
+        return None
+    # Lazy: dispatch imports this module at load time.
+    from .dispatch import inspect_dispatch_marker, settings_path
+
+    for candidate in (cwd, *cwd.parents):
+        try:
+            marker, problem = inspect_dispatch_marker(candidate)
+        except (OSError, ValueError) as exc:
+            logger.error(
+                "Failed to read dispatch marker under %s: %s. Skipping it for "
+                "the local-worktree fallback.",
+                candidate, exc,
+            )
+            continue
+        if problem is not None:
+            # The plain reader maps damage to None, so surface it here.
+            logger.error(
+                "Dispatch marker %s is damaged: %s. Skipping it for the "
+                "local-worktree fallback.",
+                settings_path(candidate), problem,
+            )
+            continue
+        if marker is None or marker.get("project_id") != project_id:
+            continue
+        task_id = marker.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            continue
+        logger.warning(
+            "Session registry unavailable: scoping to the dispatched worktree "
+            "%s via its dispatch marker (task %s, project %s) instead of the "
+            "portfolio registry.",
+            candidate, task_id, project_id,
+        )
+        return SessionRecord(
+            session_id=f"marker:{task_id}",
+            task_id=task_id,
+            project_id=project_id,
+            worktree_path=candidate,
+            active=True,
+        )
+    return None
