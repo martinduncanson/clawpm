@@ -387,3 +387,117 @@ class TestStaleBlockedFrontmatterConsistency:
         )
         assert [t["task_id"] for t in transitions] == ["TEST-051"]
         assert "disk says no" in transitions[0]["state_sync_error"]
+
+
+class TestCascadeSyncRound1Fixes:
+    """CLAWP-094 Codex r1: lock scope, multiline YAML values, surfaced failures."""
+
+    @staticmethod
+    def _seed(tasks, dep_id, blk_id, state_block):
+        _write(tasks / "done" / f"{dep_id}.md", "done", task_id=dep_id)
+        (tasks / "blocked" / f"{blk_id}.md").write_bytes(
+            (
+                f"---\nid: {blk_id}\ntitle: T\n{state_block}"
+                f"depends:\n  - {dep_id}\n---\n\nbody\n"
+            ).encode("utf-8")
+        )
+
+    def test_sync_runs_under_tasks_lock(self, isolated_portfolio, monkeypatch):
+        import os
+
+        from clawpm import tasks as tasks_mod
+        from clawpm.concurrency import _held_depths
+
+        tasks = isolated_portfolio.tasks_dir
+        self._seed(tasks, "TEST-060", "TEST-061", "state: blocked\n")
+        key = os.path.normcase(os.path.abspath(str(tasks / ".clawpm-tasks.lock")))
+        held = []
+        real = tasks_mod._sync_state_line
+
+        def spy(path, new_state):
+            held.append(_held_depths().get(key, 0))
+            return real(path, new_state)
+
+        monkeypatch.setattr(tasks_mod, "_sync_state_line", spy)
+        tasks_mod.cascade_unblock_dependents(
+            isolated_portfolio.config, "test", "TEST-060"
+        )
+        assert held and all(d > 0 for d in held)
+
+    @pytest.mark.parametrize(
+        "state_block",
+        [
+            "state: >-\n  blocked\n",
+            "state: |\n  blocked\n",
+            'state: "blocked"\n',
+            "state: 'blocked'  # note\n",
+            "state: >-\r\n  blocked\r\n",
+        ],
+    )
+    def test_multiline_and_quoted_state_fully_rewritten(
+        self, isolated_portfolio, state_block
+    ):
+        from clawpm import tasks as tasks_mod
+
+        tasks = isolated_portfolio.tasks_dir
+        if "\r\n" in state_block:
+            # whole file CRLF
+            (tasks / "done").mkdir(exist_ok=True)
+            _write(tasks / "done" / "TEST-070.md", "done", task_id="TEST-070")
+            (tasks / "blocked" / "TEST-071.md").write_bytes(
+                (
+                    "---\r\nid: TEST-071\r\ntitle: T\r\n" + state_block
+                    + "depends:\r\n  - TEST-070\r\n---\r\n\r\nbody\r\n"
+                ).encode("utf-8")
+            )
+        else:
+            self._seed(tasks, "TEST-070", "TEST-071", state_block)
+        res = tasks_mod.cascade_unblock_dependents(
+            isolated_portfolio.config, "test", "TEST-070"
+        )
+        assert "state_sync_error" not in res[0]
+        raw = (tasks / "TEST-071.md").read_bytes().decode("utf-8")
+        fm = yaml.safe_load(raw.split("---", 2)[1])
+        assert fm["state"] == "open"
+        assert fm["depends"] == ["TEST-070"]
+        assert "blocked" not in raw.split("depends")[0].replace("id:", "")
+        if "\r\n" in state_block:
+            assert "\n" not in raw.replace("\r\n", "")
+
+    def test_unsupported_state_form_is_refused_with_error(self, isolated_portfolio):
+        from clawpm import tasks as tasks_mod
+
+        tasks = isolated_portfolio.tasks_dir
+        self._seed(tasks, "TEST-080", "TEST-081", "state:\n  - blocked\n")
+        res = tasks_mod.cascade_unblock_dependents(
+            isolated_portfolio.config, "test", "TEST-080"
+        )
+        assert res[0].get("state_sync_error")
+        raw = (tasks / "TEST-081.md").read_text(encoding="utf-8")
+        assert "  - blocked" in raw  # untouched, not half-rewritten
+
+    def test_sync_error_surfaces_in_cascade_errors(self, isolated_portfolio, monkeypatch):
+        from clawpm import tasks as tasks_mod
+        from clawpm.services.tasks import transition
+
+        tasks = isolated_portfolio.tasks_dir
+        _write(tasks / "TEST-090.md", "open", task_id="TEST-090")
+        (tasks / "blocked" / "TEST-091.md").write_text(
+            "---\nid: TEST-091\ntitle: T\nstate: blocked\ndepends:\n  - TEST-090\n---\n\nb\n",
+            encoding="utf-8",
+        )
+
+        def boom(*a, **k):
+            raise OSError("disk says no")
+
+        monkeypatch.setattr(tasks_mod, "_sync_state_line", boom)
+        res = transition(
+            isolated_portfolio.config,
+            project_id="test",
+            task_id="TEST-090",
+            new_state="done",
+        )
+        assert res["ok"]
+        errs = res["data"].get("cascade_errors")
+        assert errs and "disk says no" in errs[0]["message"]
+        assert errs[0].get("task_id") == "TEST-091"

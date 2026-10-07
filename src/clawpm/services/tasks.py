@@ -16,6 +16,7 @@ CLI boundary.
 
 from __future__ import annotations
 
+import logging
 import subprocess
 from pathlib import Path
 
@@ -25,6 +26,8 @@ from clawpm.discovery import get_project, get_repo_path
 from clawpm.tasks import change_task_state, get_task
 from clawpm.worklog import add_entry, filter_files_changed, read_entries
 from clawpm.context import expand_task_id
+
+logger = logging.getLogger(__name__)
 
 
 def transition(
@@ -251,6 +254,21 @@ def transition(
             # failed, and in a bulk batch it would abort the remaining tasks.
             # (CLAWP-067 review: intentional, not an oversight.)
             cascade_errors.append({"error_class": type(exc).__name__, "message": str(exc)})
+
+        # CLAWP-094: a frontmatter-sync failure is nested in the per-task
+        # record; lift it into cascade_errors (the marker the CLI reports as
+        # "degraded") and log it, so the durable-but-degraded unblock is visible.
+        for cr in cascade_results:
+            if cr.get("state_sync_error"):
+                logger.warning(
+                    "cascade unblock of %s: frontmatter state not synced: %s",
+                    cr["task_id"], cr["state_sync_error"],
+                )
+                cascade_errors.append({
+                    "error_class": "StateSyncError",
+                    "task_id": cr["task_id"],
+                    "message": cr["state_sync_error"],
+                })
 
         for cr in cascade_results:
             _safe_add_entry(
