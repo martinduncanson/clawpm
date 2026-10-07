@@ -368,7 +368,7 @@ def research_list(
     """List research entries for a project. `status` filters by
     open|in-progress|complete|stale; `tag` narrows to entries with that tag."""
     from clawpm.models import ResearchStatus
-    from clawpm.research import list_research
+    from clawpm.research import scan_research
 
     config = _load_config()
     project_id, _ = _resolve_project(project)
@@ -381,12 +381,14 @@ def research_list(
             return {"ok": False, "error": "bad_status", "message": f"invalid status '{status}'"}
 
     tags_filter = [tag] if tag else None
-    items = list_research(config, project_id, status_filter=status_filter, tags_filter=tags_filter)
+    scan = scan_research(config, project_id, status_filter=status_filter, tags_filter=tags_filter)
     return {
         "ok": True,
         "project": project_id,
-        "count": len(items),
-        "research": [r.to_dict() for r in items],
+        "count": len(scan.items),
+        "research": [r.to_dict() for r in scan.items],
+        "malformed_count": len(scan.malformed),
+        "malformed": scan.malformed,
     }
 
 
