@@ -192,6 +192,7 @@ def test_malformed_prefix_skips_event_and_logs_error(flat, tmp_path, caplog):
         {**base, "session_id": "s-int", "project_prefix": 42},
         {**base, "session_id": "s-abs", "project_prefix": "/etc"},
         {**base, "session_id": "s-dots", "project_prefix": "a/../../b"},
+        {**base, "session_id": "s-dotdrive", "project_prefix": "./C:/outside"},
         {**base, "session_id": "s-ok", "project_prefix": "packages/foo/"},
     ]
     ledger.write_text("".join(json.dumps(x) + "\n" for x in lines), encoding="utf-8")
@@ -199,7 +200,7 @@ def test_malformed_prefix_skips_event_and_logs_error(flat, tmp_path, caplog):
         rec = find_session_for_cwd(flat["root"], wt, "foo")
     assert rec is not None and rec.session_id == "s-ok"
     assert rec.project_prefix == "packages/foo"
-    assert sum("project_prefix" in m for m in caplog.messages) >= 3
+    assert sum("project_prefix" in m for m in caplog.messages) >= 4
 
 
 # (d) a prefixed project and a sibling project do not cross-match

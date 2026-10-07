@@ -320,10 +320,14 @@ def normalise_project_prefix(value: object) -> Optional[str]:
     if any(ord(c) < 32 or ord(c) == 127 for c in value):
         return None
     text = value.replace("\\", "/")
-    if text.startswith("/") or (len(text) >= 2 and text[1] == ":"):
+    if text.startswith("/"):
         return None
     parts = [p for p in text.split("/") if p not in ("", ".")]
     if any(p == ".." for p in parts):
+        return None
+    # Drive check runs on the NORMALISED first component: "./C:/x" collapses
+    # to "C:/x", which a Windows join treats as absolute.
+    if parts and len(parts[0]) >= 2 and parts[0][1] == ":":
         return None
     return "/".join(parts)
 
