@@ -51,7 +51,10 @@ Design tradeoffs:
 from __future__ import annotations
 
 import functools
+import logging
+import shutil
 import subprocess
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
@@ -73,15 +76,75 @@ from .models import (
     Actuals,
     Predictions,
     SuccessCriterion,
+    Task,
     TaskState,
 )
 from .reflect import write_iteration_event, write_reflection_event
 from .rubric import render_rubric_markdown
-from .sessions import suppress_session_resolution
-from .tasks import add_task, change_task_state
+from .sessions import register_session, suppress_session_resolution
+from .tasks import (
+    _candidate_task_paths,
+    add_task,
+    change_task_state,
+    get_tasks_dir,
+)
 
 
 JudgeInvoker = Callable[[str], str]
+
+_log = logging.getLogger(__name__)
+
+
+def _copy_subtask_file(src: Path, dst: Path) -> None:
+    """Copy *src* to *dst*, creating parent directories. Split out as a seam."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, dst)
+
+
+def _materialize_subtask(
+    config, project_id: str, subtask_id: str, target_dir: Path
+) -> Optional[str]:
+    """Copy the generated subtask into ``target_dir/.project/tasks`` (CLAWP-115).
+
+    Returns ``None`` on success, else a human-readable reason. Never raises:
+    the caller treats any failure as "do not register a session".
+
+    "Materialized" for a COPIED file means: it exists at the same path relative
+    to the tasks dir as the canonical file, its bytes equal the canonical
+    file's, and it parses to ``subtask_id``. This is deliberately NOT the
+    current-revision gate `tasks dispatch --worktree` uses (that one requires
+    the file to be at git HEAD, which an uncommitted copy never is). Must run
+    under ``suppress_session_resolution`` so ``get_tasks_dir`` is canonical.
+    """
+    try:
+        canonical_dir = get_tasks_dir(config, project_id)
+        if canonical_dir is None:
+            return f"canonical tasks dir for {project_id!r} not found"
+        src = next(
+            (p for p in _candidate_task_paths(canonical_dir, subtask_id) if p.exists()),
+            None,
+        )
+        if src is None:
+            return f"canonical task file for {subtask_id} not found"
+        dst = target_dir / ".project" / "tasks" / src.relative_to(canonical_dir)
+        if dst.exists() and dst.read_bytes() != src.read_bytes():
+            return f"{dst} already exists with different content; not overwriting"
+        _copy_subtask_file(src, dst)
+        if not dst.exists():
+            return f"copy to {dst} did not produce a file"
+        if dst.read_bytes() != src.read_bytes():
+            # Byte compare is the strict form; a task id mismatch (checked
+            # next) gives the more useful message, so report that first.
+            copied_id = Task.from_file(dst).id
+            if copied_id != subtask_id:
+                return f"copied file parses to id {copied_id!r}, expected {subtask_id!r}"
+            return f"copied file at {dst} differs from the canonical task file"
+        copied_id = Task.from_file(dst).id
+        if copied_id != subtask_id:
+            return f"copied file parses to id {copied_id!r}, expected {subtask_id!r}"
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return None
 
 
 class AgentDispatchError(Exception):
@@ -353,22 +416,53 @@ def _dispatch_agent(
             f"write_dispatch_settings failed: {error_detail}"
         ) from exc
 
-    # CLAWP-098 scope note (Codex review, PR #55): this command deliberately
-    # does NOT register a session for its worktree, unlike `tasks dispatch
-    # --worktree`. Step 2 (create_worktree) checks out committed HEAD, so the
-    # new subtask file — written uncommitted by step 1 — never lands in
-    # target_dir. Registering a session anyway would redirect the worktree's
-    # own Stop-hook (`eval-stop`, wired below) to look up the task inside
-    # target_dir's .project/tasks/, find nothing, and block termination
-    # forever ("task not found"). The hook instead falls through to the
-    # portfolio registry (the main checkout), which is where the task must
-    # therefore live: `dispatch_agent` below pins this whole function to
-    # registry (canonical) resolution, so the subtask is created — and later
-    # transitioned — there even when the caller runs from a registered
-    # worktree (round 13 P1: the session-scoped `add_task` used to put it in
-    # the CALLER's worktree, where the unregistered nested worktree's hooks
-    # could never find it). Materializing the file into the worktree and
-    # registering a session is the proper fix — left as follow-up work.
+    # CLAWP-115: materialize the subtask into the worktree, then register a
+    # session for it (what `tasks dispatch --worktree` does). Step 2
+    # (create_worktree) checks out committed HEAD, so the subtask written
+    # uncommitted by step 1 into the canonical checkout is absent from
+    # target_dir; registering a session without it would point the worktree's
+    # Stop hook (`eval-stop`) at a store lacking the task and block
+    # termination forever ("task not found"). So the file is COPIED in
+    # (never committed) and the copy verified first; any failure leaves the
+    # session unregistered (old behaviour: the hook falls through to the
+    # canonical store, where the task also lives — `dispatch_agent` below pins
+    # this function to canonical resolution) and is reported loudly.
+    #
+    # Gated on the worktree carrying its own `.project/` (the same condition
+    # session-scoped resolution applies, discovery._session_scoped_project_dir).
+    # A project that does not git-track `.project/` has nothing worktree-local
+    # to resolve against, so it keeps the pre-CLAWP-115 behaviour: no copy, no
+    # session.
+    session_id: Optional[str] = None
+    materialize_error: Optional[str] = None
+    if (target_dir / ".project").is_dir():
+        materialize_error = _materialize_subtask(
+            config, project_id, subtask_id, target_dir
+        )
+        if materialize_error is None:
+            candidate_session = str(uuid.uuid4())
+            try:
+                register_session(
+                    config.portfolio_root, candidate_session, subtask_id,
+                    project_id, target_dir,
+                )
+                session_id = candidate_session
+            except Exception as exc:
+                materialize_error = (
+                    f"registering the worktree session failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        if materialize_error is not None:
+            # logging, not print: an unconfigured logger still reaches stderr
+            # at ERROR (logging.lastResort), and this module stays free of
+            # stdout writes (encoding_check's unconfigured-stdout rule).
+            _log.error(
+                "clawpm agent dispatch (CLAWP-115): %s was NOT isolated in %s: "
+                "%s. No session registered; the worktree's Stop hook resolves "
+                "the task from the main checkout instead. The dispatch "
+                "continues.",
+                subtask_id, target_dir, materialize_error,
+            )
 
     # 4. Invoke the subagent. Tests pass `judge_invoker`; the CLI passes
     # `judge_cmd_override` or falls through to CLAWPM_JUDGE_CMD /
@@ -502,6 +596,8 @@ def _dispatch_agent(
         ),
         "target_dir": str(target_dir),
         "settings_path": str(settings_path),
+        "session_id": session_id,
+        "materialize_error": materialize_error,
         "codegraph_initialized": codegraph_initialized,
         "rubric_markdown": rubric_markdown,
         "dispatched_at": datetime.now(timezone.utc).isoformat().replace(

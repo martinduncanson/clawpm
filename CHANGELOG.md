@@ -12,6 +12,7 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 
 ### Fixed
 
+- `agent dispatch` now copies (never commits) its generated subtask into the worktree it creates and registers a session for that worktree, gated on the worktree carrying its own `.project/`; a failed copy or verification registers nothing and is reported loudly (CLAWP-115).
 - When the session ledger (`sessions.jsonl`) is unreadable or holds no valid event, session-scoped resolution now falls back to the dispatch marker of the worktree the command runs in, instead of silently resolving to the main checkout (the CLAWP-098 corruption). Marker project must match; no marker keeps the registry lookup; every degraded path logs (#78, CLAWP-114).
 - On Windows the CLI no longer glob-expands its own arguments (Click's `windows_expand_args`): `--scope "src/double-star"` is stored verbatim instead of failing with a usage error or being rewritten to a file path, and `~`, `$VAR` and `%VAR%` in free text survive too. Options that name a filesystem path (`--target-dir`, `--body-file`, `--scope-file`, `--in-repo`, ...) still expand `~` and environment variables, on every platform (#77, CLAWP-109).
 - `tasks edit` (CLI and MCP `tasks_edit`) now merges predictions: passing one prediction flag overwrites only that field instead of nulling duration, confidence, pre-mortem, scope, `filled_by` and the rest (#76, CLAWP-108).
