@@ -616,3 +616,77 @@ class TestAnyLinkUnderTheWorktreeStoreRefusesTheSync:
         os.symlink(tracked["repo"] / "README.md", meta / "tasks" / "done" / "x.md.tmp")
         with pytest.raises(RuntimeError, match=r"x\.md\.tmp"):
             agmod._pin_worktree_scope(cfg, "test", "TEST-001", wt)
+
+
+def _clean_worktree(tmp_path: Path) -> Path:
+    wt = tmp_path / "wt"
+    (wt / ".project" / "tasks" / "done").mkdir(parents=True)
+    (wt / ".project" / "tasks" / "TEST-001.md").write_text(
+        "---\nid: TEST-001\ntitle: t\nstate: open\n---\n# t\n", encoding="utf-8"
+    )
+    return wt
+
+
+class TestLinkDetectionWithoutThePython312Api:
+    """Codex r5 P2 (PR #79): ``Path.is_junction`` is 3.12+; the project
+    supports 3.11, where every sync raised AttributeError. Detection must work
+    with both 3.12 junction APIs unavailable."""
+
+    @pytest.fixture
+    def no_312_api(self, monkeypatch):
+        monkeypatch.delattr(Path, "is_junction", raising=False)
+        monkeypatch.delattr(os.path, "isjunction", raising=False)
+        assert not hasattr(Path, "is_junction")
+        assert not hasattr(os.path, "isjunction")
+
+    def test_clean_worktree_still_pins(self, tracked, tmp_path, no_312_api):
+        wt = _clean_worktree(tmp_path)
+        scope = agmod._pin_worktree_scope(tracked["config"], "test", "TEST-001", wt)
+        assert scope.pinned_project_dir == (wt / ".project").resolve()
+
+    def test_symlink_still_refused(self, tracked, tmp_path, no_312_api):
+        reason = _link_unavailable("symlink", tmp_path)
+        if reason:
+            pytest.skip(reason)
+        wt = _clean_worktree(tmp_path)
+        os.symlink(
+            tracked["repo"] / "README.md", wt / ".project" / "tasks" / "done" / "x.md.tmp"
+        )
+        with pytest.raises(RuntimeError, match=r"x\.md\.tmp"):
+            agmod._pin_worktree_scope(tracked["config"], "test", "TEST-001", wt)
+
+    def test_junction_still_refused(self, tracked, tmp_path, no_312_api):
+        reason = _link_unavailable("junction", tmp_path)
+        if reason:
+            pytest.skip(reason)
+        wt = _clean_worktree(tmp_path)
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        _make_link("junction", wt / ".project" / "tasks" / "blocked", elsewhere)
+        with pytest.raises(RuntimeError, match="blocked"):
+            agmod._pin_worktree_scope(tracked["config"], "test", "TEST-001", wt)
+
+
+@pytest.mark.parametrize("kind", ["symlink", "junction"])
+class TestLinkedStoreRootIsRefused:
+    """Codex r5 P2 (PR #79): resolving ``<wt>/.project`` before the walk hid a
+    store root that is itself a link to another directory inside the
+    worktree, which holds the copied task. The unresolved path is checked."""
+
+    def test_linked_project_dir_inside_worktree_is_refused(
+        self, tracked, tmp_path, kind
+    ):
+        reason = _link_unavailable(kind, tmp_path)
+        if reason:
+            pytest.skip(reason)
+        wt = tmp_path / "wt"
+        real = wt / "sibling-store"
+        (real / "tasks" / "done").mkdir(parents=True)
+        (real / "tasks" / "TEST-001.md").write_text(
+            "---\nid: TEST-001\ntitle: t\nstate: open\n---\n# t\n", encoding="utf-8"
+        )
+        _make_link(kind, wt / ".project", real)
+        with pytest.raises(RuntimeError) as exc:
+            agmod._pin_worktree_scope(tracked["config"], "test", "TEST-001", wt)
+        assert str(wt / ".project") in str(exc.value)
+        assert "link" in str(exc.value) or "junction" in str(exc.value)

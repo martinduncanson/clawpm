@@ -54,6 +54,7 @@ import functools
 import logging
 import os
 import shutil
+import stat
 import subprocess
 import uuid
 from datetime import datetime, timezone
@@ -159,9 +160,31 @@ def _within(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
+def _is_junction(path: Path) -> bool:
+    """Whether *path* itself is a Windows junction (3.11-safe).
+
+    ``Path.is_junction`` / ``os.path.isjunction`` only exist on Python 3.12+,
+    and the project supports 3.11. Without them, read the reparse-point
+    attributes straight from ``lstat`` (which never follows the link).
+    """
+    isjunction = getattr(os.path, "isjunction", None)
+    if isjunction is not None:
+        return bool(isjunction(path))
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    attrs = getattr(st, "st_file_attributes", 0)
+    if not attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+        return False
+    tag = getattr(st, "st_reparse_tag", None)
+    # A reparse point whose tag we cannot read is treated as a link (fail closed).
+    return tag is None or tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+
+
 def _is_link(path: Path) -> bool:
     """Whether *path* itself is a symlink or Windows junction (never followed)."""
-    return path.is_symlink() or path.is_junction()
+    return path.is_symlink() or _is_junction(path)
 
 
 def _find_link_under(root: Path) -> Optional[Path]:
@@ -185,8 +208,12 @@ def _find_link_under(root: Path) -> Optional[Path]:
     return None
 
 
-def _refuse_links_under_store(project_dir: Path, canonical: Optional[Path]) -> None:
-    """Refuse a worktree store that contains any link (CLAWP-115).
+def _refuse_links_under_store(store_root: Path, canonical: Optional[Path]) -> None:
+    """Refuse a worktree store that is, or contains, any link (CLAWP-115).
+
+    *store_root* is the UNRESOLVED ``<worktree>/.project``: resolving it first
+    would hide a root that is itself a link to another directory inside the
+    worktree. The walk runs on it as given; containment uses the resolved form.
 
     Structural, not an enumeration of what ``change_task_state`` touches:
     rounds 3 and 4 each found a path (a linked state dir, then a ``.md.tmp``
@@ -197,12 +224,13 @@ def _refuse_links_under_store(project_dir: Path, canonical: Optional[Path]) -> N
     already present in a freshly created worktree; a link planted after this
     check (TOCTOU) is accepted residual.
     """
-    link = _find_link_under(project_dir)
+    link = _find_link_under(store_root)
     if link is not None:
         raise RuntimeError(
-            f"{link} is a symlink or junction under the worktree store "
-            f"{project_dir}; refusing to write through links"
+            f"{link} is a symlink or junction at or under the worktree store "
+            f"{store_root}; refusing to write through links"
         )
+    project_dir = store_root.resolve()
     tasks_dir = (project_dir / "tasks").resolve(strict=False)
     if not _within(tasks_dir, project_dir):
         raise RuntimeError(
@@ -228,13 +256,14 @@ def _pin_worktree_scope(
     stat fault) when any check fails; the caller then writes nothing anywhere.
     """
     wt_root = target_dir.resolve()
-    project_dir = (target_dir / ".project").resolve()
+    store_root = target_dir / ".project"
+    project_dir = store_root.resolve()
     if wt_root not in project_dir.parents:
         raise RuntimeError(f"{project_dir} is not inside the worktree {wt_root}")
     canonical = get_project_dir(config, project_id, scope=Scope.canonical())
     if canonical is not None and canonical.resolve() == project_dir:
         raise RuntimeError(f"{project_dir} is the canonical store, not a worktree's")
-    _refuse_links_under_store(project_dir, canonical)
+    _refuse_links_under_store(store_root, canonical)
     tasks_dir = project_dir / "tasks"
     if not stat_is_dir(tasks_dir):
         raise RuntimeError(f"{tasks_dir} is not a directory")
