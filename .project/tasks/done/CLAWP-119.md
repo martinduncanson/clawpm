@@ -12,7 +12,7 @@ predictions:
   - 'Task filed and linked to commit 6f176f0 / PR #57 for provenance; no code change
     required'
 priority: 5
-updated: '2026-09-17'
+updated: '2026-10-07'
 ---
 # Remove digest-fallback prefix synthesis from assign_task_prefix
 
@@ -20,7 +20,12 @@ assign_task_prefix previously synthesised a digest-derived prefix when no explic
 
 ## Acceptance Criteria
 
-- [ ] (Add criteria here)
+- [x] Change is on main: PR #57 squash-merged as 9ae813a (ancestor of fork/main, verified 2026-10-07 with
+  `git merge-base --is-ancestor`); the branch commit 6f176f0 is not itself an ancestor because of the squash.
+- [x] `assign_task_prefix` (src/clawpm/tasks.py) has no digest-fallback arm and raises with the explicit-`task_prefix` remedy.
+- [x] Covered by tests citing CLAWP-119 (tests/test_task_id_allocation.py, tests/test_phase16.py).
 
 ## Notes
+
+Closed 2026-10-07 as filing-only: no code change in this task.
 
