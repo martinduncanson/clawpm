@@ -51,12 +51,17 @@ Design tradeoffs:
 from __future__ import annotations
 
 import functools
+import logging
+import os
+import shutil
+import stat
 import subprocess
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
-from .discovery import get_project
+from .discovery import get_project, get_project_dir
 from .dispatch import (
     PartialDispatchWrite,
     create_worktree,
@@ -73,15 +78,247 @@ from .models import (
     Actuals,
     Predictions,
     SuccessCriterion,
+    Task,
     TaskState,
 )
 from .reflect import write_iteration_event, write_reflection_event
 from .rubric import render_rubric_markdown
-from .sessions import suppress_session_resolution
-from .tasks import add_task, change_task_state
+from .sessions import (
+    Scope,
+    active_sessions,
+    register_session,
+    stat_is_dir,
+    suppress_session_resolution,
+)
+from .tasks import (
+    _candidate_task_paths,
+    add_task,
+    change_task_state,
+    get_tasks_dir,
+)
 
 
 JudgeInvoker = Callable[[str], str]
+
+_log = logging.getLogger(__name__)
+
+
+def _copy_subtask_file(src: Path, dst: Path) -> None:
+    """Copy *src* to *dst*, creating parent directories. Split out as a seam."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, dst)
+
+
+def _materialize_subtask(
+    config, project_id: str, subtask_id: str, target_dir: Path
+) -> Optional[str]:
+    """Copy the generated subtask into ``target_dir/.project/tasks`` (CLAWP-115).
+
+    Returns ``None`` on success, else a human-readable reason. Never raises:
+    the caller treats any failure as "do not register a session".
+
+    "Materialized" for a COPIED file means: it exists at the same path relative
+    to the tasks dir as the canonical file, its bytes equal the canonical
+    file's, and it parses to ``subtask_id``. This is deliberately NOT the
+    current-revision gate `tasks dispatch --worktree` uses (that one requires
+    the file to be at git HEAD, which an uncommitted copy never is). Must run
+    under ``suppress_session_resolution`` so ``get_tasks_dir`` is canonical.
+    """
+    try:
+        canonical_dir = get_tasks_dir(config, project_id)
+        if canonical_dir is None:
+            return f"canonical tasks dir for {project_id!r} not found"
+        src = next(
+            (p for p in _candidate_task_paths(canonical_dir, subtask_id) if p.exists()),
+            None,
+        )
+        if src is None:
+            return f"canonical task file for {subtask_id} not found"
+        dst = target_dir / ".project" / "tasks" / src.relative_to(canonical_dir)
+        if dst.exists() and dst.read_bytes() != src.read_bytes():
+            return f"{dst} already exists with different content; not overwriting"
+        _copy_subtask_file(src, dst)
+        if not dst.exists():
+            return f"copy to {dst} did not produce a file"
+        if dst.read_bytes() != src.read_bytes():
+            # Byte compare is the strict form; a task id mismatch (checked
+            # next) gives the more useful message, so report that first.
+            copied_id = Task.from_file(dst).id
+            if copied_id != subtask_id:
+                return f"copied file parses to id {copied_id!r}, expected {subtask_id!r}"
+            return f"copied file at {dst} differs from the canonical task file"
+        copied_id = Task.from_file(dst).id
+        if copied_id != subtask_id:
+            return f"copied file parses to id {copied_id!r}, expected {subtask_id!r}"
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
+def _within(path: Path, root: Path) -> bool:
+    """Whether the (already resolved) *path* is *root* or sits beneath it."""
+    return path == root or root in path.parents
+
+
+def _is_junction(path: Path) -> bool:
+    """Whether *path* itself is a Windows junction (3.11-safe).
+
+    ``Path.is_junction`` / ``os.path.isjunction`` only exist on Python 3.12+,
+    and the project supports 3.11. Without them, read the reparse-point
+    attributes straight from ``lstat`` (which never follows the link).
+    """
+    isjunction = getattr(os.path, "isjunction", None)
+    if isjunction is not None:
+        return bool(isjunction(path))
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    attrs = getattr(st, "st_file_attributes", 0)
+    if not attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+        return False
+    tag = getattr(st, "st_reparse_tag", None)
+    # A reparse point whose tag we cannot read is treated as a link (fail closed).
+    return tag is None or tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+
+
+def _is_link(path: Path) -> bool:
+    """Whether *path* itself is a symlink or Windows junction (never followed)."""
+    return path.is_symlink() or _is_junction(path)
+
+
+def _find_link_under(root: Path) -> Optional[Path]:
+    """First symlink or junction at or beneath *root*, else ``None``.
+
+    Walks with ``os.scandir`` and never descends into a link (``os.walk``
+    would walk into a junction, which it does not report as a symlink).
+    """
+    if _is_link(root):
+        return root
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        with os.scandir(current) as entries:
+            for entry in entries:
+                child = Path(entry.path)
+                if _is_link(child):
+                    return child
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(child)
+    return None
+
+
+def _refuse_links_under_store(store_root: Path, canonical: Optional[Path]) -> None:
+    """Refuse a worktree store that is, or contains, any link (CLAWP-115).
+
+    *store_root* is the UNRESOLVED ``<worktree>/.project``: resolving it first
+    would hide a root that is itself a link to another directory inside the
+    worktree. The walk runs on it as given; containment uses the resolved form.
+
+    Structural, not an enumeration of what ``change_task_state`` touches:
+    rounds 3 and 4 each found a path (a linked state dir, then a ``.md.tmp``
+    atomic-write sibling) the list missed. Any symlink or junction at or under
+    ``.project/`` refuses the sync, whatever the mutator would have written.
+    The tasks dir must also resolve inside *project_dir* and outside the
+    canonical store. Nothing is created or written here. The threat is links
+    already present in a freshly created worktree; a link planted after this
+    check (TOCTOU) is accepted residual.
+    """
+    link = _find_link_under(store_root)
+    if link is not None:
+        raise RuntimeError(
+            f"{link} is a symlink or junction at or under the worktree store "
+            f"{store_root}; refusing to write through links"
+        )
+    project_dir = store_root.resolve()
+    tasks_dir = (project_dir / "tasks").resolve(strict=False)
+    if not _within(tasks_dir, project_dir):
+        raise RuntimeError(
+            f"{tasks_dir} is outside the worktree store {project_dir}"
+        )
+    if canonical is not None and _within(tasks_dir, canonical.resolve()):
+        raise RuntimeError(
+            f"{tasks_dir} is inside the canonical store {canonical.resolve()}"
+        )
+
+
+def _pin_worktree_scope(
+    config, project_id: str, subtask_id: str, target_dir: Path
+) -> Scope:
+    """Validate the worktree's own task store and pin a ``Scope`` to it.
+
+    Built straight from ``target_dir/.project`` — no session lookup, no
+    registry fallback — and checked BEFORE any mutation: the store must sit
+    inside the worktree (symlink/junction escapes resolve out and are
+    refused), must not be the canonical store, must hold no symlink or
+    junction anywhere beneath it (``_refuse_links_under_store``), and it must
+    hold the copy we materialized. Raises ``RuntimeError`` (or ``OSError`` on a
+    stat fault) when any check fails; the caller then writes nothing anywhere.
+    """
+    wt_root = target_dir.resolve()
+    store_root = target_dir / ".project"
+    project_dir = store_root.resolve()
+    if wt_root not in project_dir.parents:
+        raise RuntimeError(f"{project_dir} is not inside the worktree {wt_root}")
+    canonical = get_project_dir(config, project_id, scope=Scope.canonical())
+    if canonical is not None and canonical.resolve() == project_dir:
+        raise RuntimeError(f"{project_dir} is the canonical store, not a worktree's")
+    _refuse_links_under_store(store_root, canonical)
+    tasks_dir = project_dir / "tasks"
+    if not stat_is_dir(tasks_dir):
+        raise RuntimeError(f"{tasks_dir} is not a directory")
+    for path in _candidate_task_paths(tasks_dir, subtask_id):
+        if path.exists() and Task.from_file(path).id == subtask_id:
+            return Scope.pinned(project_dir)
+    raise RuntimeError(f"no copy of {subtask_id} under {tasks_dir}")
+
+
+def _sync_worktree_copy(
+    config,
+    project_id: str,
+    subtask_id: str,
+    target_dir: Path,
+    session_id: str,
+    new_state: TaskState,
+    note: str,
+) -> None:
+    """Apply the verdict transition to the worktree's own copy (CLAWP-115).
+
+    The verdict moves only the canonical task; the copy we materialized would
+    otherwise stay OPEN and `get_next_task` from the worktree would hand the
+    finished/blocked subtask out again. The SAME ``change_task_state`` runs,
+    with a ``Scope`` pinned to the worktree's store (``_pin_worktree_scope``),
+    so every lookup inside the mutator resolves there and nowhere else: a
+    session released or replaced mid-dispatch cannot redirect it to the
+    canonical store (which a concurrent reopen may own) or an enclosing
+    worktree. The session we registered must still be active for this
+    worktree; if not, the worktree no longer belongs to this dispatch and it
+    is left alone. Never raises: a failure is logged and the dispatch carries
+    on (the canonical store, which the Stop hook falls back to, is correct).
+    """
+    try:
+        if not any(
+            s.session_id == session_id for s in active_sessions(config.portfolio_root)
+        ):
+            raise RuntimeError(
+                f"session {session_id} is no longer active for the worktree"
+            )
+        scope = _pin_worktree_scope(config, project_id, subtask_id, target_dir)
+        synced = change_task_state(
+            config, project_id, subtask_id, new_state, note=note, scope=scope
+        )
+        if synced is None or synced.state != new_state:
+            raise RuntimeError(
+                "worktree transition returned "
+                f"{None if synced is None else synced.state.value!r}"
+            )
+    except Exception as exc:
+        _log.error(
+            "clawpm agent dispatch (CLAWP-115): could not sync %s to %s in the "
+            "worktree %s: %s: %s. The canonical store is correct; the "
+            "worktree copy may still read as OPEN. The dispatch continues.",
+            subtask_id, new_state.value, target_dir, type(exc).__name__, exc,
+        )
 
 
 class AgentDispatchError(Exception):
@@ -353,22 +590,67 @@ def _dispatch_agent(
             f"write_dispatch_settings failed: {error_detail}"
         ) from exc
 
-    # CLAWP-098 scope note (Codex review, PR #55): this command deliberately
-    # does NOT register a session for its worktree, unlike `tasks dispatch
-    # --worktree`. Step 2 (create_worktree) checks out committed HEAD, so the
-    # new subtask file — written uncommitted by step 1 — never lands in
-    # target_dir. Registering a session anyway would redirect the worktree's
-    # own Stop-hook (`eval-stop`, wired below) to look up the task inside
-    # target_dir's .project/tasks/, find nothing, and block termination
-    # forever ("task not found"). The hook instead falls through to the
-    # portfolio registry (the main checkout), which is where the task must
-    # therefore live: `dispatch_agent` below pins this whole function to
-    # registry (canonical) resolution, so the subtask is created — and later
-    # transitioned — there even when the caller runs from a registered
-    # worktree (round 13 P1: the session-scoped `add_task` used to put it in
-    # the CALLER's worktree, where the unregistered nested worktree's hooks
-    # could never find it). Materializing the file into the worktree and
-    # registering a session is the proper fix — left as follow-up work.
+    # CLAWP-115: materialize the subtask into the worktree, then register a
+    # session for it (what `tasks dispatch --worktree` does). Step 2
+    # (create_worktree) checks out committed HEAD, so the subtask written
+    # uncommitted by step 1 into the canonical checkout is absent from
+    # target_dir; registering a session without it would point the worktree's
+    # Stop hook (`eval-stop`) at a store lacking the task and block
+    # termination forever ("task not found"). So the file is COPIED in
+    # (never committed) and the copy verified first; any failure leaves the
+    # session unregistered (old behaviour: the hook falls through to the
+    # canonical store, where the task also lives — `dispatch_agent` below pins
+    # this function to canonical resolution) and is reported loudly.
+    #
+    # Gated on the worktree carrying its own `.project/` (the same condition
+    # session-scoped resolution applies, discovery._session_scoped_project_dir).
+    # A project that does not git-track `.project/` has nothing worktree-local
+    # to resolve against, so it keeps the pre-CLAWP-115 behaviour: no copy, no
+    # session.
+    session_id: Optional[str] = None
+    materialize_error: Optional[str] = None
+    # stat_is_dir, not Path.is_dir(): on Python 3.12 is_dir() propagates some
+    # OSErrors (PermissionError ...), which would escape this block and abort
+    # the dispatch with no log. Any fault here is a materialize failure.
+    try:
+        has_project_dir = stat_is_dir(target_dir / ".project")
+    except (FileNotFoundError, NotADirectoryError):
+        has_project_dir = False
+    except OSError as exc:
+        has_project_dir = False
+        materialize_error = (
+            f"stat of {target_dir / '.project'} failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    if has_project_dir or materialize_error is not None:
+        if materialize_error is None:
+            materialize_error = _materialize_subtask(
+                config, project_id, subtask_id, target_dir
+            )
+        if materialize_error is None:
+            candidate_session = str(uuid.uuid4())
+            try:
+                register_session(
+                    config.portfolio_root, candidate_session, subtask_id,
+                    project_id, target_dir,
+                )
+                session_id = candidate_session
+            except Exception as exc:
+                materialize_error = (
+                    f"registering the worktree session failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        if materialize_error is not None:
+            # logging, not print: an unconfigured logger still reaches stderr
+            # at ERROR (logging.lastResort), and this module stays free of
+            # stdout writes (encoding_check's unconfigured-stdout rule).
+            _log.error(
+                "clawpm agent dispatch (CLAWP-115): %s was NOT isolated in %s: "
+                "%s. No session registered; the worktree's Stop hook resolves "
+                "the task from the main checkout instead. The dispatch "
+                "continues.",
+                subtask_id, target_dir, materialize_error,
+            )
 
     # 4. Invoke the subagent. Tests pass `judge_invoker`; the CLI passes
     # `judge_cmd_override` or falls through to CLAWPM_JUDGE_CMD /
@@ -433,13 +715,15 @@ def _dispatch_agent(
         # DONE path: terminal reflection event captures the (empty for
         # now) deltas. Iterations counter rolls up via
         # count_iterations_for_task on the reflection-event read path.
+        done_note = f"agent dispatch verdict ok: {verdict.reason[:200]}"
         change_task_state(
-            config,
-            project_id,
-            subtask_id,
-            TaskState.DONE,
-            note=f"agent dispatch verdict ok: {verdict.reason[:200]}",
+            config, project_id, subtask_id, TaskState.DONE, note=done_note
         )
+        if session_id is not None:
+            _sync_worktree_copy(
+                config, project_id, subtask_id, target_dir, session_id,
+                TaskState.DONE, done_note,
+            )
         # Build minimal Actuals — no git diff or duration tracking here;
         # this is a single-shot subagent dispatch, not a long task. The
         # reflection event still captures the success_criteria predictions
@@ -463,16 +747,18 @@ def _dispatch_agent(
         # failure mode. The subtask sits in `tasks/blocked/<id>.md` for
         # the operator to triage — `clawpm tasks list --state blocked`
         # will surface it.
-        change_task_state(
-            config,
-            project_id,
-            subtask_id,
-            TaskState.BLOCKED,
-            note=(
-                f"agent dispatch verdict not-ok: {verdict.reason[:200]} "
-                f"(impossible={verdict.impossible})"
-            ),
+        blocked_note = (
+            f"agent dispatch verdict not-ok: {verdict.reason[:200]} "
+            f"(impossible={verdict.impossible})"
         )
+        change_task_state(
+            config, project_id, subtask_id, TaskState.BLOCKED, note=blocked_note
+        )
+        if session_id is not None:
+            _sync_worktree_copy(
+                config, project_id, subtask_id, target_dir, session_id,
+                TaskState.BLOCKED, blocked_note,
+            )
         reflection_event_path = write_iteration_event(
             portfolio_root=config.portfolio_root,
             task_id=subtask_id,
@@ -502,6 +788,8 @@ def _dispatch_agent(
         ),
         "target_dir": str(target_dir),
         "settings_path": str(settings_path),
+        "session_id": session_id,
+        "materialize_error": materialize_error,
         "codegraph_initialized": codegraph_initialized,
         "rubric_markdown": rubric_markdown,
         "dispatched_at": datetime.now(timezone.utc).isoformat().replace(
@@ -516,11 +804,14 @@ def dispatch_agent(*args, **kwargs) -> dict:
 
     Runs the whole dispatch with session-scoped resolution suppressed
     (CLAWP-098, Codex P1 on PR #55 round 13). The nested worktree this
-    creates is deliberately unregistered, so its hooks resolve the task from
-    the portfolio registry — the canonical checkout. Every task read/write in
-    this function (the new subtask, its state transitions) therefore has to
-    use that same canonical store, regardless of whether the CALLER happens to
-    be sitting inside some other registered worktree.
+    creates is unregistered unless CLAWP-115 materialized the subtask into it,
+    so its hooks may resolve the task from the portfolio registry — the
+    canonical checkout. Every task read/write in this function (the new
+    subtask, its state transitions) therefore has to use that same canonical
+    store, regardless of whether the CALLER happens to be sitting inside some
+    other registered worktree. The one deliberate exception is
+    ``_sync_worktree_copy``, which mirrors the verdict into the worktree's own
+    copy through an explicit ``Scope.pinned`` store, not ambient resolution.
     """
     with suppress_session_resolution():
         return _dispatch_agent(*args, **kwargs)

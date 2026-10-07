@@ -123,6 +123,7 @@ def suppress_session_resolution():
     finally:
         _suppress_session_resolution.reset(token)
 
+
 # CLAWP-098 (Codex P1, PR #55 round 15): a command that will RUN somewhere
 # other than its own cwd — `tasks dispatch --target-dir X` — must resolve its
 # task in the scope of THAT place, because the process it launches there will.
@@ -168,11 +169,21 @@ class Scope:
     session for ``target`` rather than for the process cwd (same answer as
     inside ``resolve_scope_from(target)``). Neither mode consults the cwd or
     the contextvars, so a bound scope stays put if cwd changes mid-command.
+
+    ``pinned_project_dir`` (CLAWP-115) is a third, session-free mode: the task
+    store IS that ``.project/`` directory. ``get_project_dir`` returns it
+    verbatim, with no session lookup and no registry fallback, so a command
+    that already validated one specific store (the agent-dispatch verdict sync)
+    cannot be redirected anywhere else. Only the project dir (and so the tasks
+    dir) is pinned; repo path and settings resolution stay canonical.
     """
 
     target: Optional[Path] = None
+    pinned_project_dir: Optional[Path] = None
 
     def __post_init__(self) -> None:
+        if self.target is not None and self.pinned_project_dir is not None:
+            raise ValueError("a Scope is bound to a target OR pinned to a store, not both")
         # Codex r1 P2 (PR #75): a relative target would be re-resolved against
         # whatever cwd is current at each lookup, so the "frozen" scope would
         # move with cwd. Capture an absolute path once, for every construction
@@ -181,10 +192,14 @@ class Scope:
         # (``discovery.resolve_scope``) pass an already-resolved path.
         if self.target is not None:
             object.__setattr__(self, "target", Path(self.target).absolute())
+        if self.pinned_project_dir is not None:
+            object.__setattr__(
+                self, "pinned_project_dir", Path(self.pinned_project_dir).absolute()
+            )
 
     @property
     def is_canonical(self) -> bool:
-        return self.target is None
+        return self.target is None and self.pinned_project_dir is None
 
     @classmethod
     def canonical(cls) -> "Scope":
@@ -193,6 +208,10 @@ class Scope:
     @classmethod
     def bound(cls, target: Path) -> "Scope":
         return cls(Path(target))
+
+    @classmethod
+    def pinned(cls, project_dir: Path) -> "Scope":
+        return cls(None, Path(project_dir))
 
 
 def resolve_path_or_none(

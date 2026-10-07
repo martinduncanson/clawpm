@@ -21,6 +21,13 @@ signal that scope is a decision at all. PR #55 rounds 13-17 found five commands
 Neither mode reads the cwd or the contextvars. A bound scope stays put if the
 cwd changes mid-command.
 
+`Scope.pinned(project_dir)` (CLAWP-115) is a third, session-free mode: the task
+store IS that `.project/` directory. `get_project_dir` returns it verbatim, with
+no session lookup and no registry fallback. Only the project dir (so the tasks
+dir) is pinned; repo path and settings stay canonical. `change_task_state` and
+`parent_rollup_status` accept `scope=` and thread it to every store lookup. The
+agent-dispatch verdict sync uses it to touch only the worktree's own store.
+
 `discovery.resolve_scope(config, project_id, target_dir=None)` builds one. With
 `target_dir` it binds to that directory. Without it, it freezes what ambient
 resolution would answer now: canonical inside `suppress_session_resolution()`,

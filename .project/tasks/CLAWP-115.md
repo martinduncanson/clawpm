@@ -20,7 +20,11 @@ Codex P1 on PR #55 (thread PRRT_kwDOSVLYYc6eZw4t, agent.py). clawpm agent dispat
 
 ## Acceptance Criteria
 
-- [ ] (Add criteria here)
+- [x] `agent dispatch` registers a session for its worktree when the worktree carries its own `.project/` (test_session_registered_and_subtask_resolves_in_worktree).
+- [x] The generated subtask is copied, uncommitted, into the worktree's `.project/tasks/` and parses to the same id with identical bytes before registration.
+- [x] With cwd = the worktree, `get_tasks_dir`/`get_task` (what `hook eval-stop` calls) resolve inside the worktree (test_eval_stop_lookup_from_the_worktree_finds_the_task_there).
+- [x] A worktree without `.project/` keeps the old behaviour: no copy, no session.
+- [x] A copy or verification failure registers no session, logs at ERROR (stderr) and sets `materialize_error`; the dispatch still completes.
 
 ## Notes
 
