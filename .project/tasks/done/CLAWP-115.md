@@ -12,7 +12,7 @@ predictions:
     resolves inside that worktree, and a regression test proves the eval-stop hook
     finds the task there rather than falling through to the main checkout
 priority: 5
-updated: '2026-09-03'
+updated: '2026-10-07'
 ---
 # CLAWP-098 follow-up: materialize the generated subtask into the agent-dispatch worktree
 
