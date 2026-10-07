@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
 import yaml
 
-from .frontmatter import FrontmatterError, split_frontmatter
+from .frontmatter import FrontmatterError, parse_frontmatter, split_frontmatter
 from .models import (
     Research,
     ResearchType,
@@ -19,7 +21,11 @@ from .models import (
 )
 from .discovery import get_project_dir
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
+    "ResearchScan",
+    "scan_research",
     "PLACEHOLDER_STALE_DAYS",
     "has_placeholder_sections",
     "is_stale_placeholder",
@@ -40,59 +46,105 @@ def get_research_dir(config: PortfolioConfig, project_id: str) -> Path | None:
     return None
 
 
+@dataclass
+class ResearchScan:
+    """Result of scanning a research dir: parsed items plus unreadable files.
+
+    ``malformed`` entries are ``{"file", "file_path", "reason", "message"}``.
+    """
+
+    items: list[Research] = field(default_factory=list)
+    malformed: list[dict[str, str]] = field(default_factory=list)
+
+
+def _malformed_entry(file: Path, exc: Exception) -> dict[str, str]:
+    reason = getattr(exc, "reason", None) or type(exc).__name__
+    return {
+        "file": file.name,
+        "file_path": str(file),
+        "reason": str(reason),
+        "message": str(exc),
+    }
+
+
+def scan_research(
+    config: PortfolioConfig,
+    project_id: str,
+    status_filter: ResearchStatus | None = None,
+    tags_filter: list[str] | None = None,
+) -> ResearchScan:
+    """Scan a project's research files, surfacing (not dropping) bad ones.
+
+    Malformed files are reported regardless of ``status_filter``/``tags_filter``
+    (their status/tags cannot be read), and each one is logged at WARNING.
+    """
+    scan = ResearchScan()
+    research_dir = get_research_dir(config, project_id)
+    if not research_dir or not research_dir.exists():
+        return scan
+
+    for file in sorted(research_dir.glob("*.md")):
+        try:
+            item = Research.from_file(file)
+        except Exception as exc:  # noqa: BLE001 - recorded, never dropped
+            entry = _malformed_entry(file, exc)
+            scan.malformed.append(entry)
+            logger.warning("malformed research file skipped: %s (%s)", file, entry["reason"])
+            continue
+
+        if status_filter is not None and item.status != status_filter:
+            continue
+        if tags_filter and not all(tag in item.tags for tag in tags_filter):
+            continue
+        scan.items.append(item)
+
+    # Sort by created date descending, then by ID
+    scan.items.sort(key=lambda r: (r.created or "", r.id), reverse=True)
+    return scan
+
+
 def list_research(
     config: PortfolioConfig,
     project_id: str,
     status_filter: ResearchStatus | None = None,
     tags_filter: list[str] | None = None,
 ) -> list[Research]:
-    """List all research items for a project."""
-    research_dir = get_research_dir(config, project_id)
-    if not research_dir or not research_dir.exists():
-        return []
-
-    items: list[Research] = []
-
-    for file in research_dir.glob("*.md"):
-        try:
-            item = Research.from_file(file)
-
-            # Apply status filter
-            if status_filter is not None and item.status != status_filter:
-                continue
-
-            # Apply tags filter (must have ALL specified tags)
-            if tags_filter:
-                if not all(tag in item.tags for tag in tags_filter):
-                    continue
-
-            items.append(item)
-        except Exception:
-            # Skip malformed items
-            continue
-
-    # Sort by created date descending, then by ID
-    items.sort(key=lambda r: (r.created or "", r.id), reverse=True)
-
-    return items
+    """List research items (flat list; malformed files are logged, see
+    :func:`scan_research` to get them back as data)."""
+    return scan_research(config, project_id, status_filter, tags_filter).items
 
 
 def get_research(config: PortfolioConfig, project_id: str, research_id: str) -> Research | None:
-    """Get a specific research item by ID."""
+    """Get a specific research item by ID (malformed files are logged, not matched)."""
     research_dir = get_research_dir(config, project_id)
     if not research_dir or not research_dir.exists():
         return None
 
-    # Check all files for matching ID
     for file in research_dir.glob("*.md"):
         try:
             item = Research.from_file(file)
-            if item.id == research_id:
-                return item
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "malformed research file skipped while looking up %r: %s (%s)",
+                research_id, file, getattr(exc, "reason", type(exc).__name__),
+            )
             continue
+        if item.id == research_id:
+            return item
 
     return None
+
+
+def _existing_ids(research_dir: Path) -> set[str]:
+    ids: set[str] = set()
+    for file in research_dir.glob("*.md"):
+        try:
+            fm, _ = parse_frontmatter(file.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            continue
+        if isinstance(fm, dict) and fm.get("id") is not None:
+            ids.add(str(fm["id"]))
+    return ids
 
 
 def _render_open_body(question: str) -> str:
@@ -178,7 +230,15 @@ def add_research(
         slug = "".join(c if c.isalnum() else "-" for c in slug)
         slug = "-".join(filter(None, slug.split("-")))[:50]
         slug = slug.rstrip("-")
-        research_id = f"{project_id}-research-{slug}"
+        base_id = f"{project_id}-research-{slug}"
+        # Unique the frontmatter id (not just the filename): get_research
+        # resolves by id, so a collision would shadow the later entry.
+        taken = _existing_ids(research_dir)
+        research_id = base_id
+        n = 2
+        while research_id in taken:
+            research_id = f"{base_id}-{n}"
+            n += 1
 
     # Build frontmatter
     frontmatter: dict = {

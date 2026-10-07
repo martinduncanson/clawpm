@@ -999,16 +999,19 @@ class Research:
         """Load research from markdown file with YAML frontmatter."""
         text = path.read_text(encoding="utf-8")
 
-        # Parse frontmatter (lenient: any malformation -> {} + full text as
-        # content, matching the pre-CLAWP-079 hand-rolled behaviour). Includes
-        # CLAWP-091's "not_a_mapping" reason too — see Task.from_file's
-        # identical guard above for why raising here would be worse, not
-        # better, for the mutation-site entry points this task targets.
+        # CLAWP-095: a file with NO frontmatter (absent / unterminated fence) is
+        # still loaded leniently (id = stem, whole text = content) — that is a
+        # legitimate hand-written note. A fenced block that exists but is
+        # corrupt ("unparseable" YAML or "not_a_mapping") is NOT silently
+        # degraded to empty-frontmatter any more: it raises FrontmatterError so
+        # list_research/scan_research can surface the file as malformed.
         frontmatter: dict[str, Any]
         try:
             frontmatter, body = split_frontmatter(text, where=str(path))
             content = body.strip()
-        except FrontmatterError:
+        except FrontmatterError as exc:
+            if exc.reason in ("unparseable", "not_a_mapping"):
+                raise
             frontmatter = {}
             content = text
 

@@ -6,7 +6,7 @@ import click
 
 from clawpm.models import ResearchStatus, ResearchType
 from clawpm.output import output_error, output_research_list, output_success
-from clawpm.research import add_research, link_research_session, list_research
+from clawpm.research import add_research, link_research_session, scan_research
 from clawpm.cli.base import main, get_format, require_portfolio, require_project
 
 # ============================================================================
@@ -35,8 +35,8 @@ def research_list(ctx: click.Context, project_id: str | None, status: str | None
     status_filter = ResearchStatus(status) if status else None
     tags_filter = list(tags) if tags else None
 
-    items = list_research(config, project_id, status_filter=status_filter, tags_filter=tags_filter)
-    output_research_list(items, fmt=fmt)
+    scan = scan_research(config, project_id, status_filter=status_filter, tags_filter=tags_filter)
+    output_research_list(scan.items, fmt=fmt, malformed=scan.malformed)
 
 
 @research.command("add")
