@@ -656,6 +656,7 @@ void without deleting them.
 - **One command per call**: Don't chain clawpm commands with `&&` — run each separately
 - **Portfolio root**: Default `~/clawpm`
 - **Work log**: Append-only at `<portfolio>/work_log.jsonl`
+- **Windows glob expansion (fixed after 0.2.0)**: through 0.2.0, Click expanded every argv entry on Windows (glob, `~`, `$VAR`, `%VAR%`), so `--scope "src/**"` arrived as file paths: a usage error when several files matched, a silently rewritten scope (`src\a.py`) when one did. Newer installs pass arguments verbatim. On 0.2.0 or older, pass patterns with `--scope-file` / `--predict-scope-file`, use a wildcard-free prefix, and keep literal double-star out of free text. Your own shell can still glob before clawpm runs: PowerShell expands wildcards in native-exe arguments, so check `clawpm tasks list` after a batch of adds.
 
 ## Dispatch discipline — rubric scoping & worktree safety
 

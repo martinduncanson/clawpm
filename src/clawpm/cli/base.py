@@ -74,7 +74,26 @@ _FALLBACK_POLICIES = ["requeue", "route-secondary", "escalate-to-human", "fail"]
 pass_format = click.make_pass_decorator(OutputFormat, ensure=True)
 
 
-@click.group()
+class _VerbatimArgsGroup(click.Group):
+    """Root group that hands argv to commands exactly as the shell gave it.
+
+    CLAWP-109: ``click.Command.main`` defaults ``windows_expand_args=True``, and on
+    Windows that runs every argv entry through glob + expanduser + expandvars.
+    ``--scope "src/double-star"`` therefore reached the command as a list of file
+    paths (usage error), and a single-match pattern was silently rewritten to a
+    backslash path. The same expansion also rewrote ``~``, ``$VAR`` and ``%VAR%``
+    inside free text. clawpm takes glob patterns as data, so expansion is never
+    wanted. Every entry point (console script, ``python -m clawpm``,
+    ``clawpm.cli.mcp``/``serve``) calls this group's ``main``, so disabling it
+    here covers them all. Callers can still pass ``windows_expand_args`` explicitly.
+    """
+
+    def main(self, *args, **kwargs):
+        kwargs.setdefault("windows_expand_args", False)
+        return super().main(*args, **kwargs)
+
+
+@click.group(cls=_VerbatimArgsGroup)
 @click.option(
     "--format", "-f",
     type=click.Choice(["json", "text"]),
