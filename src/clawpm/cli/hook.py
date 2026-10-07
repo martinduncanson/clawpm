@@ -94,6 +94,13 @@ def hook_session_start(
 @click.option("--refute-votes", "refute_votes", type=int, default=None,
               help="CLAWP-041: number of lens-varied refutation votes when --confirm-close "
                    "is active (>=half of refuters that ran overturn; ties overturn). Default: env CLAWPM_REFUTE_VOTES, else 1.")
+@click.option("--max-iterations", "max_iterations", type=click.IntRange(min=1), default=None,
+              help="CLAWP-070: hard cap on not-ok rubric iterations (counted after "
+                   "--iteration-baseline). At the cap the agent may stop with a "
+                   "MAX_ITERATIONS message. Default: uncapped.")
+@click.option("--iteration-baseline", "iteration_baseline", type=click.IntRange(min=0), default=0,
+              help="CLAWP-070: iteration events already on record when this dispatch "
+                   "started; only later ones count toward --max-iterations.")
 @click.pass_context
 def hook_eval_stop(
     ctx: click.Context,
@@ -103,6 +110,8 @@ def hook_eval_stop(
     rubric_file: str | None,
     confirm_close: bool | None,
     refute_votes: int | None,
+    max_iterations: int | None = None,
+    iteration_baseline: int = 0,
 ) -> None:
     """Stop-hook condition evaluator (CLAWP-017).
 
@@ -324,6 +333,40 @@ def hook_eval_stop(
             # output. Broader than OSError -- a malformed-record/parse path
             # must fail open too.
             pass
+
+    # CLAWP-070: absolute iteration cap. A satisfied (ok) or impossible verdict
+    # has already ended the loop; the cap only converts a would-be "block" into
+    # a stop once this dispatch has burned its budget. Fail-open on a read error
+    # (a cap that cannot be evaluated must not wedge the agent), but say so.
+    if (
+        max_iterations is not None
+        and not verdict.ok
+        and not verdict.impossible
+        and not verdict.stop_condition_tripped
+    ):
+        try:
+            from clawpm.reflect import count_iterations_for_task
+
+            used = count_iterations_for_task(
+                config.portfolio_root, task_id, project_id
+            ) - iteration_baseline
+            if used >= max_iterations:
+                verdict = JudgeVerdict(
+                    ok=False,
+                    reason=(
+                        "MAX_ITERATIONS reached on task " + task_id + ": "
+                        + str(used) + " of " + str(max_iterations)
+                        + " allowed iterations used without the rubric being "
+                        + "satisfied. Agent stopped; operator should triage. "
+                        + "Last verdict: " + verdict.reason[:200]
+                    ),
+                    stop_condition_tripped=True,
+                )
+        except OSError as exc:
+            click.echo(
+                f"clawpm eval-stop: max-iterations cap not enforced ({exc})",
+                err=True,
+            )
 
     output = map_verdict_to_hook_output(verdict)
     click.echo(_json_hook.dumps(output))

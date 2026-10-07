@@ -229,6 +229,8 @@ def _command_for_dispatch(
     confirm_close: bool = False,
     refute_votes: int = 1,
     lease_holder: Optional[str] = None,
+    max_iterations: Optional[int] = None,
+    iteration_baseline: int = 0,
 ) -> str:
     """Build the shell command for a hook entry.
 
@@ -264,6 +266,13 @@ def _command_for_dispatch(
             cc = f" --confirm-close --refute-votes {int(refute_votes)}"
         else:
             cc = " --no-confirm-close"
+        if max_iterations is not None:
+            # CLAWP-070: absolute iteration cap, counted from the per-dispatch
+            # baseline so a re-dispatch gets a fresh budget.
+            cc += (
+                f" --max-iterations {int(max_iterations)}"
+                f" --iteration-baseline {int(iteration_baseline)}"
+            )
         return (
             f"clawpm hook eval-stop --project {project_id} "
             f"--task {task_id}{cc}"
@@ -298,6 +307,8 @@ def build_settings_payload(
     refute_votes: int = 1,
     lease_heartbeat: bool = False,
     lease_holder: Optional[str] = None,
+    max_iterations: Optional[int] = None,
+    iteration_baseline: int = 0,
 ) -> dict:
     """Build the settings.local.json payload for a dispatched task.
 
@@ -320,6 +331,9 @@ def build_settings_payload(
     delay: a healthy judge returns in seconds.
     """
     from .judges.stop_condition import JUDGE_CALL_TIMEOUT_SECONDS
+
+    if max_iterations is not None and int(max_iterations) < 1:
+        raise ValueError("max_iterations must be >= 1")
 
     now = datetime.now(timezone.utc).isoformat()
 
@@ -345,6 +359,8 @@ def build_settings_payload(
                                 task_id, project_id, "eval-stop",
                                 confirm_close=confirm_close,
                                 refute_votes=refute_votes,
+                                max_iterations=max_iterations,
+                                iteration_baseline=iteration_baseline,
                             ),
                             "timeout": stop_timeout,
                         }
@@ -579,6 +595,8 @@ def write_dispatch_settings(
     confirm_close: bool = False,
     refute_votes: int = 1,
     lease_heartbeat: bool = False,
+    max_iterations: Optional[int] = None,
+    iteration_baseline: int = 0,
 ) -> WrittenDispatchSettings:
     """Emit settings.local.json for the dispatched task.
 
@@ -649,6 +667,7 @@ def write_dispatch_settings(
         task_id, project_id, rubric_markdown,
         confirm_close=confirm_close, refute_votes=refute_votes,
         lease_heartbeat=lease_heartbeat, lease_holder=lease_holder,
+        max_iterations=max_iterations, iteration_baseline=iteration_baseline,
     )
     # Pretty-print so dispatch settings are review-friendly when they
     # land in PR diffs.

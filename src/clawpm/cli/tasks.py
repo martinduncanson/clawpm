@@ -1345,6 +1345,13 @@ def _read_bytes_or_none(path: Path):
          "the baseline_ref was stamped, and proceed with dispatch anyway. Without "
          "this flag, dispatch is blocked when drift is detected.",
 )
+@click.option(
+    "--max-iterations", "max_iterations", type=click.IntRange(min=1), default=None,
+    help="CLAWP-070: hard cap on Stop-hook rubric iterations for THIS dispatch. "
+         "After N not-ok verdicts the hook lets the agent stop with a "
+         "MAX_ITERATIONS message for operator triage. Default: uncapped "
+         "(thrashing detection still applies).",
+)
 @click.pass_context
 def tasks_dispatch(
     ctx: click.Context,
@@ -1359,6 +1366,7 @@ def tasks_dispatch(
     lease_ttl: int | None,
     fallback_policy: str,
     confirm_stale: bool,
+    max_iterations: int | None,
 ) -> None:
     """Emit hook-wired .claude/settings.local.json for a dispatched subagent (CLAWP-018).
 
@@ -1391,7 +1399,7 @@ def tasks_dispatch(
         _tasks_dispatch_impl(
             ctx, project_id, task_id, target_dir, worktree, no_session_context,
             force, confirm_close, refute_votes, lease_ttl, fallback_policy,
-            confirm_stale,
+            confirm_stale, max_iterations,
         )
 
 
@@ -1408,6 +1416,7 @@ def _tasks_dispatch_impl(
     lease_ttl: int | None,
     fallback_policy: str,
     confirm_stale: bool,
+    max_iterations: int | None = None,
 ) -> None:
     from clawpm.dispatch import (
         create_worktree,
@@ -1951,6 +1960,16 @@ def _tasks_dispatch_impl(
 
     refute_votes = max(1, refute_votes)
 
+    # CLAWP-070: the iteration cap counts from here, so a re-dispatch after a
+    # capped run starts with a fresh budget instead of tripping immediately.
+    iteration_baseline = 0
+    if max_iterations is not None:
+        from clawpm.reflect import count_iterations_for_task
+
+        iteration_baseline = count_iterations_for_task(
+            config.portfolio_root, task_id, project_id
+        )
+
     # Serialize the whole snapshot -> write -> register -> rollback sequence
     # against another dispatch targeting the same directory (Codex P1, PR #55
     # rounds 8 and 9).
@@ -2029,6 +2048,8 @@ def _tasks_dispatch_impl(
                 confirm_close=confirm_close,
                 refute_votes=refute_votes,
                 lease_heartbeat=lease_ttl is not None,
+                max_iterations=max_iterations,
+                iteration_baseline=iteration_baseline,
             )
         except (FileExistsError, ValueError) as exc:
             output_error("dispatch_blocked", str(exc), fmt=fmt)
