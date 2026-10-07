@@ -31,7 +31,7 @@ predictions:
 priority: 5
 tags:
 - dispatch
-updated: '2026-09-03'
+updated: '2026-10-07'
 ---
 # Support --worktree dispatch for a project in a repository subdirectory (monorepo layout)
 
