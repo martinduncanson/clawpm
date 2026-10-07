@@ -12,7 +12,7 @@ predictions:
     implemented with a regression test that fails against the current fail-open, or
     the thread is closed with the documented tradeoff
 priority: 5
-updated: '2026-09-03'
+updated: '2026-10-07'
 ---
 # CLAWP-098 follow-up: decide fail-closed policy for an unreadable session ledger
 
