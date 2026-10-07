@@ -328,6 +328,78 @@ def register_session(
     append_jsonl_line(_registry_path(portfolio_root), json.dumps(event, ensure_ascii=False))
 
 
+class SessionRebindError(OSError):
+    """The ledger could not be updated with a relocated worktree's path."""
+
+
+def persist_relocated_worktree(
+    portfolio_root: Path,
+    worktree: Path,
+    task_id: Optional[str],
+    project_id: Optional[str],
+) -> int:
+    """CLAWP-117: before a teardown removes the dispatch marker of *worktree*,
+    move every ACTIVE ledger record of (*task_id*, *project_id*) whose
+    recorded path is gone onto *worktree*'s current path.
+
+    Returns the number of records moved (0 = nothing to do). Does nothing when
+    any active record's path is still a live directory (the session is
+    legitimately elsewhere) or when the ledger is degraded (no trustworthy
+    records to correct; the marker fallback owns that case). Records are
+    moved by appending a ``registered`` event with the same session id, the
+    same locked append every other writer uses; replay lets the later event
+    win. Raises :class:`SessionRebindError` (after an ERROR log) when an
+    append fails, so the caller can keep the marker. Never called on a read
+    path.
+    """
+    if not isinstance(task_id, str) or not task_id:
+        return 0
+    if not isinstance(project_id, str) or not project_id:
+        return 0
+    sessions, degraded = _load_ledger(portfolio_root)
+    if degraded or not _task_has_stale_session_only(sessions, task_id, project_id):
+        return 0
+    new_path = str(Path(worktree).resolve())
+    # Coalesce by recorded path so each stale path is judged once, then move
+    # every record that sits on one of them.
+    stale_paths = {
+        os.path.normcase(str(s.worktree_path))
+        for s in sessions.values()
+        if s.active and s.task_id == task_id and s.project_id == project_id
+    }
+    moved = 0
+    for s in sessions.values():
+        if not (s.active and s.task_id == task_id and s.project_id == project_id):
+            continue
+        if os.path.normcase(str(s.worktree_path)) not in stale_paths:
+            continue
+        event = {
+            "action": _REGISTERED,
+            "session_id": s.session_id,
+            "task_id": task_id,
+            "project_id": project_id,
+            "worktree_path": new_path,
+            "ts": _now_iso(),
+        }
+        try:
+            append_jsonl_line(
+                _registry_path(portfolio_root), json.dumps(event, ensure_ascii=False)
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to persist relocated worktree %s for session %s "
+                "(task %s, project %s): %s. Keeping the dispatch marker; "
+                "teardown is aborted.",
+                new_path, s.session_id, task_id, project_id, exc,
+            )
+            raise SessionRebindError(
+                f"could not record relocated worktree {new_path} for session "
+                f"{s.session_id}: {exc}"
+            ) from exc
+        moved += 1
+    return moved
+
+
 def release_session(portfolio_root: Path, session_id: str) -> None:
     """Append a ``released`` event retiring *session_id*. Idempotent at the
     registry level — replaying multiple releases for the same id is

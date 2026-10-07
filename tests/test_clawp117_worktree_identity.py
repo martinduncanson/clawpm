@@ -327,3 +327,160 @@ def test_redispatch_into_the_same_worktree_still_works(fx):
     assert r.exit_code == 0, r.output
     r2 = _dispatch(fx, "--force")
     assert r2.exit_code == 0, r2.output
+
+
+# ---------------------------------------------------------------------------
+# (g) round 2: teardown persists the moved path before removing the marker
+# ---------------------------------------------------------------------------
+
+
+def _moved_dispatch(fx, tmp_path, name="relocated"):
+    r = _dispatch(fx)
+    assert r.exit_code == 0, r.output
+    old = Path(json.loads(r.output)["data"]["target_dir"])
+    moved = tmp_path / name
+    _git(fx["repo"], "worktree", "move", str(old), str(moved))
+    return old, moved
+
+
+def _teardown(fx, target):
+    from clawpm.dispatch import teardown_dispatch_settings
+
+    return teardown_dispatch_settings(
+        target, task_id=fx["task"].id, portfolio_root=fx["root"], project_id="test"
+    )
+
+
+def test_moved_worktree_still_resolves_after_teardown(fx, tmp_path, monkeypatch):
+    tid = fx["task"].id
+    _old, moved = _moved_dispatch(fx, tmp_path)
+    monkeypatch.chdir(moved)
+    assert _teardown(fx, moved) is True
+    assert not (moved / ".claude" / "settings.local.json").exists()
+    got = find_session_for_cwd(fx["root"], moved, "test")
+    assert got is not None and Path(got.worktree_path).resolve() == moved.resolve()
+    assert get_project_dir(fx["config"], "test") == (moved / ".project").resolve()
+    r = CliRunner().invoke(main, ["-p", "test", "tasks", "state", tid, "blocked"])
+    assert r.exit_code == 0, r.output
+    assert (moved / ".project" / "tasks" / "blocked" / f"{tid}.md").exists()
+    assert not (fx["tasks"] / "blocked" / f"{tid}.md").exists()
+
+
+def test_teardown_moves_every_stale_record(fx, tmp_path):
+    other = _fake_worktree(fx, tmp_path, name="other")
+    register_session(fx["root"], "s1", fx["task"].id, "test", tmp_path / "gone1")
+    register_session(fx["root"], "s2", fx["task"].id, "test", tmp_path / "gone1")
+    register_session(fx["root"], "s3", fx["task"].id, "test", tmp_path / "gone2")
+    assert _teardown(fx, other) is True
+    from clawpm.sessions import _replay
+
+    recs = {s.session_id: s for s in _replay(fx["root"]).values()}
+    assert {Path(r.worktree_path).resolve() for r in recs.values()} == {other.resolve()}
+    assert all(r.active for r in recs.values())
+
+
+def test_teardown_does_not_rebind_while_a_recorded_path_is_live(fx, tmp_path):
+    live = _fake_worktree(fx, tmp_path, name="live", marker=False)
+    other = _fake_worktree(fx, tmp_path, name="other")
+    register_session(fx["root"], "s-gone", fx["task"].id, "test", tmp_path / "gone")
+    register_session(fx["root"], "s-live", fx["task"].id, "test", live)
+    before = (fx["root"] / SESSION_REGISTRY_FILENAME).read_bytes()
+    assert _teardown(fx, other) is True
+    assert (fx["root"] / SESSION_REGISTRY_FILENAME).read_bytes() == before
+
+
+def test_teardown_failed_ledger_update_keeps_marker_and_errors(
+    fx, tmp_path, caplog
+):
+    other = _fake_worktree(fx, tmp_path, name="other")
+    register_session(fx["root"], "s1", fx["task"].id, "test", tmp_path / "gone")
+    import clawpm.sessions as sessions_mod
+
+    def boom(*_a, **_k):
+        raise PermissionError("simulated ledger write failure")
+
+    orig = sessions_mod.append_jsonl_line
+    sessions_mod.append_jsonl_line = boom
+    try:
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(OSError):
+                _teardown(fx, other)
+    finally:
+        sessions_mod.append_jsonl_line = orig
+    assert (other / ".claude" / "settings.local.json").exists()
+    assert "ERROR" in {r.levelname for r in caplog.records}
+
+
+def test_teardown_cli_reports_failed_ledger_update(fx, tmp_path, monkeypatch):
+    other = _fake_worktree(fx, tmp_path, name="other")
+    register_session(fx["root"], "s1", fx["task"].id, "test", tmp_path / "gone")
+    import clawpm.sessions as sessions_mod
+
+    def boom(*_a, **_k):
+        raise PermissionError("simulated")
+
+    monkeypatch.setattr(sessions_mod, "append_jsonl_line", boom)
+    r = CliRunner().invoke(
+        main,
+        ["-p", "test", "tasks", "teardown-dispatch", fx["task"].id,
+         "--target-dir", str(other)],
+    )
+    assert r.exit_code == 1, r.output
+    assert (other / ".claude" / "settings.local.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# (h) round 2: worktree list parsed with -z (no quoted/escaped paths)
+# ---------------------------------------------------------------------------
+
+
+def test_worktree_path_for_branch_handles_spaces_and_quoted_chars(fx, tmp_path):
+    from clawpm.dispatch import worktree_path_for_branch
+
+    old, _ = None, None
+    r = _dispatch(fx)
+    assert r.exit_code == 0, r.output
+    old = Path(json.loads(r.output)["data"]["target_dir"])
+    moved = tmp_path / "re loc\u00e9 \u00fcmlaut"
+    _git(fx["repo"], "worktree", "move", str(old), str(moved))
+    got = worktree_path_for_branch(fx["repo"], f"clawpm/{fx['task'].id}")
+    assert got is not None
+    assert Path(got).resolve() == moved.resolve()
+
+
+def test_redispatch_error_names_literal_path_with_special_chars(fx, tmp_path):
+    r = _dispatch(fx)
+    old = Path(json.loads(r.output)["data"]["target_dir"])
+    moved = tmp_path / "sp ace \u00e9"
+    _git(fx["repo"], "worktree", "move", str(old), str(moved))
+    r2 = _dispatch(fx, "--force")
+    assert r2.exit_code == 1, r2.output
+    assert "branch_checked_out_elsewhere" in r2.output
+    assert "sp ace \u00e9" in json.loads(r2.output)["message"]
+
+
+def test_worktree_list_is_read_nul_delimited(tmp_path, monkeypatch):
+    """-z output: literal paths (newline, quote, space) with no git quoting,
+    bare / detached / prunable records, records split by an empty field."""
+    import clawpm.dispatch as dispatch_mod
+
+    weird = 'C:/w t/we"ird\nname'
+    out = (
+        "worktree C:/main\0HEAD aaa\0branch refs/heads/main\0\0"
+        "worktree C:/bare\0bare\0\0"
+        "worktree C:/det\0HEAD bbb\0detached\0\0"
+        f"worktree {weird}\0HEAD ccc\0branch refs/heads/clawpm/X-1\0"
+        "prunable gitdir file points to non-existent location\0\0"
+    )
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(dispatch_mod.subprocess, "run", fake_run)
+    got = dispatch_mod.worktree_path_for_branch(tmp_path, "clawpm/X-1")
+    assert "-z" in seen["cmd"]
+    assert str(got) == str(Path(weird))
+    assert dispatch_mod.worktree_path_for_branch(tmp_path, "main") == Path("C:/main")
+    assert dispatch_mod.worktree_path_for_branch(tmp_path, "nope") is None

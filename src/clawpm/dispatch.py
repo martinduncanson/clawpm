@@ -845,6 +845,20 @@ def _teardown_dispatch_settings_locked(
         and marker.get("project_id") != project_id
     ):
         return False
+    # CLAWP-117: the marker is what identifies a RELOCATED worktree, so persist
+    # the worktree's current path into the ledger BEFORE removing it. A failure
+    # raises (an OSError, so every caller reports it) and leaves the marker in
+    # place: losing the marker with the old path still recorded would send
+    # ID-based mutators back to the main checkout.
+    if portfolio_root is not None:
+        from .sessions import persist_relocated_worktree
+
+        persist_relocated_worktree(
+            portfolio_root,
+            target_dir,
+            task_id or marker.get("task_id"),
+            marker.get("project_id") or project_id,
+        )
     path.unlink()
     if remove_sidecar:
         sidecar.unlink(missing_ok=True)
@@ -1022,13 +1036,13 @@ def working_tree_blob_sha(path: Path) -> Optional[str]:
 def worktree_path_for_branch(repo_path: Path, branch: str) -> Optional[Path]:
     """CLAWP-117: path of the worktree that has *branch* checked out, or None.
 
-    Reads ``git worktree list --porcelain`` from *repo_path* (the same
+    Reads ``git worktree list --porcelain -z`` from *repo_path* (the same
     checkout ``create_worktree`` will use). Raises :class:`GitProbeError` when
     the listing itself fails.
     """
     try:
         result = subprocess.run(
-            ["git", "-C", str(repo_path), "worktree", "list", "--porcelain"],
+            ["git", "-C", str(repo_path), "worktree", "list", "--porcelain", "-z"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
     except OSError as exc:
@@ -1040,12 +1054,18 @@ def worktree_path_for_branch(repo_path: Path, branch: str) -> Optional[Path]:
             f"git worktree list in {repo_path} failed (exit {result.returncode}): "
             f"{(result.stderr or '').strip() or '<no stderr>'}"
         )
+    # -z: fields are NUL-terminated and records end with an empty field, so
+    # paths are literal (without it git C-quotes spaces-adjacent specials,
+    # non-ASCII and control characters). Bare/detached/prunable records carry
+    # no ``branch`` field and are simply never matched.
     current: Optional[Path] = None
-    for line in result.stdout.splitlines():
-        if line.startswith("worktree "):
-            current = Path(line[len("worktree "):])
-        elif line.startswith("branch ") and current is not None:
-            if line[len("branch "):].strip() == f"refs/heads/{branch}":
+    for field in result.stdout.split("\0"):
+        if field == "":
+            current = None  # record boundary
+        elif field.startswith("worktree "):
+            current = Path(field[len("worktree "):])
+        elif field.startswith("branch ") and current is not None:
+            if field[len("branch "):] == f"refs/heads/{branch}":
                 return current
     return None
 
