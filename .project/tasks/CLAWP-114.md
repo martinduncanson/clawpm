@@ -20,7 +20,14 @@ Codex P1 on PR #55 (thread PRRT_kwDOSVLYYc6eZw40, sessions.py:308). When session
 
 ## Acceptance Criteria
 
-- [ ] (Add criteria here)
+- [x] With sessions.jsonl unreadable (read fault, stat fault, or content with zero valid events), an ID-based mutator run from inside a worktree carrying a dispatch marker for the same project mutates the worktree's task file, not the main checkout's (tests/test_clawp114_unreadable_ledger_fallback.py; fails on the previous code).
+- [x] No marker (main checkout): behaviour unchanged, read-only commands still work, ERROR log kept.
+- [x] A marker naming another project is never matched (project isolation).
+- [x] Every degraded path leaves a trace: the original ERROR logs stay, and the fallback adds a WARNING naming the worktree, task and project.
+
+## Decision (2026-10-07)
+
+Option (b) chosen. The dispatch marker travels with the checkout, needs no ledger, and narrows the corruption surface to "ledger unavailable AND no marker", which is the main checkout where registry resolution is correct anyway. (a) rejected: get_project_dir has no read/write intent, so fail-closed-for-mutators means plumbing intent through every caller (large change, same chokepoint risk). (c) rejected: it leaves a known silent main-checkout mutation. Note: `sessions._rediscover_moved_session` was removed from PR #55 (see CLAWP-117), so the marker walk is new code (`sessions._marker_fallback_session`) using `dispatch.read_dispatch_marker`. An inconsistent marker never raises: another project's marker is skipped (a legitimate cross-project lookup), an unreadable one is logged and skipped. A raise would take down read-only commands sharing this chokepoint.
 
 ## Notes
 
