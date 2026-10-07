@@ -18,6 +18,7 @@ predictions:
     rationale for staying fail-open; stale-blocked cascade no longer leaves stale
     state: frontmatter; tests cover each fixed site'
 priority: 5
+updated: '2026-10-07'
 ---
 # Harden fail-open error handling + config-default contract (discovery/context/research/doctor surface)
 
