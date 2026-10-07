@@ -644,10 +644,10 @@ not only through the Claude Code skill. Requires the optional `mcp` extra:
 ```bash
 pip install 'clawpm[mcp]'           # one-time: install the MCP SDK
 clawpm mcp                          # start the stdio server (host launches this)
-clawpm mcp --tools standard         # widen the exposed tool set
+clawpm mcp --tools standard         # reserved for future tools (same 10 as core today)
 ```
 
-The server wraps the core functions **directly** (no subprocess shell-out), so
+The server wraps the core functions **directly** (nothing shells out to the `clawpm` CLI), so
 it returns structured JSON natively and sidesteps the cp1252 / spaced-path
 encoding pitfalls. It respects `CLAWPM_PORTFOLIO` / project discovery exactly as
 the CLI does, and auto-detects the project from its working directory (pass a
