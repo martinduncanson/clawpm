@@ -153,6 +153,48 @@ def _materialize_subtask(
     return None
 
 
+def _within(path: Path, root: Path) -> bool:
+    """Whether the (already resolved) *path* is *root* or sits beneath it."""
+    return path == root or root in path.parents
+
+
+def _check_transition_paths(
+    project_dir: Path, canonical: Optional[Path], subtask_id: str
+) -> None:
+    """Refuse a store whose links lead a transition out of it (CLAWP-115).
+
+    Resolves (``strict=False``: follows symlinks and Windows junctions, and
+    works for paths that do not exist yet) every path ``change_task_state``
+    can read, create or write for *subtask_id*: the tasks dir, its lock file,
+    each state subdir it may ``mkdir``, every location the task or its
+    destination can occupy, and the directory-task folders. Each must resolve
+    inside *project_dir* and outside the canonical store, else ``RuntimeError``
+    naming the offending path. Nothing is created or written here.
+    """
+    tasks_dir = project_dir / "tasks"
+    state_dirs = [tasks_dir / name for name in ("done", "blocked", "rejected")]
+    paths = [
+        tasks_dir,
+        tasks_dir / ".clawpm-tasks.lock",
+        *state_dirs,
+        *_candidate_task_paths(tasks_dir, subtask_id),
+        *(base / subtask_id for base in [tasks_dir, *state_dirs]),
+    ]
+    canonical_root = canonical.resolve() if canonical is not None else None
+    for path in paths:
+        resolved = path.resolve(strict=False)
+        if not _within(resolved, project_dir):
+            raise RuntimeError(
+                f"{path} resolves to {resolved}, outside the worktree store "
+                f"{project_dir} (a link leaves the store)"
+            )
+        if canonical_root is not None and _within(resolved, canonical_root):
+            raise RuntimeError(
+                f"{path} resolves to {resolved}, inside the canonical store "
+                f"{canonical_root}"
+            )
+
+
 def _pin_worktree_scope(
     config, project_id: str, subtask_id: str, target_dir: Path
 ) -> Scope:
@@ -161,9 +203,11 @@ def _pin_worktree_scope(
     Built straight from ``target_dir/.project`` — no session lookup, no
     registry fallback — and checked BEFORE any mutation: the store must sit
     inside the worktree (symlink/junction escapes resolve out and are
-    refused), must not be the canonical store, and must hold the copy we
-    materialized. Raises ``RuntimeError`` (or ``OSError`` on a stat fault)
-    when any check fails; the caller then writes nothing anywhere.
+    refused), must not be the canonical store, every path the transition will
+    touch must resolve inside it too (``_check_transition_paths``: a linked
+    ``tasks/`` or ``done/`` into the canonical store is refused), and it must
+    hold the copy we materialized. Raises ``RuntimeError`` (or ``OSError`` on a
+    stat fault) when any check fails; the caller then writes nothing anywhere.
     """
     wt_root = target_dir.resolve()
     project_dir = (target_dir / ".project").resolve()
@@ -172,6 +216,7 @@ def _pin_worktree_scope(
     canonical = get_project_dir(config, project_id, scope=Scope.canonical())
     if canonical is not None and canonical.resolve() == project_dir:
         raise RuntimeError(f"{project_dir} is the canonical store, not a worktree's")
+    _check_transition_paths(project_dir, canonical, subtask_id)
     tasks_dir = project_dir / "tasks"
     if not stat_is_dir(tasks_dir):
         raise RuntimeError(f"{tasks_dir} is not a directory")

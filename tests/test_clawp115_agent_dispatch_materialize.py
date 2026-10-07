@@ -411,3 +411,121 @@ class TestVerdictSyncIsPinnedToTheWorktree:
             agmod._pin_worktree_scope(
                 tracked["config"], "test", "TEST-001", tracked["repo"]
             )
+
+
+def _make_link(kind: str, link: Path, target: Path) -> None:
+    """Make *link* point at directory *target* (kind: ``symlink`` | ``junction``)."""
+    if kind == "symlink":
+        os.symlink(target, link, target_is_directory=True)
+    else:
+        import _winapi  # Windows only; callers skip elsewhere
+
+        _winapi.CreateJunction(str(target), str(link))
+
+
+def _link_unavailable(kind: str, tmp_path: Path) -> str | None:
+    """Reason this link kind cannot be created here, else ``None``."""
+    if kind == "junction" and os.name != "nt":
+        return "junctions are Windows-only"
+    probe = tmp_path / f"probe-{kind}"
+    dest = tmp_path / f"probe-{kind}-dest"
+    dest.mkdir()
+    try:
+        _make_link(kind, probe, dest)
+    except (OSError, NotImplementedError) as exc:
+        return f"cannot create a {kind} here: {exc}"
+    finally:
+        if probe.is_symlink() or probe.exists():
+            try:
+                probe.unlink()
+            except OSError:
+                probe.rmdir()
+    return None
+
+
+def _replace_with_link(kind: str, path: Path, target: Path) -> None:
+    """Swap *path* (a real dir, or absent) for a link to *target*."""
+    import shutil
+
+    if path.is_symlink():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+    _make_link(kind, path, target)
+
+
+@pytest.mark.parametrize("kind", ["symlink", "junction"])
+class TestLinkedPathsBeneathTheWorktreeStore:
+    """Codex r3 P2 (PR #79): the pin must also refuse a worktree store whose
+    tasks dir or state subdir is a link into the canonical store, or the
+    transition moves the subtask into canonical ``done/`` and overwrites the
+    canonical verdict file."""
+
+    @pytest.fixture(autouse=True)
+    def _require_link_kind(self, kind, tmp_path):
+        reason = _link_unavailable(kind, tmp_path)
+        if reason:
+            pytest.skip(reason)
+
+    def _run(self, fx, monkeypatch, caplog, kind, verdict_json, break_store):
+        canonical_meta = fx["repo"] / ".project"
+        helper = TestVerdictSyncIsPinnedToTheWorktree
+
+        def _hook(fx_, sid, sessions, seen):
+            wt_tasks = seen["target"] / ".project" / "tasks"
+            break_store(kind, fx_, sid, wt_tasks, canonical_meta / "tasks")
+            seen["canonical"] = _tree(canonical_meta)
+
+        wrapped, calls, seen = helper._race(fx, _hook)
+        monkeypatch.setattr(agmod, "change_task_state", wrapped)
+        with caplog.at_level(logging.ERROR, logger="clawpm.agent"):
+            _dispatch_with(fx, verdict_json)
+        assert "canonical" in seen, "the race hook never ran"
+        assert _tree(canonical_meta) == seen["canonical"], (
+            "the verdict sync wrote through the link into the canonical store"
+        )
+        assert len(calls) == 1, "the mutator ran for the sync despite the link"
+        msgs = " ".join(r.getMessage() for r in caplog.records)
+        assert "CLAWP-115" in msgs
+
+    @pytest.mark.parametrize(
+        "verdict_json, state_dir",
+        [
+            ('{"ok": true, "reason": "done"}', "done"),
+            ('{"ok": false, "reason": "nope", "impossible": false}', "blocked"),
+        ],
+    )
+    def test_linked_state_subdir_is_refused(
+        self, tracked, monkeypatch, caplog, kind, verdict_json, state_dir
+    ):
+        def _break(kind_, fx, sid, wt_tasks, canonical_tasks):
+            _replace_with_link(kind_, wt_tasks / state_dir, canonical_tasks / state_dir)
+
+        self._run(tracked, monkeypatch, caplog, kind, verdict_json, _break)
+
+    def test_linked_tasks_dir_is_refused(self, tracked, monkeypatch, caplog, kind):
+        real = agmod.change_task_state
+
+        def _break(kind_, fx, sid, wt_tasks, canonical_tasks):
+            # A concurrent canonical reopen makes a sync through the link a write.
+            real(fx["config"], "test", sid, TaskState.OPEN)
+            _replace_with_link(kind_, wt_tasks, canonical_tasks)
+
+        self._run(
+            tracked, monkeypatch, caplog, kind,
+            '{"ok": true, "reason": "done"}', _break,
+        )
+
+    def test_pin_names_the_offending_path(self, tracked, kind):
+        fx = tracked
+        wt = fx["root"] / "wt"
+        (wt / ".project" / "tasks").mkdir(parents=True)
+        sid = "TEST-001"
+        (wt / ".project" / "tasks" / f"{sid}.md").write_text(
+            f"---\nid: {sid}\ntitle: t\nstate: open\n---\n# t\n", encoding="utf-8"
+        )
+        canonical_done = fx["repo"] / ".project" / "tasks" / "done"
+        _make_link(kind, wt / ".project" / "tasks" / "done", canonical_done)
+        with pytest.raises(RuntimeError) as exc:
+            agmod._pin_worktree_scope(fx["config"], "test", sid, wt)
+        assert "done" in str(exc.value)
