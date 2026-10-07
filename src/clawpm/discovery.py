@@ -522,12 +522,14 @@ def _session_scoped_repo_path(
     if session is None:
         return None
     try:
-        root = session.worktree_path.resolve()
+        # CLAWP-118: the PROJECT root inside the checkout (the checkout root
+        # for a root-level project), matching repo_path semantics.
+        root = session.project_root.resolve()
     except OSError as exc:
         logger.error(
             "Failed to resolve session worktree %s: %s. Falling through to "
             "the portfolio registry (main-checkout) repo_path for this call.",
-            session.worktree_path, exc,
+            session.project_root, exc,
         )
         return None
     try:
@@ -593,12 +595,12 @@ def _session_scoped_project_dir(
         # "never raises"; before this guard, resolve() could break that
         # promise for exactly the class of caller (tasks list/next/reflect)
         # that must never hard-fail on a rare filesystem hiccup.
-        candidate = session.worktree_path.resolve() / ".project"
+        candidate = session.project_root.resolve() / ".project"
     except OSError as exc:
         logger.error(
             "Failed to resolve session worktree %s: %s. Falling through to "
             "the portfolio registry (main-checkout) lookup for this call.",
-            session.worktree_path, exc,
+            session.project_root, exc,
         )
         return None
     try:

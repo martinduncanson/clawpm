@@ -64,8 +64,10 @@ from typing import Callable, Optional
 from .discovery import get_project, get_project_dir
 from .dispatch import (
     PartialDispatchWrite,
+    GitProbeError,
     create_worktree,
     dispatch_target_lock,
+    repo_prefix,
     teardown_dispatch_settings,
     write_dispatch_settings,
 )
@@ -507,6 +509,23 @@ def _dispatch_agent(
             f"git worktree add failed: {error_detail}"
         ) from exc
 
+    # CLAWP-118: the worktree is a checkout of the whole repository; a project
+    # in a repo subdirectory lives at `<worktree>/<prefix>`, and that is where
+    # the settings, the subtask copy and the subagent's cwd belong.
+    worktree_root = target_dir
+    worktree_prefix = ""
+    try:
+        worktree_prefix = repo_prefix(project.repo_path).rstrip("/")
+    except GitProbeError as exc:
+        _log.error(
+            "clawpm agent dispatch (CLAWP-118): could not determine %s's "
+            "location inside its repository: %s. Treating it as a repo-root "
+            "project; a project in a subdirectory would not be isolated.",
+            project_id, exc,
+        )
+    if worktree_prefix:
+        target_dir = worktree_root / worktree_prefix
+
     # CLAWP-029: initialise CodeGraph in the worktree so the subagent
     # has the index from turn one. Best-effort — failure (codegraph not
     # installed, indexing timeout) silently degrades; the dispatch
@@ -632,7 +651,8 @@ def _dispatch_agent(
             try:
                 register_session(
                     config.portfolio_root, candidate_session, subtask_id,
-                    project_id, target_dir,
+                    project_id, worktree_root,
+                    project_prefix=worktree_prefix,
                 )
                 session_id = candidate_session
             except Exception as exc:

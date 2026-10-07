@@ -294,6 +294,34 @@ class SessionRecord:
     project_id: str
     worktree_path: Path
     active: bool
+    # CLAWP-118: repo-relative posix path of the project inside the worktree
+    # checkout (``packages/foo``); empty for a project at the repo root.
+    # ``worktree_path`` stays the checkout ROOT.
+    project_prefix: str = ""
+
+    @property
+    def project_root(self) -> Path:
+        """The project's root inside the worktree (``worktree_path`` itself
+        for a root-level project). Not resolved; callers resolve as needed."""
+        if not self.project_prefix:
+            return self.worktree_path
+        return self.worktree_path / self.project_prefix
+
+
+def normalise_project_prefix(value: object) -> Optional[str]:
+    """Canonical form of a project prefix (posix, no surrounding slashes), or
+    ``None`` when *value* is not a safe repo-relative path (non-str, absolute,
+    drive-qualified, or containing ``..``). ``""`` and ``"."`` mean "repo root".
+    Pure; never raises."""
+    if not isinstance(value, str):
+        return None
+    text = value.replace("\\", "/")
+    if text.startswith("/") or (len(text) >= 2 and text[1] == ":"):
+        return None
+    parts = [p for p in text.split("/") if p not in ("", ".")]
+    if any(p == ".." for p in parts):
+        return None
+    return "/".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +335,7 @@ def register_session(
     task_id: str,
     project_id: str,
     worktree_path: Path,
+    project_prefix: str = "",
 ) -> None:
     """Append a ``registered`` event mapping *session_id* to *worktree_path*.
 
@@ -325,6 +354,12 @@ def register_session(
         "worktree_path": str(Path(worktree_path).resolve()),
         "ts": _now_iso(),
     }
+    prefix = normalise_project_prefix(project_prefix)
+    if prefix is None:
+        raise ValueError(f"unsafe project_prefix {project_prefix!r}")
+    if prefix:
+        # Only when non-empty: root-level ledgers stay byte-identical.
+        event["project_prefix"] = prefix
     append_jsonl_line(_registry_path(portfolio_root), json.dumps(event, ensure_ascii=False))
 
 
@@ -359,20 +394,43 @@ def persist_relocated_worktree(
     sessions, degraded = _load_ledger(portfolio_root)
     if degraded or not _task_has_stale_session_only(sessions, task_id, project_id):
         return 0
-    new_path = str(Path(worktree).resolve())
-    # Coalesce by recorded path so each stale path is judged once, then move
-    # every record that sits on one of them.
+    # *worktree* is the dir holding the dispatch marker = the PROJECT root
+    # (CLAWP-118). The checkout root a record stores is that dir minus the
+    # record's project prefix, so derive it per record and validate it before
+    # appending anything (a mismatch must not leave a partial rewrite).
+    marker_dir = Path(worktree).resolve()
     stale_paths = {
         os.path.normcase(str(s.worktree_path))
         for s in sessions.values()
         if s.active and s.task_id == task_id and s.project_id == project_id
     }
-    moved = 0
+    pending: list[tuple[SessionRecord, str]] = []
     for s in sessions.values():
         if not (s.active and s.task_id == task_id and s.project_id == project_id):
             continue
         if os.path.normcase(str(s.worktree_path)) not in stale_paths:
             continue
+        new_path = str(marker_dir)
+        if s.project_prefix:
+            want = s.project_prefix.split("/")
+            have = marker_dir.parts[-len(want):] if len(marker_dir.parts) > len(want) else ()
+            if [os.path.normcase(p) for p in have] != [os.path.normcase(p) for p in want]:
+                logger.error(
+                    "Cannot persist relocated worktree %s for session %s (task "
+                    "%s, project %s): its path does not end in the recorded "
+                    "project prefix %r. Keeping the dispatch marker; teardown "
+                    "is aborted.",
+                    marker_dir, s.session_id, task_id, project_id, s.project_prefix,
+                )
+                raise SessionRebindError(
+                    f"relocated worktree {marker_dir} does not end in the "
+                    f"recorded project prefix {s.project_prefix!r} for session "
+                    f"{s.session_id}"
+                )
+            new_path = str(marker_dir.parents[len(want) - 1])
+        pending.append((s, new_path))
+    moved = 0
+    for s, new_path in pending:
         event = {
             "action": _REGISTERED,
             "session_id": s.session_id,
@@ -381,6 +439,8 @@ def persist_relocated_worktree(
             "worktree_path": new_path,
             "ts": _now_iso(),
         }
+        if s.project_prefix:
+            event["project_prefix"] = s.project_prefix
         try:
             append_jsonl_line(
                 _registry_path(portfolio_root), json.dumps(event, ensure_ascii=False)
@@ -561,6 +621,16 @@ def _load_ledger(portfolio_root: Path) -> tuple[dict[str, SessionRecord], bool]:
                 or not isinstance(worktree_path, str) or not worktree_path
             ):
                 continue
+            # CLAWP-118: optional project prefix; absent = repo-root project.
+            # Present but unsafe -> skip THIS event (never raise), loudly.
+            prefix = normalise_project_prefix(ev.get("project_prefix", ""))
+            if prefix is None:
+                logger.error(
+                    "Session registry %s: skipping the event for session %s: "
+                    "unsafe project_prefix %r.",
+                    path, session_id, ev.get("project_prefix"),
+                )
+                continue
             # Count an event only once it fully validates (Codex r1, PR #78):
             # a registration with bad fields yields no usable session, so it
             # must not mask a degraded ledger.
@@ -571,6 +641,7 @@ def _load_ledger(portfolio_root: Path) -> tuple[dict[str, SessionRecord], bool]:
                 project_id=project_id,
                 worktree_path=Path(worktree_path),
                 active=True,
+                project_prefix=prefix,
             )
         elif action == _RELEASED:
             valid_events += 1
