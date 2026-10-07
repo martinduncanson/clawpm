@@ -10,7 +10,7 @@ predictions:
   - All 5 SKILL.md sections below are corrected and match shipped CLI behaviour; no
     code changes, docs only
 priority: 5
-updated: '2026-09-02'
+updated: '2026-10-07'
 ---
 # SKILL.md doc-cleanup batch (5 low-severity gaps from issues.jsonl triage)
 

@@ -13,7 +13,7 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 
 ### Changed
 
-- SKILL.md doc cleanup: document `-f/--format` as the only output control (no `--json`), the `uv tool install`/`pipx` shim-only install, `doctor -p/--project`, the post-batch `tasks list` check, and the CLAWP-109 Windows glob fix state (CLAWP-110).
+- SKILL.md doc cleanup: document `-f/--format` as the only output control (no `--json`), the `uv tool install`/`pipx` shim-only install, `doctor -p/--project`, the post-batch `tasks list` check, and the CLAWP-109 Windows glob fix state (#82, CLAWP-110).
 
 ### Fixed
 
