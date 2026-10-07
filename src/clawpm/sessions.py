@@ -453,7 +453,6 @@ def _load_ledger(portfolio_root: Path) -> tuple[dict[str, SessionRecord], bool]:
             continue
         if action not in (_REGISTERED, _RELEASED):
             continue
-        valid_events += 1
         if action == _REGISTERED:
             task_id = ev.get("task_id")
             project_id = ev.get("project_id")
@@ -471,6 +470,10 @@ def _load_ledger(portfolio_root: Path) -> tuple[dict[str, SessionRecord], bool]:
                 or not isinstance(worktree_path, str) or not worktree_path
             ):
                 continue
+            # Count an event only once it fully validates (Codex r1, PR #78):
+            # a registration with bad fields yields no usable session, so it
+            # must not mask a degraded ledger.
+            valid_events += 1
             sessions[session_id] = SessionRecord(
                 session_id=session_id,
                 task_id=task_id,
@@ -479,6 +482,7 @@ def _load_ledger(portfolio_root: Path) -> tuple[dict[str, SessionRecord], bool]:
                 active=True,
             )
         elif action == _RELEASED:
+            valid_events += 1
             record = sessions.get(session_id)
             if record:
                 record.active = False
@@ -628,16 +632,24 @@ def _marker_fallback_session(
     if project_id is None:
         return None
     # Lazy: dispatch imports this module at load time.
-    from .dispatch import read_dispatch_marker
+    from .dispatch import inspect_dispatch_marker, settings_path
 
     for candidate in (cwd, *cwd.parents):
         try:
-            marker = read_dispatch_marker(candidate)
+            marker, problem = inspect_dispatch_marker(candidate)
         except (OSError, ValueError) as exc:
             logger.error(
                 "Failed to read dispatch marker under %s: %s. Skipping it for "
                 "the local-worktree fallback.",
                 candidate, exc,
+            )
+            continue
+        if problem is not None:
+            # The plain reader maps damage to None, so surface it here.
+            logger.error(
+                "Dispatch marker %s is damaged: %s. Skipping it for the "
+                "local-worktree fallback.",
+                settings_path(candidate), problem,
             )
             continue
         if marker is None or marker.get("project_id") != project_id:

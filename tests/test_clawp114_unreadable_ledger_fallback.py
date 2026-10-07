@@ -23,7 +23,7 @@ from clawpm.cli import main
 from clawpm.discovery import get_project_dir, load_portfolio_config
 from clawpm.dispatch import CLAWPM_MARKER_KEY
 from clawpm.models import Predictions
-from clawpm.sessions import SESSION_REGISTRY_FILENAME, register_session
+from clawpm.sessions import SESSION_REGISTRY_FILENAME, _load_ledger, register_session
 from clawpm.tasks import add_task
 
 
@@ -214,3 +214,65 @@ def test_unreadable_marker_logs_and_falls_through(
         got = get_project_dir(fx["config"], "test")
     assert got == fx["tasks"].parent
     assert "Failed to read session registry" in caplog.text
+    # Codex r1 P2: read_dispatch_marker swallows the JSON error and returns
+    # None, so the fallback must itself log the damaged MARKER, naming its path.
+    marker_errors = [
+        r for r in caplog.records
+        if r.levelno >= logging.ERROR and "settings.local.json" in r.getMessage()
+    ]
+    assert marker_errors, caplog.text
+
+
+def test_marker_without_clawpm_block_is_silent(
+    fx, tmp_path, monkeypatch, broken_ledger, caplog
+):
+    """An ordinary operator settings.local.json (valid JSON, no clawpm block)
+    is not damage: skip it without a marker-error log."""
+    wt = _worktree(fx, tmp_path, with_marker=False)
+    (wt / ".claude").mkdir()
+    (wt / ".claude" / "settings.local.json").write_text(
+        '{"permissions": {}}', encoding="utf-8"
+    )
+    _arm_ledger(fx, wt)
+    monkeypatch.chdir(wt)
+    with caplog.at_level(logging.WARNING):
+        got = get_project_dir(fx["config"], "test")
+    assert got == fx["tasks"].parent
+    assert not [
+        r for r in caplog.records
+        if "settings.local.json" in r.getMessage()
+    ]
+
+
+def test_registration_with_bad_fields_is_not_a_valid_event(
+    fx, tmp_path, monkeypatch, caplog
+):
+    """Codex r1 P1: a lone registered event with worktree_path: 42 yields no
+    usable session, so the ledger is degraded and the marker fallback applies."""
+    wt = _worktree(fx, tmp_path)
+    (fx["root"] / SESSION_REGISTRY_FILENAME).write_text(
+        json.dumps({"action": "registered", "session_id": "s", "worktree_path": 42})
+        + "\n",
+        encoding="utf-8",
+    )
+    assert _load_ledger(fx["root"]) == ({}, True)
+    monkeypatch.chdir(wt)
+    with caplog.at_level(logging.WARNING):
+        got = get_project_dir(fx["config"], "test")
+    assert got == (wt / ".project").resolve()
+    assert "dispatch marker" in caplog.text
+
+
+def test_mixed_valid_and_invalid_registrations_stay_healthy(fx, tmp_path):
+    """One good registration alongside a bad one: healthy ledger, not degraded."""
+    good = {
+        "action": "registered", "session_id": "good", "task_id": "T-1",
+        "project_id": "test", "worktree_path": str(tmp_path / "wt"),
+    }
+    bad = {"action": "registered", "session_id": "bad", "worktree_path": 42}
+    (fx["root"] / SESSION_REGISTRY_FILENAME).write_text(
+        json.dumps(bad) + "\n" + json.dumps(good) + "\n", encoding="utf-8"
+    )
+    sessions, degraded = _load_ledger(fx["root"])
+    assert degraded is False
+    assert set(sessions) == {"good"}
