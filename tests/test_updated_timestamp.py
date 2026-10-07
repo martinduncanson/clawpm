@@ -281,6 +281,27 @@ class TestMutatorsBumpUpdated:
         spaced = _set_updated_line("---\nid: x\nupdated : '2020-01-01'\n---\n#T\n", "2026-07-04")
         assert spaced.count("updated") == 1
 
+    @pytest.mark.parametrize("eol", ["\n", "\r\n"])
+    @pytest.mark.parametrize("has_updated", [True, False])
+    def test_stamp_preserves_line_endings_byte_exact(self, tmp_path, eol, has_updated):
+        """_stamp_updated_file must not translate line endings on any platform."""
+        from clawpm.tasks import _stamp_updated_file
+
+        fm = ["---", "id: x"]
+        if has_updated:
+            fm.append("updated: '2020-01-01'")
+        fm += ["---", "", "body", ""]
+        p = tmp_path / "x.md"
+        p.write_bytes(eol.join(fm).encode("utf-8"))
+        _stamp_updated_file(p, "2026-07-04")
+        raw = p.read_bytes().decode("utf-8")
+        assert "updated: '2026-07-04'" in raw
+        assert raw.count("updated:") == 1
+        if eol == "\r\n":
+            assert "\n" not in raw.replace("\r\n", "")
+        else:
+            assert "\r" not in raw
+
     def test_reject_bumps_updated(self, temp_portfolio):
         cfg = temp_portfolio["config"]
         task = add_task(cfg, "test", "Rejectable")

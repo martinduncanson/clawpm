@@ -650,7 +650,9 @@ def _set_updated_line(text: str, stamp: str) -> str | None:
         _parsed = None
     if _parsed is not None and not isinstance(_parsed, dict):
         return None
-    new_line = f"updated: '{stamp}'"
+    # CRLF file: split("\n") leaves a trailing "\r" on every line, so the
+    # spliced line must carry one too or the file ends up with mixed endings.
+    new_line = f"updated: '{stamp}'" + ("\r" if lines[0].endswith("\r") else "")
     for i in range(1, close_idx):
         if _UPDATED_LINE_RE.match(lines[i]):
             lines[i] = new_line
@@ -681,13 +683,17 @@ def _stamp_updated_file(file_path: Path, when: str | None = None) -> None:
     move/reload path already retries — raising after the move had committed and
     leaving state + work-log inconsistent.
     """
-    text = retry_transient(lambda: file_path.read_text(encoding="utf-8"))
+    # Bytes in, bytes out: text-mode read_text() folds CRLF to LF on every
+    # platform, while text-mode write_text() re-expands LF to CRLF on Windows
+    # only -- so CRLF files were silently converted to LF on Linux and LF files
+    # to CRLF on Windows. Binary I/O keeps the line endings verbatim.
+    text = retry_transient(lambda: file_path.read_bytes()).decode("utf-8")
     new_text = _set_updated_line(text, when or today_utc_iso())
     if new_text is None:
         return  # no well-formed frontmatter fence — leave the file untouched
     tmp = file_path.with_suffix(file_path.suffix + ".tmp")
     try:
-        tmp.write_text(new_text, encoding="utf-8")
+        tmp.write_bytes(new_text.encode("utf-8"))
         # Retry transient Windows sharing/access faults on the rename — this
         # runs under the per-project lock alongside concurrent scanners (CLAWP-051).
         retry_transient(tmp.replace, file_path)
