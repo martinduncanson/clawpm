@@ -29,6 +29,7 @@ NOT auto-applyable (documented & skipped):
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,8 @@ import yaml
 
 from .frontmatter import FrontmatterError, split_frontmatter, stamp_updated
 from .tasks import cascade_unblock_dependents
+
+logger = logging.getLogger(__name__)
 
 
 # Sentinel values for the doctor JSON output's `apply_skipped[].reason`.
@@ -257,11 +260,18 @@ def apply_stale_blocked(stale_entry: dict, config: Any, *, dry_run: bool = False
         }
 
     promoted_ids = [t["task_id"] for t in transitions]
+    # Surface sync failures for EVERY promoted dependent: a sibling's failure
+    # would otherwise vanish (later runs see it already open).
+    sync_errors = [
+        f"{t['task_id']}: {t['state_sync_error']}"
+        for t in transitions
+        if t.get("state_sync_error")
+    ]
+    note = ""
+    if sync_errors:
+        note = f"; WARNING frontmatter state not synced: {'; '.join(sync_errors)}"
+        logger.warning("stale_blocked cascade state sync failed: %s", sync_errors)
     if task_id in promoted_ids:
-        note = ""
-        for t in transitions:
-            if t["task_id"] == task_id and t.get("state_sync_error"):
-                note = f"; WARNING frontmatter state not synced: {t['state_sync_error']}"
         return {
             "class": "stale_blocked",
             "target": task_id,
@@ -273,7 +283,7 @@ def apply_stale_blocked(stale_entry: dict, config: Any, *, dry_run: bool = False
             "target": task_id,
             "result": (
                 f"cascade ran but did not promote {task_id}; "
-                f"other transitions={promoted_ids}"
+                f"other transitions={promoted_ids}{note}"
             ),
         }
     return {

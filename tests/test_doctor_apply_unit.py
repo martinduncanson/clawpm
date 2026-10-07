@@ -350,6 +350,43 @@ class TestStaleBlockedFrontmatterConsistency:
         assert fm["state"] == "open"
         assert "# keep me" in text  # surgical, not a reserialise
 
+    def test_sibling_sync_failure_is_surfaced(self, isolated_portfolio, monkeypatch, caplog):
+        """A sync failure on ANOTHER promoted dependent must not vanish (Codex r2)."""
+        import clawpm.doctor_apply as da
+
+        monkeypatch.setattr(
+            da,
+            "cascade_unblock_dependents",
+            lambda *a, **k: [
+                {"task_id": "TEST-051"},
+                {"task_id": "TEST-052", "state_sync_error": "disk says no"},
+            ],
+        )
+        with caplog.at_level("WARNING"):
+            res = apply_stale_blocked(
+                {"task_id": "TEST-051", "project_id": "test", "deps": ["TEST-050"]},
+                config=isolated_portfolio.config,
+            )
+        assert "promoted" in res["result"]
+        assert "TEST-052" in res["result"] and "disk says no" in res["result"]
+        assert any("state sync failed" in m for m in caplog.messages)
+
+    def test_sibling_sync_failure_surfaced_when_target_not_promoted(
+        self, isolated_portfolio, monkeypatch
+    ):
+        import clawpm.doctor_apply as da
+
+        monkeypatch.setattr(
+            da,
+            "cascade_unblock_dependents",
+            lambda *a, **k: [{"task_id": "TEST-062", "state_sync_error": "boom"}],
+        )
+        res = apply_stale_blocked(
+            {"task_id": "TEST-061", "project_id": "test", "deps": ["TEST-060"]},
+            config=isolated_portfolio.config,
+        )
+        assert "did not promote" in res["result"] and "boom" in res["result"]
+
     def test_cascade_without_state_key_adds_none(self, isolated_portfolio):
         tasks = isolated_portfolio.tasks_dir
         _write(tasks / "done" / "TEST-040.md", "done", task_id="TEST-040")
