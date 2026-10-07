@@ -1059,10 +1059,9 @@ class TestWorktreeSessionScopedMutation:
             "an uncommitted task in a mono-repo subdirectory project must "
             "still be blocked, not silently let through"
         )
-        assert "monorepo_worktree_unsupported" in r.output
-        # Rejected before create_worktree, so a retry is not fighting a
-        # leftover checkout.
-        assert not (project_dir / ".clawpm-worktrees").exists()
+        # CLAWP-118: the guard is gone; the block now comes from the
+        # (prefix-aware) materialization gate.
+        assert "monorepo_worktree_unsupported" not in r.output
 
 
 class TestSessionStartSidecar:

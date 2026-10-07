@@ -233,43 +233,10 @@ def _portfolio(project_subdir: str | None):
         )
 
 
-class TestMonorepoWorktreeFailsClosed:
-    """Codex P2 round 8, then P1 round 9 — the second reversed the first.
-
-    Round 8 taught the materialization checks to look under the project
-    prefix, so a monorepo `--worktree` dispatch stopped aborting and started
-    succeeding. Round 9 showed that was the worse outcome: `git worktree
-    add` checks out the repository ROOT, so the session gets registered
-    against a directory whose `.project/` is one level down,
-    `_session_scoped_project_dir` looks only at `worktree_path/.project`,
-    and every ID-based mutator in that checkout falls through to the MAIN
-    one — CLAWP-098's own corruption, arriving silently.
-
-    Until the session record can carry the project prefix, refusing is the
-    honest answer: it is the same outcome the pre-round-8 code produced,
-    with a message that says why.
-    """
-
-    def test_dispatch_refuses_a_project_in_a_repository_subdirectory(
-        self, monorepo_portfolio
-    ):
-        config = monorepo_portfolio["config"]
-        repo_dir = monorepo_portfolio["repo_dir"]
-        task = add_task(config, "test", title="Monorepo",
-                        predictions=Predictions(success_criteria=["C1"]))
-        _git(repo_dir, "add", ".")
-        _git(repo_dir, "commit", "-q", "-m", "seed")
-
-        r = CliRunner().invoke(
-            main, ["-p", "test", "tasks", "dispatch", task.id, "--worktree"]
-        )
-        assert r.exit_code == 1, r.output
-        assert "monorepo_worktree_unsupported" in r.output
-        # And it must refuse BEFORE creating anything, so a retry after the
-        # layout changes is not fighting a leftover checkout.
-        assert not (repo_dir / ".clawpm-worktrees").exists(), (
-            "the guard must run before create_worktree"
-        )
+class TestMonorepoInPlaceDispatch:
+    """CLAWP-118 replaced the `--worktree` refusal with real support (see
+    test_clawp118_monorepo_worktree_dispatch.py); in-place dispatch for a
+    monorepo project must keep working."""
 
     def test_dispatch_without_worktree_still_works_in_a_monorepo(
         self, monorepo_portfolio, tmp_path

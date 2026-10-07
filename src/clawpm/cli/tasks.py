@@ -1640,41 +1640,12 @@ def _tasks_dispatch_impl(
                 fmt=fmt,
             )
             sys.exit(1)
-        if _repo_prefix:
-            # Fail CLOSED for a project that lives in a subdirectory of its
-            # repository (Codex P1, PR #55 round 9).
-            #
-            # Round 8 taught the materialization checks to look under the
-            # project prefix, which made a monorepo `--worktree` dispatch
-            # SUCCEED where it had previously aborted. That was worse, not
-            # better: `git worktree add` checks out the repo root, so the
-            # session is registered against a directory whose `.project/` is
-            # one level down, `_session_scoped_project_dir` looks only at
-            # `worktree_path/.project`, finds nothing, and every ID-based
-            # mutator in that checkout falls through to the MAIN one — the
-            # exact corruption CLAWP-098 exists to prevent, now arriving
-            # silently instead of as an error.
-            #
-            # Supporting this properly means deciding three things together:
-            # what the session record stores (the repo root, the project root,
-            # or both), where the agent's cwd should be, and where the dispatch
-            # settings live relative to each. That is a design surface of its
-            # own, and it is not what this PR is about. Until then, refuse
-            # clearly rather than register a mapping that cannot resolve.
-            output_error(
-                "monorepo_worktree_unsupported",
-                f"Project {project_id!r} lives at {_repo_prefix!r} inside its "
-                f"repository, and `--worktree` does not yet support that "
-                f"layout: `git worktree add` checks out the repository root, "
-                f"so the session would be registered against a directory whose "
-                f".project/ is not where session-scoped resolution looks — and "
-                f"ID-based commands run in that checkout would silently mutate "
-                f"the main one instead. Dispatch without --worktree, or run "
-                f"dispatch for a project whose repo_path is its repository "
-                f"root. Tracked separately.",
-                fmt=fmt,
-            )
-            sys.exit(1)
+        # CLAWP-118: `git worktree add` checks out the whole repository, so
+        # the project root inside it is `<worktree>/<prefix>`. Everything
+        # downstream (marker, settings, agent cwd, `.project/` checks) works
+        # at that project root; the session record stores the checkout root
+        # plus the prefix. `repo_prefix` returns a trailing slash: strip it.
+        _wt_prefix = _repo_prefix.rstrip("/")
         if _head_has_project:
             from clawpm.tasks import _candidate_task_paths
             _rel_candidates = _candidate_task_paths(Path(".project/tasks"), task_id)
@@ -1853,7 +1824,7 @@ def _tasks_dispatch_impl(
                 )
                 sys.exit(1)
         try:
-            resolved_dir = create_worktree(_source_repo, task_id)
+            _wt_root = create_worktree(_source_repo, task_id)
         except subprocess.CalledProcessError as exc:
             output_error(
                 "worktree_failed",
@@ -1861,12 +1832,19 @@ def _tasks_dispatch_impl(
                 fmt=fmt,
             )
             sys.exit(1)
-        # Unprefixed on purpose: the guard above refuses `--worktree` for any
-        # project whose repo_path is a subdirectory, so `_repo_prefix` is
-        # necessarily empty here and the worktree root IS the project root.
-        # Round 8 made these checks prefix-aware instead; round 9 showed that
-        # merely let a monorepo dispatch succeed with an unresolvable session
-        # mapping. See the `if _repo_prefix:` guard for the full reasoning.
+        # CLAWP-118: the project root inside the checkout (the checkout root
+        # itself for a root-level project).
+        resolved_dir = _wt_root / _wt_prefix if _wt_prefix else _wt_root
+        if _wt_prefix and not _stat_exists(resolved_dir):
+            output_error(
+                "worktree_failed",
+                f"The worktree at {_wt_root} has no {_wt_prefix!r} directory, "
+                f"so project {project_id!r} has nothing tracked in HEAD to "
+                f"dispatch into. Commit the project directory (or omit "
+                f"--worktree) and retry.",
+                fmt=fmt,
+            )
+            sys.exit(1)
         # CLAWP-098 (grok + Codex review, round 5 — independently caught by
         # both, third confirmation this exact shape is real): the HEAD
         # probe above proves the task is committed, but create_worktree is
@@ -2260,9 +2238,8 @@ def _tasks_dispatch_impl(
             # worktree it just created, so a cwd-based lookup would silently
             # fall through to the OLD registry resolution and report a false
             # "materialized" even when the worktree's own copy is missing.
-            # Unprefixed, like the post-create check above: `--worktree` is
-            # refused outright for a project in a repository subdirectory, so
-            # the worktree root is the project root here by construction.
+            # `resolved_dir` is the PROJECT root inside the checkout
+            # (CLAWP-118), like the post-create check above.
             #
             # `_stat_exists`, not `Path.exists()` (Codex P1, PR #55 round 15):
             # exists() reports a transient stat fault as False, which would
@@ -2293,7 +2270,8 @@ def _tasks_dispatch_impl(
                 session_id = str(uuid.uuid4())
                 try:
                     register_session(
-                        config.portfolio_root, session_id, task_id, project_id, resolved_dir
+                        config.portfolio_root, session_id, task_id, project_id,
+                        _wt_root, project_prefix=_wt_prefix,
                     )
                 except Exception as exc:
                     # Make settings-install + session-registration transactional
