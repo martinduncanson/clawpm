@@ -35,6 +35,12 @@ from .sessions import Scope
 from .id_reservations import record_reservation, record_task_id, reserved_high_water
 
 
+def _scope_kw(scope: Scope | None) -> dict:
+    """``{"scope": scope}`` when given, else ``{}`` — so a ``None`` scope keeps
+    calling the resolvers with their old signature (see :func:`get_tasks_dir`)."""
+    return {} if scope is None else {"scope": scope}
+
+
 def get_tasks_dir(
     config: PortfolioConfig, project_id: str, *, scope: Scope | None = None
 ) -> Path | None:
@@ -790,9 +796,17 @@ def change_task_state(
     force: bool = False,
     rationale: str | None = None,
     supersedes: str | None = None,
+    *,
+    scope: Scope | None = None,
 ) -> Task | None:
-    """Change a task's state by moving its file (or directory for parent tasks)."""
-    tasks_dir = get_tasks_dir(config, project_id)
+    """Change a task's state by moving its file (or directory for parent tasks).
+
+    ``scope`` (CLAWP-115) is threaded to EVERY task-store lookup in the
+    transaction (the tasks dir, the task, and the parent-rollup scan), so a
+    :meth:`sessions.Scope.pinned` scope makes the whole mutation touch exactly
+    that store. ``None`` is the ambient resolution, unchanged.
+    """
+    tasks_dir = get_tasks_dir(config, project_id, **_scope_kw(scope))
     if not tasks_dir:
         return None
 
@@ -826,7 +840,7 @@ def change_task_state(
 
     with file_lock(_lock_path):
         # (0) Resolve + classify INSIDE the lock so the snapshot is consistent.
-        task = get_task(config, project_id, task_id)
+        task = get_task(config, project_id, task_id, **_scope_kw(scope))
         if not task or not task.file_path:
             return None
         current_path = task.file_path
@@ -874,13 +888,15 @@ def change_task_state(
             #     early return, matching pre-CLAWP-051 ordering).
             if new_state == TaskState.DONE and not force:
                 # Re-read the task from disk so the rollup sees current children.
-                _fresh = get_task(config, project_id, task_id)
+                _fresh = get_task(config, project_id, task_id, **_scope_kw(scope))
                 if _fresh is None:
                     raise FileNotFoundError(
                         f"Task directory '{task_dir}' no longer exists — "
                         "it may have been moved by a concurrent session."
                     )
-                status = parent_rollup_status(config, project_id, _fresh)
+                status = parent_rollup_status(
+                    config, project_id, _fresh, **_scope_kw(scope)
+                )
                 if not status["ready"]:
                     return None
 
@@ -965,13 +981,15 @@ def change_task_state(
         #     BEFORE the no-op return so a reopened child still gates an
         #     already-`done/` parent (Codex review).
         if new_state == TaskState.DONE and not force:
-            _fresh = get_task(config, project_id, task_id)
+            _fresh = get_task(config, project_id, task_id, **_scope_kw(scope))
             if _fresh is None:
                 raise FileNotFoundError(
                     f"Task file '{current_path}' no longer exists — "
                     "it may have been moved by a concurrent session."
                 )
-            status = parent_rollup_status(config, project_id, _fresh)
+            status = parent_rollup_status(
+                config, project_id, _fresh, **_scope_kw(scope)
+            )
             if not status["ready"]:
                 return None
 
@@ -1245,8 +1263,12 @@ def parent_rollup_status(
     config: PortfolioConfig,
     project_id: str,
     task: Task,
+    *,
+    scope: Scope | None = None,
 ) -> dict:
     """Report whether a parent task is ready to be marked DONE (CLAWP-037).
+
+    ``scope`` as for :func:`get_tasks_dir` (CLAWP-115).
 
     A parent is *ready* only when every child in ``task.children`` resolves
     to a task in DONE state. A child id that resolves to no task on disk
@@ -1267,7 +1289,11 @@ def parent_rollup_status(
     # glob walk per rollup check — rollup fires only on state transitions,
     # not in hot loops, so this is acceptable at typical project sizes.
     children: set[str] = set(task.children or [])
-    tasks_dir = get_tasks_dir(config, project_id) if config is not None else None
+    tasks_dir = (
+        get_tasks_dir(config, project_id, **_scope_kw(scope))
+        if config is not None
+        else None
+    )
     if tasks_dir is not None:
         # Every state dir a child can migrate to — incl. rejected/ (a
         # crash-orphaned split child later rejected lands in tasks/rejected/
@@ -1313,7 +1339,7 @@ def parent_rollup_status(
     incomplete: list[dict] = []
     missing: list[str] = []
     for child_id in sorted(children):
-        child = get_task(config, project_id, child_id)
+        child = get_task(config, project_id, child_id, **_scope_kw(scope))
         if child is None:
             missing.append(child_id)
         elif child.state != TaskState.DONE:

@@ -59,7 +59,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
-from .discovery import get_project
+from .discovery import get_project, get_project_dir
 from .dispatch import (
     PartialDispatchWrite,
     create_worktree,
@@ -82,9 +82,9 @@ from .models import (
 from .reflect import write_iteration_event, write_reflection_event
 from .rubric import render_rubric_markdown
 from .sessions import (
-    allow_session_resolution,
+    Scope,
+    active_sessions,
     register_session,
-    resolve_scope_from,
     stat_is_dir,
     suppress_session_resolution,
 )
@@ -153,11 +153,40 @@ def _materialize_subtask(
     return None
 
 
+def _pin_worktree_scope(
+    config, project_id: str, subtask_id: str, target_dir: Path
+) -> Scope:
+    """Validate the worktree's own task store and pin a ``Scope`` to it.
+
+    Built straight from ``target_dir/.project`` — no session lookup, no
+    registry fallback — and checked BEFORE any mutation: the store must sit
+    inside the worktree (symlink/junction escapes resolve out and are
+    refused), must not be the canonical store, and must hold the copy we
+    materialized. Raises ``RuntimeError`` (or ``OSError`` on a stat fault)
+    when any check fails; the caller then writes nothing anywhere.
+    """
+    wt_root = target_dir.resolve()
+    project_dir = (target_dir / ".project").resolve()
+    if wt_root not in project_dir.parents:
+        raise RuntimeError(f"{project_dir} is not inside the worktree {wt_root}")
+    canonical = get_project_dir(config, project_id, scope=Scope.canonical())
+    if canonical is not None and canonical.resolve() == project_dir:
+        raise RuntimeError(f"{project_dir} is the canonical store, not a worktree's")
+    tasks_dir = project_dir / "tasks"
+    if not stat_is_dir(tasks_dir):
+        raise RuntimeError(f"{tasks_dir} is not a directory")
+    for path in _candidate_task_paths(tasks_dir, subtask_id):
+        if path.exists() and Task.from_file(path).id == subtask_id:
+            return Scope.pinned(project_dir)
+    raise RuntimeError(f"no copy of {subtask_id} under {tasks_dir}")
+
+
 def _sync_worktree_copy(
     config,
     project_id: str,
     subtask_id: str,
     target_dir: Path,
+    session_id: str,
     new_state: TaskState,
     note: str,
 ) -> None:
@@ -166,28 +195,30 @@ def _sync_worktree_copy(
     The verdict moves only the canonical task; the copy we materialized would
     otherwise stay OPEN and `get_next_task` from the worktree would hand the
     finished/blocked subtask out again. The SAME ``change_task_state`` runs,
-    resolved against the worktree's registered session instead of the
-    canonical pin, so file placement (``done/``, ``blocked/``) matches the
-    canonical store. Never raises: a sync failure is logged and the dispatch
-    carries on (the canonical store, which the Stop hook falls back to, is
-    already correct).
+    with a ``Scope`` pinned to the worktree's store (``_pin_worktree_scope``),
+    so every lookup inside the mutator resolves there and nowhere else: a
+    session released or replaced mid-dispatch cannot redirect it to the
+    canonical store (which a concurrent reopen may own) or an enclosing
+    worktree. The session we registered must still be active for this
+    worktree; if not, the worktree no longer belongs to this dispatch and it
+    is left alone. Never raises: a failure is logged and the dispatch carries
+    on (the canonical store, which the Stop hook falls back to, is correct).
     """
     try:
-        with allow_session_resolution(), resolve_scope_from(target_dir):
-            synced = change_task_state(
-                config, project_id, subtask_id, new_state, note=note
+        if not any(
+            s.session_id == session_id for s in active_sessions(config.portfolio_root)
+        ):
+            raise RuntimeError(
+                f"session {session_id} is no longer active for the worktree"
             )
+        scope = _pin_worktree_scope(config, project_id, subtask_id, target_dir)
+        synced = change_task_state(
+            config, project_id, subtask_id, new_state, note=note, scope=scope
+        )
         if synced is None or synced.state != new_state:
             raise RuntimeError(
                 "worktree transition returned "
                 f"{None if synced is None else synced.state.value!r}"
-            )
-        if (
-            synced.file_path is None
-            or target_dir.resolve() not in synced.file_path.resolve().parents
-        ):
-            raise RuntimeError(
-                f"transition resolved to {synced.file_path}, outside the worktree"
             )
     except Exception as exc:
         _log.error(
@@ -598,7 +629,7 @@ def _dispatch_agent(
         )
         if session_id is not None:
             _sync_worktree_copy(
-                config, project_id, subtask_id, target_dir,
+                config, project_id, subtask_id, target_dir, session_id,
                 TaskState.DONE, done_note,
             )
         # Build minimal Actuals — no git diff or duration tracking here;
@@ -633,7 +664,7 @@ def _dispatch_agent(
         )
         if session_id is not None:
             _sync_worktree_copy(
-                config, project_id, subtask_id, target_dir,
+                config, project_id, subtask_id, target_dir, session_id,
                 TaskState.BLOCKED, blocked_note,
             )
         reflection_event_path = write_iteration_event(
@@ -687,8 +718,8 @@ def dispatch_agent(*args, **kwargs) -> dict:
     subtask, its state transitions) therefore has to use that same canonical
     store, regardless of whether the CALLER happens to be sitting inside some
     other registered worktree. The one deliberate exception is
-    ``_sync_worktree_copy``, which re-enables resolution to mirror the verdict
-    into the worktree's own copy.
+    ``_sync_worktree_copy``, which mirrors the verdict into the worktree's own
+    copy through an explicit ``Scope.pinned`` store, not ambient resolution.
     """
     with suppress_session_resolution():
         return _dispatch_agent(*args, **kwargs)

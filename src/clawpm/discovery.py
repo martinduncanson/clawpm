@@ -302,6 +302,10 @@ def get_project_dir(
     CLAWP-122: ``scope=None`` (the default) is the ambient behaviour above. A
     :class:`sessions.Scope` bypasses the cwd/contextvar resolution entirely.
     """
+    if scope is not None and scope.pinned_project_dir is not None:
+        # CLAWP-115: an explicitly pinned store is the answer, full stop. No
+        # session lookup, and above all no registry fallback.
+        return scope.pinned_project_dir
     session_dir = _session_scoped_project_dir(config, project_id, scope=scope)
     if session_dir is not None:
         return session_dir
@@ -477,7 +481,8 @@ def _active_session(
     if scope is None:
         if _suppress_session_resolution.get():
             return None
-    elif scope.is_canonical:
+    elif scope.target is None:
+        # CANONICAL, or PINNED (CLAWP-115): neither does a session lookup.
         return None
     portfolio_root = getattr(config, "portfolio_root", None)
     if not portfolio_root:
