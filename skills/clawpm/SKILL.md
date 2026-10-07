@@ -7,7 +7,7 @@ metadata: { "openclaw": { "homepage": "https://github.com/martinduncanson/clawpm
 
 # ClawPM Skill
 
-Multi-project task management. All commands emit JSON by default; use `-f text` for human-readable output.
+Multi-project task management. All commands emit JSON by default, so JSON needs no flag. The only output-format control is the global `-f/--format [json|text]` option, which goes before the subcommand (`clawpm -f text tasks list`). There is no `--json` flag: `clawpm projects list --json` fails with `No such option: --json`.
 
 ## When to use clawpm — defacto default
 
@@ -61,6 +61,15 @@ When adding a task on the operator's behalf, **propose all predictions in a sing
 > "Adding **CLAWP-099 Migrate auth to JWT** with: duration 4h (confidence 3), complexity m, approach 'drop-in JWT middleware', success criteria 'P95 <200ms; session writes drop ≥50%', pre-mortem 'mobile webview cookie edge case', reference task CLAWP-042. **Confirm or edit?**"
 
 The operator overrides only the fields where their gut conflicts with Claude's guess. The gut-vs-Claude delta is itself calibration signal. Always include `--confidence` honestly (1 = wild guess, 5 = done-this-exact-thing-before).
+
+## Install
+
+```bash
+uv tool install git+https://github.com/martinduncanson/clawpm   # or: pipx install git+https://github.com/martinduncanson/clawpm
+clawpm doctor                                                    # verify
+```
+
+`uv tool install` and `pipx install` put the package in an isolated environment and add only a `clawpm` shim to PATH. They do not make the package importable from your default Python, so `python -m clawpm` fails with `No module named clawpm`. Invoke `clawpm ...` through the shim. Use `python -m clawpm` only inside an environment where clawpm was installed with `pip install` (for example a dev checkout). If the shim is missing from PATH, run `uv tool update-shell` (or `pipx ensurepath`) and open a new terminal.
 
 ## First-Time Setup
 
@@ -362,7 +371,8 @@ clawpm setup               # Create portfolio (first-time)
 clawpm setup --check       # Verify installation
 clawpm status              # Project overview
 clawpm context             # Full agent context
-clawpm doctor              # Health check
+clawpm doctor              # Health check (whole portfolio)
+clawpm doctor -p myproj    # Health check scoped to one project (-p/--project)
 clawpm doctor --strict     # Health check — exits non-zero if any warning (use in CI/pre-flight)
 clawpm use [project]       # Set/show project context
 clawpm use --clear         # Clear context
@@ -653,10 +663,11 @@ void without deleting them.
 
 - **Flag order**: `clawpm [global flags] <command> [command flags]` — e.g. `clawpm -f text tasks list -s open`
 - **JSON output**: All commands emit JSON by default; use `-f text` for human-readable
-- **One command per call**: Don't chain clawpm commands with `&&` — run each separately
+- **One command per call**: Don't chain clawpm commands with `&&` — run each separately. Don't paste `;`-separated batches either.
+- **Verify batches**: after any batch of `tasks add`, run `clawpm tasks list` to confirm every task landed. On installs that predate the Windows glob fix (below), an add with a mangled argument could exit 0 and drop the task silently. The check is cheap and still worth running.
 - **Portfolio root**: Default `~/clawpm`
 - **Work log**: Append-only at `<portfolio>/work_log.jsonl`
-- **Windows glob expansion (fixed after 0.2.0)**: through 0.2.0, Click expanded every argv entry on Windows (glob, `~`, `$VAR`, `%VAR%`), so `--scope "src/**"` arrived as file paths: a usage error when several files matched, a silently rewritten scope (`src\a.py`) when one did. Newer installs pass arguments verbatim. On 0.2.0 or older, pass patterns with `--scope-file` / `--predict-scope-file`, use a wildcard-free prefix, and keep literal double-star out of free text. Options that name a filesystem path (`--target-dir`, `--body-file`, `--scope-file`, `--in-repo`, ...) still expand `~` and environment variables. Quote wildcard patterns: an unquoted one can be globbed by a POSIX shell on any OS (including Git Bash on Windows) or by PowerShell on Linux/macOS before clawpm runs. PowerShell and cmd on Windows pass arguments through verbatim.
+- **Windows glob expansion (fixed by CLAWP-109, PR #77)**: in installs that predate that fix, Click expanded every argv entry on Windows (glob, `~`, `$VAR`, `%VAR%`), so `--scope "src/**"` arrived as file paths: a usage error when several files matched, a silently rewritten scope (`src\a.py`) when one did. Newer installs pass arguments verbatim. On 0.2.0 or older, pass patterns with `--scope-file` / `--predict-scope-file`, use a wildcard-free prefix, and keep literal double-star out of free text (`--actual`, `--context`, `--summary`; write "double-star" in prose). Those installs also silently dropped any argument containing a double-star sequence, with exit 0, so verify with `clawpm tasks list` after a batch. Options that name a filesystem path (`--target-dir`, `--body-file`, `--scope-file`, `--in-repo`, ...) still expand `~` and environment variables. Quote wildcard patterns: an unquoted one can be globbed by a POSIX shell on any OS (including Git Bash on Windows) or by PowerShell on Linux/macOS before clawpm runs. PowerShell and cmd on Windows pass arguments through verbatim.
 
 ## Dispatch discipline — rubric scoping & worktree safety
 
@@ -923,7 +934,7 @@ clawpm log tail            # See recent activity
 **`add_failed` after `project init`?** Check `.project/settings.toml` — `repo_path` must use forward slashes on Windows (`F:/Git/...` not `F:\Git\...`). The CLI now warns when this is suspected, but old settings.toml files written by earlier versions may still be broken.
 
 **Windows CLI caveats (observed 2026-07-05):**
-- `--predict-scope`/`--scope` values containing glob metacharacters (`scripts/**`) can be expanded into extra positional arguments by the Windows launcher before this CLI ever sees them, failing `tasks add` with "Got unexpected extra arguments" — this happens before Python's own argument parsing runs, so it isn't fixable by quoting. Use `--predict-scope-file`/`--scope-file`/`--out-of-scope-file` instead: read patterns from a file (one per line), which never touches argv and is immune to the expansion (CLAWP-060).
+- Fixed by CLAWP-109 (PR #77): Click's Windows argv glob expansion (not PowerShell, not the launcher) used to turn `--scope "scripts/**"` into extra positional arguments ("Got unexpected extra arguments") or silently drop the argument. Current installs pass arguments verbatim. On an older install, use `--predict-scope-file`/`--scope-file`/`--out-of-scope-file` (patterns read from a file, one per line, never touching argv; CLAWP-060) and verify with `clawpm tasks list` after a batch.
 - `--predict-duration` (and any other duration-parsing flag) accepts combined units, e.g. `2h30m` -> 150 minutes, in addition to a single unit (`150m`, `2h`) (CLAWP-096).
 - If multiple `clawpm.exe` shims are on PATH, a stale one can shadow the working install (`ModuleNotFoundError: No module named 'clawpm'`). Check with `where.exe clawpm` and invoke the shim next to the Python install that has clawpm importable.
 - **`tasks edit` merges predictions field-by-field (CLAWP-108).** Only the prediction flags you pass are overwritten; every other existing prediction field, including `filled_by`, is kept. A repeatable list flag (`--predict-scope`, `--success-criteria`, ...) replaces just that one list. `--predicted-by` exists on `tasks add` but not `tasks edit`; an edit never changes `filled_by`. Caveat: an older installed clawpm (before this fix) still replaces the whole block, so re-pass all prediction flags if `clawpm --version` predates it.
