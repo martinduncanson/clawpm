@@ -310,7 +310,7 @@ class TestMalformedSurfaced:
         )
         assert len(scan.malformed) == 1
 
-    def test_cli_json_flat_when_clean_envelope_when_malformed(self, isolated_portfolio, monkeypatch):
+    def test_cli_json_always_flat_array_diagnostics_on_stderr(self, isolated_portfolio):
         from clawpm.cli import main
 
         add_research(isolated_portfolio.config, "test", "Good", ResearchType.SPIKE)
@@ -318,16 +318,33 @@ class TestMalformedSurfaced:
         args = ["--format", "json", "research", "list", "-p", "test"]
         clean = runner.invoke(main, args)
         assert isinstance(json.loads(clean.stdout), list)
+        assert "research file" not in clean.stderr
 
         (_research_dir(isolated_portfolio) / "bad.md").write_text(BAD_YAML, encoding="utf-8")
         res = runner.invoke(main, args)
         payload = json.loads(res.stdout)
-        assert payload["malformed_count"] == 1
-        assert payload["malformed"][0]["file"] == "bad.md"
-        assert len(payload["research"]) == 1
+        assert isinstance(payload, list) and len(payload) == 1
+        assert "bad.md" in res.stderr
+        assert "1 research file" in res.stderr
 
         res_text = runner.invoke(main, ["--format", "text", "research", "list", "-p", "test"])
         assert "bad.md" in res_text.output
+
+    def test_cli_with_diagnostics_envelope_is_stable(self, isolated_portfolio):
+        from clawpm.cli import main
+
+        add_research(isolated_portfolio.config, "test", "Good", ResearchType.SPIKE)
+        runner = CliRunner()
+        args = ["--format", "json", "research", "list", "-p", "test", "--with-diagnostics"]
+        clean = json.loads(runner.invoke(main, args).stdout)
+        assert clean["malformed"] == [] and clean["malformed_count"] == 0
+        assert len(clean["research"]) == 1
+
+        (_research_dir(isolated_portfolio) / "bad.md").write_text(BAD_YAML, encoding="utf-8")
+        payload = json.loads(runner.invoke(main, args).stdout)
+        assert payload["malformed_count"] == 1
+        assert payload["malformed"][0]["file"] == "bad.md"
+        assert len(payload["research"]) == 1
 
     def test_mcp_research_list_has_malformed_fields(self, isolated_portfolio, monkeypatch):
         from clawpm import mcp_server
@@ -348,3 +365,72 @@ class TestUniqueFrontmatterId:
         assert len({a.id, b.id, c.id}) == 3
         assert len(list_research(isolated_portfolio.config, "test")) == 3
         assert get_research(isolated_portfolio.config, "test", b.id).file_path == b.file_path
+
+    def test_id_reserves_filename_stem_ids(self, isolated_portfolio):
+        d = _research_dir(isolated_portfolio)
+        (d / "test-research-dup.md").write_text("# Plain note\n", encoding="utf-8")
+        (d / "test-research-dup-2.md").write_text("---\ntype: spike\n---\n# no id\n", encoding="utf-8")
+        a = add_research(isolated_portfolio.config, "test", "Dup", ResearchType.SPIKE)
+        assert a.id == "test-research-dup-3"
+
+    def test_id_scan_logs_skipped_malformed(self, isolated_portfolio, caplog):
+        (_research_dir(isolated_portfolio) / "bad.md").write_text(BAD_YAML, encoding="utf-8")
+        with caplog.at_level(logging.WARNING):
+            add_research(isolated_portfolio.config, "test", "Dup", ResearchType.SPIKE)
+        assert "bad.md" in caplog.text
+
+    def test_concurrent_adds_get_distinct_ids(self, isolated_portfolio):
+        import threading
+
+        results: list = []
+        errors: list = []
+        barrier = threading.Barrier(6)
+
+        def work():
+            try:
+                barrier.wait()
+                results.append(
+                    add_research(isolated_portfolio.config, "test", "Dup", ResearchType.SPIKE)
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=work) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors
+        assert len({r.id for r in results}) == 6
+        assert len(list_research(isolated_portfolio.config, "test")) == 6
+
+
+class TestBadTags:
+    def test_tags_null_is_empty_and_filter_does_not_crash(self, isolated_portfolio):
+        (_research_dir(isolated_portfolio) / "n.md").write_text(
+            "---\nid: n\ntype: spike\ntags:\n---\n# N\n", encoding="utf-8"
+        )
+        scan = scan_research(isolated_portfolio.config, "test", tags_filter=["x"])
+        assert scan.items == [] and scan.malformed == []
+        assert scan_research(isolated_portfolio.config, "test").items[0].tags == []
+
+    def test_tags_string_is_surfaced_as_malformed(self, isolated_portfolio):
+        (_research_dir(isolated_portfolio) / "s.md").write_text(
+            "---\nid: s\ntype: spike\ntags: abc\n---\n# S\n", encoding="utf-8"
+        )
+        scan = scan_research(isolated_portfolio.config, "test", tags_filter=["a"])
+        assert scan.items == []
+        assert [m["file"] for m in scan.malformed] == ["s.md"]
+
+    def test_filtering_guarded_per_file(self, isolated_portfolio, monkeypatch):
+        add_research(isolated_portfolio.config, "test", "Good", ResearchType.SPIKE, tags=["x"])
+        orig = Research.from_file
+
+        def weird(path):
+            item = orig(path)
+            item.tags = None  # simulate a bad value slipping past load
+            return item
+
+        monkeypatch.setattr(Research, "from_file", staticmethod(weird))
+        scan = scan_research(isolated_portfolio.config, "test", tags_filter=["x"])
+        assert len(scan.malformed) == 1

@@ -276,7 +276,7 @@ Note: State changes (start/done/block) auto-log to work_log with git files_chang
 
 ### Research
 ```bash
-clawpm research list
+clawpm research list [--with-diagnostics]   # JSON = flat array; unparseable files reported on stderr, --with-diagnostics gives {research, malformed, malformed_count}
 clawpm research add --type investigation --title "Question"
 clawpm research link --id <research_id> --session-key <key>
 ```

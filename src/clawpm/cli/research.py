@@ -24,9 +24,26 @@ def research() -> None:
 @click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
 @click.option("--status", "-s", type=click.Choice(["open", "complete", "stale"]), help="Filter by status")
 @click.option("--tags", "-t", multiple=True, help="Filter by tags (must have all)")
+@click.option(
+    "--with-diagnostics",
+    is_flag=True,
+    help="JSON only: emit {research, malformed, malformed_count} instead of a flat array "
+    "(malformed files are otherwise reported on stderr).",
+)
 @click.pass_context
-def research_list(ctx: click.Context, project_id: str | None, status: str | None, tags: tuple[str, ...]) -> None:
-    """List research items."""
+def research_list(
+    ctx: click.Context,
+    project_id: str | None,
+    status: str | None,
+    tags: tuple[str, ...],
+    with_diagnostics: bool,
+) -> None:
+    """List research items.
+
+    JSON output is a flat array. Unparseable research files are reported on
+    stderr (never silently dropped); use --with-diagnostics for a stable JSON
+    envelope that includes them.
+    """
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
     
@@ -36,7 +53,9 @@ def research_list(ctx: click.Context, project_id: str | None, status: str | None
     tags_filter = list(tags) if tags else None
 
     scan = scan_research(config, project_id, status_filter=status_filter, tags_filter=tags_filter)
-    output_research_list(scan.items, fmt=fmt, malformed=scan.malformed)
+    output_research_list(
+        scan.items, fmt=fmt, malformed=scan.malformed, with_diagnostics=with_diagnostics
+    )
 
 
 @research.command("add")
