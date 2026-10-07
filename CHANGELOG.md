@@ -12,7 +12,7 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 
 ### Fixed
 
-- On Windows the CLI no longer glob-expands its own arguments (Click's `windows_expand_args`): `--scope "src/double-star"` is stored verbatim instead of failing with a usage error or being rewritten to a file path, and `~`, `$VAR` and `%VAR%` in free text survive too. Options that name a filesystem path (`--target-dir`, `--body-file`, `--scope-file`, `--in-repo`, ...) still expand `~` and environment variables, on every platform (CLAWP-109).
+- On Windows the CLI no longer glob-expands its own arguments (Click's `windows_expand_args`): `--scope "src/double-star"` is stored verbatim instead of failing with a usage error or being rewritten to a file path, and `~`, `$VAR` and `%VAR%` in free text survive too. Options that name a filesystem path (`--target-dir`, `--body-file`, `--scope-file`, `--in-repo`, ...) still expand `~` and environment variables, on every platform (#77, CLAWP-109).
 - `tasks edit` (CLI and MCP `tasks_edit`) now merges predictions: passing one prediction flag overwrites only that field instead of nulling duration, confidence, pre-mortem, scope, `filled_by` and the rest (#76, CLAWP-108).
 - Task-id allocation now consults a portfolio-level reservation ledger (`id_reservations.jsonl`), so two worktrees of one project no longer mint the same id (#74, CLAWP-092).
 

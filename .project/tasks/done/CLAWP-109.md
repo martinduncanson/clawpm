@@ -28,7 +28,7 @@ priority: 5
 tags:
 - windows
 - silent-failure
-updated: '2026-09-02'
+updated: '2026-10-07'
 ---
 # clawpm.exe silently drops any command whose args contain a double-star glob - exits 0, no artifact, no error
 
