@@ -424,3 +424,71 @@ class TestComputeClosure:
         assert result["closure"] is None
         assert result["insufficient_data"] is True
         assert result["open_predictions"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Hardening — loud degraded paths, no-op edits, blocked events
+# ---------------------------------------------------------------------------
+
+
+class TestEmitTreeRegistrationFailureIsLoud:
+    def test_registration_failure_is_reported_not_swallowed(self, temp_portfolio, monkeypatch):
+        import clawpm.reflect as reflect_mod
+
+        def _boom(*args, **kwargs):
+            raise OSError("simulated reflection write failure")
+
+        monkeypatch.setattr(reflect_mod, "write_prediction_event", _boom)
+        raw = {
+            "schema_version": 1,
+            "root": {"title": "Root", "predictions": {"duration_min": 300, "confidence": 3}},
+            "leaves": [
+                {
+                    "ref": "L1",
+                    "parent_ref": None,
+                    "title": "Leaf",
+                    "leaf_key": "predreg-loud-L1",
+                    "predictions": {"duration_min": 60},
+                }
+            ],
+        }
+        result = emit_tree(temp_portfolio["config"], "test", parse_emit_document(raw))
+
+        # The tree is durably emitted, but the degraded path leaves a marker.
+        assert result.emitted
+        failed_ids = {f["task_id"] for f in result.registration_failures}
+        assert f"{result.root_id}-001" in failed_ids
+        assert result.root_id in failed_ids
+        assert all("simulated reflection write failure" in f["error"] for f in result.registration_failures)
+        assert result.to_dict()["registration_failures"] == result.registration_failures
+
+
+class TestEditNoopDoesNotRevise:
+    def test_edit_with_identical_values_appends_no_revision(self, temp_portfolio):
+        config = temp_portfolio["config"]
+        task = add_task(
+            config, "test", "Task", predictions=Predictions(duration_min=30, confidence=2)
+        )
+        edit_task(config, "test", task.id, predictions=Predictions(confidence=2))
+
+        events = _reflection_events(temp_portfolio["root"], task.id)
+        assert [e["event"] for e in events] == ["prediction_registered"]
+
+
+class TestBlockedEventCarriesPredictionId:
+    def test_task_blocked_event_carries_prediction_id(self, temp_portfolio):
+        config = temp_portfolio["config"]
+        task = add_task(config, "test", "Blocked task", predictions=Predictions(duration_min=30))
+        assert task is not None
+        write_reflection_event(
+            temp_portfolio["root"],
+            event="task_blocked",
+            task_id=task.id,
+            project_id="test",
+            predictions=task.predictions,
+            actuals=Actuals(duration_min=5),
+        )
+        events = _reflection_events(temp_portfolio["root"], task.id)
+        blocked = [e for e in events if e["event"] == "task_blocked"]
+        assert len(blocked) == 1
+        assert blocked[0]["prediction_id"] == task.predictions.prediction_id

@@ -2878,10 +2878,12 @@ def edit_task(
                 if not had_prediction_id:
                     merged["prediction_id"] = uuid.uuid4().hex
                 frontmatter["predictions"] = merged
-                _prediction_event = (
-                    "prediction_registered" if not had_prediction_id else "prediction_revised",
-                    merged,
-                )
+                # A no-op edit (every passed value already stored) is not a
+                # revision — don't pollute the pre-registration ledger.
+                if not had_prediction_id:
+                    _prediction_event = ("prediction_registered", merged)
+                elif merged != existing_predictions:
+                    _prediction_event = ("prediction_revised", merged)
         # CLAWP-054 — contract fields
         if out_of_scope is not None:
             if out_of_scope:

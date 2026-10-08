@@ -16,6 +16,7 @@ JSONL work_log is appended LAST, after promotion succeeds.
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import uuid
 from dataclasses import dataclass, field
@@ -24,6 +25,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 from .id_reservations import record_task_id
 from .frontmatter import (
@@ -133,6 +136,9 @@ class EmitResult:
     rejected: list[dict]         # leaves rejected by won't-do gate (report-back)
     constitution_violations: list[dict]  # constitution violations (report-back)
     dry_run: bool
+    # CLAWP-112-001 — tasks emitted fine but whose prediction_registered event
+    # could not be written (marker for the degraded path, never silent).
+    registration_failures: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -143,6 +149,7 @@ class EmitResult:
             "rejected": self.rejected,
             "constitution_violations": self.constitution_violations,
             "dry_run": self.dry_run,
+            "registration_failures": self.registration_failures,
         }
 
 
@@ -1305,6 +1312,7 @@ def _emit_tree_locked(
     # like the work-log append above: the tree is already durably promoted,
     # so a registration failure must not turn a successful emit into a
     # reported failure.
+    registration_failures: list[dict] = []
     for _emitted_task in emitted_tasks:
         if _emitted_task.predictions.is_empty():
             continue
@@ -1320,8 +1328,13 @@ def _emit_tree_locked(
                 filled_by=_emitted_task.predictions.filled_by,
                 baseline_ref=_emitted_task.baseline_ref,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "prediction registration failed for %s: %s", _emitted_task.id, exc
+            )
+            registration_failures.append(
+                {"task_id": _emitted_task.id, "error": f"{type(exc).__name__}: {exc}"}
+            )
 
     # Build result — emitted_tasks was populated by _collect_emitted_tasks
     # (new-root path) or by individual file reads (attach_to path).
@@ -1337,6 +1350,7 @@ def _emit_tree_locked(
         rejected=rejected,
         constitution_violations=constitution_violations,
         dry_run=False,
+        registration_failures=registration_failures,
     )
 
 
