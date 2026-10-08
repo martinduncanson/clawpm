@@ -271,7 +271,7 @@ def test_unexpected_exception_does_not_block_later_requests(isolated_portfolio, 
     root = isolated_portfolio.root
     _raw_append(root, "a2", _req())
     _raw_append(root, "a2", _req(GOOD))
-    real = tasks_mod.add_task
+    real = tasks_mod.add_task_with_status
     state = {"n": 0}
 
     def flaky(*a, **k):
@@ -280,7 +280,7 @@ def test_unexpected_exception_does_not_block_later_requests(isolated_portfolio, 
             raise RuntimeError("boom")
         return real(*a, **k)
 
-    monkeypatch.setattr(tasks_mod, "add_task", flaky)
+    monkeypatch.setattr(tasks_mod, "add_task_with_status", flaky)
     out = _json(_invoke("inbox", "materialize", "--agent", "a2"))
     assert [f["msg_id"] for f in out["failed"]] == [BAD]
     assert [m["msg_id"] for m in out["materialized"]] == [GOOD]

@@ -2529,12 +2529,49 @@ def add_task(
     delegability: str | None = None,
     source_request: str | None = None,
 ) -> Task | None:
-    """Add a new task to a project.
+    """Add a new task to a project (see :func:`add_task_with_status`).
+
+    With ``source_request`` set, an existing task carrying the same key is
+    returned instead of creating a second one.
+    """
+    return add_task_with_status(
+        config, project_id, title, task_id=task_id, priority=priority,
+        complexity=complexity, depends=depends, scope=scope, tags=tags,
+        description=description, predictions=predictions,
+        parallel_group=parallel_group, agent_profile=agent_profile,
+        out_of_scope=out_of_scope, stop_conditions=stop_conditions,
+        delegability=delegability, source_request=source_request,
+    )[0]
+
+
+def add_task_with_status(
+    config: PortfolioConfig,
+    project_id: str,
+    title: str,
+    task_id: str | None = None,
+    priority: int = 5,
+    complexity: TaskComplexity | None = None,
+    depends: list[str] | None = None,
+    scope: list[str] | None = None,
+    tags: list[str] | None = None,
+    description: str = "",
+    predictions: Predictions | None = None,
+    parallel_group: int | None = None,
+    agent_profile: str | None = None,
+    out_of_scope: list[str] | None = None,
+    stop_conditions: list[str] | None = None,
+    delegability: str | None = None,
+    source_request: str | None = None,
+) -> tuple[Task | None, bool]:
+    """Add a new task to a project; return ``(task, created)``.
 
     ``source_request`` (CLAWP-101) is an idempotency key — the inbox message id a
     task was materialized from — written into the frontmatter in the same atomic
     write as the task, so a retry can find the task instead of creating a second
-    one. Omitted from the file when ``None``.
+    one. Omitted from the file when ``None``. The key is rechecked INSIDE the
+    creation lock, before an id is allocated, so two concurrent callers for one
+    key cannot both create: the loser gets ``(existing_task, False)``.
+    ``(None, False)`` means the project has no tasks directory.
     """
     tasks_dir = get_tasks_dir(config, project_id)
     if not tasks_dir:
@@ -2546,7 +2583,7 @@ def add_task(
             # walk so operators don't get a silent failure when inside the repo.
             project_dot_dir = find_project_dir_fallback(config, project_id)
         if not project_dot_dir:
-            return None
+            return None, False
         tasks_dir = project_dot_dir / "tasks"
         tasks_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2620,6 +2657,15 @@ def add_task(
     # for the DURATION of one local-disk add_task call is cheap; a subtly
     # incorrect "skip it sometimes" optimization is not worth its risk.
     with portfolio_prefix_lock(config.portfolio_root), file_lock(_lock_path):
+        # CLAWP-101 (PR #88 Codex r2) — idempotency recheck. A caller's own
+        # pre-check ran outside this lock, so a concurrent materialiser may have
+        # created the task since. Recheck here, before any id is allocated or
+        # reserved, so the loser reuses the winner's task.
+        if source_request:
+            _existing = _scan_source_request(tasks_dir, source_request)
+            if _existing is not None:
+                return _existing, False
+
         # Generate task ID if not provided (inside lock: scan is now serialised)
         if not task_id:
             # CLAWP-048: resolve a portfolio-unique prefix (explicit task_prefix ->
@@ -2771,7 +2817,7 @@ def add_task(
         # reload-under-lock contract (CLAWP-051 Finding 5). The file was just
         # written under this lock, so the read can't race another clawpm writer;
         # retry_transient covers a scanner touching the fresh file (CLAWP-051).
-        return retry_transient(Task.from_file, file_path)
+        return retry_transient(Task.from_file, file_path), True
 
 
 def find_task_by_source_request(
@@ -2786,6 +2832,11 @@ def find_task_by_source_request(
     tasks_dir = get_tasks_dir(config, project_id)
     if not tasks_dir or not tasks_dir.exists():
         return None
+    return _scan_source_request(tasks_dir, source_request)
+
+
+def _scan_source_request(tasks_dir: Path, source_request: str) -> Task | None:
+    """Scan ``tasks_dir`` for the task stamped with ``source_request`` (any state)."""
     for path in sorted(tasks_dir.rglob("*.md")):
         try:
             text = path.read_text(encoding="utf-8")

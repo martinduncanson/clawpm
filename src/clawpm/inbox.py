@@ -29,14 +29,26 @@ def _inbox_dir(portfolio_root: Path) -> Path:
 # agents (message `from`, `to`). Anything carrying a path separator, a drive or
 # stream colon, a `..` segment or a trailing dot is refused so no caller can
 # steer a write outside the inbox directory.
-_AGENT_ID_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._@-]{0,62}[A-Za-z0-9_@-])?$")
+#
+# Matched with ``fullmatch``: a ``$`` anchor also matches before a trailing
+# newline, so ``"a\n"`` would pass. Windows reserves the DOS device names
+# (``NUL``, ``CON``, ``COM1``...) even with an extension (``NUL.jsonl``,
+# ``CON.foo``), so a reply to such an id would vanish or fail; they are refused
+# case-insensitively on every platform to keep the portfolio portable.
+_AGENT_ID_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._@-]{0,62}[A-Za-z0-9_@-])?")
+_WIN_DEVICE_RE = re.compile(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])", re.IGNORECASE)
 
 
 def validate_agent_id(agent_id: object) -> str:
     """Return ``agent_id`` if it is a safe inbox filename stem, else raise ValueError."""
-    if not isinstance(agent_id, str) or not _AGENT_ID_RE.match(agent_id):
+    if (
+        not isinstance(agent_id, str)
+        or not _AGENT_ID_RE.fullmatch(agent_id)
+        or _WIN_DEVICE_RE.fullmatch(agent_id.split(".", 1)[0])
+    ):
         raise ValueError(
             f"invalid agent id {agent_id!r}: use 1-64 letters, digits or . _ @ -"
+            " (not a reserved device name such as NUL or CON)"
         )
     return agent_id
 
@@ -363,7 +375,7 @@ def build_task_request_payload(
     return payload
 
 
-_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_SAFE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")  # used with fullmatch
 _MAX_TITLE = 300
 _MAX_ITEM = 500
 _CTRL_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")  # tab allowed, newlines/NUL/ESC not
@@ -371,7 +383,7 @@ _DRIVE_RE = re.compile(r"^[A-Za-z]:")
 
 
 def _is_safe_id(value: object) -> bool:
-    return isinstance(value, str) and bool(_SAFE_ID_RE.match(value))
+    return isinstance(value, str) and bool(_SAFE_ID_RE.fullmatch(value))
 
 
 def _safe_scope_entry(entry: str) -> bool:
@@ -477,15 +489,18 @@ def materialize_task_requests(
     Crash window: if the process dies after ``add_task`` but before the reply, a
     re-run finds the task by its ``source_request`` key and only replies + acks
     (``resumed``) instead of creating a duplicate. Once the reply exists, a
-    re-run only acks. The lookup is not locked against a CONCURRENT second
-    materializer for the same agent; the drain is single-writer by design.
+    re-run only acks. The pre-checks above are not locked, but ``add_task``
+    rechecks the ``source_request`` key inside its creation lock, so a CONCURRENT
+    second materializer for the same agent reuses the first one's task
+    (``resumed``) instead of creating a duplicate. Both may then send the result
+    reply (same ``task_id``); the unlocked reply check cannot prevent that.
 
     ``dry_run`` writes nothing at all (no tasks, replies or acks).
     """
     from .discovery import discover_projects
     from .models import Predictions, SuccessCriterion, TaskComplexity
     from .reflect import parse_duration
-    from .tasks import add_task, find_task_by_source_request
+    from .tasks import add_task_with_status, find_task_by_source_request
 
     validate_agent_id(agent_id)
     root = config.portfolio_root
@@ -607,7 +622,7 @@ def materialize_task_requests(
             )
 
         try:
-            task = add_task(
+            task, created = add_task_with_status(
                 config,
                 project_id,
                 payload["title"].strip(),
@@ -622,7 +637,7 @@ def materialize_task_requests(
                 source_request=msg_id,
             )
         except ValueError as exc:
-            task, err = None, str(exc)
+            task, created, err = None, False, str(exc)
         else:
             err = f"could not create task in project {project_id!r}"
         if not task:
@@ -630,10 +645,13 @@ def materialize_task_requests(
             return
 
         reply_and_ack(msg_id, sender, project_id, task.id)
-        result["materialized"].append({
+        rec = {
             "msg_id": msg_id, "project": project_id, "task_id": task.id,
             "title": task.title,
-        })
+        }
+        if not created:  # lost a race: add_task found the winner's task under its lock
+            rec["resumed"] = True
+        result["materialized"].append(rec)
 
     for msg in read_inbox(root, agent_id, unacked_only=True):
         payload = msg.get("payload")
