@@ -902,8 +902,10 @@ def _write_resolution_frontmatter(file_path: Path, resolution: str) -> None:
     """
     with guard_fs_tamper(f"Task file '{file_path}'"):
         text = file_path.read_text(encoding="utf-8")
-    fm, body = parse_frontmatter(text)
-    fm = require_mapping(fm, where=str(file_path))
+    # STRICT parse (Codex r3): the lenient parse above drops unparseable YAML
+    # to ``{}``, and rewriting from that would erase id/priority/predictions.
+    # Refuse (FrontmatterError, a ValueError) with the file untouched.
+    fm, body = split_frontmatter(text, where=str(file_path))
 
     fm["resolution"] = resolution
     stamp_updated(fm)  # CLAWP-086 — resolving a decision is a mutation.
@@ -1001,6 +1003,73 @@ def _append_decision_to_parent(
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
+
+
+def _restore_file_bytes(path: Path, data: bytes) -> None:
+    """Atomically put ``data`` back at ``path`` byte-for-byte (binary write, so
+    no newline translation on Windows)."""
+    tmp = path.with_suffix(path.suffix + ".rollback.tmp")
+    try:
+        tmp.write_bytes(data)
+        retry_transient(tmp.replace, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+@contextmanager
+def _restore_on_error(snapshots: list[tuple[Path, bytes]]):
+    """Roll back a multi-file completion (Codex r3): on ANY exception from the
+    body, restore every ``(path, original_bytes)`` snapshot recorded so far (in
+    reverse order) and re-raise the original error. A snapshotted file that no
+    longer exists is left alone (a concurrent delete must not be resurrected).
+    If a restore itself fails the error says which files were left modified
+    (loud, not silent) and chains the original."""
+    try:
+        yield
+    except BaseException as exc:
+        stuck: list[str] = []
+        for path, data in reversed(snapshots):
+            try:
+                if path.exists():
+                    _restore_file_bytes(path, data)
+            except Exception as rb_exc:  # noqa: BLE001 - report, don't mask
+                logger.error("Rollback of '%s' failed: %s", path, rb_exc)
+                stuck.append(str(path))
+        if stuck:
+            raise RuntimeError(
+                f"Completion failed ({exc!r}) and rollback could not restore: "
+                f"{', '.join(stuck)} — fix these files by hand."
+            ) from exc
+        raise
+
+
+def _apply_resolution(
+    config: PortfolioConfig,
+    project_id: str,
+    task_id: str,
+    task: Task,
+    task_md: Path,
+    resolution: str,
+    scope: Scope | None,
+    snapshots: list[tuple[Path, bytes]],
+) -> None:
+    """Write the resolution and (decision-only) the parent's "Decisions so far"
+    line, recording each file's ORIGINAL bytes in ``snapshots`` BEFORE touching
+    it so the caller's :func:`_restore_on_error` can undo a partial run."""
+    with guard_fs_tamper(f"Task file '{task_md}'"):
+        snapshots.append((task_md, task_md.read_bytes()))
+    _write_resolution_frontmatter(task_md, resolution)
+    # The parent map's "Decisions so far" is decision-only.
+    if task.kind == "decision" and task.parent:
+        # Forward `scope` (Codex r1 P1): a pinned worktree scope must resolve
+        # the parent in the SAME store as the child.
+        _parent = get_task(config, project_id, task.parent, **_scope_kw(scope))
+        if _parent and _parent.file_path and _parent.file_path.exists():
+            snapshots.append((_parent.file_path, _parent.file_path.read_bytes()))
+            _append_decision_to_parent(
+                _parent.file_path, task_id, task.title, resolution
+            )
 
 
 def change_task_state(
@@ -1137,53 +1206,54 @@ def change_task_state(
             #      corrected resolution still updates it. Backstop only — the
             #      primary gate lives in services.tasks.transition (shared by
             #      shortcuts.done and tasks_state); this defends direct callers.
+            #
+            #      ALL-OR-NOTHING (Codex r3): the resolution write, the parent
+            #      line and the state move form one unit. Each file's original
+            #      bytes are snapshotted before it is touched; a failure at any
+            #      step (including the move) restores them and re-raises, so
+            #      the task stays open, the parent unchanged, and a retry
+            #      converges (the parent line is replaced, never duplicated).
             _resolved_this_txn = False
-            if new_state == TaskState.DONE and _resolution_applies(task, resolution):
-                _check_resolution(task, task_id, resolution)
-                _task_md = task_dir / "_task.md"
-                if not _task_md.exists():
-                    raise FileNotFoundError(
-                        f"Task metadata '{_task_md}' no longer exists — "
-                        "it may have been moved by a concurrent session."
-                    )
-                _write_resolution_frontmatter(_task_md, resolution.strip())
-                _resolved_this_txn = True
-                # The parent map's "Decisions so far" is decision-only.
-                if task.kind == "decision" and task.parent:
-                    # Forward `scope` (Codex r1 P1): a pinned worktree scope
-                    # must resolve the parent in the SAME store as the child.
-                    _parent = get_task(
-                        config, project_id, task.parent, **_scope_kw(scope)
-                    )
-                    if _parent and _parent.file_path:
-                        _append_decision_to_parent(
-                            _parent.file_path, task_id, task.title, resolution.strip()
+            _snapshots: list[tuple[Path, bytes]] = []
+            with _restore_on_error(_snapshots):
+                if new_state == TaskState.DONE and _resolution_applies(task, resolution):
+                    _check_resolution(task, task_id, resolution)
+                    _task_md = task_dir / "_task.md"
+                    if not _task_md.exists():
+                        raise FileNotFoundError(
+                            f"Task metadata '{_task_md}' no longer exists — "
+                            "it may have been moved by a concurrent session."
                         )
-
-            # (b) Already in correct location — skip the MOVE only; the gate (c)
-            #     and metadata write (d) above have already run. Reload so the
-            #     return reflects any frontmatter just written. Guard _task.md
-            #     here too: step (a) only checked task_dir.exists(), so a
-            #     concurrent session removing just _task.md must surface the
-            #     friendly message, not a raw FileNotFoundError (Codex/Grok).
-            if task_dir.resolve() == new_dir.resolve():
-                _task_md = task_dir / "_task.md"
-                if not _task_md.exists():
-                    raise FileNotFoundError(
-                        f"Task metadata '{_task_md}' no longer exists — "
-                        "it may have been moved by a concurrent session."
+                    _apply_resolution(
+                        config, project_id, task_id, task, _task_md,
+                        resolution.strip(), scope, _snapshots,
                     )
-                # (b.1) CLAWP-086 (Codex review) — a directory task's PROGRESS
-                #       transition keeps `_task.md` in place (no `.progress.md`
-                #       rename), so the move-path stamp below never runs. Stamp
-                #       here so `start` on a decomposed parent still bumps
-                #       `updated`. REJECTED/DECISION already stamped above.
-                if new_state != TaskState.REJECTED and not _resolved_this_txn:
-                    _stamp_updated_file(_task_md)
-                return retry_transient(Task.from_file, _task_md)
+                    _resolved_this_txn = True
 
-            # (e) Move (retry transient Windows sharing/access faults — CLAWP-051)
-            retry_transient(shutil.move, str(task_dir), str(new_dir))
+                # (b) Already in correct location — skip the MOVE only; the gate (c)
+                #     and metadata write (d) above have already run. Reload so the
+                #     return reflects any frontmatter just written. Guard _task.md
+                #     here too: step (a) only checked task_dir.exists(), so a
+                #     concurrent session removing just _task.md must surface the
+                #     friendly message, not a raw FileNotFoundError (Codex/Grok).
+                if task_dir.resolve() == new_dir.resolve():
+                    _task_md = task_dir / "_task.md"
+                    if not _task_md.exists():
+                        raise FileNotFoundError(
+                            f"Task metadata '{_task_md}' no longer exists — "
+                            "it may have been moved by a concurrent session."
+                        )
+                    # (b.1) CLAWP-086 (Codex review) — a directory task's PROGRESS
+                    #       transition keeps `_task.md` in place (no `.progress.md`
+                    #       rename), so the move-path stamp below never runs. Stamp
+                    #       here so `start` on a decomposed parent still bumps
+                    #       `updated`. REJECTED/DECISION already stamped above.
+                    if new_state != TaskState.REJECTED and not _resolved_this_txn:
+                        _stamp_updated_file(_task_md)
+                    return retry_transient(Task.from_file, _task_md)
+
+                # (e) Move (retry transient Windows sharing/access faults — CLAWP-051)
+                retry_transient(shutil.move, str(task_dir), str(new_dir))
 
             # (e.1) CLAWP-086 — stamp `updated` on the relocated file. REJECTED/
             #       DECISION already stamped via their own frontmatter writer
@@ -1249,28 +1319,25 @@ def change_task_state(
         # (d2) CLAWP-111 — DECISION: see the directory-task branch above for
         #      full rationale. Backstop only — the primary gate lives in
         #      services.tasks.transition.
+        #      ALL-OR-NOTHING (Codex r3) — see the directory branch.
         _resolved_this_txn = False
-        if new_state == TaskState.DONE and _resolution_applies(task, resolution):
-            _check_resolution(task, task_id, resolution)
-            _write_resolution_frontmatter(current_path, resolution.strip())
-            _resolved_this_txn = True
-            if task.kind == "decision" and task.parent:
-                # Forward `scope` (Codex r1 P1) — see the directory branch.
-                _parent = get_task(
-                    config, project_id, task.parent, **_scope_kw(scope)
+        _snapshots: list[tuple[Path, bytes]] = []
+        with _restore_on_error(_snapshots):
+            if new_state == TaskState.DONE and _resolution_applies(task, resolution):
+                _check_resolution(task, task_id, resolution)
+                _apply_resolution(
+                    config, project_id, task_id, task, current_path,
+                    resolution.strip(), scope, _snapshots,
                 )
-                if _parent and _parent.file_path:
-                    _append_decision_to_parent(
-                        _parent.file_path, task_id, task.title, resolution.strip()
-                    )
+                _resolved_this_txn = True
 
-        # (b) Already in correct location — skip the MOVE only; the gate (c) and
-        #     metadata write (d) above have already run. Reload for a fresh view.
-        if current_path.resolve() == new_path.resolve():
-            return retry_transient(Task.from_file, current_path)
+            # (b) Already in correct location — skip the MOVE only; the gate (c) and
+            #     metadata write (d) above have already run. Reload for a fresh view.
+            if current_path.resolve() == new_path.resolve():
+                return retry_transient(Task.from_file, current_path)
 
-        # (e) Move (retry transient Windows sharing/access faults — CLAWP-051)
-        retry_transient(shutil.move, str(current_path), str(new_path))
+            # (e) Move (retry transient Windows sharing/access faults — CLAWP-051)
+            retry_transient(shutil.move, str(current_path), str(new_path))
 
         # (e.1) CLAWP-086 — stamp `updated` on the relocated file. REJECTED/
         #       DECISION already stamped via their own frontmatter writer

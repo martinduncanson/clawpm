@@ -948,3 +948,135 @@ class TestBuildTaskAcceptsOptionalResolution:
                 config, "test-proj", task.id, TaskState.DONE, resolution=bad
             )
         assert get_task(config, "test-proj", task.id).state == TaskState.OPEN
+
+
+# ---------------------------------------------------------------------------
+# Codex r3 — resolution write is strict, and completion is all-or-nothing
+# ---------------------------------------------------------------------------
+
+
+def _make_form(config, form, kind):
+    """Return (task, parent) with ``task`` in file- or directory-form and
+    ``parent`` its real (separate) parent; the task is still open."""
+    parent = add_task(config, "test-proj", "Parent map")
+    task = add_task(config, "test-proj", "Pick a bus", kind=kind)
+    text = task.file_path.read_text(encoding="utf-8")
+    task.file_path.write_text(
+        text.replace("---\n", f"---\nparent: {parent.id}\n", 1), encoding="utf-8"
+    )
+    if form == "dir":
+        child = add_subtask(config, "test-proj", task.id, "Sub-consideration")
+        change_task_state(config, "test-proj", child.id, TaskState.DONE)
+    task = get_task(config, "test-proj", task.id)
+    assert (task.file_path.name == "_task.md") == (form == "dir")
+    parent = get_task(config, "test-proj", parent.id)
+    return task, parent
+
+
+class TestResolutionWriteIsStrict:
+    """Codex r3 P2 #1: an unparseable frontmatter must REFUSE the write, not
+    be silently rebuilt as just resolution + timestamps."""
+
+    @pytest.mark.parametrize("form", ["file", "dir"])
+    @pytest.mark.parametrize(
+        "breakage", ["broken: [unclosed\n", "- a\n- b\n"], ids=["bad-yaml", "non-mapping"]
+    )
+    def test_malformed_frontmatter_refuses_write_and_leaves_bytes(
+        self, temp_portfolio, form, breakage
+    ):
+        from clawpm.frontmatter import FrontmatterError
+
+        config = temp_portfolio["config"]
+        task, _parent = _make_form(config, form, kind="build")
+        text = task.file_path.read_text(encoding="utf-8")
+        if breakage.startswith("- "):
+            # whole frontmatter becomes a bare list
+            body = text.split("---", 2)[2]
+            text = "---\n" + breakage + "---" + body
+        else:
+            text = text.replace("---\n", "---\n" + breakage, 1)
+        task.file_path.write_bytes(text.encode("utf-8"))
+        before = task.file_path.read_bytes()
+
+        with pytest.raises(FrontmatterError):
+            change_task_state(
+                config, "test-proj", task.id, TaskState.DONE,
+                resolution="Go big.", force=True,
+            )
+        assert task.file_path.read_bytes() == before
+        assert task.file_path.exists()  # not moved to done/
+
+    def test_service_reports_structured_error(self, temp_portfolio):
+        from clawpm.services.tasks import transition
+
+        config = temp_portfolio["config"]
+        task, _parent = _make_form(config, "file", kind="build")
+        text = task.file_path.read_text(encoding="utf-8")
+        task.file_path.write_bytes(
+            text.replace("---\n", "---\nbroken: [unclosed\n", 1).encode("utf-8")
+        )
+        before = task.file_path.read_bytes()
+        result = transition(
+            config, project_id="test-proj", task_id=task.id, new_state="done",
+            resolution="x",
+        )
+        assert result["ok"] is False
+        assert result["error"] == "state_change_failed"
+        assert task.file_path.read_bytes() == before
+
+
+class TestCompletionIsAllOrNothing:
+    """Codex r3 P2 #2: a failure at ANY completion step leaves the task open,
+    the parent unchanged, and a retry converges with exactly one parent line."""
+
+    @pytest.mark.parametrize("form", ["file", "dir"])
+    @pytest.mark.parametrize("fail_at", ["move", "parent", "resolution"])
+    def test_failure_leaves_nothing_behind_and_retry_converges(
+        self, temp_portfolio, monkeypatch, form, fail_at
+    ):
+        import clawpm.tasks as tasks_mod
+
+        config = temp_portfolio["config"]
+        task, parent = _make_form(config, form, kind="decision")
+        task_before = task.file_path.read_bytes()
+        parent_before = parent.file_path.read_bytes()
+
+        with monkeypatch.context() as m:
+            if fail_at == "move":
+                def boom(*a, **k):
+                    raise FileExistsError("destination exists")
+                m.setattr(tasks_mod.shutil, "move", boom)
+                exc = FileExistsError
+            elif fail_at == "parent":
+                def boom(*a, **k):
+                    raise OSError("parent write failed")
+                m.setattr(tasks_mod, "_append_decision_to_parent", boom)
+                exc = OSError
+            else:
+                def boom(*a, **k):
+                    raise OSError("resolution write failed")
+                m.setattr(tasks_mod, "_write_resolution_frontmatter", boom)
+                exc = OSError
+            with pytest.raises(exc):
+                change_task_state(
+                    config, "test-proj", task.id, TaskState.DONE,
+                    resolution="Go big.", force=True,
+                )
+
+        still = get_task(config, "test-proj", task.id)
+        assert still.state == TaskState.OPEN
+        assert still.resolution is None
+        assert "resolved_at" not in task.file_path.read_text(encoding="utf-8")
+        assert task.file_path.read_bytes() == task_before
+        assert parent.file_path.read_bytes() == parent_before
+        assert f"({task.id}):" not in parent.file_path.read_text(encoding="utf-8")
+
+        # Immediate retry succeeds, exactly once.
+        done = change_task_state(
+            config, "test-proj", task.id, TaskState.DONE,
+            resolution="Go big.", force=True,
+        )
+        assert done is not None and done.state == TaskState.DONE
+        assert done.resolution == "Go big."
+        body = parent.file_path.read_text(encoding="utf-8")
+        assert body.count(f"({task.id}):") == 1
