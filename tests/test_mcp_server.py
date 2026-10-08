@@ -110,6 +110,52 @@ def test_tools_env_var_default(monkeypatch):
     assert len(_run(scenario)) == 10
 
 
+def test_toolspec_rejects_unknown_min_tier():
+    """CLAWP-106: a bad min_tier fails loudly at construction, not as a
+    KeyError deep inside specs_for_tier."""
+    with pytest.raises(ValueError, match="min_tier"):
+        M.ToolSpec("bad", "nonsense", lambda: {})  # type: ignore[arg-type]
+
+
+def test_specs_for_tier_with_bad_spec_fails_loud(monkeypatch):
+    """A spec smuggled past construction still raises a clear ValueError."""
+    spec = M.ToolSpec("ok", "core", lambda: {})
+    object.__setattr__(spec, "min_tier", "nonsense")
+    monkeypatch.setattr(M, "TOOL_SPECS", [spec])
+    with pytest.raises(ValueError, match="min_tier"):
+        M.specs_for_tier("core")
+
+
+def test_tasks_state_accepts_meta_reflect_and_process_lesson(isolated_portfolio):
+    """CLAWP-106: CLI-parity params reach the reflection event."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    pid = isolated_portfolio.project_id
+    root = isolated_portfolio.root
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+            added = await _call(client, "tasks_add", {"project": pid, "title": "t"})
+            tid = added["task"]["id"]
+            await _call(client, "tasks_state", {
+                "project": pid, "task_id": tid, "new_state": "progress"})
+            done = await _call(client, "tasks_state", {
+                "project": pid, "task_id": tid, "new_state": "done",
+                "meta_reflect": "should have anticipated X",
+                "process_lesson": "check Y earlier",
+            })
+            assert done["ok"] is True
+            return tid
+
+    tid = _run(scenario)
+    lines = (root / "reflections" / f"{tid}.jsonl").read_text(encoding="utf-8").splitlines()
+    record = json.loads(lines[-1])
+    assert record["meta_reflection"] == "should have anticipated X"
+    assert record["process_lesson"] == "check Y earlier"
+
+
 def test_all_current_tools_are_core():
     assert all(s.min_tier == "core" for s in M.TOOL_SPECS)
 
@@ -272,7 +318,10 @@ def test_wire_level_context_and_next(isolated_portfolio):
 
             ctx = await _call(client, "context", {"project": pid})
             assert ctx["ok"] is True
-            assert ctx["project"]["id"] == pid
+            # CLAWP-106: `project` is the plain id string (surface-consistent
+            # with every other tool); the metadata dict lives in `project_info`.
+            assert ctx["project"] == pid
+            assert ctx["project_info"]["id"] == pid
             assert "open_count" in ctx
             assert ctx["open_count"] == 1
 
