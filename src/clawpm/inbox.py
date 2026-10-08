@@ -96,8 +96,14 @@ def send_message(
     in_reply_to: str | None = None,
     project: str | None = None,
     task: str | None = None,
+    payload: dict | None = None,
 ) -> dict:
-    """Append a message event to the recipient's inbox. Returns the event dict."""
+    """Append a message event to the recipient's inbox. Returns the event dict.
+
+    ``payload`` (CLAWP-101) is an optional structured dict. It is additive: the
+    key is omitted entirely when ``None``, so plain-text events are byte-for-byte
+    what they were before and older readers ignore it.
+    """
     _ensure_inbox_dir(portfolio_root)
     inbox_path = _inbox_file(portfolio_root, to)
 
@@ -113,6 +119,8 @@ def send_message(
         "task": task,
         "message": message,
     }
+    if payload is not None:
+        event["payload"] = payload
     _append_event(inbox_path, event)
     return event
 
@@ -270,6 +278,247 @@ def get_thread(portfolio_root: Path, msg_id: str) -> list[dict]:
     # Secondary: msg_id (deterministic tie-break within the same second)
     thread.sort(key=lambda m: (m.get("ts", ""), m.get("msg_id", "")))
     return thread
+
+
+# ---------------------------------------------------------------------------
+# Structured task requests (CLAWP-101)
+#
+# Single-writer discipline: the sender (a1) only ever appends to the inbox,
+# which lives at the portfolio root, outside every project's git tree. The
+# RECIPIENT (a2) turns the request into a task through `add_task`, from its own
+# context. Nothing here gives a1 a path into `.project/tasks/`.
+# ---------------------------------------------------------------------------
+
+TASK_REQUEST = "task_request"
+TASK_REQUEST_RESULT = "task_request_result"
+TASK_REQUEST_REJECTED = "task_request_rejected"
+
+_COMPLEXITIES = ("s", "m", "l", "xl")
+_LIST_FIELDS = ("success_criteria", "scope", "depends", "tags")
+_STR_FIELDS = ("title", "description", "predict_duration", "predict_complexity",
+               "predict_approach", "pre_mortem")
+
+
+class TaskRequestError(ValueError):
+    """A task_request payload is malformed."""
+
+
+def build_task_request_payload(
+    *,
+    title: str | None,
+    priority: int | None = None,
+    complexity: str | None = None,
+    description: str | None = None,
+    depends: list[str] | tuple[str, ...] | None = None,
+    scope: list[str] | tuple[str, ...] | None = None,
+    tags: list[str] | tuple[str, ...] | None = None,
+    success_criteria: list[str] | tuple[str, ...] | None = None,
+    predict_duration: str | None = None,
+    predict_complexity: str | None = None,
+    predict_approach: str | None = None,
+    confidence: int | None = None,
+    pre_mortem: str | None = None,
+) -> dict:
+    """Build and validate a ``task_request`` payload. Omits unset fields."""
+    payload: dict = {
+        "type": TASK_REQUEST,
+        "title": title,
+        "priority": priority,
+        "complexity": complexity,
+        "description": description,
+        "depends": list(depends) if depends else None,
+        "scope": list(scope) if scope else None,
+        "tags": list(tags) if tags else None,
+        "success_criteria": list(success_criteria) if success_criteria else None,
+        "predict_duration": predict_duration,
+        "predict_complexity": predict_complexity,
+        "predict_approach": predict_approach,
+        "confidence": confidence,
+        "pre_mortem": pre_mortem,
+    }
+    payload = {k: v for k, v in payload.items() if v is not None}
+    _validate_task_request(payload)
+    return payload
+
+
+def _validate_task_request(payload: dict) -> None:
+    """Raise TaskRequestError if ``payload`` is not a usable task_request."""
+    title = payload.get("title")
+    if not isinstance(title, str) or not title.strip():
+        raise TaskRequestError("task_request needs a non-empty title")
+    for key in _STR_FIELDS:
+        v = payload.get(key)
+        if v is not None and not isinstance(v, str):
+            raise TaskRequestError(f"{key} must be a string")
+    for key in _LIST_FIELDS:
+        v = payload.get(key)
+        if v is not None and not (isinstance(v, list) and all(isinstance(i, str) for i in v)):
+            raise TaskRequestError(f"{key} must be a list of strings")
+    for key, lo, hi in (("priority", 1, 10), ("confidence", 1, 5)):
+        v = payload.get(key)
+        if v is not None and (isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi):
+            raise TaskRequestError(f"{key} must be an integer {lo}-{hi}")
+    for key in ("complexity", "predict_complexity"):
+        v = payload.get(key)
+        if v is not None and v not in _COMPLEXITIES:
+            raise TaskRequestError(f"{key} must be one of {'|'.join(_COMPLEXITIES)}")
+    if payload.get("predict_duration") is not None:
+        from .reflect import parse_duration
+
+        try:
+            parse_duration(payload["predict_duration"])
+        except Exception as exc:  # click.BadParameter et al.
+            raise TaskRequestError(f"bad predict_duration: {exc}") from exc
+
+
+def _has_result_reply(portfolio_root: Path, agent_id: str, msg_id: str) -> dict | None:
+    """Return a prior result reply from ``agent_id`` to ``msg_id`` (resume guard)."""
+    for f in _all_inbox_files(portfolio_root):
+        for ev in _read_events(f):
+            if (
+                ev.get("event") == "message"
+                and ev.get("in_reply_to") == msg_id
+                and ev.get("from") == agent_id
+                and (ev.get("payload") or {}).get("type") == TASK_REQUEST_RESULT
+            ):
+                return ev
+    return None
+
+
+def materialize_task_requests(
+    config,
+    agent_id: str,
+    default_project: str | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """Turn pending ``task_request`` messages for ``agent_id`` into real tasks.
+
+    Runs in the RECEIVER's context via ``add_task``. Per message:
+
+    - invalid payload  -> reply ``task_request_rejected`` + ack (permanent; retrying
+      cannot help) -> ``rejected``
+    - project unknown  -> left unacked, no reply -> ``failed`` (retryable)
+    - ok               -> ``add_task``, reply ``task_request_result`` (in_reply_to),
+      ack -> ``materialized``
+
+    Crash window: if the process dies after ``add_task`` but before the reply, a
+    re-run creates a duplicate task. Once the reply exists, a re-run only acks.
+
+    ``dry_run`` writes nothing at all (no tasks, replies or acks).
+    """
+    from .discovery import get_project
+    from .models import Predictions, SuccessCriterion, TaskComplexity
+    from .reflect import parse_duration
+    from .tasks import add_task
+
+    root = config.portfolio_root
+    result: dict = {
+        "agent": agent_id,
+        "dry_run": dry_run,
+        "materialized": [],
+        "would_create": [],
+        "rejected": [],
+        "failed": [],
+    }
+
+    for msg in read_inbox(root, agent_id, unacked_only=True):
+        payload = msg.get("payload")
+        if not isinstance(payload, dict) or payload.get("type") != TASK_REQUEST:
+            continue
+        msg_id = msg["msg_id"]
+        sender = msg.get("from") or "main"
+
+        try:
+            _validate_task_request(payload)
+        except TaskRequestError as exc:
+            result["rejected"].append({"msg_id": msg_id, "reason": str(exc)})
+            if not dry_run:
+                send_message(
+                    root, to=sender, from_agent=agent_id, in_reply_to=msg_id,
+                    project=msg.get("project"),
+                    message=f"task_request {msg_id} rejected: {exc}",
+                    payload={"type": TASK_REQUEST_REJECTED, "reason": str(exc)},
+                )
+                ack_messages(root, [msg_id], acked_by=agent_id)
+            continue
+
+        project_id = msg.get("project") or payload.get("project") or default_project
+        if not project_id or get_project(config, project_id) is None:
+            result["failed"].append({
+                "msg_id": msg_id,
+                "reason": f"project not resolvable: {project_id!r}",
+            })
+            continue
+
+        if dry_run:
+            result["would_create"].append({
+                "msg_id": msg_id, "project": project_id, "title": payload["title"],
+                "from": sender,
+            })
+            continue
+
+        prior = _has_result_reply(root, agent_id, msg_id)
+        if prior is not None:
+            ack_messages(root, [msg_id], acked_by=agent_id)
+            result["materialized"].append({
+                "msg_id": msg_id, "project": project_id,
+                "task_id": (prior.get("payload") or {}).get("task_id"),
+                "resumed": True,
+            })
+            continue
+
+        has_pred = any(payload.get(k) is not None for k in (
+            "predict_duration", "predict_complexity", "predict_approach",
+            "confidence", "pre_mortem", "success_criteria"))
+        predictions = None
+        if has_pred:
+            predictions = Predictions(
+                duration_min=parse_duration(payload.get("predict_duration")),
+                complexity=(TaskComplexity(payload["predict_complexity"])
+                            if payload.get("predict_complexity") else None),
+                success_criteria=[SuccessCriterion.from_cli(s)
+                                  for s in payload.get("success_criteria") or []],
+                approach=payload.get("predict_approach"),
+                confidence=payload.get("confidence"),
+                pre_mortem=payload.get("pre_mortem"),
+                filled_by="agent",
+            )
+
+        try:
+            task = add_task(
+                config,
+                project_id,
+                payload["title"].strip(),
+                priority=payload.get("priority") or 5,
+                complexity=(TaskComplexity(payload["complexity"])
+                            if payload.get("complexity") else None),
+                depends=payload.get("depends") or None,
+                scope=payload.get("scope") or None,
+                tags=payload.get("tags") or None,
+                description=payload.get("description") or "",
+                predictions=predictions,
+            )
+        except ValueError as exc:
+            task, err = None, str(exc)
+        else:
+            err = f"could not create task in project {project_id!r}"
+        if not task:
+            result["failed"].append({"msg_id": msg_id, "reason": err})
+            continue
+
+        send_message(
+            root, to=sender, from_agent=agent_id, in_reply_to=msg_id,
+            project=project_id, task=task.id,
+            message=f"task_request {msg_id} materialized as {task.id} in {project_id}",
+            payload={"type": TASK_REQUEST_RESULT, "task_id": task.id, "project": project_id},
+        )
+        ack_messages(root, [msg_id], acked_by=agent_id)
+        result["materialized"].append({
+            "msg_id": msg_id, "project": project_id, "task_id": task.id,
+            "title": task.title,
+        })
+
+    return result
 
 
 # ---------------------------------------------------------------------------
