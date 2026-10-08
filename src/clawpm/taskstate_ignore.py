@@ -66,6 +66,19 @@ def _degraded(project_dir: Path, verb: str, result: subprocess.CompletedProcess)
     )
 
 
+def _degraded_prefix(project_dir: Path, what: str, exc: BaseException) -> None:
+    """WARNING marker: the probe prefix is a fallback, not the allocator's answer.
+
+    A wrong probe prefix can let a filename allowlist (``!...CODE-???.md``)
+    accept the probe and so mask a real blanket-ignore finding.
+    """
+    logger.warning(
+        "clawpm: %s for %s (%r); the git-ignored task-state check is degraded "
+        "(probing a fallback task prefix)",
+        what, project_dir, exc,
+    )
+
+
 def _check_ignore_source(project_dir: Path, rel_path: str) -> str | None:
     """Return ``<source>:<line>:<pattern>`` if git ignores *rel_path*, else None.
 
@@ -113,8 +126,11 @@ def _task_shape(project_dir: Path, folder: Path) -> tuple[str, int]:
 
         settings = ProjectSettings.load(project_dir / ".project" / "settings.toml")
         prefix = _allocator_prefix(project_dir, settings)
-    except Exception as exc:
-        logger.debug("could not derive a task prefix for %s: %r", project_dir, exc)
+    except FileNotFoundError as exc:  # no settings.toml: not an initialised project
+        logger.debug("no settings to derive a task prefix from in %s: %r", project_dir, exc)
+        prefix = "TASK"
+    except Exception as exc:  # unreadable or malformed settings, or a failed own-project scan
+        _degraded_prefix(project_dir, "could not derive a task prefix", exc)
         prefix = "TASK"
     return prefix, _DEFAULT_WIDTH
 
@@ -124,9 +140,10 @@ def _allocator_prefix(project_dir: Path, settings) -> str:
 
     A prefix collision with a sibling (``CODE`` taken -> ``CODE-B``) means the
     naive ``id[:5]`` placeholder is not what real tasks will carry, so ask the
-    allocator itself. Without a loadable portfolio, or when the allocator
-    refuses (candidates exhausted), fall back to the project's current or
-    naive prefix.
+    allocator itself. Without a portfolio config, use the project's current or
+    naive prefix quietly. When the allocator raises (malformed portfolio,
+    failed sibling scan, candidates exhausted) keep that fallback but log a
+    WARNING, since the fallback may differ from the real prefix.
     """
     from .discovery import load_portfolio_config
     from .tasks import _naive_prefix_placeholder, assign_task_prefix, resolve_existing_prefix
@@ -141,7 +158,11 @@ def _allocator_prefix(project_dir: Path, settings) -> str:
                 explicit_prefix=getattr(settings, "task_prefix", None),
             )
     except Exception as exc:
-        logger.debug("allocator could not resolve a prefix for %s: %r", project_dir, exc)
+        # Absence is not an exception here (no portfolio.toml yields defaults
+        # and an unregistered project is minted like any other), so anything
+        # raised -- malformed portfolio, failed sibling scan, exhausted
+        # candidates -- is a real degradation.
+        _degraded_prefix(project_dir, "allocator could not resolve a task prefix", exc)
     return resolve_existing_prefix(settings) or _naive_prefix_placeholder(settings.id)
 
 

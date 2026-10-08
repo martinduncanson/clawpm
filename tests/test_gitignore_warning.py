@@ -430,3 +430,152 @@ def test_not_a_git_repo_stays_quiet_at_warning_level(tmp_path, caplog):
         assert ti.find_ignored_task_state(plain) is None
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("ls-files" in r.getMessage() for r in caplog.records)  # still debug-logged
+
+
+# --- CLAWP-135 r2: allocator/settings failures announce the fallback prefix ----
+
+
+def _settings_ns(project_id="code-beta"):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(id=project_id, task_prefix=None, project_dir=None)
+
+
+def _ti_warnings(caplog):
+    return [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and r.name == "clawpm.taskstate_ignore"
+    ]
+
+
+def _scan_error():
+    from clawpm.tasks import PortfolioPrefixScanError
+
+    return PortfolioPrefixScanError("code-alpha", OSError("locked"))
+
+
+_ALLOCATOR_FAILURES = [
+    pytest.param("load", RuntimeError("portfolio.toml malformed"), id="portfolio-load"),
+    pytest.param("scan", _scan_error(), id="sibling-scan"),
+    pytest.param("scan", ValueError("every candidate claimed"), id="candidates-exhausted"),
+]
+
+
+def _break_allocator(monkeypatch, where, exc):
+    import clawpm.discovery
+    import clawpm.tasks
+
+    def boom(*a, **kw):
+        raise exc
+
+    if where == "load":
+        monkeypatch.setattr(clawpm.discovery, "load_portfolio_config", boom)
+    else:
+        monkeypatch.setattr(clawpm.tasks, "assign_all_prefixes", boom)
+
+
+@pytest.mark.parametrize("where,exc", _ALLOCATOR_FAILURES)
+def test_allocator_failure_warns_and_keeps_naive_fallback(
+    tmp_path, monkeypatch, caplog, where, exc
+):
+    from clawpm import taskstate_ignore as ti
+
+    _portfolio(tmp_path, monkeypatch, tmp_path)
+    _break_allocator(monkeypatch, where, exc)
+    with caplog.at_level("DEBUG", logger="clawpm.taskstate_ignore"):
+        assert ti._allocator_prefix(tmp_path / "code-beta", _settings_ns()) == "CODE"
+    msgs = _ti_warnings(caplog)
+    assert len(msgs) == 1
+    assert "clawpm:" in msgs[0].getMessage()
+    assert "degraded" in msgs[0].getMessage()
+
+
+def test_allocator_failure_announced_when_it_masks_the_ignore_finding(
+    tmp_path, monkeypatch, caplog
+):
+    # The reviewer's repro: with the allocator unreachable the probe falls back
+    # to CODE, a CODE-??? allowlist accepts it, and the finding (which the
+    # allocator-resolved CODE-B would have raised) disappears. Announce it.
+    sib = tmp_path / "code-alpha"
+    (sib / ".project").mkdir(parents=True)
+    (sib / ".project" / "settings.toml").write_text(
+        'id = "code-alpha"\nname = "A"\nstatus = "active"\npriority = 3\n'
+        f'repo_path = "{sib.as_posix()}"\ntask_prefix = "CODE"\n',
+        encoding="utf-8",
+    )
+    repo = tmp_path / "code-beta"
+    repo.mkdir()
+    _git_init(repo)
+    (repo / ".gitignore").write_text(
+        ".project/tasks/*\n!.project/tasks/CODE-???.md\n", encoding="utf-8"
+    )
+    _portfolio(tmp_path, monkeypatch, tmp_path)
+    _break_allocator(monkeypatch, "scan", _scan_error())
+    with caplog.at_level("DEBUG", logger="clawpm.taskstate_ignore"):
+        _init_stderr(tmp_path, repo, "code-beta")
+    assert _ti_warnings(caplog)
+
+
+def test_allocator_without_portfolio_or_registration_stays_quiet(tmp_path, monkeypatch, caplog):
+    # Expected absence: no loadable portfolio, or a project the portfolio has
+    # never heard of. Neither is a degraded check; no warning on every run.
+    import clawpm.discovery
+    from clawpm import taskstate_ignore as ti
+
+    monkeypatch.setattr(clawpm.discovery, "load_portfolio_config", lambda *a, **kw: None)
+    with caplog.at_level("DEBUG", logger="clawpm.taskstate_ignore"):
+        assert ti._allocator_prefix(tmp_path / "p", _settings_ns()) == "CODE"
+    assert not _ti_warnings(caplog)
+
+    monkeypatch.undo()
+    _portfolio(tmp_path, monkeypatch, tmp_path)
+    caplog.clear()
+    with caplog.at_level("DEBUG", logger="clawpm.taskstate_ignore"):
+        assert ti._allocator_prefix(tmp_path / "p", _settings_ns("unregistered")) == "UNREG"
+    assert not _ti_warnings(caplog)
+
+
+def test_task_shape_malformed_settings_warns_and_falls_back_to_task(tmp_path, caplog):
+    from clawpm import taskstate_ignore as ti
+
+    proj = tmp_path / "p"
+    (proj / ".project" / "tasks").mkdir(parents=True)
+    (proj / ".project" / "settings.toml").write_text("not = [valid toml\n", encoding="utf-8")
+    with caplog.at_level("DEBUG", logger="clawpm.taskstate_ignore"):
+        assert ti._task_shape(proj, proj / ".project" / "tasks") == ("TASK", 3)
+    msgs = _ti_warnings(caplog)
+    assert len(msgs) == 1
+    assert "clawpm:" in msgs[0].getMessage()
+
+
+def test_task_shape_allocator_oserror_warns_and_falls_back_to_task(
+    tmp_path, monkeypatch, caplog
+):
+    # Even the fallback inside _allocator_prefix can raise (own-project scan).
+    import clawpm.tasks
+    from clawpm import taskstate_ignore as ti
+
+    proj = tmp_path / "p"
+    _make_project(proj)
+    (proj / ".project" / "tasks" / "GI-001.md").unlink()
+    _portfolio(tmp_path, monkeypatch, tmp_path)
+    _break_allocator(monkeypatch, "scan", _scan_error())
+
+    def boom(settings):
+        raise OSError("cannot scan own tasks")
+
+    monkeypatch.setattr(clawpm.tasks, "resolve_existing_prefix", boom)
+    with caplog.at_level("DEBUG", logger="clawpm.taskstate_ignore"):
+        assert ti._task_shape(proj, proj / ".project" / "tasks") == ("TASK", 3)
+    assert _ti_warnings(caplog)
+
+
+def test_task_shape_missing_settings_stays_quiet(tmp_path, caplog):
+    # No settings.toml is an unregistered/uninitialised dir, not a failure.
+    from clawpm import taskstate_ignore as ti
+
+    proj = tmp_path / "p"
+    (proj / ".project" / "tasks").mkdir(parents=True)
+    with caplog.at_level("DEBUG", logger="clawpm.taskstate_ignore"):
+        assert ti._task_shape(proj, proj / ".project" / "tasks") == ("TASK", 3)
+    assert not _ti_warnings(caplog)
