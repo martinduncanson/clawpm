@@ -8,6 +8,7 @@ predictions:
   duration_min: 180
   filled_by: agent
 priority: 5
+updated: '2026-10-08'
 ---
 # loop: bounded recurring task execution command
 
