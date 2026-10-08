@@ -8,6 +8,7 @@ Events are never rewritten or deleted — acks are events too.
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import warnings
 from datetime import datetime, timezone
@@ -24,9 +25,25 @@ def _inbox_dir(portfolio_root: Path) -> Path:
     return portfolio_root / "inbox"
 
 
+# An agent id becomes a filename (`<inbox>/<id>.jsonl`) and ids arrive from other
+# agents (message `from`, `to`). Anything carrying a path separator, a drive or
+# stream colon, a `..` segment or a trailing dot is refused so no caller can
+# steer a write outside the inbox directory.
+_AGENT_ID_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._@-]{0,62}[A-Za-z0-9_@-])?$")
+
+
+def validate_agent_id(agent_id: object) -> str:
+    """Return ``agent_id`` if it is a safe inbox filename stem, else raise ValueError."""
+    if not isinstance(agent_id, str) or not _AGENT_ID_RE.match(agent_id):
+        raise ValueError(
+            f"invalid agent id {agent_id!r}: use 1-64 letters, digits or . _ @ -"
+        )
+    return agent_id
+
+
 def _inbox_file(portfolio_root: Path, agent_id: str) -> Path:
-    """Return the JSONL path for an agent's inbox."""
-    return _inbox_dir(portfolio_root) / f"{agent_id}.jsonl"
+    """Return the JSONL path for an agent's inbox (validated: stays inside the inbox dir)."""
+    return _inbox_dir(portfolio_root) / f"{validate_agent_id(agent_id)}.jsonl"
 
 
 def _ensure_inbox_dir(portfolio_root: Path) -> Path:
@@ -77,9 +94,13 @@ def _read_events(path: Path) -> list[dict]:
             if not line:
                 continue
             try:
-                events.append(json.loads(line))
+                ev = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            # Valid JSON that is not an object (`[1]`, `"x"`, `42`) would crash
+            # every `ev.get(...)` caller; treat it like any other malformed line.
+            if isinstance(ev, dict):
+                events.append(ev)
     return events
 
 
@@ -104,8 +125,9 @@ def send_message(
     key is omitted entirely when ``None``, so plain-text events are byte-for-byte
     what they were before and older readers ignore it.
     """
-    _ensure_inbox_dir(portfolio_root)
+    validate_agent_id(from_agent)
     inbox_path = _inbox_file(portfolio_root, to)
+    _ensure_inbox_dir(portfolio_root)
 
     ts = _now_iso()
     event: dict = {
@@ -158,13 +180,13 @@ def read_inbox(
         elif ev.get("event") == "ack":
             if ev.get("acked_by") == agent_id:
                 ref = ev.get("msg_id_ref")
-                if ref:
+                if isinstance(ref, str) and ref:
                     acked_ids.add(ref)
 
     # Apply filters
     result: list[dict] = []
     for msg in messages:
-        if unacked_only and msg.get("msg_id") in acked_ids:
+        if unacked_only and isinstance(msg.get("msg_id"), str) and msg["msg_id"] in acked_ids:
             continue
         if since is not None and not _ts_at_or_after(msg.get("ts", ""), since):
             continue
@@ -194,7 +216,7 @@ def ack_messages(
     for inbox_file in _all_inbox_files(portfolio_root):
         for ev in _read_events(inbox_file):
             mid = ev.get("msg_id")
-            if mid:
+            if isinstance(mid, str) and mid:
                 known_ids.add(mid)
 
     ts = _now_iso()
@@ -239,12 +261,12 @@ def get_thread(portfolio_root: Path, msg_id: str) -> list[dict]:
     unique_messages: list[dict] = []
     for msg in all_messages:
         mid = msg.get("msg_id", "")
-        if mid and mid not in seen:
+        if isinstance(mid, str) and mid and mid not in seen:
             seen.add(mid)
             unique_messages.append(msg)
 
     # Index by msg_id for fast lookup
-    by_id: dict[str, dict] = {m["msg_id"]: m for m in unique_messages if "msg_id" in m}
+    by_id: dict[str, dict] = {m["msg_id"]: m for m in unique_messages}
 
     if msg_id not in by_id:
         return []
@@ -254,7 +276,7 @@ def get_thread(portfolio_root: Path, msg_id: str) -> list[dict]:
     cursor = msg_id
     while True:
         parent_id = by_id.get(cursor, {}).get("in_reply_to")
-        if not parent_id or parent_id in thread_ids:
+        if not isinstance(parent_id, str) or not parent_id or parent_id in thread_ids:
             break
         thread_ids.add(parent_id)
         cursor = parent_id
@@ -268,7 +290,7 @@ def get_thread(portfolio_root: Path, msg_id: str) -> list[dict]:
             mid = msg.get("msg_id", "")
             if mid in thread_ids:
                 continue
-            if msg.get("in_reply_to") in frontier:
+            if isinstance(msg.get("in_reply_to"), str) and msg["in_reply_to"] in frontier:
                 thread_ids.add(mid)
                 next_frontier.add(mid)
         frontier = next_frontier
@@ -341,11 +363,38 @@ def build_task_request_payload(
     return payload
 
 
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_MAX_TITLE = 300
+_MAX_ITEM = 500
+_CTRL_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")  # tab allowed, newlines/NUL/ESC not
+_DRIVE_RE = re.compile(r"^[A-Za-z]:")
+
+
+def _is_safe_id(value: object) -> bool:
+    return isinstance(value, str) and bool(_SAFE_ID_RE.match(value))
+
+
+def _safe_scope_entry(entry: str) -> bool:
+    """A claimed file glob must be relative and stay inside the repo."""
+    if not entry or _CTRL_RE.search(entry) or len(entry) > _MAX_ITEM:
+        return False
+    if entry.startswith(("/", "\\", "~")) or _DRIVE_RE.match(entry):
+        return False
+    return ".." not in re.split(r"[\\/]", entry)
+
+
 def _validate_task_request(payload: dict) -> None:
-    """Raise TaskRequestError if ``payload`` is not a usable task_request."""
+    """Raise TaskRequestError if ``payload`` is not a usable task_request.
+
+    Every field is untrusted (it comes from another agent), so this also covers
+    what would later reach a path, a heading or the criteria parser.
+    """
     title = payload.get("title")
     if not isinstance(title, str) or not title.strip():
         raise TaskRequestError("task_request needs a non-empty title")
+    if len(title) > _MAX_TITLE or _CTRL_RE.search(title):
+        raise TaskRequestError(
+            f"title must be a single line of at most {_MAX_TITLE} characters")
     for key in _STR_FIELDS:
         v = payload.get(key)
         if v is not None and not isinstance(v, str):
@@ -369,6 +418,23 @@ def _validate_task_request(payload: dict) -> None:
             parse_duration(payload["predict_duration"])
         except Exception as exc:  # click.BadParameter et al.
             raise TaskRequestError(f"bad predict_duration: {exc}") from exc
+    for dep in payload.get("depends") or []:
+        if not _is_safe_id(dep):
+            raise TaskRequestError(f"depends entry is not a task id: {dep!r}")
+    for entry in payload.get("scope") or []:
+        if not _safe_scope_entry(entry):
+            raise TaskRequestError(f"scope entry must be a relative path inside the repo: {entry!r}")
+    for tag in payload.get("tags") or []:
+        if not tag.strip() or len(tag) > 64 or _CTRL_RE.search(tag):
+            raise TaskRequestError(f"bad tag: {tag!r}")
+    if payload.get("success_criteria"):
+        from .models import SuccessCriterion
+
+        for crit in payload["success_criteria"]:
+            try:
+                SuccessCriterion.from_cli(crit)
+            except Exception as exc:
+                raise TaskRequestError(f"bad success_criteria entry {crit!r}: {exc}") from exc
 
 
 def _has_result_reply(portfolio_root: Path, agent_id: str, msg_id: str) -> dict | None:
@@ -379,7 +445,8 @@ def _has_result_reply(portfolio_root: Path, agent_id: str, msg_id: str) -> dict 
                 ev.get("event") == "message"
                 and ev.get("in_reply_to") == msg_id
                 and ev.get("from") == agent_id
-                and (ev.get("payload") or {}).get("type") == TASK_REQUEST_RESULT
+                and isinstance(ev.get("payload"), dict)
+                and ev["payload"].get("type") == TASK_REQUEST_RESULT
             ):
                 return ev
     return None
@@ -393,24 +460,34 @@ def materialize_task_requests(
 ) -> dict:
     """Turn pending ``task_request`` messages for ``agent_id`` into real tasks.
 
-    Runs in the RECEIVER's context via ``add_task``. Per message:
+    Runs in the RECEIVER's context via ``add_task``. Every field of a request is
+    untrusted. Per message:
 
-    - invalid payload  -> reply ``task_request_rejected`` + ack (permanent; retrying
-      cannot help) -> ``rejected``
-    - project unknown  -> left unacked, no reply -> ``failed`` (retryable)
-    - ok               -> ``add_task``, reply ``task_request_result`` (in_reply_to),
-      ack -> ``materialized``
+    - invalid payload, or malformed sender / project / msg id -> reply
+      ``task_request_rejected`` (when the sender is a usable inbox id) + ack
+      (permanent; retrying cannot help) -> ``rejected``
+    - project well-formed but not registered -> left unacked, no reply ->
+      ``failed`` (retryable)
+    - ok -> ``add_task`` (stamping ``source_request: <msg_id>`` in the task's own
+      frontmatter), reply ``task_request_result`` (in_reply_to), ack ->
+      ``materialized``
+    - anything unexpected -> ``failed`` for that message only; later requests
+      still run.
 
     Crash window: if the process dies after ``add_task`` but before the reply, a
-    re-run creates a duplicate task. Once the reply exists, a re-run only acks.
+    re-run finds the task by its ``source_request`` key and only replies + acks
+    (``resumed``) instead of creating a duplicate. Once the reply exists, a
+    re-run only acks. The lookup is not locked against a CONCURRENT second
+    materializer for the same agent; the drain is single-writer by design.
 
     ``dry_run`` writes nothing at all (no tasks, replies or acks).
     """
-    from .discovery import get_project
+    from .discovery import discover_projects
     from .models import Predictions, SuccessCriterion, TaskComplexity
     from .reflect import parse_duration
-    from .tasks import add_task
+    from .tasks import add_task, find_task_by_source_request
 
+    validate_agent_id(agent_id)
     root = config.portfolio_root
     result: dict = {
         "agent": agent_id,
@@ -420,42 +497,76 @@ def materialize_task_requests(
         "rejected": [],
         "failed": [],
     }
+    registered = {p.id for p in discover_projects(config)}
 
-    for msg in read_inbox(root, agent_id, unacked_only=True):
-        payload = msg.get("payload")
-        if not isinstance(payload, dict) or payload.get("type") != TASK_REQUEST:
-            continue
-        msg_id = msg["msg_id"]
-        sender = msg.get("from") or "main"
+    def reject(msg_id, sender, project, reason: str) -> None:
+        """Loud, permanent refusal: record, reply when possible, ack when possible."""
+        result["rejected"].append({"msg_id": msg_id, "reason": reason})
+        if dry_run or not isinstance(msg_id, str) or not msg_id:
+            return
+        if sender is not None:
+            send_message(
+                root, to=sender, from_agent=agent_id, in_reply_to=msg_id,
+                project=project if _is_safe_id(project) else None,
+                message=f"task_request {msg_id} rejected: {reason}",
+                payload={"type": TASK_REQUEST_REJECTED, "reason": reason},
+            )
+        ack_messages(root, [msg_id], acked_by=agent_id)
+
+    def reply_and_ack(msg_id, sender, project_id, task_id) -> None:
+        send_message(
+            root, to=sender, from_agent=agent_id, in_reply_to=msg_id,
+            project=project_id, task=task_id,
+            message=f"task_request {msg_id} materialized as {task_id} in {project_id}",
+            payload={"type": TASK_REQUEST_RESULT, "task_id": task_id, "project": project_id},
+        )
+        ack_messages(root, [msg_id], acked_by=agent_id)
+
+    def handle(msg: dict, payload: dict) -> None:
+        msg_id = msg.get("msg_id")
+        if not _is_safe_id(msg_id):
+            # Nothing trustworthy to reply to or reference; report and move on.
+            reject(msg_id if isinstance(msg_id, str) else None, None, None,
+                   f"malformed msg_id {msg_id!r}")
+            return
+
+        raw_sender = msg.get("from") or "main"
+        try:
+            sender = validate_agent_id(raw_sender)
+        except ValueError:
+            # No safe inbox to reply to: refuse + ack (so it cannot wedge the drain).
+            reject(msg_id, None, None, f"malformed sender {raw_sender!r}")
+            return
 
         try:
             _validate_task_request(payload)
         except TaskRequestError as exc:
-            result["rejected"].append({"msg_id": msg_id, "reason": str(exc)})
-            if not dry_run:
-                send_message(
-                    root, to=sender, from_agent=agent_id, in_reply_to=msg_id,
-                    project=msg.get("project"),
-                    message=f"task_request {msg_id} rejected: {exc}",
-                    payload={"type": TASK_REQUEST_REJECTED, "reason": str(exc)},
-                )
-                ack_messages(root, [msg_id], acked_by=agent_id)
-            continue
+            reject(msg_id, sender, msg.get("project"), str(exc))
+            return
 
-        project_id = msg.get("project") or payload.get("project") or default_project
-        if not project_id or get_project(config, project_id) is None:
+        # Project: from the (untrusted) message/payload it must be a well-formed
+        # registry id; the operator-supplied default is only ever retryable.
+        claimed = msg.get("project") or payload.get("project")
+        if claimed:
+            if not _is_safe_id(claimed):
+                reject(msg_id, sender, None, f"malformed project {claimed!r}")
+                return
+            project_id = claimed
+        else:
+            project_id = default_project
+        if not _is_safe_id(project_id) or project_id not in registered:
             result["failed"].append({
                 "msg_id": msg_id,
                 "reason": f"project not resolvable: {project_id!r}",
             })
-            continue
+            return
 
         if dry_run:
             result["would_create"].append({
                 "msg_id": msg_id, "project": project_id, "title": payload["title"],
                 "from": sender,
             })
-            continue
+            return
 
         prior = _has_result_reply(root, agent_id, msg_id)
         if prior is not None:
@@ -465,7 +576,18 @@ def materialize_task_requests(
                 "task_id": (prior.get("payload") or {}).get("task_id"),
                 "resumed": True,
             })
-            continue
+            return
+
+        # Crash window guard: a task already stamped with this request id means a
+        # previous run created it but died before replying.
+        existing = find_task_by_source_request(config, project_id, msg_id)
+        if existing is not None:
+            reply_and_ack(msg_id, sender, project_id, existing.id)
+            result["materialized"].append({
+                "msg_id": msg_id, "project": project_id, "task_id": existing.id,
+                "title": existing.title, "resumed": True,
+            })
+            return
 
         has_pred = any(payload.get(k) is not None for k in (
             "predict_duration", "predict_complexity", "predict_approach",
@@ -497,6 +619,7 @@ def materialize_task_requests(
                 tags=payload.get("tags") or None,
                 description=payload.get("description") or "",
                 predictions=predictions,
+                source_request=msg_id,
             )
         except ValueError as exc:
             task, err = None, str(exc)
@@ -504,19 +627,26 @@ def materialize_task_requests(
             err = f"could not create task in project {project_id!r}"
         if not task:
             result["failed"].append({"msg_id": msg_id, "reason": err})
-            continue
+            return
 
-        send_message(
-            root, to=sender, from_agent=agent_id, in_reply_to=msg_id,
-            project=project_id, task=task.id,
-            message=f"task_request {msg_id} materialized as {task.id} in {project_id}",
-            payload={"type": TASK_REQUEST_RESULT, "task_id": task.id, "project": project_id},
-        )
-        ack_messages(root, [msg_id], acked_by=agent_id)
+        reply_and_ack(msg_id, sender, project_id, task.id)
         result["materialized"].append({
             "msg_id": msg_id, "project": project_id, "task_id": task.id,
             "title": task.title,
         })
+
+    for msg in read_inbox(root, agent_id, unacked_only=True):
+        payload = msg.get("payload")
+        if not isinstance(payload, dict) or payload.get("type") != TASK_REQUEST:
+            continue
+        try:
+            handle(msg, payload)
+        except Exception as exc:  # one bad request must never block the rest
+            mid = msg.get("msg_id")
+            result["failed"].append({
+                "msg_id": mid if isinstance(mid, str) else None,
+                "reason": f"{type(exc).__name__}: {exc}",
+            })
 
     return result
 

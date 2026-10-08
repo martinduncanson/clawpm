@@ -2500,8 +2500,15 @@ def add_task(
     out_of_scope: list[str] | None = None,
     stop_conditions: list[str] | None = None,
     delegability: str | None = None,
+    source_request: str | None = None,
 ) -> Task | None:
-    """Add a new task to a project."""
+    """Add a new task to a project.
+
+    ``source_request`` (CLAWP-101) is an idempotency key — the inbox message id a
+    task was materialized from — written into the frontmatter in the same atomic
+    write as the task, so a retry can find the task instead of creating a second
+    one. Omitted from the file when ``None``.
+    """
     tasks_dir = get_tasks_dir(config, project_id)
     if not tasks_dir:
         # Registry lookup succeeded but tasks/ doesn't exist yet - or registry
@@ -2677,6 +2684,8 @@ def add_task(
             frontmatter["stop_conditions"] = stop_conditions
         if delegability and delegability != "either":
             frontmatter["delegability"] = delegability
+        if source_request:
+            frontmatter["source_request"] = source_request
 
         if predictions and not predictions.is_empty():
             pred_dict = predictions.to_dict()
@@ -2736,6 +2745,34 @@ def add_task(
         # written under this lock, so the read can't race another clawpm writer;
         # retry_transient covers a scanner touching the fresh file (CLAWP-051).
         return retry_transient(Task.from_file, file_path)
+
+
+def find_task_by_source_request(
+    config: PortfolioConfig, project_id: str, source_request: str
+) -> Task | None:
+    """Return the task whose frontmatter ``source_request`` equals the key, in any state.
+
+    CLAWP-101 retry guard for ``inbox materialize``. Scans every task file under
+    the project's tasks dir (open, progress, done, blocked, rejected); a cheap
+    substring pre-check avoids parsing files that cannot match.
+    """
+    tasks_dir = get_tasks_dir(config, project_id)
+    if not tasks_dir or not tasks_dir.exists():
+        return None
+    for path in sorted(tasks_dir.rglob("*.md")):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if source_request not in text:
+            continue
+        try:
+            fm, _ = split_frontmatter(text, where=str(path))
+        except FrontmatterError:
+            continue
+        if fm.get("source_request") == source_request:
+            return Task.from_file(path)
+    return None
 
 
 def edit_task(

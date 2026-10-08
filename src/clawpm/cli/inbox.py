@@ -6,12 +6,22 @@ import click
 
 from clawpm.models import Task
 from clawpm.output import output_error, output_json
-from clawpm.inbox import TaskRequestError, build_task_request_payload, materialize_task_requests, ack_messages as _inbox_ack, get_thread as _inbox_thread, read_inbox as _inbox_read, send_message as _inbox_send
+from clawpm.inbox import TaskRequestError, validate_agent_id, build_task_request_payload, materialize_task_requests, ack_messages as _inbox_ack, get_thread as _inbox_thread, read_inbox as _inbox_read, send_message as _inbox_send
 from clawpm.cli.base import main, get_format, require_portfolio, require_project
 
 # ============================================================================
 # Inbox commands
 # ============================================================================
+
+
+def _require_agent_ids(fmt, *agent_ids: str) -> None:
+    """Exit 1 with a clean error if any agent id is not a safe inbox filename."""
+    for agent_id in agent_ids:
+        try:
+            validate_agent_id(agent_id)
+        except ValueError as exc:
+            output_error("bad_agent_id", str(exc), fmt=fmt)
+            sys.exit(1)
 
 
 @main.group("inbox")
@@ -76,6 +86,7 @@ def inbox_send(
     """
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
+    _require_agent_ids(fmt, to_agent, from_agent)
 
     payload = None
     if task_request:
@@ -129,6 +140,7 @@ def inbox_read(
     """Read messages from an agent's inbox."""
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
+    _require_agent_ids(fmt, agent_id)
 
     unacked_only = filter_mode == "unacked"
     messages = _inbox_read(
@@ -149,6 +161,7 @@ def inbox_ack(ctx: click.Context, msg_ids: tuple[str, ...], acked_by: str) -> No
     """Acknowledge one or more messages (marks them as read)."""
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
+    _require_agent_ids(fmt, acked_by)
 
     result = _inbox_ack(
         portfolio_root=config.portfolio_root,
@@ -181,7 +194,9 @@ def inbox_materialize(ctx: click.Context, agent_id: str, project_id: str | None,
     Creates each task via the normal add path in THIS agent's context, replies to
     the sender (in_reply_to) with the new task id, and acks the request.
     """
+    fmt = get_format(ctx)
     config = require_portfolio(ctx)
+    _require_agent_ids(fmt, agent_id)
     default_project, _ = require_project(ctx, project_id, required=False, auto_init=False)
     result = materialize_task_requests(config, agent_id, default_project=default_project, dry_run=dry_run)
     output_json(result)
