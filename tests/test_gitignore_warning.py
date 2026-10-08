@@ -9,6 +9,7 @@ file:line and the fix. Ignoring only the lock file is correct and silent;
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -338,3 +339,94 @@ def test_probe_uses_next_width_when_every_number_is_taken(tmp_path):
     rel = ti._probe_path(proj, "", tasks)
     assert rel == ".project/tasks/GI-9999.md"
     assert not (proj / rel).exists()
+
+
+# --- CLAWP-135 r1: a failed git read is a loud degraded path, not silence ----
+
+_REAL_RUN = subprocess.run
+
+
+def _fail_git(monkeypatch, verb, *, exc=None, rc=128, stderr="fatal: boom"):
+    """Make ``git <verb>`` fail inside taskstate_ignore; everything else is real."""
+    from clawpm import taskstate_ignore as ti
+
+    def fake(cmd, *a, **kw):
+        if verb in cmd:
+            if exc is not None:
+                raise exc
+            return subprocess.CompletedProcess(cmd, rc, stdout="", stderr=stderr)
+        return _REAL_RUN(cmd, *a, **kw)
+
+    monkeypatch.setattr(ti.subprocess, "run", fake)
+
+
+def _warnings(caplog, needle):
+    return [
+        r for r in caplog.records
+        if r.levelname == "WARNING" and r.name == "clawpm.taskstate_ignore"
+        and needle in r.getMessage()
+    ]
+
+
+_FAILURES = [
+    pytest.param(dict(exc=OSError("no git")), id="oserror"),
+    pytest.param(dict(exc=subprocess.TimeoutExpired("git", 5)), id="timeout"),
+    pytest.param(dict(rc=128, stderr="fatal: index file corrupt"), id="nonzero-exit"),
+]
+
+
+@pytest.mark.parametrize("failure", _FAILURES)
+def test_failed_ls_files_warns(tmp_path, monkeypatch, caplog, repo, failure):
+    from clawpm import taskstate_ignore as ti
+
+    _make_project(repo)
+    _fail_git(monkeypatch, "ls-files", **failure)
+    with caplog.at_level("DEBUG", logger="clawpm.taskstate_ignore"):
+        assert ti._index_names(repo, "") == set()
+    msgs = _warnings(caplog, "ls-files")
+    assert len(msgs) == 1
+    assert "clawpm:" in msgs[0].getMessage()
+
+
+@pytest.mark.parametrize("failure", _FAILURES)
+def test_failed_check_ignore_warns(tmp_path, monkeypatch, caplog, repo, failure):
+    from clawpm import taskstate_ignore as ti
+
+    (repo / ".gitignore").write_text(".project/\n", encoding="utf-8")
+    _make_project(repo)
+    _fail_git(monkeypatch, "check-ignore", **failure)
+    with caplog.at_level("DEBUG", logger="clawpm.taskstate_ignore"):
+        assert ti.find_ignored_task_state(repo) is None
+    assert len(_warnings(caplog, "check-ignore")) == 1
+
+
+def test_failed_ls_files_in_doctor_is_visible_not_masked_silently(
+    tmp_path, monkeypatch, caplog, repo
+):
+    # The reviewer's repro: GI-999 is tracked-but-deleted, the index read
+    # fails, the probe lands on GI-999 and the blanket-ignore warning vanishes.
+    # The loss of the exclusion must at least be announced.
+    (repo / ".gitignore").write_text(".project/\n", encoding="utf-8")
+    _make_project(repo)
+    ghost = repo / ".project" / "tasks" / "GI-999.md"
+    ghost.write_text("---\nid: GI-999\n---\n# g\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "-f", ".project/tasks/GI-999.md"], check=True)
+    ghost.unlink()
+    _fail_git(monkeypatch, "ls-files", rc=128, stderr="fatal: index file corrupt")
+    with caplog.at_level("DEBUG", logger="clawpm.taskstate_ignore"):
+        _doctor_warnings(tmp_path, monkeypatch, tmp_path)
+    assert _warnings(caplog, "ls-files")
+
+
+def test_not_a_git_repo_stays_quiet_at_warning_level(tmp_path, caplog):
+    # "Not a repo" is the normal answer for an unversioned project, not a
+    # degraded check: it must not start warning on every doctor run.
+    from clawpm import taskstate_ignore as ti
+
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    _make_project(plain)
+    with caplog.at_level("DEBUG", logger="clawpm.taskstate_ignore"):
+        assert ti.find_ignored_task_state(plain) is None
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("ls-files" in r.getMessage() for r in caplog.records)  # still debug-logged

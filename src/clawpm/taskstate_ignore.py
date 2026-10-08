@@ -11,6 +11,7 @@ Never edits a ``.gitignore`` and never commits -- that is a repo-owner call.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -23,6 +24,48 @@ _DEFAULT_WIDTH = 3  # the allocator mints ``{prefix}-{num:03d}``
 FIX_TEXT = "replace `.project/` with `.project/tasks/.clawpm-tasks.lock` in that ignore file"
 
 
+def _run_git(project_dir: Path, verb: str, *args: str) -> subprocess.CompletedProcess | None:
+    """Run ``git -C project_dir <verb> *args``; None when git could not run.
+
+    Fail-open (this check must never raise) but not fail-SILENT: a git that is
+    missing or times out leaves a WARNING, because the caller carries on
+    without that answer and a blanket ignore could go unreported (CLAWP-094
+    marker style). Exit codes are the caller's call -- see ``_degraded``.
+    """
+    try:
+        return subprocess.run(
+            ["git", "-C", str(project_dir), verb, *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            env={**os.environ, "LC_ALL": "C"},  # stable text for the not-a-repo test
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning(
+            "clawpm: git %s could not run for %s (%r); "
+            "the git-ignored task-state check is degraded",
+            verb, project_dir, exc,
+        )
+        return None
+
+
+def _degraded(project_dir: Path, verb: str, result: subprocess.CompletedProcess) -> None:
+    """Log a git exit that is not an answer: WARNING, or debug for "not a repo".
+
+    "Not a git repository" is the normal state of an unversioned project, so
+    it must not warn on every doctor run.
+    """
+    stderr = result.stderr.strip()
+    log = logger.debug if "not a git repository" in stderr else logger.warning
+    log(
+        "clawpm: git %s failed for %s (rc=%s: %s); "
+        "the git-ignored task-state check is degraded",
+        verb, project_dir, result.returncode, stderr,
+    )
+
+
 def _check_ignore_source(project_dir: Path, rel_path: str) -> str | None:
     """Return ``<source>:<line>:<pattern>`` if git ignores *rel_path*, else None.
 
@@ -30,28 +73,17 @@ def _check_ignore_source(project_dir: Path, rel_path: str) -> str | None:
     (and report the rule's source) correctly for a project that lives in a
     repo subdirectory. ``check-ignore -v`` also exits 0 when the last matching
     rule is a negation (``!pattern``), which means NOT ignored. Any failure
-    (git missing, not a repo, timeout) is "no finding" and is logged at debug
-    level -- this check must never raise or false-WARN.
+    (git missing, timeout, unexpected exit) is "no finding" with a WARNING
+    marker; "not a repo" is debug-logged only. Never raises or false-WARNs
+    about the project's ignore rules.
     """
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(project_dir), "check-ignore", "-v", "--", rel_path],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        logger.debug("git check-ignore could not run for %s: %r", project_dir, exc)
+    result = _run_git(project_dir, "check-ignore", "-v", "--", rel_path)
+    if result is None:
         return None
     if result.returncode == 1:  # git's "not ignored"
         return None
     if result.returncode != 0:
-        logger.debug(
-            "git check-ignore degraded for %s: rc=%s stderr=%s",
-            project_dir, result.returncode, result.stderr.strip(),
-        )
+        _degraded(project_dir, "check-ignore", result)
         return None
     line = result.stdout.splitlines()[0] if result.stdout.strip() else ""
     source = line.split("\t", 1)[0]
@@ -118,26 +150,16 @@ def _index_names(project_dir: Path, sub: str) -> set[str]:
 
     ``check-ignore`` never reports a tracked path, so a probe naming a file
     that is in the index -- even one deleted from disk but not yet staged as
-    removed -- would hide a blanket ignore. Failure is "no names" (debug log).
+    removed -- would hide a blanket ignore. A failed read is "no names" but
+    leaves a WARNING: the probe may then land on a tracked path and the
+    blanket-ignore finding can be masked.
     """
     rel = "/".join(p for p in (".project", "tasks", sub) if p)
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(project_dir), "ls-files", "-z", "--", rel],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        logger.debug("git ls-files could not run for %s: %r", project_dir, exc)
+    result = _run_git(project_dir, "ls-files", "-z", "--", rel)
+    if result is None:
         return set()
     if result.returncode != 0:
-        logger.debug(
-            "git ls-files degraded for %s: rc=%s stderr=%s",
-            project_dir, result.returncode, result.stderr.strip(),
-        )
+        _degraded(project_dir, "ls-files", result)
         return set()
     names: set[str] = set()
     for entry in result.stdout.split("\0"):
