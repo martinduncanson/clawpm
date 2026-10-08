@@ -520,7 +520,7 @@ clawpm tasks emit-rubric <id> [--rubric-format markdown]
 clawpm tasks dispatch <id> [--worktree] \
     [--confirm-close] [--refute-votes N] \
     [--lease-ttl <secs>] [--fallback-policy requeue|route-secondary|escalate-to-human|fail] \
-    [--confirm-stale]
+    [--confirm-stale] [--max-iterations N]
 
 # Remove dispatch settings
 clawpm tasks teardown-dispatch <id>
@@ -533,7 +533,7 @@ clawpm agent dispatch --prompt "..." --rubric-criteria "..." \
     [--judge-cmd-override "..."]
 
 # Stop-hook judge (invoked by dispatched settings; also callable standalone)
-clawpm hook eval-stop --task <id>
+clawpm hook eval-stop --task <id> [--max-iterations N --iteration-baseline B]  # cap baked in by `tasks dispatch --max-iterations`
 
 # SessionStart context sidecar
 clawpm hook session-start
