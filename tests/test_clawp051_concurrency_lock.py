@@ -31,7 +31,9 @@ import sys
 import tempfile
 import textwrap
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -227,6 +229,246 @@ class TestIdAllocationUnderContention:
             assert len(set(ids)) < self.N_WORKERS, (
                 f"Expected duplicates without lock, got unique ids: {ids}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Test: PORTFOLIO-wide prefix allocation under cross-project contention
+# (CLAWP-116)
+# ---------------------------------------------------------------------------
+
+_CROSS_PROJECT_WORKER_SCRIPT = textwrap.dedent("""\
+    import sys, json
+    from pathlib import Path
+    sys.path.insert(0, r'{src_path}')
+    from clawpm.discovery import load_portfolio_config
+    from clawpm.tasks import add_task
+
+    portfolio_root = Path(r'{portfolio_root}')
+    project_id = '{project_id}'
+    title = sys.argv[1]
+    config = load_portfolio_config(portfolio_root)
+    task = add_task(config, project_id, title)
+    if task is None:
+        print(json.dumps({{"error": "add_task returned None", "project": project_id}}))
+        sys.exit(1)
+    print(json.dumps({{"id": task.id, "project": project_id}}))
+""")
+
+def _make_multi_project_portfolio(tmp_dir: Path, project_ids: list[str]) -> Path:
+    """Set up a portfolio with several TASK-LESS sibling projects."""
+    (tmp_dir / "portfolio.toml").write_text(
+        f'portfolio_root = "{tmp_dir.as_posix()}"\n'
+        f'project_roots = ["{(tmp_dir / "projects").as_posix()}"]\n',
+        encoding="utf-8",
+    )
+    for project_id in project_ids:
+        meta = tmp_dir / "projects" / project_id / ".project"
+        tasks_dir = meta / "tasks"
+        (tasks_dir / "done").mkdir(parents=True)
+        (tasks_dir / "blocked").mkdir(parents=True)
+        (meta / "settings.toml").write_text(
+            f'id = "{project_id}"\nname = "{project_id}"\nstatus = "active"\npriority = 3\n',
+            encoding="utf-8",
+        )
+    return tmp_dir
+
+
+def _spawn_cross_project_workers(
+    script: str, tmp_dir: Path, project_ids: list[str]
+) -> list[dict]:
+    """Spawn one subprocess PER project id, all launched before any is
+    awaited (true concurrency, no stagger), each minting that project's
+    first task. Returns each worker's parsed JSON result."""
+    import subprocess
+
+    src_path = str(Path(__file__).parent.parent / "src")
+    env = {**os.environ, "CLAWPM_PORTFOLIO": str(tmp_dir)}
+    procs = []
+    for project_id in project_ids:
+        code = script.format(
+            src_path=src_path,
+            portfolio_root=str(tmp_dir),
+            project_id=project_id,
+        )
+        procs.append((
+            project_id,
+            subprocess.Popen(
+                [sys.executable, "-c", code, f"first task for {project_id}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+            ),
+        ))
+    results = []
+    for project_id, proc in procs:
+        out, err = proc.communicate(timeout=30)
+        raw = out.decode("utf-8", errors="replace").strip()
+        if proc.returncode != 0 or not raw:
+            pytest.fail(
+                f"Worker for {project_id} failed (rc={proc.returncode}):\n"
+                f"stdout: {raw!r}\nstderr: {err.decode('utf-8', errors='replace')!r}"
+            )
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            pytest.fail(f"Worker for {project_id} produced non-JSON: {raw!r}")
+        if "error" in data:
+            pytest.fail(f"Worker for {project_id} add_task error: {data['error']}")
+        results.append(data)
+    return results
+
+
+def _prefix_of(task_id: str) -> str:
+    """The prefix portion of a minted id ('ABCDE1-000' -> 'ABCDE1')."""
+    return task_id.rsplit("-", 1)[0]
+
+
+class TestPortfolioWidePrefixAllocationContention:
+    """CLAWP-116: two (or more) task-less near-twin projects minting their
+    FIRST task concurrently must never derive the same prefix -- the
+    portfolio-wide allocator's read (scan every sibling) -> decide ->
+    write sequence must be serialised against every OTHER concurrent
+    first-minter, or two calls can observe a torn snapshot and collide.
+    """
+
+    PROJECT_IDS = ["abcde1", "abcde2", "abcde3", "abcde4"]
+
+    def test_concurrent_first_mints_never_collide_on_prefix(self, tmp_path):
+        """With portfolio_prefix_lock in place, N concurrent first-minters
+        (near-twin task-less projects sharing a base) always derive
+        distinct prefixes."""
+        _make_multi_project_portfolio(tmp_path, self.PROJECT_IDS)
+
+        results = _spawn_cross_project_workers(
+            _CROSS_PROJECT_WORKER_SCRIPT, tmp_path, self.PROJECT_IDS
+        )
+        prefixes = [_prefix_of(r["id"]) for r in results]
+        assert len(set(prefixes)) == len(self.PROJECT_IDS), (
+            f"Duplicate prefix across concurrent first mints (lock failed!): {results}"
+        )
+
+    def _assert_add_task_blocks_on_held_portfolio_lock(self, tmp_path, **add_task_kwargs):
+        """Shared body for the two load-bearing proofs below. Instruments
+        entry into ``portfolio_prefix_lock`` itself (an ``acquiring`` Event
+        fired the instant add_task reaches the lock call, BEFORE it
+        actually contends on the underlying OS lock) rather than timing
+        add_task's call as a whole (grok-4.5, PR #65 round 3: add_task's
+        UNLOCKED prologue -- resolve_baseline_ref can invoke git,
+        get_scoped_project_settings does its own I/O -- could in principle
+        outlast a fixed wait window on its own, false-passing the
+        "still blocked" check without the adder thread ever having reached
+        the real lock. Waiting on `acquiring` first decouples the prologue's
+        duration from the blocking assertion entirely)."""
+        import threading
+        import clawpm.tasks as tasks_mod
+        from clawpm.discovery import load_portfolio_config
+
+        _make_multi_project_portfolio(tmp_path, ["abcde1"])
+        config = load_portfolio_config(tmp_path)
+
+        real_lock = tasks_mod.portfolio_prefix_lock
+        acquiring = threading.Event()
+
+        @contextmanager
+        def spy_lock(portfolio_root):
+            acquiring.set()
+            with real_lock(portfolio_root):
+                yield
+
+        held = threading.Event()
+        release = threading.Event()
+
+        def holder():
+            with real_lock(config.portfolio_root):
+                held.set()
+                release.wait(10)
+
+        t = threading.Thread(target=holder)
+        t.start()
+
+        done = threading.Event()
+        result_box: dict = {}
+
+        def adder():
+            result_box["r"] = tasks_mod.add_task(
+                config, "abcde1", "first task", **add_task_kwargs
+            )
+            done.set()
+
+        a = threading.Thread(target=adder)
+        try:
+            assert held.wait(5), "holder thread failed to acquire the portfolio lock"
+            with mock.patch.object(tasks_mod, "portfolio_prefix_lock", spy_lock):
+                a.start()
+                assert acquiring.wait(10), (
+                    "add_task never reached portfolio_prefix_lock "
+                    "(prologue hung, or the lock call was removed)"
+                )
+                # The adder has now reached the real acquire attempt -- from
+                # here, any remaining "not done" window is genuine lock
+                # contention, not prologue latency.
+                assert not done.wait(0.6), (
+                    "add_task did not block on the held portfolio lock"
+                )
+                release.set()
+                assert done.wait(10), "add_task did not complete after release"
+                assert result_box["r"] is not None
+        finally:
+            release.set()
+            t.join(10)
+            a.join(10)
+
+    def test_portfolio_lock_actually_serializes_add_task(self, tmp_path):
+        """Direct proof the lock is load-bearing, not just present-but-
+        unused (Codex P2 + grok-4.5 HIGH, PR #65 round 1: the cross-process
+        'without lock' reproduction could never actually collide under
+        CLAWP-124's deterministic matching, so that test's positive
+        counterpart proved nothing)."""
+        self._assert_add_task_blocks_on_held_portfolio_lock(tmp_path)
+
+    def test_portfolio_lock_also_serializes_explicit_id_creates(self, tmp_path):
+        """Codex P1 (PR #65 round 1): an explicit-ID create for a project's
+        OWN first task never calls assign_task_prefix, yet still
+        establishes that project's future inferred prefix -- it needs the
+        SAME portfolio-lock coordination against a sibling's concurrent
+        auto-mint."""
+        self._assert_add_task_blocks_on_held_portfolio_lock(
+            tmp_path, task_id="ABCDE1-900"
+        )
+
+    def test_portfolio_lock_resolves_a_relative_portfolio_root(self, tmp_path):
+        """Codex P1 (PR #65 round 3): PortfolioConfig.portfolio_root is only
+        ``.expanduser()``-ed at load time (models.py), never absolutized --
+        a relative value (``portfolio_root = "."`` in portfolio.toml, or a
+        bare relative ``CLAWPM_PORTFOLIO``) propagates all the way through.
+        ``file_lock`` requires an absolute path and raises ``ValueError``
+        otherwise, which would make EVERY add_task call fail outright in
+        such a configuration -- not just under contention. Calls the real
+        function (not a hand-encoded path check) and asserts the result is
+        absolute regardless of what was passed in."""
+        import os
+        from clawpm.tasks import portfolio_prefix_lock
+        from clawpm.models import PortfolioConfig, ProjectStatus
+
+        _make_multi_project_portfolio(tmp_path, ["abcde1"])
+        old_cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            relative_config = PortfolioConfig(
+                portfolio_root=Path("."),
+                project_roots=[Path("projects")],
+                default_status=ProjectStatus.ACTIVE,
+            )
+            assert not relative_config.portfolio_root.is_absolute(), (
+                "test setup error: portfolio_root must actually be relative"
+            )
+            # Must not raise ValueError (file_lock's own guard for a
+            # non-absolute lock_path) -- confirms the fix, not a hand-typed
+            # path string.
+            with portfolio_prefix_lock(relative_config.portfolio_root):
+                pass
+        finally:
+            os.chdir(old_cwd)
 
 
 # ---------------------------------------------------------------------------

@@ -106,3 +106,45 @@ class TestResolveProject:
         monkeypatch.chdir(outside)
         monkeypatch.setattr(context, "CONTEXT_FILE", tmp_path / ".clawpm-context")
         assert context.resolve_project() == (None, "none")
+
+
+class TestFailOpenMarkers:
+    """CLAWP-094 — fail-open paths must leave a degraded-path marker, not be silent."""
+
+    def test_malformed_settings_toml_is_logged_not_silent(
+        self, isolated_portfolio, monkeypatch, caplog
+    ):
+        import logging
+
+        (isolated_portfolio.project_dir / ".project" / "settings.toml").write_text(
+            "this is = = not toml [[", encoding="utf-8"
+        )
+        monkeypatch.chdir(isolated_portfolio.project_dir)
+        with caplog.at_level(logging.WARNING, logger="clawpm.context"):
+            assert context.detect_project_from_cwd() is None
+        assert any(
+            "settings.toml" in r.getMessage() and r.levelno == logging.WARNING
+            for r in caplog.records
+        ), caplog.text
+
+    def test_unreadable_context_file_is_logged_not_silent(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import logging
+
+        ctx = tmp_path / ".clawpm-context"
+        ctx.write_bytes(b"\xff\xfe\x00bad")  # not valid UTF-8
+        monkeypatch.setattr(context, "CONTEXT_FILE", ctx)
+        with caplog.at_level(logging.WARNING, logger="clawpm.context"):
+            assert context.get_context_project() is None
+        assert any(".clawpm-context" in r.getMessage() for r in caplog.records), caplog.text
+
+    def test_valid_context_file_emits_no_warning(self, tmp_path, monkeypatch, caplog):
+        import logging
+
+        ctx = tmp_path / ".clawpm-context"
+        ctx.write_text("proj", encoding="utf-8")
+        monkeypatch.setattr(context, "CONTEXT_FILE", ctx)
+        with caplog.at_level(logging.WARNING, logger="clawpm.context"):
+            assert context.get_context_project() == "proj"
+        assert not caplog.records

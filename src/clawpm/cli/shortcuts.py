@@ -2,16 +2,15 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 
 import click
 
-from clawpm.models import ProjectStatus, Task, TaskState, WorkLogAction
+from clawpm.models import ProjectStatus, TaskState, WorkLogAction
 from clawpm.output import OutputFormat, output_context, output_error, output_json, output_task_detail
 from clawpm.discovery import discover_projects, get_project
 from clawpm.tasks import get_next_task, get_task, list_tasks
-from clawpm.worklog import add_entry, tail_entries
+from clawpm.worklog import add_entry
 from clawpm.context import expand_task_id
 from clawpm.cli.tasks import _render_state_results, tasks_add, tasks_state
 from clawpm.services.tasks import transition_isolated
@@ -360,142 +359,11 @@ def agent_context(ctx: click.Context, project_id: str | None, log_limit: int) ->
         output_error("no_project", "No project specified or detected. Use -p or cd into a project.", fmt=fmt)
         sys.exit(1)
     
-    proj = get_project(config, resolved_id)
-    if not proj:
+    from clawpm.context import build_agent_context
+
+    context = build_agent_context(config, resolved_id, source=source, log_limit=log_limit)
+    if context is None:
         output_error("project_not_found", f"Project '{resolved_id}' not found", fmt=fmt)
         sys.exit(1)
-    
-    # Build comprehensive context
-    context: dict = {
-        "project": {
-            "id": proj.id,
-            "name": proj.name,
-            "status": proj.status.value,
-            "priority": proj.priority,
-            "labels": proj.labels,
-            "repo_path": str(proj.repo_path) if proj.repo_path else None,
-        },
-        "source": source,
-    }
-    
-    # Read spec if exists
-    if proj.project_dir:
-        spec_file = proj.project_dir / ".project" / "SPEC.md"
-        if spec_file.exists():
-            spec_content = spec_file.read_text(encoding="utf-8")
-            # Truncate if too long
-            if len(spec_content) > 2000:
-                context["spec"] = spec_content[:2000] + "\n\n[...truncated...]"
-            else:
-                context["spec"] = spec_content
-    
-    # CLAWP-082 — build the derived link index once and attach backlinks
-    # (`linked_from`) to every task dict surfaced below. `links` (outbound
-    # wiki-links) already rides along in each task's to_dict().
-    from clawpm.links import build_link_index
-    _link_index = build_link_index(config, resolved_id)
 
-    def _with_backlinks(t: Task) -> dict:
-        d = t.to_dict()
-        d["linked_from"] = _link_index.linked_from(t.id)
-        return d
-
-    # Current task (in progress)
-    in_progress = list_tasks(config, resolved_id, state_filter=TaskState.PROGRESS)
-    context["in_progress"] = [_with_backlinks(t) for t in in_progress]
-
-    # Next task if nothing in progress
-    if not in_progress:
-        next_task = get_next_task(config, resolved_id)
-        if next_task:
-            context["next_task"] = _with_backlinks(next_task)
-
-    # Blocked tasks
-    blocked = list_tasks(config, resolved_id, state_filter=TaskState.BLOCKED)
-    context["blockers"] = [_with_backlinks(t) for t in blocked]
-    
-    # Open task count
-    open_tasks = list_tasks(config, resolved_id, state_filter=TaskState.OPEN)
-    context["open_count"] = len(open_tasks)
-    
-    # Recent work log
-    recent_entries = tail_entries(config, project=resolved_id, limit=log_limit)
-    context["recent_work"] = [e.to_dict() for e in recent_entries]
-    
-    # Git status if repo_path exists
-    if proj.repo_path and proj.repo_path.exists():
-        git_status = {}
-        try:
-            # Current branch
-            result = subprocess.run(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                cwd=proj.repo_path,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",  # CLAWP-046: git output is UTF-8, not cp1252
-                errors="replace",
-                timeout=5,
-            )
-            if result.returncode == 0:
-                git_status["branch"] = result.stdout.strip()
-            
-            # Uncommitted changes
-            result = subprocess.run(
-                ["git", "status", "--porcelain"],
-                cwd=proj.repo_path,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",  # CLAWP-046: git output is UTF-8, not cp1252
-                errors="replace",
-                timeout=5,
-            )
-            if result.returncode == 0:
-                changes = [line for line in result.stdout.strip().split('\n') if line]
-                git_status["uncommitted_count"] = len(changes)
-                if changes:
-                    git_status["uncommitted"] = changes[:10]  # Limit to 10
-                    if len(changes) > 10:
-                        git_status["uncommitted"].append(f"... and {len(changes) - 10} more")
-            
-            # Recent commits
-            result = subprocess.run(
-                ["git", "log", "--oneline", "-3"],
-                cwd=proj.repo_path,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",  # CLAWP-046: git output is UTF-8, not cp1252
-                errors="replace",
-                timeout=5,
-            )
-            if result.returncode == 0:
-                git_status["recent_commits"] = [line for line in result.stdout.strip().split('\n') if line]
-        except Exception:
-            pass
-        
-        if git_status:
-            context["git"] = git_status
-    
-    # Open issues
-    if proj.project_dir:
-        import json as json_mod
-        issues_file = proj.project_dir / ".agent" / "issues.jsonl"
-        if issues_file.exists():
-            try:
-                open_issues = []
-                with open(issues_file, encoding="utf-8", errors="replace") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line:
-                            issue = json_mod.loads(line)
-                            if not issue.get("fixed"):
-                                open_issues.append({
-                                    "type": issue.get("type"),
-                                    "severity": issue.get("severity"),
-                                    "summary": (issue.get("actual") or issue.get("context", ""))[:100],
-                                })
-                if open_issues:
-                    context["open_issues"] = open_issues[:5]
-            except Exception:
-                pass
-    
     output_context(context, fmt=fmt)

@@ -25,11 +25,13 @@ from typing import Any
 
 import yaml
 
+from .id_reservations import record_task_id
 from .frontmatter import (
     FrontmatterError,
     parse_frontmatter,
     split_frontmatter,
     stamp_updated,
+    today_utc_iso,
 )
 from .models import (
     Predictions,
@@ -452,7 +454,12 @@ def _check_constitution(
         return []
 
 
-def _existing_child_nums(tasks_dir: Path, parent_id: str) -> set[int]:
+def _existing_child_nums(
+    tasks_dir: Path,
+    parent_id: str,
+    portfolio_root: Path | None = None,
+    project_id: str | None = None,
+) -> set[int]:
     """Union-scan the existing child ordinals for ``parent_id``.
 
     Delegates to the single shared allocator (:func:`tasks._existing_child_ordinals`)
@@ -467,7 +474,10 @@ def _existing_child_nums(tasks_dir: Path, parent_id: str) -> set[int]:
     # CLAWP-085 child-ordinal archive-awareness now lives in the shared
     # allocator (_existing_child_ordinals) so emit-tree and add_subtask can't
     # disagree — see that function.
-    return _existing_child_ordinals(tasks_dir, tasks_dir / parent_id, parent_id)
+    # CLAWP-092: ``portfolio_root`` adds the cross-worktree reservation ledger.
+    return _existing_child_ordinals(
+        tasks_dir, tasks_dir / parent_id, parent_id, portfolio_root, project_id
+    )
 
 
 def _check_id_collisions(
@@ -481,13 +491,14 @@ def _check_id_collisions(
     Returns list of collision dicts. Empty = no collisions.
     Read-only — mirrors add_subtask's union-scan logic but does not write.
     """
-    from .tasks import get_tasks_dir
-
+    from .tasks import get_tasks_dir, _ledger_project_id
     tasks_dir = get_tasks_dir(config, project_id)
     if not tasks_dir:
         return []
 
-    existing_nums = _existing_child_nums(tasks_dir, parent_id)
+    existing_nums = _existing_child_nums(
+        tasks_dir, parent_id, config.portfolio_root, _ledger_project_id(config, project_id)
+    )
 
     # Predict IDs for leaves in order
     collisions: list[dict] = []
@@ -520,11 +531,38 @@ def _resolve_idempotency(
     """Return leaf_keys of leaves that already exist (idempotent re-emit).
 
     Scans every location a previously-emitted child of ``parent_id`` can live —
-    the live parent dir, plus ``done/``, ``blocked/``, and (CLAWP-085) the
-    ``done/archive/`` silo (standalone and inside a wholesale-archived parent) —
-    for matching ``leaf_key`` frontmatter. Without the terminal-state dirs, a
-    child that was completed (and possibly archived) since the last emit would
-    not be recognised and the same leaf would be minted twice (Codex review r2).
+    the live parent dir, plus ``done/``, ``blocked/``, ``rejected/``, and
+    (CLAWP-085) the ``done/archive/`` silo (standalone and inside a
+    wholesale-archived parent) — for matching ``leaf_key`` frontmatter.
+    Without the terminal-state dirs, a child that was completed (and possibly
+    archived) since the last emit would not be recognised and the same leaf
+    would be minted twice (Codex review r2). CLAWP-127 (grok-4.5, PR #62):
+    ``rejected/`` too, for the identical reason — ``_check_reject_match``
+    (title-based) is the intended gate for a rejected leaf, but it fail-opens
+    on an unreadable ledger and only matches on an EXACT title, so a title
+    that drifted between emits would leave the previously-emitted-then-
+    rejected child invisible to BOTH checks and get silently re-minted.
+
+    Also covers the WHOLESALE-PARENT nest for done/blocked, not just
+    rejected/archive (grok-4.5, PR #62 round 3): ``parent_id`` itself can be a
+    directory task that was completed or blocked wholesale (``change_task_state``
+    moves the whole directory, ``tasks.py`` ~712-719), landing its own children
+    at ``done/<parent_id>/`` or ``blocked/<parent_id>/`` — the same shape
+    CLAWP-085 already handled for the archived case
+    (``done/archive/<parent_id>/``). Without these, a decomposed parent that
+    finishes or blocks would make its own already-emitted children invisible
+    to a later re-emit under the same parent.
+
+    Also covers a CHILD that is itself a directory task (has its own
+    children), which stores its metadata at ``<state-dir>/<child_id>/
+    _task.md`` rather than a flat ``<state-dir>/<child_id>.md`` (CLAWP-128;
+    Codex P2, PR #62 round 3). The flat-file glob above can never match that
+    shape, so each ``scan_dir`` is also globbed for ``{parent_id}-*``
+    subdirectories containing ``_task.md`` — mirroring how
+    ``_existing_child_ordinals`` (``tasks.py``) already scans both shapes for
+    the identical reason (a directory-shaped child moved to done/blocked/
+    rejected/archive must not have its ordinal, or here its leaf_key, treated
+    as free).
     """
     from .tasks import get_tasks_dir
 
@@ -535,10 +573,37 @@ def _resolve_idempotency(
     leaf_keys = {lf.leaf_key for lf in leaves}
     already_emitted: list[str] = []
 
+    def _leaf_key_of(task_file: Path) -> str | None:
+        # Fails open on a missing/unreadable/malformed file, matching this
+        # function's own pre-existing contract for the flat-file case (grok
+        # PR #67: worth naming explicitly, not silently inherited) — a
+        # leaf_key this can't read is treated as "not yet seen", so the
+        # worst case is a re-mint (visible, recoverable), never a silent
+        # collision. isinstance-guarded so a non-string leaf_key (malformed
+        # YAML) can't reach the `in leaf_keys` set-membership test below.
+        if not task_file.is_file():
+            return None
+        try:
+            # errors="replace" (not a stricter decode + exception list): a
+            # non-UTF-8 byte in one sibling's hand-edited file must not abort
+            # the whole emit (grok-4.6 PR #67 round 2 — a bare `except
+            # OSError` missed UnicodeDecodeError, which read_text raises as a
+            # ValueError, not an OSError).
+            text = task_file.read_text(encoding="utf-8", errors="replace")
+            fm, _ = parse_frontmatter(text)
+            lk = fm.get("leaf_key") if isinstance(fm, dict) else None
+        except OSError:
+            return None
+        return lk if isinstance(lk, str) else None
+
     scan_dirs = (
         tasks_dir / parent_id,                          # live children
         tasks_dir / "done",                             # completed standalone children
+        tasks_dir / "done" / parent_id,                 # children of a wholesale-done parent
         tasks_dir / "blocked",                          # blocked standalone children
+        tasks_dir / "blocked" / parent_id,              # children of a wholesale-blocked parent
+        tasks_dir / "rejected",                         # rejected standalone children
+        tasks_dir / "rejected" / parent_id,             # children of a wholesale-rejected parent
         tasks_dir / "done" / "archive",                 # archived standalone children
         tasks_dir / "done" / "archive" / parent_id,     # children of a wholesale-archived parent
     )
@@ -546,14 +611,15 @@ def _resolve_idempotency(
         if not scan_dir.exists():
             continue
         for f in scan_dir.glob(f"{parent_id}-*.md"):
-            try:
-                text = f.read_text(encoding="utf-8")
-                fm, _ = parse_frontmatter(text)
-                lk = fm.get("leaf_key")
-                if lk and lk in leaf_keys:
-                    already_emitted.append(lk)
-            except Exception:
-                pass
+            lk = _leaf_key_of(f)
+            if lk and lk in leaf_keys:
+                already_emitted.append(lk)
+        for d in scan_dir.glob(f"{parent_id}-*"):
+            if not d.is_dir():
+                continue
+            lk = _leaf_key_of(d / "_task.md")
+            if lk and lk in leaf_keys:
+                already_emitted.append(lk)
 
     return already_emitted
 
@@ -611,7 +677,8 @@ def _render_task_content(
     not silently lost.
     """
     # CLAWP-086 — mirror add_task/add_subtask: `updated` == `created` at emit time.
-    _today = date.today().isoformat()
+    # CLAWP-126: UTC calendar day, not local — see today_utc_iso().
+    _today = today_utc_iso()
     frontmatter: dict[str, Any] = {
         "id": task_id,
         "priority": 5,
@@ -698,15 +765,21 @@ def _predict_parent_id(
         return doc.root.attach_to
 
     # New root — predict the next ID add_task would generate
-    from .tasks import get_tasks_dir, assign_task_prefix
-    from .discovery import get_project
-    import re
+    from .tasks import (
+        get_tasks_dir, assign_task_prefix, _next_root_ordinal, _ledger_project_id,
+    )
+    from .discovery import get_scoped_project_settings
 
     tasks_dir = get_tasks_dir(config, project_id)
     if not tasks_dir:
         raise EmitValidationError(f"Cannot locate tasks directory for project {project_id!r}")
 
-    _settings = get_project(config, project_id)
+    # Session-scoped like `tasks_dir` above and `add_task`'s own prefix
+    # resolution (CLAWP-098, Codex P2 on PR #55 round 13): the cwd-independent
+    # `get_project` would read the CANONICAL settings.toml and give the whole
+    # emitted tree the wrong prefix while it lands in a worktree. A foreign
+    # project id in the worktree's settings raises (a ValueError subclass).
+    _settings = get_scoped_project_settings(config, project_id)
     prefix = assign_task_prefix(
         project_id,
         tasks_dir,
@@ -714,27 +787,13 @@ def _predict_parent_id(
         explicit_prefix=getattr(_settings, "task_prefix", None) if _settings else None,
     )
 
-    _dir_pat = re.compile(rf"^{re.escape(prefix)}-(\d+)$")
-    _file_pat = re.compile(rf"^{re.escape(prefix)}-(\d+)(?:\.progress)?$")
-    existing_nums = []
-
-    # CLAWP-085: include done/archive so this prediction stays in lockstep with
-    # add_task's (archive-aware) allocator — otherwise emit-tree could re-mint an
-    # archived root id and clobber archived history.
-    for scan_dir in [tasks_dir, tasks_dir / "done", tasks_dir / "blocked", tasks_dir / "done" / "archive"]:
-        if not scan_dir.exists():
-            continue
-        for f in scan_dir.glob(f"{prefix}-*.md"):
-            m = _file_pat.match(f.stem)
-            if m:
-                existing_nums.append(int(m.group(1)))
-        for entry in scan_dir.iterdir():
-            if entry.is_dir():
-                m = _dir_pat.match(entry.name)
-                if m:
-                    existing_nums.append(int(m.group(1)))
-
-    next_num = max(existing_nums, default=-1) + 1
+    # CLAWP-113: one shared scan + separator rule with add_task, so the
+    # prediction cannot drift from what add_task mints (CLAWP-085/127: the
+    # archive and rejected dirs are included there; CLAWP-092: so is the
+    # cross-worktree reservation ledger).
+    next_num = _next_root_ordinal(
+        config, tasks_dir, prefix, _ledger_project_id(config, project_id, _settings)
+    )
     return f"{prefix}-{next_num:03d}"
 
 
@@ -744,6 +803,26 @@ def _predict_parent_id(
 
 
 def emit_tree(
+    config: PortfolioConfig,
+    project_id: str,
+    doc: EmitTreeDocument,
+    dry_run: bool = False,
+    strict: bool = False,
+) -> EmitResult:
+    """Persist a fully-contracted task-tree atomically (see ``_emit_tree_locked``).
+
+    CLAWP-092: runs under the portfolio prefix lock, like ``add_task``, so the
+    id prediction and the reservation-ledger writes are atomic across
+    worktrees. The lock is OUTER; ``split_task`` takes the per-project lock
+    inside, matching the ordering invariant on ``portfolio_prefix_lock``.
+    """
+    from .tasks import portfolio_prefix_lock
+
+    with portfolio_prefix_lock(config.portfolio_root):
+        return _emit_tree_locked(config, project_id, doc, dry_run, strict)
+
+
+def _emit_tree_locked(
     config: PortfolioConfig,
     project_id: str,
     doc: EmitTreeDocument,
@@ -764,10 +843,10 @@ def emit_tree(
 
     Returns EmitResult — the caller is responsible for logging.
     """
-    from .tasks import get_tasks_dir, add_task, split_task, get_task
+    from .tasks import get_tasks_dir, add_task, split_task, get_task, _ledger_project_id
     from .tasks import _append_child_to_parent_frontmatter
     from .baseline import resolve_baseline_ref
-    from .discovery import get_project
+    from .discovery import get_repo_path, get_scoped_project_settings
     from .worklog import add_entry
     from .models import WorkLogAction
 
@@ -775,26 +854,49 @@ def emit_tree(
     if not tasks_dir:
         raise EmitValidationError(f"No tasks directory for project {project_id!r}")
 
+    # Identity guard for the scoped store the tree is minted into, applied to
+    # EVERY emit — `attach_to` roots included, which return before
+    # `_predict_parent_id` would otherwise resolve settings (CLAWP-098, PR #55
+    # round 14). Fail closed (ValueError) on a worktree naming another project.
+    _ledger_pid = _ledger_project_id(
+        config, project_id, get_scoped_project_settings(config, project_id)
+    )
+
     # -----------------------------------------------------------------------
     # Phase 2 — Gate barrier (all read-only)
     # -----------------------------------------------------------------------
 
     # Resolve baseline once for the whole tree (planning baseline).
-    _settings = get_project(config, project_id)
-    _repo_path = getattr(_settings, "repo_path", None) if _settings else None
+    #
+    # Session-scoped, exactly as `add_task` resolves it (CLAWP-098, Codex P2
+    # on PR #55 round 8). `get_tasks_dir` above already redirects into a
+    # registered worktree, so taking the baseline from the cwd-independent
+    # `get_project(...).repo_path` stamped EVERY emitted task with the main
+    # checkout's HEAD while writing them into a worktree on a different
+    # commit — the same scope-drift error the single-task path fixed, just
+    # multiplied across a whole tree.
+    _repo_path = get_repo_path(config, project_id)
     baseline_ref = resolve_baseline_ref(_repo_path)
 
     # Predict parent/root task ID (before writing anything)
     parent_id = _predict_parent_id(doc, config, project_id)
+
+    # Won't-do reject-match (CLAWP-053) — classify against the FULL leaf set,
+    # before idempotency filtering. CLAWP-127 (Codex P2, PR #62 round 3):
+    # _resolve_idempotency now also recognises a rejected leaf_key match (so
+    # it isn't silently re-minted) — but idempotency-filtering leaves_to_emit
+    # FIRST would remove that same leaf before this check ever saw it,
+    # silently swallowing the documented "every matching incoming leaf is
+    # reported, and strict mode raises" contract. Running this against
+    # doc.leaves directly preserves that contract regardless of what
+    # idempotency separately decides to skip.
+    rejected = _check_reject_match(doc.leaves, config, project_id)
 
     # Idempotent re-emit: leaves whose leaf_key already exists are skipped
     already_emitted_keys = _resolve_idempotency(
         config, project_id, parent_id, doc.leaves
     )
     leaves_to_emit = [lf for lf in doc.leaves if lf.leaf_key not in already_emitted_keys]
-
-    # Won't-do reject-match (CLAWP-053)
-    rejected = _check_reject_match(leaves_to_emit, config, project_id)
     if rejected and strict:
         raise EmitValidationError(
             f"Emission aborted (--strict): {len(rejected)} leaf(ves) matched the won't-do ledger: "
@@ -908,7 +1010,9 @@ def emit_tree(
     next_ordinal: dict[str, int] = {}  # minted-parent-id -> next ordinal
 
     # Seed root-level ordinal from existing children on disk.
-    existing_nums = _existing_child_nums(tasks_dir, parent_id)
+    existing_nums = _existing_child_nums(
+        tasks_dir, parent_id, config.portfolio_root, _ledger_pid
+    )
     next_ordinal[parent_id] = (max(existing_nums) if existing_nums else 0) + 1
 
     for ref in topo_order:
@@ -919,11 +1023,26 @@ def emit_tree(
             else parent_id
         )
         if effective_parent_id not in next_ordinal:
-            # Newly-created inner node: ordinal starts at 1 (no existing children)
-            next_ordinal[effective_parent_id] = 1
+            # Newly-created inner node: no children on disk, but CLAWP-092 --
+            # another worktree may have reserved ordinals under this id, so
+            # seed it through the same allocator as the root level.
+            inner_nums = _existing_child_nums(
+                tasks_dir, effective_parent_id, config.portfolio_root, _ledger_pid
+            )
+            next_ordinal[effective_parent_id] = (
+                max(inner_nums) if inner_nums else 0
+            ) + 1
         ordinal = next_ordinal[effective_parent_id]
         next_ordinal[effective_parent_id] = ordinal + 1
         leaf_id_map[ref] = f"{effective_parent_id}-{ordinal:03d}"
+
+    # CLAWP-092: reserve every id this call minted (the new root, if any, plus
+    # each leaf at every depth) in the portfolio ledger while still inside the
+    # portfolio lock held by emit_tree(), so a sibling worktree skips them.
+    if not doc.root.attach_to:
+        record_task_id(config.portfolio_root, parent_id, _ledger_pid)
+    for minted_id in leaf_id_map.values():
+        record_task_id(config.portfolio_root, minted_id, _ledger_pid)
 
     # Direct children of parent_id (for root's children list + attach_to update)
     child_ids: list[str] = [

@@ -7,7 +7,7 @@ metadata: { "openclaw": { "homepage": "https://github.com/martinduncanson/clawpm
 
 # ClawPM Skill
 
-Multi-project task management. All commands emit JSON by default; use `-f text` for human-readable output.
+Multi-project task management. All commands emit JSON by default, so JSON needs no flag. The only output-format control is the global `-f/--format [json|text]` option, which goes before the subcommand (`clawpm -f text tasks list`). There is no `--json` flag: `clawpm projects list --json` fails with `No such option: --json`.
 
 ## When to use clawpm — defacto default
 
@@ -61,6 +61,15 @@ When adding a task on the operator's behalf, **propose all predictions in a sing
 > "Adding **CLAWP-099 Migrate auth to JWT** with: duration 4h (confidence 3), complexity m, approach 'drop-in JWT middleware', success criteria 'P95 <200ms; session writes drop ≥50%', pre-mortem 'mobile webview cookie edge case', reference task CLAWP-042. **Confirm or edit?**"
 
 The operator overrides only the fields where their gut conflicts with Claude's guess. The gut-vs-Claude delta is itself calibration signal. Always include `--confidence` honestly (1 = wild guess, 5 = done-this-exact-thing-before).
+
+## Install
+
+```bash
+uv tool install git+https://github.com/martinduncanson/clawpm   # or: pipx install git+https://github.com/martinduncanson/clawpm
+clawpm doctor                                                    # verify
+```
+
+`uv tool install` and `pipx install` put the package in an isolated environment and add only a `clawpm` shim to PATH. They do not make the package importable from your default Python, so `python -m clawpm` fails with `No module named clawpm`. Invoke `clawpm ...` through the shim. Use `python -m clawpm` only inside an environment where clawpm was installed with `pip install` (for example a dev checkout). If the shim is missing from PATH, run `uv tool update-shell` (or `pipx ensurepath`) and open a new terminal.
 
 ## First-Time Setup
 
@@ -276,7 +285,7 @@ Note: State changes (start/done/block) auto-log to work_log with git files_chang
 
 ### Research
 ```bash
-clawpm research list
+clawpm research list [--with-diagnostics]   # JSON = flat array; unparseable files reported on stderr, --with-diagnostics gives {research, malformed, malformed_count}
 clawpm research add --type investigation --title "Question"
 clawpm research link --id <research_id> --session-key <key>
 ```
@@ -362,7 +371,8 @@ clawpm setup               # Create portfolio (first-time)
 clawpm setup --check       # Verify installation
 clawpm status              # Project overview
 clawpm context             # Full agent context
-clawpm doctor              # Health check
+clawpm doctor              # Health check (whole portfolio)
+clawpm doctor -p myproj    # Health check scoped to one project (-p/--project)
 clawpm doctor --strict     # Health check — exits non-zero if any warning (use in CI/pre-flight)
 clawpm use [project]       # Set/show project context
 clawpm use --clear         # Clear context
@@ -465,10 +475,11 @@ workday — calibration compares elapsed time, not scheduled hours):
 | `2h` | 120 minutes |
 | `3d` | 4 320 minutes (3 × 24 h) |
 | `1w` | 10 080 minutes (7 × 24 h) |
+| `2h30m` | 150 minutes (combined units, CLAWP-096) |
 
 **Phase 1 prediction flags** (on `tasks add` and `tasks edit`):
 ```
---predict-duration      Predicted duration: 90, 90m, 2h, 3d, 1w
+--predict-duration      Predicted duration: 90, 90m, 2h, 2h30m, 3d, 1w
 --predict-complexity    s|m|l|xl
 --predict-files-changed Number of files expected to change
 --predict-scope         File glob scope (repeatable)
@@ -652,9 +663,11 @@ void without deleting them.
 
 - **Flag order**: `clawpm [global flags] <command> [command flags]` — e.g. `clawpm -f text tasks list -s open`
 - **JSON output**: All commands emit JSON by default; use `-f text` for human-readable
-- **One command per call**: Don't chain clawpm commands with `&&` — run each separately
+- **One command per call**: Don't chain clawpm commands with `&&` — run each separately. Don't paste `;`-separated batches either.
+- **Verify batches**: after any batch of `tasks add`, run `clawpm tasks list` to confirm every task landed. On installs that predate the Windows glob fix (below), an add with a mangled argument could exit 0 and drop the task silently. The check is cheap and still worth running.
 - **Portfolio root**: Default `~/clawpm`
 - **Work log**: Append-only at `<portfolio>/work_log.jsonl`
+- **Windows glob expansion (fixed by CLAWP-109, PR #77)**: in installs that predate that fix, Click expanded every argv entry on Windows (glob, `~`, `$VAR`, `%VAR%`), so `--scope "src/**"` arrived as file paths: a usage error when several files matched, a silently rewritten scope (`src\a.py`) when one did. Newer installs pass arguments verbatim. On 0.2.0 or older, pass patterns with `--scope-file` / `--predict-scope-file`, use a wildcard-free prefix, and keep literal double-star out of free text (`--actual`, `--context`, `--summary`; write "double-star" in prose). Those installs also silently dropped any argument containing a double-star sequence, with exit 0, so verify with `clawpm tasks list` after a batch. Options that name a filesystem path (`--target-dir`, `--body-file`, `--scope-file`, `--in-repo`, ...) still expand `~` and environment variables. Quote wildcard patterns: an unquoted one can be globbed by a POSIX shell on any OS (including Git Bash on Windows) or by PowerShell on Linux/macOS before clawpm runs. PowerShell and cmd on Windows pass arguments through verbatim.
 
 ## Dispatch discipline — rubric scoping & worktree safety
 
@@ -669,6 +682,8 @@ void without deleting them.
 This is the dark-side counterpart to the rubric/Stop-hook power: a goal-scoped rubric is exactly as safe as the gap between "what satisfies it" and "what the agent is allowed to do." Keep that gap at zero.
 
 **Never `--worktree`-dispatch a task that mutates a single shared store.** Worktree isolation is built for parallel *code* work with disjoint file scopes (see Scope-Aware Dispatch below). A task that appends to one shared ledger — a decisions store, `work_log.jsonl`, leases, any append-only state, **including clawpm's own JSONL stores** — must dispatch **in-place against the main repo dir**, or the ledger forks per worktree branch and records diverge or are lost. Worktree dispatch is for code; in-place dispatch is for state.
+
+**ID-based mutator commands are safe to run from inside a `tasks dispatch --worktree` checkout (CLAWP-098, fixed).** Prior to the fix, `tasks state/done/block <id>` run with cwd inside a dispatched worktree resolved the project via the global portfolio registry — which ignores cwd entirely — and silently mutated the MAIN checkout's task file instead of the worktree's own copy. `tasks dispatch --worktree` now mints a session pointer (`~/clawpm/sessions.jsonl`) mapping the worktree's filesystem path to the dispatch; any ID-based mutator run with cwd inside that path resolves against the worktree's own `.project/tasks/`, not the registry. This requires the worktree to actually carry its own `.project/` (true for any project that tracks it in git, per CLAWP-075) — a project that doesn't commit `.project/` still has nothing for a worktree-scoped mutator to act on, same as before. Normal single-checkout usage (cwd outside any dispatched worktree) is unaffected either way. The session stays live for as long as the worktree directory exists on disk — tearing down one task's dispatch settings does NOT retire its session (a bulk `tasks state A B done` run from inside a worktree needs both A's and B's lookups to keep resolving there for the whole invocation, even after A's own teardown fires mid-loop). **`clawpm agent dispatch` (CLAWP-024) is NOT covered by this fix** — it auto-creates its subtask uncommitted, then immediately worktree-checks-out committed HEAD, so the new task file never lands in that worktree; registering a session for it would hang the Stop hook looking for a task that isn't there. Follow-up work if that path needs the same guarantee.
 
 ## Scope-Aware Dispatch
 
@@ -919,7 +934,7 @@ clawpm log tail            # See recent activity
 **`add_failed` after `project init`?** Check `.project/settings.toml` — `repo_path` must use forward slashes on Windows (`F:/Git/...` not `F:\Git\...`). The CLI now warns when this is suspected, but old settings.toml files written by earlier versions may still be broken.
 
 **Windows CLI caveats (observed 2026-07-05):**
-- `--predict-scope` values containing glob metacharacters (`scripts/**`) get expanded into extra positional arguments and fail `tasks add` with "Got unexpected extra arguments". Use plain directory prefixes (`scripts/`) or exact file paths — the conflict heuristic strips glob chars anyway.
-- `--predict-duration` rejects combined units (`2h30m`) — use a single unit (`150m`, `2h`).
+- Fixed by CLAWP-109 (PR #77): Click's Windows argv glob expansion (not PowerShell, not the launcher) used to turn `--scope "scripts/**"` into extra positional arguments ("Got unexpected extra arguments") or silently drop the argument. Current installs pass arguments verbatim. On an older install, use `--predict-scope-file`/`--scope-file`/`--out-of-scope-file` (patterns read from a file, one per line, never touching argv; CLAWP-060) and verify with `clawpm tasks list` after a batch.
+- `--predict-duration` (and any other duration-parsing flag) accepts combined units, e.g. `2h30m` -> 150 minutes, in addition to a single unit (`150m`, `2h`) (CLAWP-096).
 - If multiple `clawpm.exe` shims are on PATH, a stale one can shadow the working install (`ModuleNotFoundError: No module named 'clawpm'`). Check with `where.exe clawpm` and invoke the shim next to the Python install that has clawpm importable.
-- **`tasks edit` replaces the predictions block wholesale, not field-by-field.** Editing only `--hypothesis` nulls duration/complexity/confidence/pre-mortem/scope/filled_by. When editing any prediction field, re-pass ALL prediction flags you want to keep. Also: `--predicted-by` exists on `tasks add` but not `tasks edit`, so `filled_by` is lost on any prediction edit.
+- **`tasks edit` merges predictions field-by-field (CLAWP-108).** Only the prediction flags you pass are overwritten; every other existing prediction field, including `filled_by`, is kept. A repeatable list flag (`--predict-scope`, `--success-criteria`, ...) replaces just that one list. `--predicted-by` exists on `tasks add` but not `tasks edit`; an edit never changes `filled_by`. Caveat: an older installed clawpm (before this fix) still replaces the whole block, so re-pass all prediction flags if `clawpm --version` predates it.
