@@ -9,11 +9,13 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 ### Added
 
 - `tasks dispatch --max-iterations N`: an absolute cap on Stop-hook rubric iterations, counted from a per-dispatch baseline; at the cap `hook eval-stop` stops the agent with a `MAX_ITERATIONS` triage message, and fails closed (Stop allowed, enforcement-error message) if the iteration log cannot be read or written. `clawpm loop` was evaluated and folded into dispatch (`docs/design/loop.md`); `--max-budget` deferred (#87, CLAWP-070)
+- Doc-staleness gate (`tests/test_clawp102_readme_staleness.py`, run by the existing CI pytest step): fails when a non-hidden command or long option in `clawpm introspect` has no mention in README's `## All commands` section; README gaps it found (mission/inbox subcommands, `introspect`, `project announce`, `research link`, ~70 flags) are now documented (#85, CLAWP-102).
 - `tasks dispatch --worktree` and `agent dispatch` now support a project that lives in a repository subdirectory: the session record carries an optional repo-relative `project_prefix` (absent for root-level projects, so existing records resolve unchanged), the agent runs in the project root inside the worktree, and session-scoped resolution maps any cwd under the worktree to `<worktree>/<prefix>/.project`; the `monorepo_worktree_unsupported` refusal is removed. `agent dispatch` fails closed (nothing created) when it cannot determine the project's repo prefix, and a session prefix containing control characters is rejected (#81, CLAWP-118).
 - Opt-in explicit scope: `sessions.Scope` plus `discovery.resolve_scope`, and a keyword-only `scope=` on `get_project_dir`, `get_repo_path`, `get_scoped_project_settings`, `get_tasks_dir`, `get_task` and `touch_task_updated`; `log add` migrated as the exemplar (#75, CLAWP-122).
 
 ### Changed
 
+- MCP server tech-debt (CLAWP-106): `tasks_state` gains `meta_reflect`/`process_lesson` (CLI parity); the `context` tool returns `project` as the plain id string with the metadata dict moved to `project_info` (BREAKING for consumers reading `context["project"]["id"]`); `ToolSpec.min_tier` is a `Literal` validated at construction; README no longer claims `--tools standard` widens the set; `build_agent_context` imports hoisted and docstring/module claims corrected.
 - SKILL.md doc cleanup: document `-f/--format` as the only output control (no `--json`), the `uv tool install`/`pipx` shim-only install, `doctor -p/--project`, the post-batch `tasks list` check, and the CLAWP-109 Windows glob fix state (#82, CLAWP-110).
 
 ### Fixed

@@ -6,7 +6,7 @@ Claude Code skill. It is launched by ``clawpm mcp`` over stdio.
 
 Design:
 
-- **Direct core calls, zero subprocess.** Every tool wraps the existing core
+- **Direct core calls.** Every tool wraps the existing core
   functions (``clawpm.tasks`` / ``clawpm.research`` / ``clawpm.mission`` /
   ``clawpm.context``) and the CLAWP-077 service layer
   (``clawpm.services.tasks.transition``) directly. Nothing shells out to the
@@ -36,7 +36,7 @@ import functools
 import os
 import sys
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Literal, get_args
 
 # Root-cause cp1252 fix (mirrors clawpm.cli's package-level reconfigure,
 # CLAWP-045/046): this module's _catch_unhandled wrapper writes diagnostics to
@@ -58,7 +58,9 @@ except (AttributeError, ValueError, OSError):  # pragma: no cover
 # Tool-tier gating
 # ---------------------------------------------------------------------------
 
+Tier = Literal["core", "standard", "all"]
 TIERS: dict[str, int] = {"core": 0, "standard": 1, "all": 2}
+assert set(TIERS) == set(get_args(Tier))  # keep the type and the map in lockstep
 DEFAULT_TIER = "core"
 TOOLS_ENV_VAR = "CLAWPM_MCP_TOOLS"
 
@@ -74,8 +76,10 @@ SERVER_INSTRUCTIONS = (
 def resolve_tier(value: str | None) -> int:
     """Map a ``CLAWPM_MCP_TOOLS`` value to a numeric tier ceiling.
 
-    Unknown / empty values fall back to ``core`` — the safe, lean default — so a
-    typo can never silently expose a wider surface than intended.
+    This is *user input* (an env var / CLI flag), so unknown / empty values fall
+    back to ``core`` — the safe, lean default — so a typo can never silently
+    expose a wider surface than intended. A bad ``ToolSpec.min_tier`` is a
+    *programmer* error and fails loudly instead (``ToolSpec.__post_init__``).
     """
     if not value:
         return TIERS[DEFAULT_TIER]
@@ -85,8 +89,15 @@ def resolve_tier(value: str | None) -> int:
 @dataclass(frozen=True)
 class ToolSpec:
     name: str
-    min_tier: str
+    min_tier: Tier
     fn: Callable[..., Any]
+
+    def __post_init__(self) -> None:
+        if self.min_tier not in TIERS:
+            raise ValueError(
+                f"ToolSpec {self.name!r}: invalid min_tier {self.min_tier!r} "
+                f"(expected one of {sorted(TIERS, key=TIERS.get)})"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +356,11 @@ def context(project: str | None = None, log_limit: int = 5) -> dict:
     ctx = build_agent_context(config, project_id, source=source, log_limit=log_limit)
     if ctx is None:
         return {"ok": False, "error": "not_found", "message": f"Project '{project_id}' not found"}
+    # CLAWP-106: every other tool returns `project` as the plain id string;
+    # build_agent_context's metadata dict (shared with the CLI renderer, which
+    # keeps its own shape) is exposed here as `project_info`.
+    ctx["project_info"] = ctx["project"]
+    ctx["project"] = project_id
     ctx["ok"] = True
     return ctx
 
@@ -529,6 +545,8 @@ def tasks_state(
     note: str | None = None,
     force: bool = False,
     reflect_note: str | None = None,
+    meta_reflect: str | None = None,
+    process_lesson: str | None = None,
     surprise_tags: list[str] | None = None,
     rationale: str | None = None,
     supersedes: str | None = None,
@@ -539,7 +557,9 @@ def tasks_state(
     parent rollup (pass `force=True` to complete over incomplete subtasks),
     appends the work-log, runs the dependency cascade, and writes the reflection
     event on done/blocked. `surprise_tags` (validated against the fixed
-    taxonomy) and `reflect_note` enrich that calibration event. `rationale` /
+    taxonomy), `reflect_note`, `meta_reflect` (what could have been anticipated)
+    and `process_lesson` (what prediction-process change would have caught it)
+    enrich that calibration event. `rationale` /
     `supersedes` document a `rejected` won't-do decision. Returns the updated
     task plus any cascade/teardown side-effects."""
     from clawpm.context import expand_task_id
@@ -565,6 +585,8 @@ def tasks_state(
             note=note,
             force=force,
             reflect_note=reflect_note,
+            meta_reflect=meta_reflect,
+            process_lesson=process_lesson,
             surprise_tags=tuple(surprise_tags or ()),
             rationale=rationale,
             supersedes=supersedes,
@@ -876,6 +898,11 @@ def _catch_unhandled(fn: Callable[..., Any]) -> Callable[..., Any]:
 def specs_for_tier(tools_tier: str | None) -> list[ToolSpec]:
     """The subset of tool specs exposed at the requested tier ceiling."""
     ceiling = resolve_tier(tools_tier)
+    for s in TOOL_SPECS:
+        # Re-validate: a spec mutated past __post_init__ must fail with the
+        # same clear error, not a bare KeyError.
+        if s.min_tier not in TIERS:
+            raise ValueError(f"ToolSpec {s.name!r}: invalid min_tier {s.min_tier!r}")
     return [s for s in TOOL_SPECS if TIERS[s.min_tier] <= ceiling]
 
 

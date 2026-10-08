@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path
 
 from .discovery import load_portfolio_config, get_project, is_git_repo, init_project_from_repo
-from .models import ProjectSettings
+from .models import ProjectSettings, Task, TaskState
 
 logger = logging.getLogger(__name__)
 
@@ -210,15 +210,11 @@ def build_agent_context(config, project_id: str, source: str = "explicit", log_l
     implementation and can never drift (the tool wraps this core function
     directly rather than shelling out).
 
-    ``get_project`` and the git enrichment mirror the CLI exactly; imports are
-    function-local because ``tasks``/``links``/``worklog`` import back into this
-    module (``expand_task_id``), which would be a circular import at module
-    load.
+    ``get_project`` and the git enrichment mirror the CLI exactly.
     """
     from .tasks import get_next_task, list_tasks
     from .worklog import tail_entries
     from .links import build_link_index
-    from .models import Task, TaskState
 
     proj = get_project(config, project_id)
     if not proj:
