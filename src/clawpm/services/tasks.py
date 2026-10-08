@@ -125,7 +125,7 @@ def transition(
         state == TaskState.DONE
         and pre_transition_task is not None
         and pre_transition_task.kind == "decision"
-        and not (resolution and resolution.strip())
+        and not (isinstance(resolution, str) and resolution.strip())
     ):
         return {
             "ok": False,
@@ -134,6 +134,25 @@ def transition(
             "message": (
                 f"Task {task_id} is a decision (kind: decision) and requires "
                 "a non-empty --resolution to complete."
+            ),
+        }
+    # A build task's resolution is optional, but one that IS supplied must be
+    # a non-blank string: refuse loudly (task untouched) rather than store
+    # nothing and report success.
+    if (
+        state == TaskState.DONE
+        and pre_transition_task is not None
+        and pre_transition_task.kind != "decision"
+        and resolution is not None
+        and not (isinstance(resolution, str) and resolution.strip())
+    ):
+        return {
+            "ok": False,
+            "task_id": task_id,
+            "error": "invalid_resolution",
+            "message": (
+                f"Task {task_id}: --resolution must be non-blank when "
+                "supplied (omit it to complete without one)."
             ),
         }
 

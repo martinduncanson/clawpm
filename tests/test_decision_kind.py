@@ -849,3 +849,102 @@ class TestEditKindGuardUsesParsedResolution:
         )
         edit_task(config, "test-proj", task.id, kind="decision")
         assert get_task(config, "test-proj", task.id).kind == "decision"
+
+
+class TestBuildTaskAcceptsOptionalResolution:
+    """Codex r2 P2: the ADR says `--resolution` is "accepted and stored but
+    optional" for kind: build. Completing a build task with a resolution must
+    persist it (both file-form and directory-form), without the mandatory gate
+    or the parent-map line that are decision-only."""
+
+    def test_file_form_build_task_stores_resolution(self, temp_portfolio):
+        config = temp_portfolio["config"]
+        task = add_task(config, "test-proj", "Plain build work")
+        result = CliRunner().invoke(
+            main, ["-p", "test-proj", "done", task.id, "--resolution", "Shipped via X."]
+        )
+        assert result.exit_code == 0, result.output
+        reloaded = get_task(config, "test-proj", task.id)
+        assert reloaded.state == TaskState.DONE
+        assert reloaded.kind == "build"
+        assert reloaded.resolution == "Shipped via X."
+        assert reloaded.resolved_at is not None
+
+    def test_build_task_without_resolution_still_closes(self, temp_portfolio):
+        config = temp_portfolio["config"]
+        task = add_task(config, "test-proj", "Plain build work")
+        result = CliRunner().invoke(main, ["-p", "test-proj", "done", task.id])
+        assert result.exit_code == 0, result.output
+        reloaded = get_task(config, "test-proj", task.id)
+        assert reloaded.state == TaskState.DONE
+        assert reloaded.resolution is None
+        assert reloaded.resolved_at is None
+
+    def test_directory_form_build_task_stores_resolution(self, temp_portfolio):
+        config = temp_portfolio["config"]
+        build = add_task(config, "test-proj", "Build with a child")
+        child = add_subtask(config, "test-proj", build.id, "The child")
+        runner = CliRunner()
+        assert runner.invoke(main, ["-p", "test-proj", "done", child.id]).exit_code == 0
+        assert get_task(config, "test-proj", build.id).file_path.name == "_task.md"
+
+        result = runner.invoke(
+            main, ["-p", "test-proj", "done", build.id, "--resolution", "All merged."]
+        )
+        assert result.exit_code == 0, result.output
+        reloaded = get_task(config, "test-proj", build.id)
+        assert reloaded.state == TaskState.DONE
+        assert reloaded.resolution == "All merged."
+
+    def test_build_resolution_does_not_touch_parent_map(self, temp_portfolio):
+        config = temp_portfolio["config"]
+        parent = add_task(config, "test-proj", "Parent epic")
+        child = add_subtask(config, "test-proj", parent.id, "Build child")
+        before = get_task(config, "test-proj", parent.id).file_path.read_text(
+            encoding="utf-8"
+        )
+        result = CliRunner().invoke(
+            main, ["-p", "test-proj", "done", child.id, "--resolution", "Done it."]
+        )
+        assert result.exit_code == 0, result.output
+        after = get_task(config, "test-proj", parent.id).file_path.read_text(
+            encoding="utf-8"
+        )
+        assert "Decisions so far" not in after
+        assert after == before
+
+    @pytest.mark.parametrize("blank", ["", "   "])
+    def test_blank_resolution_on_build_is_loud_and_leaves_task_open(
+        self, temp_portfolio, blank
+    ):
+        config = temp_portfolio["config"]
+        task = add_task(config, "test-proj", "Plain build work")
+        result = CliRunner().invoke(
+            main, ["-p", "test-proj", "done", task.id, "--resolution", blank]
+        )
+        assert result.exit_code != 0, result.output
+        assert get_task(config, "test-proj", task.id).state == TaskState.OPEN
+
+    @pytest.mark.parametrize("bad", ["", "   ", 5, ["a"]])
+    def test_change_task_state_rejects_bad_resolution_on_build(
+        self, temp_portfolio, bad
+    ):
+        config = temp_portfolio["config"]
+        task = add_task(config, "test-proj", "Plain build work")
+        with pytest.raises(ValueError, match="resolution"):
+            change_task_state(
+                config, "test-proj", task.id, TaskState.DONE, resolution=bad
+            )
+        assert get_task(config, "test-proj", task.id).state == TaskState.OPEN
+
+    @pytest.mark.parametrize("bad", [5, ["a"]])
+    def test_change_task_state_rejects_non_string_resolution_on_decision(
+        self, temp_portfolio, bad
+    ):
+        config = temp_portfolio["config"]
+        task = add_task(config, "test-proj", "A decision", kind="decision")
+        with pytest.raises(ValueError, match="resolution"):
+            change_task_state(
+                config, "test-proj", task.id, TaskState.DONE, resolution=bad
+            )
+        assert get_task(config, "test-proj", task.id).state == TaskState.OPEN

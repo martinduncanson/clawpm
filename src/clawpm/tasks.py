@@ -867,9 +867,35 @@ def _write_rejection_frontmatter(
         raise
 
 
+def _resolution_applies(task: Task, resolution: object) -> bool:
+    """True when completing ``task`` must validate and persist ``resolution``:
+    always for a decision (mandatory), and for a build task only when the
+    caller supplied one (optional, ADR D1) — ``None`` means "not supplied"."""
+    return task.kind == "decision" or resolution is not None
+
+
+def _check_resolution(task: Task, task_id: str, resolution: object) -> None:
+    """Raise ``ValueError`` unless ``resolution`` is a non-blank string. A
+    supplied-but-blank (or non-string) resolution on a build task fails as
+    loudly as a missing one on a decision, rather than being silently dropped."""
+    if isinstance(resolution, str) and resolution.strip():
+        return
+    if task.kind == "decision":
+        raise ValueError(
+            f"Task {task_id} is a decision (kind: decision) and "
+            "requires a non-empty resolution to complete. "
+            "Pass resolution='<text>' to change_task_state()."
+        )
+    raise ValueError(
+        f"Task {task_id}: resolution must be a non-empty string when "
+        "supplied (omit it to complete without one)."
+    )
+
+
 def _write_resolution_frontmatter(file_path: Path, resolution: str) -> None:
     """Rewrite the task file's YAML frontmatter to add resolution/resolved_at
-    before a ``kind: decision`` task is moved to ``done/`` (CLAWP-111).
+    before a task is moved to ``done/`` (CLAWP-111; mandatory for
+    ``kind: decision``, optional for build).
 
     Mirrors ``_write_rejection_frontmatter``: preserves all existing
     frontmatter keys, only adds/overwrites ``resolution`` and ``resolved_at``.
@@ -1104,20 +1130,16 @@ def change_task_state(
                     )
                 _write_rejection_frontmatter(_task_md, rationale.strip(), supersedes)  # type: ignore[arg-type]
 
-            # (d2) CLAWP-111 — DECISION: a kind=="decision" task requires a
-            #      non-empty resolution to complete. Written INSIDE the lock,
-            #      BEFORE the no-op return, so rerunning with a corrected
-            #      resolution still updates it. Backstop only — the primary
-            #      gate lives in services.tasks.transition (shared by
+            # (d2) CLAWP-111 — RESOLUTION: a kind=="decision" task REQUIRES a
+            #      non-empty resolution to complete; a build task ACCEPTS an
+            #      optional one (ADR D1) and must not drop it. Written INSIDE
+            #      the lock, BEFORE the no-op return, so rerunning with a
+            #      corrected resolution still updates it. Backstop only — the
+            #      primary gate lives in services.tasks.transition (shared by
             #      shortcuts.done and tasks_state); this defends direct callers.
             _resolved_this_txn = False
-            if new_state == TaskState.DONE and task.kind == "decision":
-                if not resolution or not resolution.strip():
-                    raise ValueError(
-                        f"Task {task_id} is a decision (kind: decision) and "
-                        "requires a non-empty resolution to complete. "
-                        "Pass resolution='<text>' to change_task_state()."
-                    )
+            if new_state == TaskState.DONE and _resolution_applies(task, resolution):
+                _check_resolution(task, task_id, resolution)
                 _task_md = task_dir / "_task.md"
                 if not _task_md.exists():
                     raise FileNotFoundError(
@@ -1126,7 +1148,8 @@ def change_task_state(
                     )
                 _write_resolution_frontmatter(_task_md, resolution.strip())
                 _resolved_this_txn = True
-                if task.parent:
+                # The parent map's "Decisions so far" is decision-only.
+                if task.kind == "decision" and task.parent:
                     # Forward `scope` (Codex r1 P1): a pinned worktree scope
                     # must resolve the parent in the SAME store as the child.
                     _parent = get_task(
@@ -1227,16 +1250,11 @@ def change_task_state(
         #      full rationale. Backstop only — the primary gate lives in
         #      services.tasks.transition.
         _resolved_this_txn = False
-        if new_state == TaskState.DONE and task.kind == "decision":
-            if not resolution or not resolution.strip():
-                raise ValueError(
-                    f"Task {task_id} is a decision (kind: decision) and "
-                    "requires a non-empty resolution to complete. "
-                    "Pass resolution='<text>' to change_task_state()."
-                )
+        if new_state == TaskState.DONE and _resolution_applies(task, resolution):
+            _check_resolution(task, task_id, resolution)
             _write_resolution_frontmatter(current_path, resolution.strip())
             _resolved_this_txn = True
-            if task.parent:
+            if task.kind == "decision" and task.parent:
                 # Forward `scope` (Codex r1 P1) — see the directory branch.
                 _parent = get_task(
                     config, project_id, task.parent, **_scope_kw(scope)

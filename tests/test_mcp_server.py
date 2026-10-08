@@ -1122,3 +1122,69 @@ def test_tasks_state_resolution_completes_a_decision(isolated_portfolio):
     _run(scenario)
     reloaded = get_task(isolated_portfolio.config, pid, task.id)
     assert reloaded.resolution == "Kafka."
+
+
+def test_tasks_add_and_edit_expose_kind(isolated_portfolio):
+    """CLAWP-111 (Codex r2 P2): MCP must be able to create and reclassify
+    decision tasks, with the same vocabulary the CLI enforces."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    pid = isolated_portfolio.project_id
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+            added = await _call(client, "tasks_add", {
+                "project": pid, "title": "Pick a bus", "kind": "decision"})
+            assert added["ok"] is True, added
+            assert added["task"]["kind"] == "decision"
+            tid = added["task"]["id"]
+
+            plain = await _call(client, "tasks_add", {"project": pid, "title": "Plain"})
+            assert plain["task"]["kind"] == "build"
+
+            bad_add = await _call(client, "tasks_add", {
+                "project": pid, "title": "Bad", "kind": "epic"})
+            assert bad_add["ok"] is False
+            assert bad_add["error"] == "bad_kind"
+
+            # kind alone is a real change (no_changes guard must count it)
+            back = await _call(client, "tasks_edit", {
+                "project": pid, "task_id": tid, "kind": "build"})
+            assert back["ok"] is True, back
+            assert back["task"]["kind"] == "build"
+
+            fwd = await _call(client, "tasks_edit", {
+                "project": pid, "task_id": tid, "kind": "decision"})
+            assert fwd["ok"] is True, fwd
+            assert fwd["task"]["kind"] == "decision"
+
+            bad_edit = await _call(client, "tasks_edit", {
+                "project": pid, "task_id": tid, "kind": "epic"})
+            assert bad_edit["ok"] is False
+            assert bad_edit["error"] == "bad_kind"
+
+    _run(scenario)
+
+
+def test_tasks_state_resolution_is_stored_on_a_build_task(isolated_portfolio):
+    """CLAWP-111 (Codex r2 P2): resolution is optional-but-stored for build."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    from clawpm.tasks import add_task, get_task
+
+    pid = isolated_portfolio.project_id
+    task = add_task(isolated_portfolio.config, pid, "Plain work")
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+            done = await _call(client, "tasks_state", {
+                "project": pid, "task_id": task.id, "new_state": "done",
+                "resolution": "Shipped."})
+            assert done["ok"] is True, done
+
+    _run(scenario)
+    assert get_task(isolated_portfolio.config, pid, task.id).resolution == "Shipped."

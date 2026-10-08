@@ -461,6 +461,7 @@ def tasks_add(
     reference_tasks: list[str] | None = None,
     hypothesis: str | None = None,
     predicted_by: str | None = None,
+    kind: str | None = None,
 ) -> dict:
     """Create a task. Prefer verifiable goals: pass `success_criteria` (plain
     strings — this tool's schema is `list[str]`; the CLI's structured
@@ -471,8 +472,10 @@ def tasks_add(
     `predict_iterations`) so the task is gradeable and feeds calibration.
     Predictions are attributed `filled_by="agent"` by default (pass
     `predicted_by="operator"` for a human-in-the-loop host). `delegability`
-    is agent|human|either. `depends` accepts short ids (expanded the same
-    way as `task_id` elsewhere). Returns the created task."""
+    is agent|human|either. `kind` is build (default) | decision — a decision
+    task needs a `resolution` to complete (see `tasks_state`). `depends`
+    accepts short ids (expanded the same way as `task_id` elsewhere). Returns
+    the created task."""
     from clawpm.context import expand_task_id
     from clawpm.models import TaskComplexity
     from clawpm.tasks import add_task
@@ -488,6 +491,10 @@ def tasks_add(
     if delegability is not None and delegability not in ("agent", "human", "either"):
         return {"ok": False, "error": "bad_delegability",
                 "message": f"invalid delegability '{delegability}' (agent|human|either)"}
+
+    if kind is not None and kind not in ("build", "decision"):
+        return {"ok": False, "error": "bad_kind",
+                "message": f"invalid kind '{kind}' (build|decision)"}
 
     try:
         predictions = _build_predictions(
@@ -531,6 +538,7 @@ def tasks_add(
         out_of_scope=list(out_of_scope) if out_of_scope else None,
         stop_conditions=list(stop_conditions) if stop_conditions else None,
         delegability=delegability,
+        kind=kind,
     )
     if not task:
         return {"ok": False, "error": "add_failed",
@@ -562,7 +570,8 @@ def tasks_state(
     and `process_lesson` (what prediction-process change would have caught it)
     enrich that calibration event. `rationale` /
     `supersedes` document a `rejected` won't-do decision. `resolution` is
-    required to complete (`done`) a `kind: decision` task. Returns the updated
+    required to complete (`done`) a `kind: decision` task, optional (but
+    stored, and must be non-blank) for a build task. Returns the updated
     task plus any cascade/teardown side-effects."""
     from clawpm.context import expand_task_id
     from clawpm.models import TaskState
@@ -630,9 +639,12 @@ def tasks_edit(
     reference_tasks: list[str] | None = None,
     hypothesis: str | None = None,
     predicted_by: str | None = None,
+    kind: str | None = None,
 ) -> dict:
     """Edit an existing task's metadata (title, priority, complexity, body,
-    scope, tags, dispatch-contract fields, predictions). Only the fields you
+    scope, tags, dispatch-contract fields, `kind` build|decision, predictions).
+    Reclassifying an already-done, resolution-less task as a decision is
+    refused (it would bypass the done gate). Only the fields you
     pass are changed — EXCEPT `scope`/`out_of_scope`/`stop_conditions`, where
     an explicit empty list `[]` clears the field (matches `edit_task`'s own
     contract) while omitting the argument entirely leaves it unchanged; `tags`
@@ -660,6 +672,10 @@ def tasks_edit(
     if delegability is not None and delegability not in ("agent", "human", "either"):
         return {"ok": False, "error": "bad_delegability",
                 "message": f"invalid delegability '{delegability}' (agent|human|either)"}
+
+    if kind is not None and kind not in ("build", "decision"):
+        return {"ok": False, "error": "bad_kind",
+                "message": f"invalid kind '{kind}' (build|decision)"}
 
     # Preserve the existing filled_by unless the caller overrides it —
     # _build_predictions' own default ("agent" when predicted_by is omitted)
@@ -714,7 +730,7 @@ def tasks_edit(
         title is not None, priority is not None, complexity, body is not None,
         scope is not None, predictions is not None, parallel_group is not None,
         clear_parallel_group, out_of_scope is not None, stop_conditions is not None,
-        delegability is not None, tags, clear_tags,
+        delegability is not None, tags, clear_tags, kind is not None,
     ]):
         return {"ok": False, "error": "no_changes",
                 "message": "Specify at least one field to edit"}
@@ -727,29 +743,35 @@ def tasks_edit(
         return {"ok": False, "error": "conflicting_flags",
                 "message": "Cannot supply both tags and clear_tags"}
 
-    task = edit_task(
-        config,
-        project_id,
-        full_id,
-        title=title,
-        priority=priority,
-        complexity=cmplx,
-        # None if x is None else list(x): an explicit [] must reach edit_task
-        # as [] (its own contract treats that as "clear the field"), not be
-        # coerced to None ("leave unchanged") — `x if x else None` silently
-        # broke JSON callers' ability to clear these via an empty array
-        # (CLAWP-068 review, grok-4.6).
-        scope=None if scope is None else list(scope),
-        tags=list(tags) if tags else None,
-        clear_tags=clear_tags,
-        body=body,
-        predictions=predictions,
-        parallel_group=parallel_group,
-        clear_parallel_group=clear_parallel_group,
-        out_of_scope=None if out_of_scope is None else list(out_of_scope),
-        stop_conditions=None if stop_conditions is None else list(stop_conditions),
-        delegability=delegability,
-    )
+    try:
+        task = edit_task(
+            config,
+            project_id,
+            full_id,
+            title=title,
+            priority=priority,
+            complexity=cmplx,
+            # None if x is None else list(x): an explicit [] must reach edit_task
+            # as [] (its own contract treats that as "clear the field"), not be
+            # coerced to None ("leave unchanged") — `x if x else None` silently
+            # broke JSON callers' ability to clear these via an empty array
+            # (CLAWP-068 review, grok-4.6).
+            scope=None if scope is None else list(scope),
+            tags=list(tags) if tags else None,
+            clear_tags=clear_tags,
+            body=body,
+            predictions=predictions,
+            parallel_group=parallel_group,
+            clear_parallel_group=clear_parallel_group,
+            out_of_scope=None if out_of_scope is None else list(out_of_scope),
+            stop_conditions=None if stop_conditions is None else list(stop_conditions),
+            delegability=delegability,
+            kind=kind,
+        )
+    except ValueError as exc:
+        # edit_task refuses reclassifying a done, resolution-less task as a
+        # decision (CLAWP-111) — surface it as a structured error, not a crash.
+        return {"ok": False, "task_id": full_id, "error": "edit_failed", "message": str(exc)}
     if not task:
         return {"ok": False, "error": "not_found", "task_id": full_id,
                 "message": f"No task '{full_id}' in project '{project_id}'"}

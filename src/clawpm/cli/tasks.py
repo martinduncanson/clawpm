@@ -663,7 +663,7 @@ def _render_state_results(
 # CLAWP-111 — decision-kind tasks: resolution is required when new_state is
 # 'done' on a kind: decision task.
 @click.option("--resolution", "resolution", default=None,
-              help="Required to complete (done) a kind: decision task: the decision's outcome.")
+              help="Outcome text. Required to complete (done) a kind: decision task; optional (stored) for build tasks.")
 @click.pass_context
 def tasks_state(ctx: click.Context, project_id: str | None, task_ids: tuple[str, ...], new_state: str, note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...], rationale: str | None, supersedes: str | None, resolution: str | None) -> None:
     """Change one or many tasks' state (CLAWP-083 bulk mode).

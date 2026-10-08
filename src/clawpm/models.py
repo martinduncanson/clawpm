@@ -552,8 +552,8 @@ class Task:
     # CLAWP-111 — a task can BE a decision instead of a unit of build work.
     # kind: "build" (default) | "decision". Omitted from frontmatter when at
     # the default, so every pre-111 task file round-trips byte-for-byte.
-    # resolution/resolved_at are only meaningful for kind=="decision" and are
-    # set when the decision closes (`done --resolution "..."`); None until then.
+    # resolution/resolved_at are set when a task closes with `done --resolution
+    # "..."` — mandatory for kind=="decision", optional for build; None until then.
     kind: str = "build"
     resolution: str | None = None
     resolved_at: str | None = None
