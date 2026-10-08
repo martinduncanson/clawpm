@@ -449,21 +449,6 @@ def _validate_task_request(payload: dict) -> None:
                 raise TaskRequestError(f"bad success_criteria entry {crit!r}: {exc}") from exc
 
 
-def _has_result_reply(portfolio_root: Path, agent_id: str, msg_id: str) -> dict | None:
-    """Return a prior result reply from ``agent_id`` to ``msg_id`` (resume guard)."""
-    for f in _all_inbox_files(portfolio_root):
-        for ev in _read_events(f):
-            if (
-                ev.get("event") == "message"
-                and ev.get("in_reply_to") == msg_id
-                and ev.get("from") == agent_id
-                and isinstance(ev.get("payload"), dict)
-                and ev["payload"].get("type") == TASK_REQUEST_RESULT
-            ):
-                return ev
-    return None
-
-
 def materialize_task_requests(
     config,
     agent_id: str,
@@ -488,12 +473,17 @@ def materialize_task_requests(
 
     Crash window: if the process dies after ``add_task`` but before the reply, a
     re-run finds the task by its ``source_request`` key and only replies + acks
-    (``resumed``) instead of creating a duplicate. Once the reply exists, a
-    re-run only acks. The pre-checks above are not locked, but ``add_task``
-    rechecks the ``source_request`` key inside its creation lock, so a CONCURRENT
-    second materializer for the same agent reuses the first one's task
-    (``resumed``) instead of creating a duplicate. Both may then send the result
-    reply (same ``task_id``); the unlocked reply check cannot prevent that.
+    (``resumed``) instead of creating a duplicate. That key, read from a task
+    file in the resolved project, is the ONLY evidence a request was already
+    handled: a result reply found in an inbox is never trusted, because its
+    ``from``, ``in_reply_to`` and ``task_id`` are self-declared by whoever wrote
+    it, and a forged one would get a real request acked without a task. The
+    pre-check is not locked, but ``add_task`` rechecks the key inside its
+    creation lock, so a CONCURRENT second materializer for the same agent reuses
+    the first one's task (``resumed``) instead of creating a duplicate. A crash
+    between reply and ack, or two concurrent materializers, can send the result
+    reply twice (same ``task_id``); a duplicate reply is harmless, a lost
+    request is not.
 
     ``dry_run`` writes nothing at all (no tasks, replies or acks).
     """
@@ -583,18 +573,10 @@ def materialize_task_requests(
             })
             return
 
-        prior = _has_result_reply(root, agent_id, msg_id)
-        if prior is not None:
-            ack_messages(root, [msg_id], acked_by=agent_id)
-            result["materialized"].append({
-                "msg_id": msg_id, "project": project_id,
-                "task_id": (prior.get("payload") or {}).get("task_id"),
-                "resumed": True,
-            })
-            return
-
         # Crash window guard: a task already stamped with this request id means a
-        # previous run created it but died before replying.
+        # previous run created it but died before replying or acking. The stamp on
+        # a task in the resolved project is the only evidence we trust; a result
+        # reply in some inbox is self-declared by its writer and proves nothing.
         existing = find_task_by_source_request(config, project_id, msg_id)
         if existing is not None:
             reply_and_ack(msg_id, sender, project_id, existing.id)
