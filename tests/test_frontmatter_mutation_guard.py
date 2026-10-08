@@ -244,14 +244,19 @@ class TestReadPathsStayLenientByDesign:
         assert found is not None
         assert found.file_path == task.file_path
 
-    def test_research_from_file_defaults_rather_than_raises(self, tmp_path):
+    def test_research_from_file_raises_on_corrupt_frontmatter(self, tmp_path):
+        """CLAWP-095 reverses the old lenient policy for research: a corrupt
+        fenced block raises so scan_research can surface the file as malformed
+        instead of silently listing a ghost entry with id = filename stem."""
+        from clawpm.frontmatter import FrontmatterError
         from clawpm.models import Research
 
         f = tmp_path / "research-001.md"
         _write_list_frontmatter(f, "research-001")
 
-        item = Research.from_file(f)  # must not raise
-        assert item.id == "research-001"
+        with pytest.raises(FrontmatterError) as ei:
+            Research.from_file(f)
+        assert ei.value.reason == "not_a_mapping"
 
     def test_mission_from_file_defaults_rather_than_raises(self, tmp_path):
         from clawpm.mission import Mission

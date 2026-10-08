@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
-from datetime import date, datetime, timezone
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 from .concurrency import (
     ConcurrentModificationError,
@@ -23,14 +27,35 @@ from .frontmatter import (
     require_mapping,
     split_frontmatter,
     stamp_updated,
+    today_utc_iso,
 )
 from .models import Task, TaskState, TaskComplexity, Predictions, PortfolioConfig, normalize_tags
 from .discovery import get_project_dir, find_project_dir_fallback
+from .sessions import Scope
+from .id_reservations import record_reservation, record_task_id, reserved_high_water
 
 
-def get_tasks_dir(config: PortfolioConfig, project_id: str) -> Path | None:
-    """Get the tasks directory for a project."""
-    project_dir = get_project_dir(config, project_id)
+def _scope_kw(scope: Scope | None) -> dict:
+    """``{"scope": scope}`` when given, else ``{}`` — so a ``None`` scope keeps
+    calling the resolvers with their old signature (see :func:`get_tasks_dir`)."""
+    return {} if scope is None else {"scope": scope}
+
+
+def get_tasks_dir(
+    config: PortfolioConfig, project_id: str, *, scope: Scope | None = None
+) -> Path | None:
+    """Get the tasks directory for a project.
+
+    CLAWP-122: ``scope=None`` is the ambient (cwd / contextvar) resolution; a
+    :class:`sessions.Scope` bypasses it. See ``get_project_dir``.
+    """
+    # `scope` is forwarded only when given, so callers/tests that wrap
+    # `get_project_dir` with the old two-argument signature keep working.
+    project_dir = (
+        get_project_dir(config, project_id)
+        if scope is None
+        else get_project_dir(config, project_id, scope=scope)
+    )
     if project_dir:
         tasks_dir = project_dir / "tasks"
         if tasks_dir.exists():
@@ -189,6 +214,65 @@ def _parent_id_of(task_id: str) -> str | None:
     return None
 
 
+def _ancestor_chain(task_id: str) -> list[str]:
+    """Full ancestor-id chain of a subtask id, shallowest first (CLAWP-131).
+
+    ``PARENT-001-001`` -> ``["PARENT", "PARENT-001"]``. ``_parent_id_of``
+    cannot tell a REAL subtask relationship from a top-level task id that
+    merely LOOKS like one (every ``PREFIX-NNN`` shaped id, including an
+    ordinary top-level task's own id, peels one more level — e.g.
+    ``_ancestor_chain("CLAWP-131-001-001")`` returns ``["CLAWP",
+    "CLAWP-131", "CLAWP-131-001"]`` even though ``CLAWP-131`` is a
+    top-level task, not nested under a real ``CLAWP`` directory). This
+    over-counts by exactly the number of spurious prefix-is-a-project-stem
+    levels; callers must probe every SUFFIX of this chain (see
+    ``_nested_dir_candidates``), not just the chain itself, since the real
+    nesting boundary can start partway through it.
+    """
+    chain: list[str] = []
+    current = task_id
+    while True:
+        parent = _parent_id_of(current)
+        if parent is None:
+            break
+        chain.append(parent)
+        current = parent
+    chain.reverse()
+    return chain
+
+
+def _nested_dir_candidates(task_id: str) -> list[list[str]]:
+    """Every 1+-level-deep directory-nesting candidate for ``task_id``
+    (CLAWP-131), shallowest-chain-first.
+
+    ``_ancestor_chain`` can over-count the real nesting depth (see its
+    docstring) because ``_parent_id_of`` can't distinguish a genuine
+    subtask relationship from a top-level id that merely looks like one.
+    The real on-disk nesting -- wherever it actually starts -- is always
+    SOME contiguous suffix of the full chain, since ``add_subtask`` only
+    ever peels off exactly one ``-NNN`` group per real nesting level, the
+    same operation ``_parent_id_of`` itself performs. Returning every
+    suffix, INCLUDING length-1 (grok-4.6 review catch, PR #69: a length-1
+    suffix is NOT already covered by the existing one-level probes for the
+    done/blocked/rejected state roots -- that probe only checks ``task_id``'s
+    DIRECTORY form under the OPEN root, reasoning that ``task_id`` moving to
+    a terminal state relocates it to the top-level ``<state>/<task_id>/``.
+    That reasoning only holds when ``task_id`` ITSELF transitions. It misses
+    the case where ``task_id`` is itself a directory task (further
+    decomposed) whose IMMEDIATE PARENT transitions independently while
+    ``task_id`` stays open -- then the parent's whole directory, with
+    ``task_id``'s subdirectory still nested inside it, relocates to
+    ``<state>/<parent_id>/<task_id>/_task.md``, which only this length-1
+    suffix candidate reaches) means the genuine nesting depth is always
+    among the candidates, whichever one it turns out to be -- each is
+    existence-checked by the caller, so a wrong guess costs a harmless
+    stat call, never a false match (every candidate still embeds
+    ``task_id`` in the final path component).
+    """
+    chain = _ancestor_chain(task_id)
+    return [chain[i:] for i in range(len(chain))]
+
+
 def _archive_candidate_paths(tasks_dir: Path, task_id: str) -> list[Path]:
     """Every ``done/archive/`` location a task with ``task_id`` could occupy.
 
@@ -208,6 +292,17 @@ def _archive_candidate_paths(tasks_dir: Path, task_id: str) -> list[Path]:
         paths.extend([
             archive / parent_id / f"{task_id}.md",        # archived subtask file
             archive / parent_id / task_id / "_task.md",   # nested decomposed archived subtask
+        ])
+    # CLAWP-131: the one-level probes above assume the immediate parent's
+    # archived directory sits at the top of done/archive/. A grandchild+
+    # whose immediate parent is itself nested under an ancestor's archived
+    # directory needs every 2+-level nesting candidate, same gap and same
+    # fix shape as _candidate_task_paths below.
+    for candidate in _nested_dir_candidates(task_id):
+        nested_archive_dir = archive.joinpath(*candidate)
+        paths.extend([
+            nested_archive_dir / f"{task_id}.md",
+            nested_archive_dir / task_id / "_task.md",
         ])
     return paths
 
@@ -254,9 +349,42 @@ def _candidate_task_paths(tasks_dir: Path, task_id: str) -> list[Path]:
             # When marked done/blocked the directory migrates to the top-
             # level done/<child>/ or blocked/<child>/ via change_task_state,
             # so the existing tasks_dir/done/<task_id>/_task.md probe
-            # already covers the terminal states.
+            # already covers task_id's OWN transition. The orthogonal case --
+            # task_id stays open but its immediate PARENT transitions, moving
+            # the parent's whole directory (task_id's subdirectory still
+            # nested inside it) to <state>/parent_id/task_id/_task.md -- is
+            # covered by the length-1 _nested_dir_candidates suffix in the
+            # state-root loop below (grok-4.6 review catch, PR #69), not here.
             tasks_dir / parent_id / task_id / "_task.md",
         ])
+
+    # CLAWP-131: the one-level probes above assume the immediate parent's
+    # OWN directory sits at the TOP level of tasks_dir. A grandchild+ whose
+    # immediate parent is itself nested under an ancestor's directory (e.g.
+    # parent -> add_subtask -> child [nests under parent] -> add_subtask ->
+    # grandchild [nests under child, itself nested under parent]) lives at
+    # tasks_dir/<ancestor_k>/.../<ancestor_n>/<task_id>.md, which the
+    # one-level probe never reaches. Probe every 2+-level nesting candidate
+    # (see _nested_dir_candidates — the naive full ancestor chain can
+    # overshoot the real nesting depth for an ordinary top-level id).
+    #
+    # Must probe all FOUR state roots, not just tasks_dir itself (reviewer
+    # catch, verified live): an ANCESTOR further up the chain can
+    # independently transition to done/blocked/rejected (change_task_state's
+    # directory-task branch moves that ancestor's whole subtree wholesale,
+    # keeping its relative nested structure), which relocates the
+    # grandchild's nested directory under that state root while the
+    # grandchild itself is still open. The one-level probe above already
+    # covers all four roots for exactly this reason; the nested probe must
+    # match it or the bug reopens via e.g. `tasks state <parent> blocked`.
+    for candidate in _nested_dir_candidates(task_id):
+        for state_root in (tasks_dir, tasks_dir / "done", tasks_dir / "blocked", tasks_dir / "rejected"):
+            nested_dir = state_root.joinpath(*candidate)
+            possible_paths.extend([
+                nested_dir / f"{task_id}.md",
+                nested_dir / f"{task_id}.progress.md",
+                nested_dir / task_id / "_task.md",  # the grandchild itself further decomposed
+            ])
 
     # CLAWP-085 — archived done tasks live under done/archive/ (every path shape,
     # incl. nested decomposed subtasks). Resolvable by get_task so `tasks show`
@@ -267,9 +395,15 @@ def _candidate_task_paths(tasks_dir: Path, task_id: str) -> list[Path]:
     return possible_paths
 
 
-def get_task(config: PortfolioConfig, project_id: str, task_id: str) -> Task | None:
-    """Get a specific task by ID."""
-    tasks_dir = get_tasks_dir(config, project_id)
+def get_task(
+    config: PortfolioConfig, project_id: str, task_id: str, *, scope: Scope | None = None
+) -> Task | None:
+    """Get a specific task by ID (``scope`` as for :func:`get_tasks_dir`)."""
+    tasks_dir = (
+        get_tasks_dir(config, project_id)
+        if scope is None
+        else get_tasks_dir(config, project_id, scope=scope)
+    )
     if not tasks_dir:
         return None
 
@@ -516,7 +650,9 @@ def _set_updated_line(text: str, stamp: str) -> str | None:
         _parsed = None
     if _parsed is not None and not isinstance(_parsed, dict):
         return None
-    new_line = f"updated: '{stamp}'"
+    # CRLF file: split("\n") leaves a trailing "\r" on every line, so the
+    # spliced line must carry one too or the file ends up with mixed endings.
+    new_line = f"updated: '{stamp}'" + ("\r" if lines[0].endswith("\r") else "")
     for i in range(1, close_idx):
         if _UPDATED_LINE_RE.match(lines[i]):
             lines[i] = new_line
@@ -547,13 +683,17 @@ def _stamp_updated_file(file_path: Path, when: str | None = None) -> None:
     move/reload path already retries — raising after the move had committed and
     leaving state + work-log inconsistent.
     """
-    text = retry_transient(lambda: file_path.read_text(encoding="utf-8"))
-    new_text = _set_updated_line(text, when or date.today().isoformat())
+    # Bytes in, bytes out: text-mode read_text() folds CRLF to LF on every
+    # platform, while text-mode write_text() re-expands LF to CRLF on Windows
+    # only -- so CRLF files were silently converted to LF on Linux and LF files
+    # to CRLF on Windows. Binary I/O keeps the line endings verbatim.
+    text = retry_transient(lambda: file_path.read_bytes()).decode("utf-8")
+    new_text = _set_updated_line(text, when or today_utc_iso())
     if new_text is None:
         return  # no well-formed frontmatter fence — leave the file untouched
     tmp = file_path.with_suffix(file_path.suffix + ".tmp")
     try:
-        tmp.write_text(new_text, encoding="utf-8")
+        tmp.write_bytes(new_text.encode("utf-8"))
         # Retry transient Windows sharing/access faults on the rename — this
         # runs under the per-project lock alongside concurrent scanners (CLAWP-051).
         retry_transient(tmp.replace, file_path)
@@ -562,11 +702,87 @@ def _stamp_updated_file(file_path: Path, when: str | None = None) -> None:
         raise
 
 
+_STATE_LINE_RE = re.compile(r"^state\s*:")
+
+
+def _sync_state_line(file_path: Path, new_state: str) -> bool:
+    """Rewrite an EXISTING top-level ``state:`` frontmatter value, in place (CLAWP-094).
+
+    Surgical like :func:`_stamp_updated_file`: only the ``state`` entry changes,
+    so comments / key order / body / line endings are preserved. Returns ``True``
+    if the value was rewritten. A file with no well-formed fence, or with no
+    ``state:`` key, is left untouched (``False``) -- we never ADD a state key
+    tasks don't carry.
+
+    The COMPLETE value is rewritten: a multi-line scalar (``state: >-`` /
+    ``state: |`` / a folded plain or quoted scalar) has its indented
+    continuation lines consumed, never left stale. A non-scalar value (sequence,
+    mapping) is REFUSED with ``ValueError`` and the file is untouched, and the
+    result is re-parsed so a rewrite that does not read back as ``new_state``
+    raises rather than reporting success (Codex r1, fail loud not silent).
+
+    Callers must hold the project's ``.clawpm-tasks.lock`` (the read-modify-write
+    here is not itself atomic against concurrent mutators).
+    """
+    raw = retry_transient(lambda: file_path.read_bytes()).decode("utf-8")
+    if not raw.startswith("---"):
+        return False
+    crlf = "\r\n" in raw
+    lines = raw.split("\n")  # a CRLF file keeps a trailing "\r" on each line
+    if lines[0].strip() != "---":
+        return False
+    close_idx = next(
+        (i for i in range(1, len(lines)) if lines[i].strip() == "---"), None
+    )
+    if close_idx is None:
+        return False
+    for i in range(1, close_idx):
+        if _STATE_LINE_RE.match(lines[i]):
+            break
+    else:
+        return False
+    # Value region: the key line plus indented / blank continuation lines. Blank
+    # lines at the tail belong to the gap before the next key, so keep them out.
+    end = i + 1
+    while end < close_idx and (
+        not lines[end].strip() or lines[end][:1] in (" ", "\t")
+    ):
+        end += 1
+    while end > i + 1 and not lines[end - 1].strip():
+        end -= 1
+    fragment = "\n".join(ln.rstrip("\r") for ln in lines[i:end])
+    try:
+        parsed = yaml.safe_load(fragment)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"unparseable 'state' value: {exc}") from exc
+    value = parsed.get("state") if isinstance(parsed, dict) else None
+    if not (value is None and end == i + 1) and not isinstance(value, str):
+        raise ValueError("unsupported 'state' frontmatter form (not a scalar string)")
+    if end == i + 1 and lines[i].rstrip("\r") == f"state: {new_state}":
+        return False
+    lines[i:end] = [f"state: {new_state}" + ("\r" if crlf else "")]
+    out = "\n".join(lines)
+    # Verify the rewrite reads back before committing it to disk.
+    check = yaml.safe_load(out.replace("\r\n", "\n").split("---", 2)[1])
+    if not isinstance(check, dict) or check.get("state") != new_state:
+        raise ValueError("state rewrite did not read back as the new state")
+    tmp = file_path.with_suffix(file_path.suffix + ".tmp")
+    try:
+        tmp.write_bytes(out.encode("utf-8"))
+        retry_transient(tmp.replace, file_path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    return True
+
+
 def touch_task_updated(
     config: PortfolioConfig,
     project_id: str,
     task_id: str,
     when: str | None = None,
+    *,
+    scope: Scope | None = None,
 ) -> bool:
     """Bump a task's ``updated`` stamp without otherwise mutating it (CLAWP-086).
 
@@ -577,11 +793,19 @@ def touch_task_updated(
     a missing task, since the work-log entry is the primary artefact and must not
     be undone by a stamping failure.
     """
-    tasks_dir = get_tasks_dir(config, project_id)
+    tasks_dir = (
+        get_tasks_dir(config, project_id)
+        if scope is None
+        else get_tasks_dir(config, project_id, scope=scope)
+    )
     if not tasks_dir:
         return False
     with file_lock(tasks_dir / ".clawpm-tasks.lock"):
-        task = get_task(config, project_id, task_id)
+        task = (
+            get_task(config, project_id, task_id)
+            if scope is None
+            else get_task(config, project_id, task_id, scope=scope)
+        )
         if not task or not task.file_path or not task.file_path.exists():
             return False
         try:
@@ -740,7 +964,7 @@ def _append_decision_to_parent(
     # a child (_child_append_text). Surgical splice (not a frontmatter
     # reserialize) so the body edit above stays the only formatting change;
     # a parent with no well-formed fence just skips the stamp.
-    _stamped = _set_updated_line(new_text, date.today().isoformat())
+    _stamped = _set_updated_line(new_text, today_utc_iso())
     if _stamped is not None:
         new_text = _stamped
 
@@ -763,9 +987,17 @@ def change_task_state(
     rationale: str | None = None,
     supersedes: str | None = None,
     resolution: str | None = None,
+    *,
+    scope: Scope | None = None,
 ) -> Task | None:
-    """Change a task's state by moving its file (or directory for parent tasks)."""
-    tasks_dir = get_tasks_dir(config, project_id)
+    """Change a task's state by moving its file (or directory for parent tasks).
+
+    ``scope`` (CLAWP-115) is threaded to EVERY task-store lookup in the
+    transaction (the tasks dir, the task, and the parent-rollup scan), so a
+    :meth:`sessions.Scope.pinned` scope makes the whole mutation touch exactly
+    that store. ``None`` is the ambient resolution, unchanged.
+    """
+    tasks_dir = get_tasks_dir(config, project_id, **_scope_kw(scope))
     if not tasks_dir:
         return None
 
@@ -799,7 +1031,7 @@ def change_task_state(
 
     with file_lock(_lock_path):
         # (0) Resolve + classify INSIDE the lock so the snapshot is consistent.
-        task = get_task(config, project_id, task_id)
+        task = get_task(config, project_id, task_id, **_scope_kw(scope))
         if not task or not task.file_path:
             return None
         current_path = task.file_path
@@ -847,13 +1079,15 @@ def change_task_state(
             #     early return, matching pre-CLAWP-051 ordering).
             if new_state == TaskState.DONE and not force:
                 # Re-read the task from disk so the rollup sees current children.
-                _fresh = get_task(config, project_id, task_id)
+                _fresh = get_task(config, project_id, task_id, **_scope_kw(scope))
                 if _fresh is None:
                     raise FileNotFoundError(
                         f"Task directory '{task_dir}' no longer exists — "
                         "it may have been moved by a concurrent session."
                     )
-                status = parent_rollup_status(config, project_id, _fresh)
+                status = parent_rollup_status(
+                    config, project_id, _fresh, **_scope_kw(scope)
+                )
                 if not status["ready"]:
                     return None
 
@@ -967,13 +1201,15 @@ def change_task_state(
         #     BEFORE the no-op return so a reopened child still gates an
         #     already-`done/` parent (Codex review).
         if new_state == TaskState.DONE and not force:
-            _fresh = get_task(config, project_id, task_id)
+            _fresh = get_task(config, project_id, task_id, **_scope_kw(scope))
             if _fresh is None:
                 raise FileNotFoundError(
                     f"Task file '{current_path}' no longer exists — "
                     "it may have been moved by a concurrent session."
                 )
-            status = parent_rollup_status(config, project_id, _fresh)
+            status = parent_rollup_status(
+                config, project_id, _fresh, **_scope_kw(scope)
+            )
             if not status["ready"]:
                 return None
 
@@ -1250,16 +1486,33 @@ def cascade_unblock_dependents(
         if not all_deps_done:
             continue
 
-        moved = change_task_state(
-            config, project_id, task.id, TaskState.OPEN
-        )
-        if moved is not None:
-            transitions.append({
+        # CLAWP-094: the move AND the frontmatter state sync run in ONE locked
+        # transaction (file_lock is reentrant per-thread, CLAWP-066), so a
+        # concurrent edit/move cannot interleave between them -- the sync would
+        # otherwise overwrite the edit or recreate the old path.
+        with file_lock(tasks_dir / ".clawpm-tasks.lock"):
+            moved = change_task_state(
+                config, project_id, task.id, TaskState.OPEN
+            )
+            if moved is None:
+                continue
+            record = {
                 "task_id": task.id,
                 "from_state": "blocked",
                 "to_state": "open",
                 "trigger": completed_task_id,
-            })
+            }
+            # The move alone left a stale `state: blocked` line in frontmatter
+            # (doctor then reported it as drift). The move has already
+            # committed, so a failure here must not abort the cascade for the
+            # remaining dependents -- it is recorded (and surfaced by the
+            # service as a cascade_errors marker), not swallowed.
+            if moved.file_path is not None:
+                try:
+                    _sync_state_line(moved.file_path, TaskState.OPEN.value)
+                except Exception as exc:
+                    record["state_sync_error"] = f"{type(exc).__name__}: {exc}"
+        transitions.append(record)
 
     return transitions
 
@@ -1268,8 +1521,12 @@ def parent_rollup_status(
     config: PortfolioConfig,
     project_id: str,
     task: Task,
+    *,
+    scope: Scope | None = None,
 ) -> dict:
     """Report whether a parent task is ready to be marked DONE (CLAWP-037).
+
+    ``scope`` as for :func:`get_tasks_dir` (CLAWP-115).
 
     A parent is *ready* only when every child in ``task.children`` resolves
     to a task in DONE state. A child id that resolves to no task on disk
@@ -1290,7 +1547,11 @@ def parent_rollup_status(
     # glob walk per rollup check — rollup fires only on state transitions,
     # not in hot loops, so this is acceptable at typical project sizes.
     children: set[str] = set(task.children or [])
-    tasks_dir = get_tasks_dir(config, project_id) if config is not None else None
+    tasks_dir = (
+        get_tasks_dir(config, project_id, **_scope_kw(scope))
+        if config is not None
+        else None
+    )
     if tasks_dir is not None:
         # Every state dir a child can migrate to — incl. rejected/ (a
         # crash-orphaned split child later rejected lands in tasks/rejected/
@@ -1336,7 +1597,7 @@ def parent_rollup_status(
     incomplete: list[dict] = []
     missing: list[str] = []
     for child_id in sorted(children):
-        child = get_task(config, project_id, child_id)
+        child = get_task(config, project_id, child_id, **_scope_kw(scope))
         if child is None:
             missing.append(child_id)
         elif child.state != TaskState.DONE:
@@ -1391,8 +1652,157 @@ def parent_ready_signal(
 _PREFIX_NUM_RE = re.compile(r"^([A-Z][A-Z0-9-]*?)-(\d+)(?:\.progress)?$")
 
 
-def _infer_prefix_from_tasks(tasks_dir: Path) -> str | None:
+def _is_subtask_shaped(prefix: str) -> bool:
+    """Whether ``prefix`` itself ends in ``-<digits>`` -- the shape
+    ``_infer_prefix_from_tasks`` treats as "this is a PARENT task id, so a
+    file matching it is a stray subtask, not evidence of a real top-level
+    prefix" (CLAWP-048), and therefore a shape no candidate this module
+    hands out may stably use (CLAWP-132; see ``_desubtask_prefix``, which
+    normalises such a candidate before it is yielded).
+    """
+    return bool(re.search(r"-\d+$", prefix))
+
+
+def _desubtask_prefix(prefix: str) -> str:
+    """Normalise ``prefix`` until it is no longer subtask-shaped, by removing
+    the hyphen immediately before its trailing digit run (CLAWP-132 decision
+    (b), operator 2026-10-03): ``WEB-2`` -> ``WEB2``, ``TEAM-2`` -> ``TEAM2``.
+
+    Repeats, because a single collapse is not enough when the digit run is
+    itself preceded by another ``-<digits>`` group: ``X-1-2`` -> ``X-12``
+    (still subtask-shaped) -> ``X12``. The result ends in a digit run with no
+    hyphen before it, so ``f"{result}-000"`` is parsed back to ``result`` by
+    ``_PREFIX_NUM_RE`` / ``_infer_prefix_from_tasks`` -- the stability
+    invariant a ``-<digits>`` prefix cannot meet. A prefix that is not
+    subtask-shaped is returned unchanged.
+    """
+    while True:
+        m = re.search(r"-(\d+)$", prefix)
+        if not m:
+            return prefix
+        prefix = prefix[: m.start()] + m.group(1)
+
+
+def _parse_root_task_name(name: str) -> tuple[str, str] | None:
+    """Parse a top-level task file stem / directory name into
+    ``(raw_prefix, normalised_prefix)``, or None when it is not a root id.
+
+    The parse-direction half of the shared id rule (see `_task_id_regex`).
+    ``raw_prefix`` keeps a legacy doubled-separator mint's trailing hyphen
+    (``CODE--000`` -> ``"CODE-"``, CLAWP-113: no real mint ever ends a
+    prefix in a hyphen, so that shape is unambiguously legacy);
+    ``normalised_prefix`` strips it. A subtask-shaped result (a prefix that
+    itself ends in ``-<digits>``) is a stray subtask, not evidence of a
+    top-level prefix (CLAWP-048), and returns None -- checked AFTER
+    normalising so a legacy-spelled subtask (``CODE--001--002`` parses as
+    ``"CODE--001-"``) is still caught. Known pre-existing gap: the regex
+    needs a LEADING LETTER, so a prefix derived from a digit-leading id is
+    never re-inferred from its own files.
+    """
+    m = _PREFIX_NUM_RE.match(name)
+    if not m:
+        return None
+    raw = m.group(1)
+    clean = _strip_trailing_non_alnum(raw)
+    if not clean or _is_subtask_shaped(clean):
+        return None
+    return raw, clean
+
+
+def _task_id_regex(
+    prefix: str, *, subtasks: bool = False, progress: bool = True, strict: bool = False
+) -> re.Pattern[str]:
+    """THE separator / id-shape rule (CLAWP-113, Codex round 7): the one place
+    that decides what ``{prefix}{sep}{NNN}`` looks like on disk, shared by the
+    ``add_task`` scan, emit-tree's ``_predict_parent_id``, the namespace check
+    and the short-ref resolver.
+
+    Group 1 is the root ordinal. A NORMALISED prefix (``CODE``) accepts one or
+    two hyphens before the ordinal, because a legacy doubled-separator mint
+    (``CODE--006``, pre-CLAWP-096) must still count toward the next number. A
+    kept-legacy prefix already ends in ``-`` (``CODE-``) and takes exactly one
+    more. ``strict=True`` forces a single hyphen (the normalised spelling
+    ALONE, used to tell ``CODE-007`` from ``CODE--007``). ``subtasks=True``
+    also accepts any ``-{1,2}NNN`` nesting after the root (root ids only
+    otherwise); ``progress`` allows the in-progress ``.progress`` stem suffix.
+    Case-sensitive on the prefix, like the file names it matches.
+    """
+    sep = "-" if strict or prefix.endswith("-") else "-{1,2}"
+    tail = r"(?:-{1,2}\d+)*" if subtasks else ""
+    suffix = r"(?:(?i:\.progress))?" if progress else ""
+    return re.compile(rf"^{re.escape(prefix)}{sep}(\d+){tail}{suffix}$")
+
+
+def _root_ordinals(tasks_dir: Path, prefix: str, *, strict: bool = False) -> list[int]:
+    """Every root-task ordinal minted under ``prefix`` in ``tasks_dir``'s five
+    scan locations (open, done, blocked, done/archive, rejected), as parsed by
+    :func:`_task_id_regex`. Both ``.md`` files AND parent-task directories
+    count (a split task becomes a directory). Subtask files live inside
+    parent dirs and the anchored pattern excludes them anyway.
+
+    CLAWP-085/127: done/archive/rejected are scanned so an archived or
+    rejected id is never silently re-minted.
+    """
+    file_pat = _task_id_regex(prefix, strict=strict)
+    dir_pat = _task_id_regex(prefix, progress=False, strict=strict)
+    nums: list[int] = []
+    for scan_dir in (
+        tasks_dir,
+        tasks_dir / "done",
+        tasks_dir / "blocked",
+        tasks_dir / "done" / "archive",
+        tasks_dir / "rejected",
+    ):
+        if not scan_dir.exists():
+            continue
+        for entry in scan_dir.iterdir():
+            if entry.is_dir():
+                m = dir_pat.match(entry.name)
+            elif entry.suffix.lower() == ".md":
+                m = file_pat.match(entry.stem)
+            else:
+                continue
+            if m:
+                nums.append(int(m.group(1)))
+    return nums
+
+
+def _ledger_project_id(config: PortfolioConfig, project_id: str, settings=None) -> str:
+    """The id the project's own settings declare, for reservation-ledger keys.
+
+    CLAWP-092 (Codex r1): ``--project clawpm`` and ``--project CLAWPM`` resolve
+    to one project on a case-insensitive filesystem, so the caller's spelling
+    must not scope a reservation. ``settings`` may be passed to skip a re-read;
+    an unresolvable project falls back to the spelling given.
+    """
+    from .discovery import get_scoped_project_settings
+
+    if settings is None:
+        settings = get_scoped_project_settings(config, project_id)
+    return getattr(settings, "id", None) or project_id
+
+
+def _next_root_ordinal(
+    config: PortfolioConfig, tasks_dir: Path, prefix: str, project_id: str
+) -> int:
+    """Next free root ordinal under ``prefix``: one past the higher of the
+    on-disk scan and the portfolio reservation ledger's high-water mark.
+
+    CLAWP-092: the scan alone cannot see a sibling worktree's uncommitted task
+    files, so two worktrees minted the same id. The ledger lives outside every
+    checkout. Shared by ``add_task`` and emit-tree's predictor so the two
+    cannot disagree.
+    """
+    scan_max = max(_root_ordinals(tasks_dir, prefix), default=-1)
+    reserved = reserved_high_water(config.portfolio_root, prefix, project_id)
+    return max(scan_max, -1 if reserved is None else reserved) + 1
+
+
+def _infer_prefix_from_tasks(tasks_dir: Path, *, keep_legacy: bool = False) -> str | None:
     """Most common task-ID prefix among existing task files/dirs, or None.
+
+    ``keep_legacy=True`` (CLAWP-113) votes on the RAW on-disk spelling (a
+    legacy ``CODE--000`` stays ``"CODE-"``) instead of the normalised one.
 
     Anchored + non-greedy so a hyphenated prefix (``ARB-P``) is recovered intact
     from ``ARB-P-000`` (cf. CLAWP-047). Subtask files live inside parent dirs,
@@ -1403,21 +1813,28 @@ def _infer_prefix_from_tasks(tasks_dir: Path) -> str | None:
     counts: Counter[str] = Counter()
     # CLAWP-085: include done/archive so prefix inference stays stable even when
     # every non-archived task of a project has been archived out of the hot path.
-    for scan_dir in (tasks_dir, tasks_dir / "done", tasks_dir / "blocked", tasks_dir / "done" / "archive"):
+    # CLAWP-127 (Codex P1, PR #62): rejected/ too — a rejected-only project's
+    # prefix claim must still be seen by the PORTFOLIO-wide allocator, or a
+    # different taskless project can be assigned the same prefix and mint a
+    # colliding id (this project's own rejected/ dir would be empty from that
+    # OTHER project's perspective, so nothing local would catch it).
+    for scan_dir in (
+        tasks_dir,
+        tasks_dir / "done",
+        tasks_dir / "blocked",
+        tasks_dir / "done" / "archive",
+        tasks_dir / "rejected",
+    ):
         if not scan_dir.exists():
             continue
         for entry in scan_dir.iterdir():
             name = entry.stem if entry.is_file() else entry.name
-            m = _PREFIX_NUM_RE.match(name)
-            if m:
-                pfx = m.group(1)
-                # Skip subtask-shaped names: a real prefix never ends in
-                # -<digits> (that's a parent task id, so this file is a stray
-                # subtask, not a top-level task). Mirrors the allocator's
-                # anchored exclusion of {prefix}-NNN-MMM files.
-                if re.search(r"-\d+$", pfx):
-                    continue
-                counts[pfx] += 1
+            # CLAWP-113: the shared root-id parse (subtask-shaped and legacy
+            # spellings handled in one place): (raw, normalised) or None.
+            parsed = _parse_root_task_name(name)
+            if parsed:
+                raw_pfx, pfx = parsed
+                counts[raw_pfx if keep_legacy else pfx] += 1
     if not counts:
         return None
     # Most common; deterministic tie-break by longer prefix then lexical.
@@ -1442,17 +1859,745 @@ def resolve_existing_prefix(settings) -> str | None:
     return None
 
 
-def _portfolio_prefixes(config, exclude_id: str) -> set[str]:
-    """Prefixes already claimed by OTHER projects (resolved, or ``[:5]`` for the
-    task-less ones, so a new project can't grab a prefix another would derive)."""
+def _legacy_alt_from_dir(tasks_dir: Path, clean: str | None) -> str | None:
+    """The legacy doubled-separator spelling (``"CODE-"``) a project's own
+    files vote for when it differs from the normalised ``clean`` claim
+    (CLAWP-113), else None."""
+    if clean is None:
+        return None
+    raw = _infer_prefix_from_tasks(tasks_dir, keep_legacy=True)
+    # Any raw winner that differs from the merged winner counts (CLAWP-113
+    # round 4, Codex): merging split votes can flip the plurality to a
+    # DIFFERENT prefix than the pre-merge winner, and a collision must fall
+    # back to that pre-merge claim too.
+    if raw and raw != clean:
+        return raw
+    return None
+
+
+def _legacy_alt_prefix(settings, clean: str | None) -> str | None:
+    """``_legacy_alt_from_dir`` for a project's settings; explicit
+    ``task_prefix`` projects never have one."""
+    if clean is None or getattr(settings, "task_prefix", None):
+        return None
+    if not getattr(settings, "project_dir", None):
+        return None
+    return _legacy_alt_from_dir(settings.project_dir / ".project" / "tasks", clean)
+
+
+def _claim_spellings(clean: str, alt: str | None) -> set[str]:
+    """Every spelling a project may end up minting under: its normalised
+    ``clean`` prefix AND, for a legacy project, its raw ``alt``. A sibling
+    claims BOTH (CLAWP-113 round 7, Codex): two legacy projects with distinct
+    raw winners (``CODE-``, ``OTHER``) can share one NORMALISED winner
+    (``CODE``), and each must see the other's normalised candidate as taken
+    or both migrate onto it and mint the same id."""
+    return {clean} | ({alt} if alt else set())
+
+
+def _decide_inferred_prefix(clean: str, alt: str | None, sibling_claims: set[str]) -> str:
+    """THE normalise-or-keep decision (CLAWP-113) -- the only place it is
+    made; allocation (`assign_task_prefix`, `assign_all_prefixes`) and doctor
+    all route through it. A legacy project (``alt`` set) takes the
+    normalised ``clean`` prefix only when no sibling can end up on it;
+    otherwise it KEEPS the legacy spelling and keeps minting ``CODE--NNN``,
+    so it can never mint an id a sibling already owns. ``sibling_claims``
+    is the union of each sibling's :func:`_claim_spellings` -- never
+    recursive."""
+    if alt is not None and clean in sibling_claims:
+        return alt
+    return clean
+
+
+def _other_projects_claims(config, exclude_id: str) -> set[str]:
+    """Conservative real claims of every project except ``exclude_id``: both
+    the raw and the normalised spelling of each (:func:`_claim_spellings`)."""
     from .discovery import discover_projects
 
-    used: set[str] = set()
+    claims: set[str] = set()
     for p in discover_projects(config):
         if p.id == exclude_id:
             continue
-        used.add(resolve_existing_prefix(p) or p.id.upper()[:5])
-    return used
+        try:
+            clean = resolve_existing_prefix(p)
+            alt = _legacy_alt_prefix(p, clean)
+        except OSError as exc:
+            raise PortfolioPrefixScanError(p.id, exc) from exc
+        if clean is not None:
+            claims |= _claim_spellings(clean, alt)
+    return claims
+
+
+def resolve_ref_prefix(settings, config=None, task_ref: str | None = None) -> str | None:
+    """Prefix for expanding a short ref (``--parent 7``) to an EXISTING id.
+
+    Without ``task_ref``: the RAW on-disk spelling, so a legacy
+    ``CODE--000`` still expands to ``CODE--000`` (CLAWP-113 round 4,
+    Codex).
+
+    With a numeric ``task_ref`` (``7`` or ``7-001``; CLAWP-113 round 7,
+    Codex): resolve against the ids ACTUALLY on disk across BOTH spellings.
+    A project-wide prefix cannot be right once a legacy project has also
+    minted normalised ids (``CODE--000..006`` then ``CODE-007``), but ordinals
+    are shared across spellings, so the on-disk match for one ordinal is
+    unique. Both spellings holding the same ordinal raises ``ValueError``
+    (ambiguous). No match falls back to the prefix a new mint would use
+    (``config`` given) or the raw winner.
+    """
+    clean = resolve_existing_prefix(settings)
+
+    def fallback() -> str | None:
+        # Lazy: the portfolio scan reads SIBLING stores, so an unreadable
+        # sibling must not break a ref that resolves from local ids alone.
+        if config is not None:
+            return resolve_portfolio_prefix(settings, config)
+        return _legacy_alt_prefix(settings, clean) or clean
+
+    if clean is None or task_ref is None or getattr(settings, "task_prefix", None):
+        return fallback()
+    m = re.fullmatch(r"(\d+)(?:-\d+)?", task_ref)
+    if not m or not getattr(settings, "project_dir", None):
+        return fallback()
+    tasks_dir = settings.project_dir / ".project" / "tasks"
+    ordinal = int(m.group(1))
+    spellings = []
+    if ordinal in _root_ordinals(tasks_dir, clean, strict=True):
+        spellings.append(clean)
+    if not clean.endswith("-") and ordinal in _root_ordinals(tasks_dir, clean + "-"):
+        spellings.append(clean + "-")
+    if len(spellings) > 1:
+        raise ValueError(
+            f"Task reference '{task_ref}' is ambiguous: both '{clean}-{ordinal:03d}' "
+            f"and '{clean}--{ordinal:03d}' exist. Use the full task id."
+        )
+    return spellings[0] if spellings else fallback()
+
+
+def resolve_portfolio_prefix(settings, config) -> str | None:
+    """``resolve_existing_prefix`` plus the CLAWP-113 normalise-or-keep
+    decision for a legacy doubled-separator project (needs the portfolio)."""
+    clean = resolve_existing_prefix(settings)
+    alt = _legacy_alt_prefix(settings, clean)
+    if clean is None or alt is None:
+        return clean
+    return _decide_inferred_prefix(clean, alt, _other_projects_claims(config, settings.id))
+
+
+def _resolve_own_inferred_prefix(project_id: str, tasks_dir: Path, config) -> str | None:
+    """Own-project inferred prefix from ``tasks_dir`` with the CLAWP-113
+    normalise-or-keep decision against the portfolio."""
+    clean = _infer_prefix_from_tasks(tasks_dir)
+    alt = _legacy_alt_from_dir(tasks_dir, clean)
+    if clean is None or alt is None:
+        return clean
+    return _decide_inferred_prefix(clean, alt, _other_projects_claims(config, project_id))
+
+
+def _strip_trailing_non_alnum(prefix: str) -> str:
+    """Drop trailing non-alphanumeric characters from a derived prefix slice.
+
+    A fixed-length slice of an uppercased project id can land exactly on a
+    separator — ``"code-quorum".upper()[:5]`` is ``"CODE-"``, hyphen last.
+    Left alone, the later ``f"{prefix}-{num:03d}"`` join doubles the
+    separator (``"CODE-" + "-000"`` -> ``"CODE--000"``, CLAWP-096). Only the
+    trailing run is trimmed — an internal separator like ``"ARB-P"``
+    (``"arb-prd".upper()[:5]``) is untouched by design (CLAWP-047). Never
+    strips down to empty: an all-punctuation slice is returned unchanged
+    rather than nulled out.
+    """
+    stripped = prefix.rstrip("-_.")
+    return stripped or prefix
+
+
+def _naive_prefix_placeholder(project_id: str) -> str:
+    """The prefix a task-less project would derive on its first mint.
+
+    Mirrors ``assign_task_prefix``'s own ``base`` candidate exactly
+    (``id.upper()[:5]`` + the CLAWP-096 trailing-separator strip). Used as
+    the ``assign_all_prefixes`` collision-set placeholder for a sibling
+    project that has no explicit ``task_prefix`` and no tasks minted yet —
+    if this placeholder disagreed with what ``assign_task_prefix`` actually
+    derives, two still-task-less siblings whose slices land on the same
+    boundary (e.g. two "code-*" projects, both -> "CODE") could each fail to
+    see the other as a collision and independently mint the same prefix.
+
+    A base that is subtask-shaped (``"web-2"`` -> ``"WEB-2"``) is normalised
+    via ``_desubtask_prefix`` (-> ``"WEB2"``; CLAWP-132 decision (b)) so this
+    always equals the FIRST value ``_naive_prefix_candidates`` yields.
+    """
+    full = project_id.upper()
+    base = full[:5] if len(full) >= 5 else full
+    return _desubtask_prefix(_strip_trailing_non_alnum(base))
+
+
+class PortfolioPrefixScanError(OSError):
+    """A sibling's tasks directory couldn't be scanned while collecting
+    portfolio prefixes.
+
+    Raised by ``assign_all_prefixes`` (not ``resolve_existing_prefix``
+    itself, whose own-project callers still want a bare ``OSError``) so a
+    caller iterating a DIFFERENT project can tell "my own resolve failed"
+    apart from "a sibling's scan failed" and attribute the issue to the
+    sibling that actually failed (``sibling_id``), not to whichever
+    project's minting/resolution happened to trigger the portfolio scan
+    (Codex P2 + grok-4.5 + antigravity, PR #57 round: one locked sibling
+    directory was previously blamed on every OTHER taskless project
+    processed afterward).
+    """
+
+    def __init__(self, sibling_id: str, original: OSError):
+        self.sibling_id = sibling_id
+        self.original = original
+        message = (
+            f"could not evaluate prefix collisions for sibling '{sibling_id}': "
+            f"{type(original).__name__}: {original}"
+        )
+        super().__init__(message)
+
+
+def _naive_prefix_candidates(project_id: str):
+    """The full id-derived candidate sequence for ``project_id``, shortest
+    first: the base (``_naive_prefix_placeholder``), then each longer
+    stripped slice through the full id -- in the exact order
+    ``_assign_taskless_prefixes``'s bipartite matching (CLAWP-124) tries
+    them, both for a pid's own search and for a reassignment attempt when
+    augmenting a path through an already-matched candidate.
+
+    NOT deduplicated: trailing-separator stripping can make more than one
+    slice length collapse to the identical string (``"clawpm-".upper()``'s
+    ``[:6]`` and ``[:7]`` both strip to ``"CLAWPM"``), so this can yield
+    the same value more than once. The matching search's own ``visited``
+    guard (per augmenting-path attempt) makes a repeated value harmless --
+    it's just skipped the second time. ``_naive_prefix_reach`` (distinct
+    set) derives from this same ONE sequence, so the two can never
+    disagree about what a given id's chain contains.
+
+    SUBTASK-SHAPED CANDIDATES ARE NORMALISED, NOT YIELDED RAW (CLAWP-132
+    decision (b), operator 2026-10-03): a slice that
+    itself ends in ``-<digits>`` (e.g. project id ``"team-2-b"`` sliced to
+    ``"TEAM-2"``) is a candidate `_infer_prefix_from_tasks` can NEVER
+    stably re-derive once minted -- its own subtask-shape filter treats
+    any file named ``{that-candidate}-NNN.md`` as a stray subtask of
+    parent task ``{candidate-minus-its-trailing-"-N"}``, not evidence of a
+    real top-level prefix, so the project would look task-less again on
+    its very next mint and be re-resolved from scratch -- possibly handed
+    a DIFFERENT prefix next time, while its EXISTING files keep using the
+    old one, which a differently-composed or differently-ordered taskless
+    pool can then assign out from under it to a wholly different project
+    (reproduced: two projects both minting a real, on-disk ``TEAM-2-000``).
+    Such a candidate is rewritten by ``_desubtask_prefix`` (``"TEAM-2"`` ->
+    ``"TEAM2"``, ``"X-1-2"`` -> ``"X12"``) instead of being skipped, so the
+    allocator never hands out a prefix that `_infer_prefix_from_tasks`
+    rejects for being subtask-shaped (a ``-<digits>`` suffix) -- the one
+    invariant that function's own filter already assumes but this module did
+    not previously guarantee. LIMIT (pre-existing, not addressed here): the
+    inference regex ``_PREFIX_NUM_RE`` also requires a LEADING LETTER, so a
+    prefix derived from a digit-leading id (``2-b``, ``2024``) can still
+    never be re-inferred from its own files; that is a separate gap. A short digit-suffixed id (``"web-2"``) still has a candidate
+    (skipping them left such ids with none, hard-failing ``tasks add``).
+    The chain is therefore never empty: it always yields at least the
+    placeholder. Normalising can make adjacent slices collapse to the same
+    string (``"TEAM-2"`` and ``"TEAM-2-"`` both -> ``"TEAM2"``), which the
+    non-deduplication note above already covers.
+    """
+    full = project_id.upper()
+    yield _naive_prefix_placeholder(project_id)
+    for n in range(6, len(full) + 1):
+        yield _desubtask_prefix(_strip_trailing_non_alnum(full[:n]))
+
+
+def _naive_prefix_reach(project_id: str) -> frozenset[str]:
+    """The DISTINCT id-derived candidates ``project_id`` could ever mint
+    into -- the size of this set is the project's real flexibility.
+
+    CLAWP-121 round-1-of-this-rewrite (Codex + grok-4.6, PR #60): sorting
+    task-less ids alphabetically by raw id does NOT correctly prioritise
+    "no room to extend" the way CLAWP-119 needs, because trailing-
+    separator stripping can make a SHORT-on-real-options id (e.g.
+    ``"ab-cd_"``, whose only extension collapses right back to its own
+    base) sort AFTER a sibling that merely shares its base but has real
+    room to move (e.g. ``"ab-cd-f"``) -- alphabetical order tracks raw
+    string content, not how many DISTINCT prefixes an id can actually
+    reach. Sorting by ``len(_naive_prefix_reach(...))`` ascending instead
+    generalises CLAWP-119 exactly: an id with only ONE reachable candidate
+    (no room at all -- the original CLAWP-119 case) is always processed
+    before any id with more, regardless of raw id length or content.
+    """
+    return frozenset(_naive_prefix_candidates(project_id))
+
+
+def _assign_taskless_prefixes(
+    taskless_ids: set[str], used: set[str]
+) -> tuple[dict[str, str], dict[str, ValueError]]:
+    """Assign every id in ``taskless_ids`` a collision-free prefix via
+    MAXIMUM BIPARTITE MATCHING (Kuhn's algorithm / augmenting paths;
+    CLAWP-124), not greedy most-constrained-first (CLAWP-121, superseded).
+
+    Left nodes: task-less project ids. Right nodes: id-derived candidate
+    strings (:func:`_naive_prefix_candidates`, shortest-first per id).
+    Edges: a pid's own candidate chain. Real claims in ``used`` are FIXED
+    pre-occupied right-nodes -- never part of the matching search space,
+    never reassigned. A pid only ever STEALS an already-held candidate
+    (reassigning the holder via an augmenting path) when NONE of its own
+    candidates are outright free -- an outright-free candidate is always
+    preferred first (grok-4.6, PR #64 round 1: completeness doesn't
+    require disturbing an earlier pid's shorter prefix when the current
+    one has its own unclaimed alternative; doing so anyway would violate
+    this function's own "simulates sequential `tasks add`" contract below).
+
+    Why greedy was replaced (not just re-tuned again): greedy commits each
+    pid's pick immediately and never reconsiders an earlier one, which is
+    PROVABLY INCOMPLETE for this problem -- it can spuriously refuse a
+    project even when a valid, collision-free assignment for the whole
+    portfolio exists. Concrete counter-example (Codex, PR #60 round 3):
+    three ids tying at reach=2 -- ``abcde-c`` -> {ABCDE, ABCDE-C},
+    ``abcdeb-`` -> {ABCDE, ABCDEB}, ``abcdeb--`` -> {ABCDE, ABCDEB}
+    (identical to `abcdeb-`'s, via trailing-separator collapse). Greedy
+    processes `abcde-c` first (tiebreak), takes ABCDE even though it has a
+    perfectly good alternative (ABCDE-C) -- leaving the two `abcdeb*` ids
+    to split {ABCDE, ABCDEB} with ABCDE gone, so one of them refuses, even
+    though `abcde-c -> ABCDE-C` plus the two `abcdeb*` ids splitting
+    {ABCDE, ABCDEB} is a fully valid assignment. No greedy tiebreak fixes
+    this: the flaw is the SHAPE of the algorithm (never reconsiders a
+    commitment), not the ordering heuristic on top of it -- three prior
+    ordering heuristics on this exact function each patched one bug shape
+    and exposed another (see the CLAWP-121/PR #60 history this docstring
+    used to carry). Augmenting-path matching is provably COMPLETE for
+    bipartite matching (Hall's/König's theorem): a valid assignment is
+    found whenever one exists, because reassigning an earlier pick to free
+    up its OWN alternate candidate is exactly what an augmenting path does.
+
+    Determinism (an explicit invariant to preserve, not a nice-to-have --
+    concurrent first-mint safety depends on it, CLAWP-116/PR #57): left
+    nodes are processed in a FIXED total order (``(pid.upper(), pid)``,
+    independent of `taskless_ids`' set-iteration order / hash seed);
+    within each pid's own search, candidates are tried in
+    :func:`_naive_prefix_candidates`'s fixed shortest-first order, and a
+    reassignment attempt explores the CURRENT holder's candidates in that
+    same fixed order too. Two runs against the same portfolio state always
+    produce the same assignment.
+
+    A pid with no augmenting path (every reachable candidate is
+    permanently claimed, transitively) is collected into the returned
+    error map rather than aborting the whole pass -- a sibling that can't
+    get a prefix contributes nothing to the matching and must not block
+    anyone else's unrelated resolution (mirrors doctor's existing
+    "skipping the map entry doesn't drop it from the check" reasoning).
+    """
+    fixed_used = frozenset(used)
+    match_candidate_to_pid: dict[str, str] = {}
+
+    def try_augment(pid: str, visited: set[str]) -> bool:
+        candidates = list(_naive_prefix_candidates(pid))
+        # Phase 1: prefer an OUTRIGHT-FREE candidate of pid's own over
+        # stealing one that's already held (grok-4.6, PR #64 round 1). A
+        # single combined pass -- steal on the FIRST held candidate whose
+        # holder happens to have SOME alternate, even when pid itself has a
+        # free candidate later in its own list -- still finds *a* valid
+        # assignment (completeness is unaffected either way), but needlessly
+        # disturbs an earlier pid's shorter prefix when nothing forced it
+        # to. This violates assign_all_prefixes' own documented intent of
+        # simulating what sequential `tasks add` calls would do (the first
+        # real mint is never retroactively bumped). Preferring free
+        # candidates first means a pid only ever steals when it has no
+        # candidate of its own left to try.
+        for candidate in candidates:
+            if candidate in fixed_used or candidate in visited:
+                continue
+            if candidate not in match_candidate_to_pid:
+                visited.add(candidate)
+                match_candidate_to_pid[candidate] = pid
+                return True
+        # Phase 2: no free candidate of pid's own -- fall back to
+        # augmenting through an already-held candidate, in the same fixed
+        # order. Every candidate reaching here is held by construction
+        # (phase 1 already ruled out every free one).
+        for candidate in candidates:
+            if candidate in fixed_used or candidate in visited:
+                continue
+            visited.add(candidate)
+            holder = match_candidate_to_pid[candidate]
+            if try_augment(holder, visited):
+                match_candidate_to_pid[candidate] = pid
+                return True
+        return False
+
+    order = sorted(taskless_ids, key=lambda p: (p.upper(), p))
+    errors: dict[str, ValueError] = {}
+    for pid in order:
+        if not try_augment(pid, set()):
+            # No augmenting path exists: every candidate reachable from pid,
+            # transitively through reassignment, is permanently claimed by a
+            # REAL (explicit or inferred) prefix -- `used` holds those, and
+            # they are never part of the matching search space. This is only
+            # reachable when sibling projects set explicit `task_prefix`
+            # values that exhaust the whole chain (Codex P1, PR #57: siblings
+            # "ABCDE" and "ABCDE-F" exhaust every stripped candidate through
+            # n=len(full)).
+            #
+            # There is no synthesised last-resort candidate here: this fails
+            # loudly and tells the operator to set an explicit `task_prefix`.
+            # A generated fallback (a digest of the project id) was tried
+            # across PR #57 rounds 4-9 and split back out to CLAWP-119 -- it
+            # was correct in isolation and wrong in aggregate (a review
+            # finding in five consecutive rounds; its length budget can't be
+            # made correct by tuning, since emit_tree mints child ids
+            # recursively with no depth cap, so ANY fixed suffix reserve is a
+            # wall at SOME depth). An actionable error beats a synthesised
+            # prefix the rest of the tool cannot use.
+            #
+            # CLAWP-132 decision (b): the candidate chain is never empty
+            # (`_naive_prefix_candidates` always yields at least the
+            # placeholder, normalising subtask-shaped slices rather than
+            # skipping them), so this branch only ever means "claimed".
+            full = pid.upper()
+            errors[pid] = ValueError(
+                f"Cannot derive a collision-free task prefix for project "
+                f"{pid!r}: every id-derived candidate through {full!r} is "
+                f"claimed by another project. "
+                f"Set an explicit `task_prefix` in this project's settings.toml."
+            )
+
+    assignments = {pid: candidate for candidate, pid in match_candidate_to_pid.items()}
+    used.update(assignments.values())
+    return assignments, errors
+
+
+def assign_all_prefixes(
+    config, extra_taskless_id: str | None = None
+) -> tuple[dict[str, str], dict[str, ValueError]]:
+    """Deterministic global pass (CLAWP-121): resolve every project's task-id
+    prefix in ONE fixed run, instead of predicting what each task-less
+    sibling might independently mint and reserving against the prediction.
+
+    PR #60 (this task's first attempt) reserved each task-less sibling's
+    naive placeholder, then its full candidate CHAIN, in the `used` set
+    passed to a project's OWN independent `assign_task_prefix` call --
+    treating a sibling's eventual mint as something to guess and defend
+    against. Four review rounds each found a new way that guess could be
+    wrong: too narrow (misses a shared first EXTENSION, not just a shared
+    base), too broad (a chain reservation can starve the very project whose
+    id the chain is a literal prefix of), imprecise (a length-based cap
+    doesn't track what trailing-separator stripping actually collapses to),
+    and still-too-broad even after three patches (a flexible sibling's
+    speculative reservation can starve a THIRD project that never needed
+    to touch that candidate at all). See PR #60's thread for the specifics.
+
+    This function does not predict anything. Real claims (explicit
+    ``task_prefix``, or inferred from tasks a project already minted) are
+    resolved first and never move. Every remaining task-less project is
+    then minted in a single deterministic order via
+    ``_assign_taskless_prefixes`` -- exactly simulating what already
+    happens for sequential ``clawpm tasks add`` calls (the second call
+    sees the first's REAL minted prefix already claimed and naturally
+    extends past it), just run once up front instead of relying on mint
+    order to happen to be sequential. There is no chain to reserve and no
+    set-algebra to get subtly wrong, because nothing is ever reserved on
+    another project's behalf -- each project's own entry in the returned
+    map is either a real claim or an actually-minted value.
+
+    Args:
+        extra_taskless_id: when the caller already knows this specific
+            project is task-less (about to mint its first task, so it has
+            its own -- possibly session/worktree-scoped -- ``tasks_dir``
+            to resolve against, per CLAWP-098), pass its id here so this
+            pass treats it as task-less without re-resolving it via
+            ``discover_projects``' canonical project_dir, which could
+            disagree with the caller's session-scoped resolution.
+
+    Returns:
+        ``(assignments, errors)``. ``assignments`` maps every successfully
+        resolved/minted project id to its prefix. ``errors`` maps any
+        task-less project id whose candidates were all exhausted to the
+        ``ValueError`` it hit -- collected rather than raised immediately,
+        so one project's refusal doesn't abort resolution for the rest of
+        the portfolio (doctor's cross-project scan needs this; a single
+        ``assign_task_prefix`` call re-raises its own project's entry).
+
+    Raises:
+        PortfolioPrefixScanError: a project's own tasks directory couldn't
+            be scanned (locked/unreadable) while resolving its REAL claim.
+            Unlike a taskless mint refusal, this aborts the whole pass --
+            it means the portfolio's true state genuinely couldn't be
+            read, not that one candidate space is exhausted.
+    """
+    from .discovery import discover_projects
+
+    resolved: dict[str, str] = {}
+    legacy: dict[str, tuple[str, str]] = {}  # CLAWP-113: pid -> (clean, alt)
+    taskless_ids: set[str] = set()
+    if extra_taskless_id is not None:
+        taskless_ids.add(extra_taskless_id)
+    for p in discover_projects(config):
+        if p.id == extra_taskless_id:
+            continue
+        try:
+            prefix = resolve_existing_prefix(p)
+            alt = _legacy_alt_prefix(p, prefix)
+        except OSError as exc:
+            raise PortfolioPrefixScanError(p.id, exc) from exc
+        if prefix is not None:
+            resolved[p.id] = prefix
+            if alt is not None:
+                legacy[p.id] = (prefix, alt)
+        else:
+            taskless_ids.add(p.id)
+    # CLAWP-113: a legacy project normalises only if no sibling claims the
+    # clean spelling; otherwise it keeps its legacy claim. Decided once from
+    # the already-collected claims (no per-sibling rescans, no recursion).
+    if legacy:
+        spellings = {
+            pid: _claim_spellings(pfx, legacy[pid][1] if pid in legacy else None)
+            for pid, pfx in resolved.items()
+        }
+        decided = {}
+        for pid, (clean, alt) in legacy.items():
+            siblings: set[str] = set()
+            for other, other_claims in spellings.items():
+                if other != pid:
+                    siblings |= other_claims
+            decided[pid] = _decide_inferred_prefix(clean, alt, siblings)
+        resolved.update(decided)
+
+    used = set(resolved.values())
+    taskless_assignments, errors = _assign_taskless_prefixes(taskless_ids, used)
+    assignments = {**resolved, **taskless_assignments}
+    return assignments, errors
+
+
+def _portfolio_prefix_lock_path(portfolio_root: Path) -> Path:
+    """Sentinel path serialising portfolio-wide prefix allocation (CLAWP-116).
+
+    Lives under ``<portfolio_root>/locks/``, mirroring dispatch's own lock
+    convention (``dispatch.py``'s ``dispatch_lock_path``) -- a single fixed
+    name is correct here (unlike dispatch's per-target digest) because
+    there is only ever ONE portfolio-wide allocator critical section, not
+    one per project.
+
+    ``.resolve()`` (Codex P1, PR #65 round 3): ``PortfolioConfig.portfolio_root``
+    is only ``.expanduser()``-ed at load time (``models.py``), which expands
+    ``~`` but does NOT absolutize an otherwise-relative value (e.g.
+    ``portfolio_root = "."`` in ``portfolio.toml``, or a bare relative
+    ``CLAWPM_PORTFOLIO``). ``file_lock`` requires an absolute path and
+    raises ``ValueError`` otherwise — without resolving here, EVERY
+    ``add_task`` call in such a configuration would fail outright, not just
+    under contention.
+    """
+    return portfolio_root.resolve() / "locks" / "prefix-allocation.lock"
+
+
+@contextmanager
+def portfolio_prefix_lock(portfolio_root: Path):
+    """Hold the portfolio-wide prefix-allocation lock (CLAWP-116, Codex P1
+    on PR #57 round 5).
+
+    Serialises EVERY ``add_task`` call's critical section (prefix
+    resolution -- explicit, inferred, or the portfolio-wide
+    ``assign_all_prefixes`` scan-decide pass -- through the task-file
+    write that follows it) against every OTHER concurrent
+    ``add_task`` call in the same portfolio, across ALL projects, not just
+    first mints.
+
+    Held unconditionally (round 2 of this fix; PR #65 round 1 tried to
+    acquire it only for a heuristically-detected first mint, skipping it
+    whenever a pre-lock read of the calling project's OWN state looked
+    like it already had a stable prefix -- three independent review
+    findings showed that optimisation unsound: the pre-check is itself an
+    unlocked read that can go stale in the window before the per-project
+    lock is taken (e.g. this project's one inferred-from task gets
+    concurrently REJECTED by another session in that exact window,
+    silently reopening the first-mint path without this lock), and an
+    explicit-ID create for a project's own first task never calls
+    ``assign_task_prefix`` at all yet still establishes that project's
+    future inferred prefix, so it needs the same coordination against a
+    sibling's concurrent auto-mint even though it never touches the
+    allocator itself). Given the portfolio scale this tool targets (dozens
+    of projects, not a high-throughput hot path -- CLAWP-124's own sizing
+    note), a short-lived lock held for the duration of one local-disk
+    ``add_task`` call is the correct trade against a subtly-incomplete
+    "skip it sometimes" optimisation.
+
+    Without this lock, prefix selection for one project and the task-file
+    write that reserves it are not atomic relative to a sibling's
+    concurrent first mint -- the specific non-injective-extension scenario
+    this task was originally filed against (PR #57: two near-twin
+    task-less projects both independently selecting the same candidate)
+    predates the current deterministic global pass (CLAWP-121/124) and is
+    not straightforwardly reproducible against it in isolation (confirmed
+    empirically, PR #65 round 1: a same-snapshot concurrent read of the
+    whole taskless set deterministically yields distinct candidates per
+    caller, by construction), but the underlying gap it named -- no
+    coordination between prefix SELECTION and the task-file WRITE that
+    reserves it, across a portfolio scan that reads each sibling
+    one-at-a-time rather than atomically -- remains real, and this lock is
+    defense-in-depth against it regardless of which specific interleaving
+    would trigger a collision.
+
+    LOCK ORDERING INVARIANT (must never be reversed, or two callers
+    acquiring both locks in opposite orders deadlock): this portfolio lock
+    is always OUTER, a per-project ``.clawpm-tasks.lock`` is always INNER.
+    Nothing else currently takes this lock, so there is no inversion risk
+    today -- this must not change without re-auditing every caller.
+
+    Reentrant per-thread (via the shared :func:`file_lock` primitive),
+    like every other lock in this module.
+    """
+    lock_path = _portfolio_prefix_lock_path(portfolio_root)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with file_lock(lock_path):
+        yield
+
+
+def _id_is_within_prefix_namespace(task_id: str, prefix: str) -> bool:
+    """Whether ``task_id`` (case-insensitively) IS ``prefix``, or ``prefix``
+    followed by one or more ``-<digits>`` segments (any subtask nesting
+    depth) and an optional ``.progress`` suffix -- i.e. whether ``task_id``
+    lives inside ``prefix``'s id-namespace.
+
+    Compares the id directly against a REAL prefix STRING rather than first
+    trying to derive "the" prefix from ``task_id`` alone via a fixed
+    character-class regex. An explicit ``task_prefix`` in settings.toml is
+    accepted and minted VERBATIM by ``ProjectSettings``/``assign_task_prefix``
+    with no character restriction -- ``task_prefix = "OPS_TEAM"`` (an
+    underscore) is valid and real, but the old ``_PREFIX_NUM_RE``-based
+    derivation (``[A-Z0-9-]`` only) couldn't match it at all, silently
+    exempting that whole namespace from this check (Codex catch, PR #66
+    round 3). Comparing directly against each REAL claim string sidesteps
+    that character-set problem entirely -- there is no "derive, then guess
+    where the prefix ends and numbering begins" step to get wrong.
+    """
+    upper_id = task_id.upper()
+    upper_prefix = prefix.upper()
+    if upper_id == upper_prefix:
+        return True
+    # CLAWP-113: the shared separator rule (`_task_id_regex`) tolerates a
+    # legacy doubled separator (``CODE--000``, ``CODE--001--002``) so a
+    # normalised claim still owns its legacy-spelled ids, and a kept-legacy
+    # ``CODE-`` claim owns exactly ``CODE--NNN``.
+    return bool(_task_id_regex(upper_prefix, subtasks=True).match(upper_id))
+
+def check_explicit_id_prefix_collision(
+    task_id: str,
+    project_id: str,
+    tasks_dir: Path,
+    config,
+    explicit_prefix: str | None,
+) -> None:
+    """Refuse an explicit-ID create whose namespace belongs to a DIFFERENT
+    project's real claim OR future deterministic mint (CLAWP-129, widened
+    CLAWP-130).
+
+    Before CLAWP-129, an explicit ``--id`` create was never validated
+    against the portfolio at all -- only the same-project clobber guard
+    (Finding 2, CLAWP-051, a few lines below in ``add_task``) ran, which
+    catches a literal id reused within ONE project but has nothing to say
+    about ``tasks add --project foo --id BAR-001`` when ``BAR`` is another
+    project's prefix. That silently broke the "task id is a
+    portfolio-unique handle" invariant this module's own CLAWP-048 comment
+    names, feeding the same cross-project-isolation bug class the resolver
+    already guards against for auto-generated ids.
+
+    CLAWP-129 compared only against each sibling's CURRENT real claim
+    (``resolve_existing_prefix``: an explicit ``task_prefix`` or the
+    dominant inferred prefix). That left a still-taskless sibling's FUTURE
+    first mint uncovered: project A explicitly creates ``--id BRAVO-900``
+    (allowed -- nothing currently claims ``BRAVO``); a still-taskless
+    ``bravo-project`` later auto-mints its first task via
+    ``assign_all_prefixes``, deterministically lands on ``BRAVO`` (nothing
+    has claimed it, by construction), and mints ``BRAVO-000`` -- colliding
+    with A's pre-existing ``BRAVO-900``. CLAWP-130 (operator decision,
+    2026-10-01, option 2) closes this by comparing against
+    ``assign_all_prefixes``' full returned assignment map instead of each
+    sibling's ``resolve_existing_prefix`` individually -- that map already
+    covers every currently-taskless sibling's deterministic candidate, not
+    just real claims. Accepted consequence: an explicit id that nobody
+    currently holds can now be refused solely because the deterministic
+    allocator would someday assign its prefix to a different still-taskless
+    project.
+
+    Must run under the SAME portfolio lock as the auto-ID path (the caller
+    already holds it, per ``portfolio_prefix_lock``) -- reading the
+    portfolio's prefix assignments without the lock races a concurrent
+    sibling establishing its own first-mint prefix in the exact window this
+    check is trying to protect.
+
+    LONGEST-MATCH tie-break (grok-4.5 + Codex, PR #66 round 3): a shorter
+    real prefix can be a syntactic ANCESTOR of a longer one -- this
+    project's own ``"TEAM"`` and a sibling's real ``"TEAM-2"`` can BOTH
+    match ``"TEAM-2-001"``'s namespace-shape, since ``"2-001"`` reads as
+    valid subtask numbering under either. That ambiguity is real, not a
+    bug to eliminate -- the id's shape alone cannot say which is intended.
+    The safe resolution: whichever REAL claim matches MOST SPECIFICALLY
+    (longest matching prefix) wins. This also means an id matching only
+    THIS project's own claim (no sibling matches, or every matching
+    sibling is less specific than our own) is let through even when it
+    doesn't match this project's prefix at position zero -- including a
+    project's own first explicit-ID task establishing its future inferred
+    prefix (nothing else claims it yet, so nothing outscores "no claim").
+
+    Raises:
+        ValueError: the MOST SPECIFIC real claim (explicit ``task_prefix``
+            or inferred from minted tasks) matching this id's namespace
+            belongs to a different project. Operator policy (2026-09-27):
+            refuse outright rather than warn-and-proceed or auto-suffix --
+            a silent id rewrite would surprise a caller that expected
+            their literal id.
+        PortfolioPrefixScanError: a sibling's tasks directory couldn't be
+            scanned. FAILS CLOSED here, matching ``assign_all_prefixes``'s
+            own contract for the identical failure (an unreadable sibling
+            means the portfolio's true state genuinely can't be read, not
+            that this one candidate is ruled out) -- three independent
+            reviewers (grok-4.6, grok-4.5, a history-lens pass, PR #66)
+            caught an earlier version of this function silently treating
+            an unreadable sibling as "not a collision" and letting the
+            create through, which is exactly backwards: a locked/
+            unreadable sibling directory is itself a signal of concurrent
+            activity, the precise race window the portfolio lock exists to
+            protect.
+    """
+    own_prefix = (
+        explicit_prefix.upper()
+        if explicit_prefix
+        else _resolve_own_inferred_prefix(project_id, tasks_dir, config)
+    )
+
+    best_len = -1
+    best_owner: str | None = None  # None = this project itself
+    best_prefix = ""
+
+    if own_prefix and _id_is_within_prefix_namespace(task_id, own_prefix):
+        best_len = len(own_prefix)
+        best_prefix = own_prefix
+
+    # CLAWP-130: the full deterministic assignment map, not just each
+    # sibling's CURRENT real claim -- covers a still-taskless sibling's
+    # future first-mint candidate too. `assign_all_prefixes` itself raises
+    # `PortfolioPrefixScanError` for an unreadable sibling's REAL-claim
+    # scan (same fail-closed contract this check already had); a
+    # taskless sibling whose own candidate chain is exhausted is absent
+    # from `assignments` (collected in the returned `errors` instead) and
+    # is correctly skipped below, same as an unresolvable sibling was
+    # skipped before this widening.
+    assignments, _errors = assign_all_prefixes(config)
+
+    for sibling_id, sibling_prefix in assignments.items():
+        if sibling_id == project_id:
+            continue
+        if (
+            sibling_prefix
+            and _id_is_within_prefix_namespace(task_id, sibling_prefix)
+            and len(sibling_prefix) > best_len
+        ):
+            best_len = len(sibling_prefix)
+            best_owner = sibling_id
+            best_prefix = sibling_prefix
+
+    if best_owner is not None:
+        raise ValueError(
+            f"Task id '{task_id}' derives prefix '{best_prefix}', which is "
+            f"already claimed by project '{best_owner}'. Pass a "
+            "different task_id, or omit it to auto-generate one."
+        )
 
 
 def assign_task_prefix(
@@ -1463,21 +2608,40 @@ def assign_task_prefix(
     explicit ``task_prefix`` -> inferred-from-existing (stability) -> shortest
     collision-free extension of ``id.upper()[:5]``. A new project that would
     collide on ``[:5]`` gets the shortest longer prefix no other project uses.
+    The base candidate is derived via ``_naive_prefix_placeholder`` (CLAWP-096)
+    so a slice boundary landing on a hyphen never produces a doubled separator
+    once ``-{num:03d}`` is appended.
+
+    The portfolio-wide candidate search (once this project's own explicit/
+    inferred prefix is ruled out) delegates to ``assign_all_prefixes``
+    (CLAWP-121): a single deterministic pass that mints every task-less
+    project in the portfolio in one fixed order, rather than this call
+    trying to predict what OTHER task-less siblings might independently
+    mint and defending against the prediction. That pass is a pure function
+    of the portfolio's real claims and the full set of currently task-less
+    ids -- independent of which project happens to be asking -- so two
+    different projects' calls can never converge on the same candidate
+    (Codex P1, PR #57: what makes concurrent first mints safe without a
+    lock -- see the pass's own docstring for why a reservation-based
+    design kept finding new ways to disagree with itself across review
+    rounds instead).
+
+    Raises:
+        ValueError: if every id-derived candidate is already claimed. Only
+            reachable when sibling projects set explicit ``task_prefix``
+            values (or earlier-processed task-less siblings, in this same
+            pass) exhaust them; the remedy is an explicit ``task_prefix``
+            on this project, which the message names.
     """
     if explicit_prefix:
         return explicit_prefix.upper()
-    inferred = _infer_prefix_from_tasks(tasks_dir)
+    inferred = _resolve_own_inferred_prefix(project_id, tasks_dir, config)
     if inferred:
         return inferred
-    full = project_id.upper()
-    used = _portfolio_prefixes(config, project_id)
-    base = full[:5] if len(full) >= 5 else full
-    if base and base not in used:
-        return base
-    for n in range(6, len(full) + 1):
-        if full[:n] not in used:
-            return full[:n]
-    return full  # ids are portfolio-unique, so the full id can't collide
+    assignments, errors = assign_all_prefixes(config, extra_taskless_id=project_id)
+    if project_id in errors:
+        raise errors[project_id]
+    return assignments[project_id]
 
 
 def add_task(
@@ -1517,11 +2681,33 @@ def add_task(
     # CLAWP-055 — resolve baseline_ref BEFORE entering the lock: this may
     # invoke a git subprocess, which must not be held inside a critical section.
     from .baseline import resolve_baseline_ref
-    from .discovery import get_project as _get_project_for_baseline
+    from .discovery import get_repo_path as _get_repo_path_for_baseline
 
-    _proj_settings = _get_project_for_baseline(config, project_id)
-    _repo_path = getattr(_proj_settings, "repo_path", None) if _proj_settings else None
+    # Session-scoped, like the task store itself (CLAWP-098, Codex P2 on
+    # PR #55). `get_tasks_dir` above already redirects into a registered
+    # worktree, so resolving the baseline from the cwd-independent
+    # `get_project(...).repo_path` stamped a task created in that worktree
+    # against the MAIN checkout's HEAD. When the two sit on different
+    # commits the baseline is simply wrong, and every later scope-drift
+    # decision inherits the error. Git metadata has to come from whichever
+    # checkout the task store was redirected to.
+    _repo_path = _get_repo_path_for_baseline(config, project_id)
     _baseline_ref = resolve_baseline_ref(_repo_path)
+
+    # Session-scoped settings, resolved for EVERY create — explicit `--id`
+    # included (CLAWP-098, PR #55 rounds 11-14). `tasks_dir` was already
+    # redirected into a registered worktree by `get_tasks_dir`, so the
+    # settings that pick a prefix must come from that same checkout (the
+    # cwd-independent `get_project(...)` reads the CANONICAL one). Resolving
+    # it outside the auto-ID branch is what makes the identity guard cover an
+    # explicit-ID create too: a worktree whose settings.toml names another
+    # project raises ScopedSettingsMismatchError (a ValueError) here, failing
+    # closed, instead of the write landing in the mismatched checkout. Shared
+    # with emit-tree and add_subtask, which also mint IDs into a store.
+    from .discovery import get_scoped_project_settings
+
+    _settings = get_scoped_project_settings(config, project_id)
+    _ledger_pid = _ledger_project_id(config, project_id, _settings)
 
     # CLAWP-051 — per-project file lock serialises ID allocation (scan→write)
     # and explicit-ID creates so two concurrent sessions in the same project
@@ -1529,24 +2715,52 @@ def add_task(
     # Granularity: one lock file per tasks-dir — different projects run freely.
     # DEADLOCK SAFETY: do NOT call any function that re-enters file_lock on
     # the same lock_path from within this block.
+    #
+    # LOCK ORDERING INVARIANT (CLAWP-116, see portfolio_prefix_lock's own
+    # docstring): this per-project lock is always INNER, relative to the
+    # portfolio-wide lock acquired below — never the reverse. The
+    # `with portfolio_prefix_lock(...), file_lock(_lock_path):` statement a
+    # few lines down enforces the ordering syntactically (the portfolio
+    # lock is always entered first).
     _lock_path = tasks_dir / ".clawpm-tasks.lock"
     # Capture whether this is an explicit-ID create BEFORE entering the lock
     # so the clobber guard (Finding 2) can be applied inside atomically.
     _explicit_id = task_id is not None
-    with file_lock(_lock_path):
+    _explicit_prefix = getattr(_settings, "task_prefix", None) if _settings else None
+
+    # CLAWP-116 — the portfolio lock is held UNCONDITIONALLY here, not just
+    # for a heuristically-detected "first mint". An earlier version tried
+    # to skip it whenever a pre-lock read of THIS project's own state
+    # looked like it already had a stable prefix — three independent
+    # findings (Codex P1 x2, grok-4.5, PR #65 round 1) showed that
+    # optimization is unsound: the pre-check itself is an unlocked read
+    # that can go stale between the check and the per-project lock
+    # acquisition (e.g. this project's one inferred-from task gets
+    # concurrently REJECTED by another session in that exact window,
+    # silently flipping this call onto the portfolio-wide path without the
+    # lock that path needs), and an explicit-ID create for a project's
+    # OWN first task never calls assign_task_prefix at all yet still
+    # establishes that project's future inferred prefix, so it needs the
+    # SAME coordination against a sibling's concurrent auto-mint even
+    # though it never touches the allocator itself. Given the portfolio
+    # scale this tool targets (dozens of projects, not a high-throughput
+    # hot path — see CLAWP-124's own sizing note), a short-lived lock held
+    # for the DURATION of one local-disk add_task call is cheap; a subtly
+    # incorrect "skip it sometimes" optimization is not worth its risk.
+    with portfolio_prefix_lock(config.portfolio_root), file_lock(_lock_path):
         # Generate task ID if not provided (inside lock: scan is now serialised)
         if not task_id:
             # CLAWP-048: resolve a portfolio-unique prefix (explicit task_prefix ->
             # inferred from existing tasks -> collision-free derivation) instead of
             # the naive id.upper()[:5], which collides across near-name-twin ids.
-            from .discovery import get_project
-
-            _settings = get_project(config, project_id)
+            #
+            # `_settings` was resolved (session-scoped) before the lock; see
+            # the comment there.
             prefix = assign_task_prefix(
                 project_id,
                 tasks_dir,
                 config,
-                explicit_prefix=getattr(_settings, "task_prefix", None) if _settings else None,
+                explicit_prefix=_explicit_prefix,
             )
 
             # Find highest existing task number.
@@ -1563,37 +2777,32 @@ def add_task(
             # regex instead (the in-progress `.progress` suffix is part of the
             # stem) — the same shape the directory scan below already uses, so the
             # two scans can't disagree.
-            _dir_pat = re.compile(rf"^{re.escape(prefix)}-(\d+)$")
-            _file_pat = re.compile(rf"^{re.escape(prefix)}-(\d+)(?:\.progress)?$")
-
-            existing_nums = []
-
-            # CLAWP-085: include done/archive so an archived task's number is
-            # never re-minted. add_task is not a hot path, so paying the extra
-            # archive scan here (unlike list/next/reflect) is the correct
-            # trade — a silently reused ID would clobber archived history.
-            for scan_dir in [tasks_dir, tasks_dir / "done", tasks_dir / "blocked", tasks_dir / "done" / "archive"]:
-                if not scan_dir.exists():
-                    continue
-                # .md files at this level. Subtask files ({prefix}-000-001.md) live
-                # inside parent dirs, not here, and the anchored pattern excludes
-                # them regardless, so they never pollute top-level numbering.
-                for f in scan_dir.glob(f"{prefix}-*.md"):
-                    m = _file_pat.match(f.stem)
-                    if m:
-                        existing_nums.append(int(m.group(1)))
-                # Parent-task directories at this level
-                for entry in scan_dir.iterdir():
-                    if entry.is_dir():
-                        m = _dir_pat.match(entry.name)
-                        if m:
-                            existing_nums.append(int(m.group(1)))
-
-            next_num = max(existing_nums, default=-1) + 1
+            # CLAWP-113: the separator rule (a legacy ``CODE--006`` still counts
+            # toward the next ordinal) lives in `_task_id_regex`, shared with
+            # emit-tree's predictor so the two scans cannot disagree.
+            # CLAWP-092: the ledger high-water mark joins the scan so a sibling
+            # worktree's id (invisible on this disk) is never re-minted; the
+            # reservation is recorded here, inside the portfolio lock.
+            next_num = _next_root_ordinal(config, tasks_dir, prefix, _ledger_pid)
             task_id = f"{prefix}-{next_num:03d}"
+            record_reservation(
+                config.portfolio_root, prefix, next_num, task_id, _ledger_pid
+            )
+        else:
+            # CLAWP-129 — an explicit id was never checked against the
+            # portfolio's real prefix claims at all (only the same-project
+            # clobber guard below, which is a different check). Must run
+            # inside the same portfolio lock the auto-ID path uses above.
+            check_explicit_id_prefix_collision(
+                task_id, project_id, tasks_dir, config, _explicit_prefix
+            )
+            # CLAWP-092: reserve an explicit id too, so a later auto-mint in
+            # ANY worktree skips past it.
+            record_task_id(config.portfolio_root, task_id, _ledger_pid)
 
         # Build frontmatter. CLAWP-086 — `updated` equals `created` at add time.
-        _today = date.today().isoformat()
+        # CLAWP-126: UTC calendar day, not local — see today_utc_iso().
+        _today = today_utc_iso()
         frontmatter = {
             "id": task_id,
             "priority": priority,
@@ -1792,11 +3001,21 @@ def edit_task(
             if predictions.is_empty():
                 frontmatter.pop("predictions", None)
             else:
-                pred_dict = predictions.to_dict()
-                frontmatter["predictions"] = {
-                    k: v for k, v in pred_dict.items()
+                # CLAWP-108 — MERGE, don't replace. The caller's Predictions
+                # carries only the fields it set (None / [] = "not passed"),
+                # so overlay those onto the existing block. Replacing it
+                # wholesale silently nulled every field the edit didn't name
+                # (duration, confidence, pre_mortem, filled_by, ...). Working
+                # on the raw mapping also keeps keys the dataclass doesn't
+                # model. A list field that IS passed still replaces just
+                # that one list.
+                existing = frontmatter.get("predictions")
+                merged = dict(existing) if isinstance(existing, dict) else {}
+                merged.update({
+                    k: v for k, v in predictions.to_dict().items()
                     if v is not None and v != []
-                }
+                })
+                frontmatter["predictions"] = merged
         # CLAWP-054 — contract fields
         if out_of_scope is not None:
             if out_of_scope:
@@ -2039,21 +3258,39 @@ def _child_state_dirs(tasks_dir: Path, parent_dir: Path) -> list[Path]:
     archived directory-task parent's own dir (its children travelled with it)
     are included too, so a re-decompose can never re-mint an ordinal that has
     been archived out of ``done/``.
+
+    CLAWP-127 (grok-4.6 + grok-4.5, PR #62 rounds 3-4): a directory-task
+    parent's own dir needs the same treatment as the archived case for EVERY
+    terminal state, not just archived — ``change_task_state`` moves a
+    done/blocked/rejected directory parent wholesale to
+    ``tasks/<state>/<parent_id>/``, taking its children with it, and
+    ``emit_tree``'s ``attach_to`` path always resolves ``parent_dir`` to the
+    LIVE ``tasks/<parent_id>/`` path — without these entries a wholesale-
+    moved parent's already-existing child ordinals are invisible and would be
+    re-minted. (Round 3 added only the ``rejected/`` nest; round 4 found the
+    same gap still open for ``done/``/``blocked/``.)
     """
     parent_id = parent_dir.name
     return [
         parent_dir,
         tasks_dir,
         tasks_dir / "done",
+        tasks_dir / "done" / parent_id,
         tasks_dir / "blocked",
+        tasks_dir / "blocked" / parent_id,
         tasks_dir / "rejected",
+        tasks_dir / "rejected" / parent_id,
         tasks_dir / "done" / "archive",
         tasks_dir / "done" / "archive" / parent_id,
     ]
 
 
 def _existing_child_ordinals(
-    tasks_dir: Path, parent_dir: Path, parent_id: str,
+    tasks_dir: Path,
+    parent_dir: Path,
+    parent_id: str,
+    portfolio_root: Path | None = None,
+    project_id: str | None = None,
 ) -> set[int]:
     """Union of every ordinal already used by a child of ``parent_id``.
 
@@ -2066,6 +3303,10 @@ def _existing_child_ordinals(
     outright after creation, invisible to any dir scan). Reading the max of this
     set and adding 1 guarantees a fresh ordinal even when earlier children have
     migrated, reopened, been rejected, or crash-orphaned.
+
+    CLAWP-092: with ``portfolio_root``, the reservation ledger's high-water mark
+    for ``parent_id`` joins the set, so a child minted by a sibling worktree
+    (invisible to every scan above) is skipped too.
     """
     nums: set[int] = set()
 
@@ -2105,6 +3346,11 @@ def _existing_child_ordinals(
             if isinstance(cid, str) and cid.startswith(parent_id + "-"):
                 _record(cid)
 
+    if portfolio_root is not None:
+        reserved = reserved_high_water(portfolio_root, parent_id, project_id)
+        if reserved is not None:
+            nums.add(reserved)
+
     return nums
 
 
@@ -2135,7 +3381,17 @@ def add_subtask(
     tasks_dir = get_tasks_dir(config, project_id)
     if not tasks_dir:
         return None
-    
+
+    # Identity guard for the scoped store this subtask is minted into (CLAWP-098,
+    # PR #55 round 14): same fail-closed check as `add_task` — a registered
+    # worktree whose settings.toml names another project raises
+    # ScopedSettingsMismatchError instead of taking new IDs.
+    from .discovery import get_scoped_project_settings
+
+    _ledger_pid = _ledger_project_id(
+        config, project_id, get_scoped_project_settings(config, project_id)
+    )
+
     # CLAWP-051 Finding 6 — wrap the ENTIRE parent-resolution + allocate-and-create
     # in file_lock so concurrent sessions decomposing the same parent can't mint
     # the same subtask ID, clobber each other, OR read a half-written parent.
@@ -2151,7 +3407,11 @@ def add_subtask(
     # self-deadlocking. get_task (fs scan) and _append_child_to_parent_frontmatter
     # (plain read/write) take no lock.
     _lock_path = tasks_dir / ".clawpm-tasks.lock"
-    with file_lock(_lock_path):
+    # CLAWP-092: portfolio lock OUTER, per-project lock INNER (the ordering
+    # invariant on portfolio_prefix_lock) so allocate-and-record against the
+    # reservation ledger is atomic across worktrees. Both are reentrant per
+    # thread, and nothing calls add_subtask while holding a project lock.
+    with portfolio_prefix_lock(config.portfolio_root), file_lock(_lock_path):
         # Resolve the parent as a directory INSIDE the lock (read + optional split).
         parent = get_task(config, project_id, parent_id)
         if not parent:
@@ -2181,12 +3441,18 @@ def add_subtask(
         # can't have its number silently reused (CLAWP-071 Codex r1-3).
         # emit_tree's attach path routes through the same helper so the two
         # allocators can't drift.
-        existing_nums = _existing_child_ordinals(tasks_dir, parent_dir, parent_id)
+        existing_nums = _existing_child_ordinals(
+            tasks_dir, parent_dir, parent_id, config.portfolio_root, _ledger_pid
+        )
         next_num = (max(existing_nums) if existing_nums else 0) + 1
         subtask_id = f"{parent_id}-{next_num:03d}"
+        record_reservation(
+            config.portfolio_root, parent_id, next_num, subtask_id, _ledger_pid
+        )
 
         # Build frontmatter. CLAWP-086 — `updated` equals `created` at add time.
-        _today = date.today().isoformat()
+        # CLAWP-126: UTC calendar day, not local — see today_utc_iso().
+        _today = today_utc_iso()
         frontmatter: dict = {
             "id": subtask_id,
             "priority": priority,

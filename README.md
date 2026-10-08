@@ -346,6 +346,11 @@ clawpm reflect summarize    # update the calibration corpus
 | `clawpm use <id>` | — | Set project context |
 | `clawpm conflicts --task <id>` | — | Pre-flight check for scope overlap |
 | `clawpm serve` | — | Start read-only web dashboard at http://127.0.0.1:8080 (needs the `web` extra: `pip install 'clawpm[web]'`) |
+| `clawpm mcp` | — | Start the stdio MCP server so any MCP host (Cursor, Windsurf, VS Code, Claude Code, Amazon Q) can drive clawpm (needs the `mcp` extra: `pip install 'clawpm[mcp]'`) |
+
+| `clawpm introspect` | — | Emit the full command tree (groups, commands, options, types, help) as JSON; the ground truth the README reference is gated against (CLAWP-088, CLAWP-102) |
+
+Global options (before any subcommand): `--format json|text` (default json), `--project <id>`, `--no-hints` (suppress next-action hints; also `CLAWPM_NO_HINTS`), `--version`.
 
 Short task IDs work everywhere: `42` expands to `CLAWP-042` based on project prefix. `start` / `done` / `block` / `unblock` (and `tasks state`) accept many IDs at once — see **Bulk state** below.
 
@@ -357,6 +362,9 @@ clawpm projects next               # Next task across all projects
 clawpm project init [--id myproj]  # Initialise project in cwd
 clawpm project context             # Full project context
 clawpm project doctor              # Health check
+clawpm project announce            # Write/refresh the 'uses clawpm' stanza in the repo's agent docs
+clawpm project init --in-repo <path> --name "My Project"   # Init for a repo path with a display name
+clawpm projects list --filter active   # Filter by status
 ```
 
 ### Tasks
@@ -371,6 +379,8 @@ clawpm tasks edit <id> [--title/--priority/--complexity/--body/--scope/--tag/--c
 clawpm tasks state <id> <state> [--note] [--reflect-note] [--meta-reflect]
 clawpm tasks state 72 73 74 done    # bulk mode (CLAWP-083): per-task isolation, aggregate result
 clawpm tasks state <id> rejected --rationale "reason"   # add to won't-do ledger (reject one at a time)
+clawpm tasks add -t "Pick a DB" --kind decision                 # decision task (CLAWP-111): done requires --resolution
+clawpm done <id> --resolution "Postgres, for JSONB"        # records resolution; appends a line under the parent's ## Decisions so far
 clawpm tasks split <id>             # Convert to parent directory for subtasks
 ```
 
@@ -512,7 +522,7 @@ clawpm tasks emit-rubric <id> [--rubric-format markdown]
 clawpm tasks dispatch <id> [--worktree] \
     [--confirm-close] [--refute-votes N] \
     [--lease-ttl <secs>] [--fallback-policy requeue|route-secondary|escalate-to-human|fail] \
-    [--confirm-stale]
+    [--confirm-stale] [--max-iterations N]
 
 # Remove dispatch settings
 clawpm tasks teardown-dispatch <id>
@@ -525,7 +535,7 @@ clawpm agent dispatch --prompt "..." --rubric-criteria "..." \
     [--judge-cmd-override "..."]
 
 # Stop-hook judge (invoked by dispatched settings; also callable standalone)
-clawpm hook eval-stop --task <id>
+clawpm hook eval-stop --task <id> [--max-iterations N --iteration-baseline B]  # cap baked in by `tasks dispatch --max-iterations`
 
 # SessionStart context sidecar
 clawpm hook session-start
@@ -619,8 +629,19 @@ clawpm reflect void --all-empty-actuals --reason "Phase 1 corpus cleanup"
 ### Mission and inbox
 
 ```bash
-clawpm mission                     # Mission Control — macro binary-outcome layer above tasks
-clawpm inbox                       # Inter-agent messaging
+# Mission Control — macro binary-outcome layer above tasks
+clawpm mission add --title "Ship X" --binary-outcome "Is X live?" --deadline-days 14
+clawpm mission add-goal <mission-id> --task <id> [--actor agent]
+clawpm mission list [--status active]
+clawpm mission status <mission-id>
+clawpm mission tasks <mission-id> [--actor agent]
+clawpm mission state <mission-id> complete
+
+# Inbox — inter-agent messaging (filesystem-first, append-only)
+clawpm inbox send --to <agent> --message "text" [--from <agent>] [--in-reply-to <msg-id>] [--stdin]
+clawpm inbox read [--agent <agent>] [--unacked] [--since 2026-01-01] [--from <agent>]
+clawpm inbox ack <msg-id>... [--agent <agent>]
+clawpm inbox thread <msg-id>
 ```
 
 ### Web dashboard
@@ -634,6 +655,66 @@ clawpm serve                       # Start on http://127.0.0.1:8080
 clawpm serve --port 8888
 ```
 
+### MCP server (stdio)
+
+Expose clawpm's core to any MCP host — Cursor, Windsurf, VS Code, Claude Code,
+Amazon Q — so an agent can drive task/research/mission management directly,
+not only through the Claude Code skill. Requires the optional `mcp` extra:
+
+```bash
+pip install 'clawpm[mcp]'           # one-time: install the MCP SDK
+clawpm mcp                          # start the stdio server (host launches this)
+clawpm mcp --tools standard         # reserved for future tools (same 10 as core today)
+```
+
+The server wraps the core functions **directly** (nothing shells out to the `clawpm` CLI), so
+it returns structured JSON natively and sidesteps the cp1252 / spaced-path
+encoding pitfalls. It respects `CLAWPM_PORTFOLIO` / project discovery exactly as
+the CLI does, and auto-detects the project from its working directory (pass a
+`project` argument to any tool to target another).
+
+**Core tool set** (10 tools, the default — kept ≤ 12 to keep a host's tool list
+lean): reads `tasks_list`, `tasks_get`, `context`, `next`, `research_list`,
+`mission_list`; writes `tasks_add`, `tasks_state`, `tasks_edit`, `research_add`.
+Writes go through the same validated, calibration-aware path as the CLI
+(`services.tasks.transition` for state changes — parent-rollup gate, work-log,
+dependency cascade, reflection event; surprise-taxonomy validation).
+
+**Tool-count discipline.** The exposed surface is gated by `CLAWPM_MCP_TOOLS`
+(`core` | `standard` | `all`, default `core`) or the `--tools` flag, so future
+tiers never bloat the default. `tasks_add` accepts `success_criteria` and
+predictions (`predict_duration`, `confidence`, `pre_mortem`, …) so tasks created
+over MCP stay verifiable goals that feed calibration.
+
+**Per-project registration (anti-pollution).** Register the server per-project
+via a `.mcp.json` in the project root, so the tool surface loads only when the
+host is opened inside a clawpm project — not globally:
+
+```json
+{
+  "mcpServers": {
+    "clawpm": {
+      "command": "clawpm",
+      "args": ["mcp"],
+      "env": { "CLAWPM_MCP_TOOLS": "core" }
+    }
+  }
+}
+```
+
+stdio is the only transport in v1 (it matches how editors launch MCP servers); an
+HTTP transport may follow.
+
+**Known limitation — git worktrees.** Project resolution follows cwd, but the
+task/research files a tool reads or writes are located via the portfolio
+registry's recorded `repo_path`, not cwd. Launch the server from a git
+worktree (rather than the project's main checkout) and it will silently
+read/write the *main checkout's* files, not the worktree's own — the same
+underlying gap as CLAWP-098 (`clawpm tasks state` et al. from inside a
+dispatched worktree), now also reachable through this server. Don't register
+`.mcp.json` inside a worktree until that's fixed; launch from the main
+checkout.
+
 ### Admin
 
 ```bash
@@ -645,6 +726,56 @@ clawpm doctor --check-codex
 clawpm doctor --check-encoding
 clawpm version
 clawpm resume                      # 2-paragraph session-resume briefing
+```
+
+### Additional options
+
+Less common flags, grouped by command. Run `clawpm introspect` for the complete machine-readable list.
+
+```bash
+# tasks add / edit: richer task contracts
+clawpm tasks add -t "..." --depends <id> --parallel-group 1 --delegability agent \
+    --body-file body.md --scope-file scope.txt --out-of-scope "docs/**" \
+    --out-of-scope-file oos.txt --stop-condition "tests red" \
+    --success-criteria "P95 latency <200ms" --unknowns "cache behaviour" \
+    --predict-iterations 2 --predict-scope-file pscope.txt --predicted-by agent
+clawpm tasks edit <id> --clear-parallel-group
+clawpm tasks list --state progress --flat
+clawpm tasks tags --include-done
+clawpm tasks state <id> rejected --rationale "..." --supersedes <id2>
+clawpm tasks state <id> done --force --process-lesson "..." --surprise scope_drift
+clawpm block <id> --process-lesson "..." --surprise dependency
+clawpm done <id> --force                   # complete even if subtasks are incomplete
+clawpm tasks dispatch <id> --target-dir <dir> --no-session-context
+clawpm next --batch                        # next parallel batch (shared parallel_group)
+
+# constitution add
+clawpm constitution add --name n --kind advisory --description "text"
+
+# hooks, agent dispatch, leases
+clawpm hook eval-stop --task <id> --transcript-file t.jsonl --no-confirm-close
+clawpm agent dispatch --prompt "..." --rubric-criteria "..." --no-codegraph
+clawpm lease grant --task <id> --ttl 600 --fallback-policy fail --holder <id> --target-dir <dir>
+
+# logging, issues, research
+clawpm log add --task <id> --action progress --summary "..." \
+    --next "..." --files a.py --blocker "..." --session-key <key>
+clawpm issues add --type bug --severity low --command "clawpm x" --expected "..." \
+    --actual "..." --context "..."
+clawpm research add --type investigation --title "..." --question "..." --tags a,b
+clawpm research list --status open --with-diagnostics
+clawpm research link --id <id> --run-id <run> --spawned-by <session-key>
+
+# reflection, context, resume, serve, use
+clawpm reflect suggest CLAWP-042 --min-bucket 5
+clawpm context --log-limit 20
+clawpm resume --no-cache
+clawpm serve --host 127.0.0.1
+clawpm use --clear
+
+# doctor: tuning and per-arm opt-outs for --apply
+clawpm doctor --apply --yes --commits-drift-threshold 10 \
+    --no-apply-drift --no-apply-cascade --no-apply-stale-blocked --no-apply-half-rename
 ```
 
 Looking for a seed portfolio? See `examples/portfolio/` — drop-in fixtures with sample projects, tasks across all states, and a populated `work_log.jsonl`. Edit the absolute paths in `portfolio.toml` before pointing `CLAWPM_PORTFOLIO` at it.

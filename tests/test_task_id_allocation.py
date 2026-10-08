@@ -84,6 +84,1022 @@ class TestNonHyphenatedPrefixUnaffected:
         assert ids == ["TEST-000", "TEST-001"], ids
 
 
+class TestHyphenOnSliceBoundary:
+    """CLAWP-096: a project id whose ``upper()[:5]`` slice lands EXACTLY on the
+    hyphen (e.g. "code-quorum", where "code" is 4 chars) must not carry a
+    trailing hyphen into the prefix — that doubles the separator once
+    ``-{num:03d}`` is appended ("CODE-" + "-000" -> "CODE--000")."""
+
+    def test_slice_boundary_hyphen_is_stripped(self, tmp_path, monkeypatch):
+        _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        ids = [_add("code-quorum", f"t{i}") for i in range(2)]
+        assert ids == ["CODE-000", "CODE-001"], ids
+        assert "--" not in ids[0]
+
+    def test_internal_hyphen_still_preserved(self, tmp_path, monkeypatch):
+        # Regression guard: the fix must not regress CLAWP-047's intentional
+        # internal-hyphen behaviour ("arb-prd" -> "ARB-P", hyphen mid-prefix).
+        _make_portfolio(tmp_path, monkeypatch, "arb-prd")
+        assert _add("arb-prd", "epic") == "ARB-P-000"
+
+    def test_two_taskless_siblings_on_the_same_slice_boundary_do_not_collide(
+        self, tmp_path, monkeypatch
+    ):
+        # Code-quorum review finding: _portfolio_prefixes' collision-set
+        # placeholder for a still task-less sibling must agree with what
+        # assign_task_prefix's OWN candidate strips to, or two siblings that
+        # both slice-with-boundary-hyphen to "CODE" (here: "code-quorum" and
+        # "code-runner", both registered but neither has minted yet) could
+        # each independently conclude "CODE" is free and collide.
+        #
+        # With the placeholders in agreement, EITHER sibling seeing the
+        # other's not-yet-real "CODE" placeholder is enough to make it
+        # defensively extend past the short prefix -- unlike the arb-prd/
+        # arb-prod case (where the first minter keeps the short prefix
+        # cleanly because the second hasn't registered a same-shaped
+        # placeholder yet), here neither has minted, so it's not knowable in
+        # advance which one "should" get to keep "CODE". Collision-safety
+        # (the actual invariant under test), not who keeps the short prefix,
+        # is what this test asserts.
+        _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        _add_project(tmp_path, "code-runner")  # also task-less at this point
+        first = _add("code-quorum", "e")
+        second = _add("code-runner", "e")
+        pre = lambda tid: tid.rsplit("-", 1)[0]
+        assert pre(second) != pre(first), (first, second)  # distinct namespaces
+        assert len({first, second}) == 2, (first, second)  # no literal id collision
+
+
+class TestLegacyDoubledSeparatorNormalization:
+    """CLAWP-113: CLAWP-096 stopped `assign_task_prefix` MINTING a doubled
+    separator, but did nothing for a project that already reproduced the
+    papercut on disk. ``_infer_prefix_from_tasks`` is anchored + non-greedy,
+    so it reads an existing ``CODE--000`` as prefix ``CODE-`` (trailing
+    hyphen) and ``assign_task_prefix`` returns that inferred value early,
+    before any normalization -- so such a project keeps minting
+    ``CODE--001``, ``CODE--002`` forever. The fix must recognise the legacy
+    spelling, mint the normalized form going forward, and derive the next
+    ordinal across BOTH spellings already on disk."""
+
+    def test_legacy_doubled_separator_mints_normalized_form(self, tmp_path, monkeypatch):
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        # Pre-existing on-disk tasks already reproduced the doubled-separator
+        # papercut (as if minted before CLAWP-096 shipped).
+        (tasks_dir / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE--001.md").write_text("---\nid: CODE--001\n---\n", encoding="utf-8")
+        next_id = _add("code-quorum", "next task")
+        assert next_id == "CODE-002", next_id
+        assert "--" not in next_id
+
+    def test_legacy_doubled_separator_numbering_continues_across_spellings(
+        self, tmp_path, monkeypatch
+    ):
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        for n in range(6):
+            (tasks_dir / f"CODE--{n:03d}.md").write_text(
+                f"---\nid: CODE--{n:03d}\n---\n", encoding="utf-8"
+            )
+        # The next mint must continue from 006, not restart at 001 and not
+        # collide with any of the six legacy-spelled ids already on disk.
+        assert _add("code-quorum", "next") == "CODE-006"
+
+    def test_mixed_spellings_merge_and_continue(self, tmp_path, monkeypatch):
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        # Legacy files outnumber normalized ones; the votes must merge, and
+        # the highest number across both spellings (and across dir-form,
+        # .progress, done/) drives the next mint.
+        (tasks_dir / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE--001.md").write_text("---\nid: CODE--001\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE-002.md").write_text("---\nid: CODE-002\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE--003.progress.md").write_text("---\nid: CODE--003\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE--004").mkdir()
+        (tasks_dir / "done" / "CODE--007.md").write_text("---\nid: CODE--007\n---\n", encoding="utf-8")
+        assert _add("code-quorum", "next") == "CODE-008"
+
+    def test_infer_prefix_merges_split_votes_directly(self, tmp_path):
+        from clawpm.tasks import _infer_prefix_from_tasks
+
+        # 2x legacy + 1x normalized CODE (3 merged votes) beats 2x OTHER.
+        for name in ("CODE--000", "CODE--001", "CODE-002", "OTHER-000", "OTHER-001"):
+            (tmp_path / f"{name}.md").write_text(f"---\nid: {name}\n---\n", encoding="utf-8")
+        assert _infer_prefix_from_tasks(tmp_path) == "CODE"
+
+    def test_infer_prefix_legacy_only_returns_normalized(self, tmp_path):
+        from clawpm.tasks import _infer_prefix_from_tasks
+
+        (tmp_path / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        assert _infer_prefix_from_tasks(tmp_path) == "CODE"
+
+    def test_infer_prefix_ignores_legacy_doubled_separator_subtasks(self, tmp_path):
+        from clawpm.tasks import _infer_prefix_from_tasks
+
+        # A legacy-spelled subtask (CODE--001--002 parses as prefix "CODE--001-")
+        # must be excluded like CODE-001-002, not stripped to "CODE--001" and
+        # counted as a top-level prefix vote. 2x OTHER must beat 1x CODE here.
+        for name in ("CODE--001--002", "CODE--001--003", "OTHER-000", "OTHER-001", "CODE-005"):
+            (tmp_path / f"{name}.md").write_text(f"---\nid: {name}\n---\n", encoding="utf-8")
+        assert _infer_prefix_from_tasks(tmp_path) == "OTHER"
+
+    @pytest.mark.parametrize(
+        "subdir", ["done", "done/archive", "blocked", "rejected"]
+    )
+    def test_legacy_ids_in_every_scan_location_count(self, tmp_path, monkeypatch, subdir):
+        from clawpm.tasks import _infer_prefix_from_tasks
+
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        loc = tasks_dir / subdir
+        loc.mkdir(parents=True, exist_ok=True)
+        (loc / "CODE--009.md").write_text("---\nid: CODE--009\n---\n", encoding="utf-8")
+        # Re-minting an archived/done/blocked/rejected id would clobber history.
+        assert _infer_prefix_from_tasks(tasks_dir) == "CODE"
+        assert _add("code-quorum", "next") == "CODE-010"
+
+    def test_hyphenated_legacy_prefix_keeps_inner_hyphen(self, tmp_path, monkeypatch):
+        from clawpm.tasks import _infer_prefix_from_tasks
+
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "arb-pipeline")
+        (tasks_dir / "ARB-P--000.md").write_text("---\nid: ARB-P--000\n---\n", encoding="utf-8")
+        assert _infer_prefix_from_tasks(tasks_dir) == "ARB-P"
+        assert _add("arb-pipeline", "next") == "ARB-P-001"
+
+    def test_subtask_shaped_name_excluded_from_ordinal_scan(self, tmp_path, monkeypatch):
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        (tasks_dir / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE-000-001.md").write_text("---\nid: CODE-000-001\n---\n", encoding="utf-8")
+        # The subtask must not be read as top-level ordinal 001 -> next is 001.
+        assert _add("code-quorum", "next") == "CODE-001"
+
+    def test_triple_hyphen_name_not_matched_by_ordinal_scan(self, tmp_path, monkeypatch):
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        (tasks_dir / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        # Locks in current behaviour: only a SINGLE legacy doubled separator
+        # (CLAWP-096's papercut) is recognised. ``CODE---050`` is not a shape
+        # any mint produced, so the -{1,2} scan must not count it.
+        (tasks_dir / "CODE---050.md").write_text("---\nid: CODE---050\n---\n", encoding="utf-8")
+        assert _add("code-quorum", "next") == "CODE-001"
+
+    def test_resolve_existing_prefix_legacy_only(self, tmp_path):
+        from types import SimpleNamespace
+
+        from clawpm.tasks import resolve_existing_prefix
+
+        tasks_dir = tmp_path / ".project" / "tasks"
+        tasks_dir.mkdir(parents=True)
+        (tasks_dir / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        settings = SimpleNamespace(task_prefix=None, project_dir=tmp_path)
+        assert resolve_existing_prefix(settings) == "CODE"
+
+    def test_neighbouring_prefix_is_not_counted(self, tmp_path, monkeypatch):
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        (tasks_dir / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        (tasks_dir / "CODE--001.md").write_text("---\nid: CODE--001\n---\n", encoding="utf-8")
+        # A different prefix that merely starts with CODE- must not bump the ordinal.
+        (tasks_dir / "CODE-X-005.md").write_text("---\nid: CODE-X-005\n---\n", encoding="utf-8")
+        assert _add("code-quorum", "next") == "CODE-002"
+
+    def test_emit_tree_prediction_matches_add_task_for_legacy_project(
+        self, tmp_path, monkeypatch
+    ):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.emit_tree import _predict_parent_id
+
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        for n in range(6):
+            (tasks_dir / f"CODE--{n:03d}.md").write_text(
+                f"---\nid: CODE--{n:03d}\n---\n", encoding="utf-8"
+            )
+        config = load_portfolio_config()
+        doc = type("Doc", (), {"root": type("Root", (), {"attach_to": None})()})()
+        assert _predict_parent_id(doc, config, "code-quorum") == "CODE-006"
+
+
+class TestLegacyNormalizationSiblingCollision:
+    """CLAWP-113 review round 4 (operator decision 2026-10-04). A legacy
+    ``CODE--000`` project used to claim ``CODE-`` while a sibling holding
+    ``CODE-001`` claimed ``CODE``: distinct. Naive normalisation merged them
+    and the legacy project minted a duplicate ``CODE-001``. Rule: normalise
+    only when no sibling claims the clean prefix; otherwise KEEP the legacy
+    spelling (``CODE--NNN``) exactly as before CLAWP-113."""
+
+    @staticmethod
+    def _seed(tasks_dir, *names):
+        for name in names:
+            (tasks_dir / f"{name}.md").write_text(f"---\nid: {name}\n---\n", encoding="utf-8")
+
+    def _collide(self, tmp_path, monkeypatch):
+        legacy_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        self._seed(legacy_dir, "CODE--000")
+        _add_project(tmp_path, "code-sibling")
+        sib_dir = tmp_path / "projects" / "code-sibling" / ".project" / "tasks"
+        self._seed(sib_dir, "CODE-001")
+        return legacy_dir, sib_dir
+
+    def test_collision_keeps_legacy_spelling_no_duplicate(self, tmp_path, monkeypatch):
+        legacy_dir, sib_dir = self._collide(tmp_path, monkeypatch)
+        legacy_next = _add("code-quorum", "legacy next")
+        assert legacy_next == "CODE--001", legacy_next
+        sib_next = _add("code-sibling", "sibling next")
+        assert sib_next == "CODE-002", sib_next
+        ids = {p.stem for d in (legacy_dir, sib_dir) for p in d.glob("CODE-*.md")}
+        assert len(ids) == 4  # CODE--000, CODE--001, CODE-001, CODE-002
+
+    def test_collision_with_explicit_sibling_prefix_keeps_legacy(self, tmp_path, monkeypatch):
+        legacy_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        self._seed(legacy_dir, "CODE--000")
+        _add_project(tmp_path, "other", task_prefix="CODE")
+        assert _add("code-quorum", "next") == "CODE--001"
+
+    def test_assign_all_prefixes_distinct_on_collision(self, tmp_path, monkeypatch):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_all_prefixes
+
+        self._collide(tmp_path, monkeypatch)
+        assignments, errors = assign_all_prefixes(load_portfolio_config())
+        assert not errors
+        assert assignments["code-quorum"] == "CODE-"
+        assert assignments["code-sibling"] == "CODE"
+
+    def test_no_collision_still_normalises(self, tmp_path, monkeypatch):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_all_prefixes
+
+        legacy_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        self._seed(legacy_dir, "CODE--000")
+        _add_project(tmp_path, "unrelated")
+        assignments, _ = assign_all_prefixes(load_portfolio_config())
+        assert assignments["code-quorum"] == "CODE"
+        assert _add("code-quorum", "next") == "CODE-001"
+
+    def test_emit_tree_prediction_agrees_when_kept(self, tmp_path, monkeypatch):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.emit_tree import _predict_parent_id
+
+        self._collide(tmp_path, monkeypatch)
+        doc = type("Doc", (), {"root": type("Root", (), {"attach_to": None})()})()
+        predicted = _predict_parent_id(doc, load_portfolio_config(), "code-quorum")
+        assert predicted == "CODE--001"
+        assert _add("code-quorum", "next") == predicted
+
+    def test_emit_tree_prediction_agrees_when_normalised(self, tmp_path, monkeypatch):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.emit_tree import _predict_parent_id
+
+        legacy_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        self._seed(legacy_dir, "CODE--000")
+        _add_project(tmp_path, "unrelated")
+        doc = type("Doc", (), {"root": type("Root", (), {"attach_to": None})()})()
+        predicted = _predict_parent_id(doc, load_portfolio_config(), "code-quorum")
+        assert predicted == "CODE-001"
+        assert _add("code-quorum", "next") == predicted
+
+    def test_other_project_cannot_explicitly_create_legacy_id_normalised(
+        self, tmp_path, monkeypatch
+    ):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import add_task
+
+        legacy_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        self._seed(legacy_dir, "CODE--000")
+        _add_project(tmp_path, "intruder")
+        with pytest.raises(ValueError, match="CODE"):
+            add_task(load_portfolio_config(), "intruder", "squat", task_id="CODE--000")
+
+    def test_other_project_cannot_explicitly_create_legacy_id_when_kept(
+        self, tmp_path, monkeypatch
+    ):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import add_task
+
+        self._collide(tmp_path, monkeypatch)
+        _add_project(tmp_path, "intruder")
+        with pytest.raises(ValueError, match="CODE"):
+            add_task(load_portfolio_config(), "intruder", "squat", task_id="CODE--000")
+
+    def test_kept_legacy_project_cannot_explicitly_take_sibling_namespace(
+        self, tmp_path, monkeypatch
+    ):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import add_task
+
+        self._collide(tmp_path, monkeypatch)
+        with pytest.raises(ValueError, match="code-sibling"):
+            add_task(load_portfolio_config(), "code-quorum", "x", task_id="CODE-005")
+
+    def test_doctor_reports_no_collision_when_kept(self, tmp_path, monkeypatch):
+        self._collide(tmp_path, monkeypatch)
+        res = CliRunner().invoke(main, ["--format", "json", "doctor"])
+        data = json.loads(res.output)
+        assert data["prefix_collisions"] == [], data
+
+
+class TestLegacyNormalizationRound4Codex:
+    """Codex round 4: mixed votes whose merged winner differs from the raw
+    winner must still honour sibling claims; short refs must expand to the
+    on-disk spelling of existing legacy ids."""
+
+    def test_mixed_votes_flip_falls_back_to_raw_winner_on_collision(self, tmp_path, monkeypatch):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_all_prefixes
+
+        d = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        for n in ("CODE--000", "CODE--001", "CODE-002", "CODE-003", "OTHER-001", "OTHER-002", "OTHER-003"):
+            (d / f"{n}.md").write_text(f"---\nid: {n}\n---\n", encoding="utf-8")
+        _add_project(tmp_path, "sib")
+        (tmp_path / "projects" / "sib" / ".project" / "tasks" / "CODE-004.md").write_text(
+            "---\nid: CODE-004\n---\n", encoding="utf-8"
+        )
+        assignments, _ = assign_all_prefixes(load_portfolio_config())
+        assert assignments["code-quorum"] == "OTHER"
+        assert assignments["sib"] == "CODE"
+        assert _add("code-quorum", "next") == "OTHER-004"
+
+    def test_short_ref_expands_to_legacy_on_disk_spelling(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+
+        from clawpm.context import expand_task_id
+        from clawpm.tasks import resolve_ref_prefix
+
+        d = tmp_path / ".project" / "tasks"
+        d.mkdir(parents=True)
+        (d / "CODE--000.md").write_text("---\nid: CODE--000\n---\n", encoding="utf-8")
+        settings = SimpleNamespace(task_prefix=None, project_dir=tmp_path)
+        assert expand_task_id("0", "code-quorum", resolve_ref_prefix(settings)) == "CODE--000"
+
+
+class TestLegacyNormalizationRound7Codex:
+    """Codex round 7: sibling claims must keep BOTH raw and normalised
+    spellings (two migrations can converge), and short refs must resolve
+    against the ids actually on disk across both spellings."""
+
+    @staticmethod
+    def _seed(tasks_dir, *names):
+        for name in names:
+            (tasks_dir / f"{name}.md").write_text(f"---\nid: {name}\n---\n", encoding="utf-8")
+
+    def _converging(self, tmp_path, monkeypatch):
+        a_dir = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        self._seed(a_dir, "CODE--013")
+        _add_project(tmp_path, "other")
+        b_dir = tmp_path / "projects" / "other" / ".project" / "tasks"
+        names = (
+            [f"OTHER-{n:03d}" for n in range(0, 5)]
+            + [f"CODE--{n:03d}" for n in range(7, 10)]
+            + [f"CODE-{n:03d}" for n in range(10, 14)]
+        )
+        self._seed(b_dir, *names)
+
+    def test_two_migrations_do_not_converge_on_one_namespace(self, tmp_path, monkeypatch):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_all_prefixes
+
+        self._converging(tmp_path, monkeypatch)
+        assignments, _ = assign_all_prefixes(load_portfolio_config())
+        assert assignments["code-quorum"] != assignments["other"], assignments
+        id_a = _add("code-quorum", "a")
+        id_b = _add("other", "b")
+        assert id_a != id_b
+        assert id_a == "CODE--014"
+
+    def test_doctor_agrees_with_allocation_on_converging_migrations(self, tmp_path, monkeypatch):
+        self._converging(tmp_path, monkeypatch)
+        res = CliRunner().invoke(main, ["--format", "json", "doctor"])
+        data = json.loads(res.output)
+        assert data["prefix_collisions"] == [], data
+
+    def _legacy_then_normalised(self, tmp_path, monkeypatch):
+        d = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        self._seed(d, *[f"CODE--{n:03d}" for n in range(7)])
+        assert _add("code-quorum", "new") == "CODE-007"
+        return d
+
+    def test_short_ref_resolves_across_both_spellings(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+
+        from clawpm.context import expand_task_id
+        from clawpm.tasks import resolve_ref_prefix
+
+        self._legacy_then_normalised(tmp_path, monkeypatch)
+        settings = SimpleNamespace(
+            task_prefix=None, project_dir=tmp_path / "projects" / "code-quorum"
+        )
+
+        def expand(ref):
+            return expand_task_id(ref, "code-quorum", resolve_ref_prefix(settings, task_ref=ref))
+
+        assert expand("7") == "CODE-007"
+        assert expand("3") == "CODE--003"
+        assert expand("3-001") == "CODE--003-001"
+
+    def test_short_ref_ambiguous_across_spellings_raises(self, tmp_path):
+        from types import SimpleNamespace
+
+        from clawpm.tasks import resolve_ref_prefix
+
+        d = tmp_path / ".project" / "tasks"
+        d.mkdir(parents=True)
+        self._seed(d, "CODE--005", "CODE-005", "CODE-006")
+        settings = SimpleNamespace(task_prefix=None, project_dir=tmp_path)
+        with pytest.raises(ValueError, match="ambiguous"):
+            resolve_ref_prefix(settings, task_ref="5")
+
+    def test_short_ref_without_match_falls_back(self, tmp_path):
+        from types import SimpleNamespace
+
+        from clawpm.tasks import resolve_ref_prefix
+
+        d = tmp_path / ".project" / "tasks"
+        d.mkdir(parents=True)
+        self._seed(d, "CODE--000")
+        settings = SimpleNamespace(task_prefix=None, project_dir=tmp_path)
+        assert resolve_ref_prefix(settings, task_ref="9") == resolve_ref_prefix(settings)
+
+    def test_shared_id_rule(self):
+        from clawpm.tasks import _task_id_regex
+
+        norm = _task_id_regex("CODE")
+        assert norm.match("CODE-007") and norm.match("CODE--007")
+        assert not norm.match("CODE---007")
+        assert not norm.match("CODE-007-001")
+        assert _task_id_regex("CODE", subtasks=True).match("CODE--001--002")
+        assert _task_id_regex("CODE", strict=True).match("CODE-007")
+        assert not _task_id_regex("CODE", strict=True).match("CODE--007")
+        kept = _task_id_regex("CODE-")
+        assert kept.match("CODE--007")
+        assert not kept.match("CODE-007")
+        assert not kept.match("CODE---007")
+
+
+class TestRound8Codex:
+    """Codex round 8: suffix test is case-insensitive on every platform, and
+    the portfolio fallback is lazy (an unreadable sibling store must not break
+    refs that resolve locally, nor full-id refs)."""
+
+    def test_uppercase_md_suffix_counts_toward_ordinals(self, tmp_path):
+        from clawpm.tasks import _root_ordinals
+
+        d = tmp_path / "tasks"
+        d.mkdir()
+        (d / "CODE-000.MD").write_text("---\nid: CODE-000\n---\n", encoding="utf-8")
+        assert _root_ordinals(d, "CODE") == [0]
+
+    def test_uppercase_md_suffix_is_not_reminted(self, tmp_path, monkeypatch):
+        d = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        (d / "CODE-000.MD").write_text("---\nid: CODE-000\n---\n", encoding="utf-8")
+        assert _add("code-quorum", "next") == "CODE-001"
+
+    def _legacy_with_broken_sibling(self, tmp_path, monkeypatch):
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import PortfolioPrefixScanError
+
+        d = _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        (d / "CODE--003.md").write_text("---\nid: CODE--003\n---\n", encoding="utf-8")
+        calls = []
+
+        def boom(*args, **kwargs):
+            calls.append(args)
+            raise PortfolioPrefixScanError("sib", RuntimeError("unreadable"))
+
+        monkeypatch.setattr("clawpm.tasks._other_projects_claims", boom)
+        return load_portfolio_config(), calls
+
+    def test_local_numeric_ref_survives_unreadable_sibling(self, tmp_path, monkeypatch):
+        from clawpm.discovery import get_project
+        from clawpm.tasks import resolve_ref_prefix
+
+        config, calls = self._legacy_with_broken_sibling(tmp_path, monkeypatch)
+        settings = get_project(config, "code-quorum")
+        assert resolve_ref_prefix(settings, config, "3") == "CODE-"
+        assert resolve_ref_prefix(settings, config, "3-001") == "CODE-"
+        assert calls == []
+
+    def test_full_id_parent_does_not_scan_portfolio(self, tmp_path, monkeypatch):
+        config, calls = self._legacy_with_broken_sibling(tmp_path, monkeypatch)
+        res = CliRunner().invoke(
+            main, ["--format", "json", "tasks", "list", "-p", "code-quorum", "--parent", "CODE--003"]
+        )
+        assert res.exit_code == 0, res.output
+        assert calls == []
+
+
+class TestDeterministicGlobalPrefixPass:
+    """CLAWP-121: two task-less siblings assigned via INDEPENDENT calls to
+    ``assign_task_prefix`` (exactly what ``clawpm doctor``'s per-project loop
+    does — unlike sequential ``clawpm tasks add`` calls, where the second call
+    sees the first's REAL minted prefix already claimed) could each guess a
+    prefix the other would also guess, because the old implementation
+    reserved only a PREDICTION of what a sibling might mint.
+
+    PR #60 tried to fix this by having ``_portfolio_prefixes`` reserve each
+    task-less sibling's full candidate CHAIN instead of just its first
+    guess, then patching the fallout of that over-reservation round by
+    round: capping the chain (round 2), discarding the excluding project's
+    own final candidate (round 3), and re-including that final candidate
+    when a peer genuinely contests it (round 4). Four independent review
+    rounds each found a NEW bug in that approach, including one (Codex,
+    round 3, P1 "Preserve a candidate before a resolved terminal claim")
+    that round 4 never fixed — see PR #60's thread for the full history.
+
+    This class replaces that whole "reserve a prediction, then patch what
+    the prediction gets wrong" design with a single deterministic pass:
+    every task-less project's prefix is decided EXACTLY ONCE, in a fixed
+    (alphabetical) order, from the prefixes already decided for the
+    projects before it in that order — simulating what sequential
+    ``tasks add`` calls already do naturally, with nothing to predict and
+    nothing to over-reserve. Every test below reproduces one of the five
+    distinct bug shapes the four review rounds found and confirms the new
+    pass resolves it cleanly (no collision, no spurious refusal) rather
+    than needing a bespoke patch for that shape.
+    """
+
+    def test_two_taskless_siblings_with_deep_collision_do_not_converge_on_the_same_extension(
+        self, tmp_path, monkeypatch
+    ):
+        # PR #60 round 1 (grok-4.6 repro): "code-quorum" and "code-quiz"
+        # both reduce to base "CODE" -- AND their first extension also
+        # collides (both slice to "CODE-Q" at n=6). Neither has minted, so
+        # both independent `assign_task_prefix` calls (doctor's per-project
+        # loop) see an identical task-less portfolio.
+        _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        _add_project(tmp_path, "code-quiz")  # also task-less at this point
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        a = assign_task_prefix(
+            "code-quorum",
+            tmp_path / "projects" / "code-quorum" / ".project" / "tasks",
+            config,
+        )
+        b = assign_task_prefix(
+            "code-quiz",
+            tmp_path / "projects" / "code-quiz" / ".project" / "tasks",
+            config,
+        )
+        assert a != b, (a, b)  # the actual id-uniqueness invariant under test
+
+    def test_taskless_sibling_whose_id_is_a_literal_prefix_does_not_starve_the_shorter_project(
+        self, tmp_path, monkeypatch
+    ):
+        # PR #60 round 2: when one sibling's id is a literal prefix of
+        # another's ("clawpm" / "clawpm-extra" -- this repo's own naming
+        # pattern), a chain-reservation approach can leave the SHORTER
+        # project with no free candidate at all, even though it has no room
+        # to move and should win. Under a deterministic pass this never
+        # arises: "clawpm" sorts before any sibling whose id starts with
+        # "clawpm" (a strict prefix always sorts first lexicographically),
+        # so it is minted FIRST and simply claims its own base.
+        _make_portfolio(tmp_path, monkeypatch, "clawpm")
+        _add_project(tmp_path, "clawpm-extra")  # literal-prefix sibling, task-less
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        short = assign_task_prefix(
+            "clawpm", tmp_path / "projects" / "clawpm" / ".project" / "tasks", config,
+        )
+        long_ = assign_task_prefix(
+            "clawpm-extra",
+            tmp_path / "projects" / "clawpm-extra" / ".project" / "tasks",
+            config,
+        )
+        assert short is not None  # must not raise/refuse -- a real candidate exists
+        assert short != long_, (short, long_)
+
+    def test_trailing_separator_id_still_keeps_its_own_final_candidate(
+        self, tmp_path, monkeypatch
+    ):
+        # PR #60 round 3 (grok-4.5 + Codex): a length-based cap on a
+        # sibling's reservation doesn't track the actual STRIPPED candidate
+        # string when the excluding project's own id ends in a separator --
+        # "clawpm-" (7 raw chars) and "clawpm" (6 raw chars) can collapse
+        # onto the same stripped string despite different raw lengths. A
+        # deterministic pass has no cap to get wrong: "clawpm-"'s base is
+        # "CLAWP" (its OWN first-5-chars slice, distinct from "clawpm-extra"'s
+        # base once stripped), minted directly with nothing to contest it.
+        _make_portfolio(tmp_path, monkeypatch, "clawpm-")
+        _add_project(tmp_path, "clawpm-extra")  # task-less, shares the collapse
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        short = assign_task_prefix(
+            "clawpm-", tmp_path / "projects" / "clawpm-" / ".project" / "tasks", config,
+        )
+        long_ = assign_task_prefix(
+            "clawpm-extra",
+            tmp_path / "projects" / "clawpm-extra" / ".project" / "tasks",
+            config,
+        )
+        assert short is not None
+        assert "--" not in short  # CLAWP-096: no doubled separator either
+        assert short != long_, (short, long_)
+
+    def test_taskless_twins_whose_ids_collapse_to_the_same_final_candidate_resolve_without_collision(
+        self, tmp_path, monkeypatch
+    ):
+        # PR #60 round 4 (grok-4.5): "clawpm-" and "clawpm---" both
+        # trailing-separator-collapse to the same FINAL candidate ("CLAWPM")
+        # once each has exhausted every shorter slice. The chain-reservation
+        # approach's round-3 fix unconditionally discarded the excluding
+        # project's own final candidate from the reserved set -- which let
+        # BOTH independent calls discard it and mint the identical "CLAWPM",
+        # an actual literal id collision (worse than refusing).
+        #
+        # Under a deterministic pass there is no "final candidate" special
+        # case at all: "clawpm-" sorts before "clawpm---" (a strict prefix),
+        # is minted first, and claims its own BASE ("CLAWP", not "CLAWPM"
+        # -- it never needs to reach its final candidate because nothing
+        # has claimed its base yet). "clawpm---" is minted second, sees
+        # "CLAWP" already taken, and extends to "CLAWPM". Both resolve
+        # cleanly with DISTINCT prefixes -- a strictly better outcome than
+        # PR #60's fix, which had both sides refuse (CLAWP-121's premise:
+        # switching approaches removes this failure mode rather than
+        # patching around it).
+        _make_portfolio(tmp_path, monkeypatch, "clawpm-")
+        _add_project(tmp_path, "clawpm---")  # also collapses to "CLAWPM", task-less
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        results = {}
+        for pid in ("clawpm-", "clawpm---"):
+            results[pid] = assign_task_prefix(
+                pid, tmp_path / "projects" / pid / ".project" / "tasks", config,
+            )
+        # Neither call may raise (unlike PR #60's fix), and the two must
+        # never share a namespace.
+        assert len(set(results.values())) == 2, results
+
+    def test_taskless_sibling_with_room_to_extend_is_not_starved_by_a_flexible_peers_reservation(
+        self, tmp_path, monkeypatch
+    ):
+        # PR #60 round 3, Codex P1 "Preserve a candidate before a resolved
+        # terminal claim" -- the ONE finding round 4 never fixed (PR #60
+        # paused there per its own stop condition rather than attempting a
+        # round 5). Task-less "abcdefg" and "abcdefgh" plus a THIRD project
+        # with an explicit claim on "ABCDEFG": a chain-reservation approach
+        # has the longer sibling ("abcdefgh") speculatively reserve EVERY
+        # candidate through its own full length, including "ABCDE" and
+        # "ABCDEF" -- entries it doesn't actually need, since it has room
+        # to sit at "ABCDEFGH" instead. That over-reservation, combined
+        # with the real "ABCDEFG" claim, exhausted "abcdefg" entirely even
+        # though a collision-free assignment plainly exists.
+        #
+        # A deterministic pass never reserves a merely-POSSIBLE candidate:
+        # "abcdefg" is minted first (sorts before "abcdefgh", a strict
+        # prefix) and simply claims its own free base "ABCDE" -- nothing
+        # has claimed it yet, so there is nothing to starve.
+        _make_portfolio(tmp_path, monkeypatch, "abcdefg")
+        _add_project(tmp_path, "abcdefgh")  # task-less, shares the base
+        _add_project(tmp_path, "claimant", task_prefix="ABCDEFG")
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        short = assign_task_prefix(
+            "abcdefg", tmp_path / "projects" / "abcdefg" / ".project" / "tasks", config,
+        )
+        long_ = assign_task_prefix(
+            "abcdefgh",
+            tmp_path / "projects" / "abcdefgh" / ".project" / "tasks",
+            config,
+        )
+        assert short is not None  # must not raise -- a real candidate exists
+        assert long_ is not None
+        assert short != long_, (short, long_)
+        assert short != "ABCDEFG" and long_ != "ABCDEFG"  # the real claim
+
+    def test_three_way_prefix_ladder_resolves_without_collision(self, tmp_path, monkeypatch):
+        # Round-1 review concern (not itself a confirmed bug, but explicitly
+        # flagged as unverified): 3+ task-less siblings that are all mutual
+        # id-prefixes of one another ("code" / "code-a" / "code-ab" /
+        # "code-abc") all share the same 5-char base. A deterministic pass
+        # handles this the same way as the 2-sibling cases: alphabetical
+        # order matches shortest-prefix-first, so each is minted in turn
+        # and extends only as far as it needs to.
+        _make_portfolio(tmp_path, monkeypatch, "code")
+        _add_project(tmp_path, "code-a")
+        _add_project(tmp_path, "code-ab")
+        _add_project(tmp_path, "code-abc")
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        results = {
+            pid: assign_task_prefix(
+                pid, tmp_path / "projects" / pid / ".project" / "tasks", config,
+            )
+            for pid in ("code", "code-a", "code-ab", "code-abc")
+        }
+        assert len(set(results.values())) == 4, results
+
+    def test_trailing_separator_id_with_no_real_extension_is_not_starved_by_a_flexible_sibling(
+        self, tmp_path, monkeypatch
+    ):
+        # PR #60, round 1 of THIS rewrite (Codex + grok-4.6, independently,
+        # different concrete repros converging on the same root cause):
+        # sorting task-less ids ALPHABETICALLY BY RAW ID does not correctly
+        # encode "who has less room to move". "ab-cd_" (trailing "_" strips
+        # away, so its ONLY extension collapses right back to its own base
+        # -- genuinely zero room) sorts AFTER "ab-cd-f" (shares that same
+        # base but can extend to "AB-CD-F") under plain alphabetical order,
+        # because '_' > '-' in ASCII. The flexible sibling was minted
+        # first, greedily took the shared base it didn't actually need,
+        # and starved the constrained one -- exactly the CLAWP-119 failure
+        # mode this whole design is supposed to prevent, reopened by the
+        # new sort key.
+        #
+        # Fix: order by ``len(_naive_prefix_reach(pid))`` ascending (how
+        # many DISTINCT candidates an id can reach) instead of raw id
+        # content -- "ab-cd_" has exactly 1 reachable candidate, "ab-cd-f"
+        # has 2, so the constrained one is always minted first regardless
+        # of what either raw id looks like.
+        _make_portfolio(tmp_path, monkeypatch, "ab-cd_")
+        _add_project(tmp_path, "ab-cd-f")  # shares the base, but can extend
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        short = assign_task_prefix(
+            "ab-cd_", tmp_path / "projects" / "ab-cd_" / ".project" / "tasks", config,
+        )
+        long_ = assign_task_prefix(
+            "ab-cd-f",
+            tmp_path / "projects" / "ab-cd-f" / ".project" / "tasks",
+            config,
+        )
+        assert short is not None  # must not raise -- "ab-cd-f" can step around
+        assert long_ is not None
+        assert short != long_, (short, long_)
+
+    def test_case_variant_twins_resolve_deterministically_across_runs(
+        self, tmp_path, monkeypatch
+    ):
+        # PR #60, round 1 of this rewrite (Codex): two task-less ids that
+        # differ only by case ("abcde" / "ABCDE") both uppercase to the
+        # IDENTICAL string, so a sort keyed only on `pid.upper()` (or
+        # `len(reach)` alone, which also ties for these two) leaves the
+        # relative order dependent on `taskless_ids`' set-iteration order
+        # -- which varies with Python's per-process hash seed. Two
+        # concurrent processes could each pick a DIFFERENT winner and both
+        # believe they minted the free candidate.
+        #
+        # A same-process test can't directly observe a DIFFERENT hash
+        # seed (it's fixed for the life of the process, so calling the
+        # allocator twice in one test process trivially agrees with
+        # itself regardless of whether the tiebreak is hash-independent).
+        # The property that actually needs pinning is the SORT KEY
+        # ITSELF: does it produce the same ordering no matter what order
+        # its inputs are handed to it in (the same thing a different
+        # process's hash seed would vary)? Test that directly against the
+        # private key function -- sorting the SAME two ids as two
+        # differently-ORDERED input lists must agree, which is exactly
+        # what set-iteration-order independence requires.
+        from clawpm.tasks import _naive_prefix_reach
+
+        def _sort_key(pid: str) -> tuple:
+            return (len(_naive_prefix_reach(pid)), pid.upper(), pid)
+
+        forward = sorted(["abcde", "ABCDE"], key=_sort_key)
+        reverse = sorted(["ABCDE", "abcde"], key=_sort_key)
+        assert forward == reverse, (forward, reverse)
+        # Case-sensitive comparison ('A' < 'a' in ASCII) is what actually
+        # makes this deterministic -- a key without the raw-`pid` tiebreak
+        # (just `(len(reach), pid.upper())`) would tie completely on this
+        # pair and fall through to input order, which is exactly the
+        # hash-seed-dependent behaviour being fixed.
+        assert forward[0] == "ABCDE", forward
+
+        # End-to-end sanity check through the public API: whichever side
+        # wins must be the SAME side every time this process resolves it
+        # (weaker than the property above, but confirms the private key
+        # is the one actually driving `assign_task_prefix`).
+        #
+        # Windows directory names are case-insensitive, so the two
+        # projects can't live in dirs named "abcde" / "ABCDE" (they'd
+        # collide on disk) -- a project's id comes from its settings.toml
+        # `id =` field, not its directory name, so two distinctly-named
+        # directories declaring case-variant ids reproduces the same
+        # logical scenario without touching the filesystem's own
+        # case-folding.
+        ids = {"proj-lower": "abcde", "proj-upper": "ABCDE"}
+        _make_portfolio(tmp_path, monkeypatch, "proj-lower")
+        (tmp_path / "projects" / "proj-lower" / ".project" / "settings.toml").write_text(
+            'id = "abcde"\nname = "proj-lower"\nstatus = "active"\npriority = 3\n',
+            encoding="utf-8",
+        )
+        meta = tmp_path / "projects" / "proj-upper" / ".project"
+        (meta / "tasks" / "done").mkdir(parents=True)
+        (meta / "tasks" / "blocked").mkdir(parents=True)
+        (meta / "settings.toml").write_text(
+            'id = "ABCDE"\nname = "proj-upper"\nstatus = "active"\npriority = 3\n',
+            encoding="utf-8",
+        )
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+
+        def _resolve():
+            results = {}
+            for dirname, pid in ids.items():
+                try:
+                    results[pid] = assign_task_prefix(
+                        pid, tmp_path / "projects" / dirname / ".project" / "tasks", config,
+                    )
+                except ValueError as exc:
+                    results[pid] = exc
+            return results
+
+        first_run = _resolve()
+        second_run = _resolve()
+        # Whichever side won (got "ABCDE" back, not a ValueError) must be
+        # the SAME side both times -- not merely "some deterministic
+        # result", but the identical winner across repeated calls.
+        winners_first = {pid for pid, v in first_run.items() if isinstance(v, str)}
+        winners_second = {pid for pid, v in second_run.items() if isinstance(v, str)}
+        assert winners_first == winners_second, (first_run, second_run)
+        assert len(winners_first) == 1, first_run  # exactly one side can win
+
+    def test_real_claims_that_unevenly_exhaust_a_flexible_siblings_reach_do_not_starve_it(
+        self, tmp_path, monkeypatch
+    ):
+        # PR #60, round 2 of this rewrite (Codex): a STATIC sort by TOTAL
+        # reach-count (computed once, before any minting) fixed round 1's
+        # bug but missed a second one -- pre-existing REAL claims can
+        # consume a nominally-more-flexible sibling's options so unevenly
+        # that it ends up MORE constrained in practice than one with a
+        # smaller total reach.
+        #
+        # Task-less "abcdefg" (own total reach: ABCDE, ABCDEF, ABCDEFG --
+        # 3) and "abcdefgh"-shaped "abcdefhi" (own total reach: ABCDE,
+        # ABCDEF, ABCDEFH, ABCDEFHI -- 4) share "ABCDEF" (both ids start
+        # "abcdef"). Three OTHER projects already hold explicit claims on
+        # ABCDE, ABCDEFH, and ABCDEFHI -- leaving "abcdefhi" with exactly
+        # ONE real option (ABCDEF) despite its total reach of 4, while
+        # "abcdefg" still has TWO (ABCDEF, ABCDEFG) despite its smaller
+        # total reach of 3. A static total-reach sort ranks "abcdefg" as
+        # more constrained (3 < 4) and lets it go first, greedily taking
+        # the shared "ABCDEF" it didn't strictly need -- starving
+        # "abcdefhi", which then has nothing left, even though the valid
+        # assignment "abcdefg -> ABCDEFG" / "abcdefhi -> ABCDEF" exists.
+        #
+        # Fix: recompute each id's REMAINING reach (candidates not yet in
+        # `used`) at EVERY pick, not once upfront -- this already reflects
+        # the real claims from the start, so "abcdefhi"'s true remaining
+        # count (1) correctly beats "abcdefg"'s (2) and it is minted
+        # first.
+        _make_portfolio(tmp_path, monkeypatch, "abcdefg")
+        _add_project(tmp_path, "abcdefhi")  # task-less, shares "abcdef"
+        _add_project(tmp_path, "claim-base", task_prefix="ABCDE")
+        _add_project(tmp_path, "claim-h", task_prefix="ABCDEFH")
+        _add_project(tmp_path, "claim-hi", task_prefix="ABCDEFHI")
+
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        # Note the inversion this test exists to pin: "abcdefg" (smaller
+        # TOTAL reach, 3) ends up with the LONGER final prefix, while
+        # "abcdefhi" (larger total reach, 4, but only 1 REMAINING once
+        # real claims are subtracted) correctly wins the shorter shared
+        # candidate it has no alternative to.
+        g_result = assign_task_prefix(
+            "abcdefg", tmp_path / "projects" / "abcdefg" / ".project" / "tasks", config,
+        )
+        hi_result = assign_task_prefix(
+            "abcdefhi",
+            tmp_path / "projects" / "abcdefhi" / ".project" / "tasks",
+            config,
+        )
+        assert g_result is not None  # must not raise -- a real candidate exists
+        assert hi_result is not None  # "abcdefhi" must not be starved
+        assert g_result != hi_result, (g_result, hi_result)
+        assert hi_result == "ABCDEF", hi_result  # its only remaining real option
+        assert g_result == "ABCDEFG", g_result  # pushed to its own last resort
+
+    def test_greedy_counter_example_all_three_resolve_without_spurious_refusal(self):
+        """CLAWP-124: the exact PR #60 round-3 counter-example (Codex) that
+        PROVED greedy most-constrained-first incomplete for this problem --
+        confirmed live (2026-09-25) to spuriously refuse one of the three
+        under the (now-replaced) greedy allocator.
+
+        Three ids tie at reach=2: ``abcde-c`` -> {ABCDE, ABCDE-C},
+        ``abcdeb-`` -> {ABCDE, ABCDEB}, ``abcdeb--`` -> {ABCDE, ABCDEB}
+        (identical to `abcdeb-`'s -- its only non-base candidate ALSO
+        collapses to ABCDEB via trailing-separator stripping). Greedy
+        processed `abcde-c` first (tiebreak on `pid.upper()`), took ABCDE
+        even though ABCDE-C was free, then had nothing left to give one of
+        the two `abcdeb*` siblings. A valid assignment for all three exists
+        regardless (`abcde-c -> ABCDE-C` frees ABCDE for the `abcdeb*` pair
+        to split) -- augmenting-path matching must find it.
+
+        Deliberately does NOT hand-encode which id gets which prefix (more
+        than one valid assignment exists here -- the two `abcdeb*` ids can
+        swap which one takes ABCDE vs ABCDEB) -- asserts the INVARIANTS
+        Kuhn's algorithm actually guarantees instead: no refusal, every id
+        assigned, all assigned prefixes distinct, and each assigned prefix
+        is a real member of that id's own reachable candidate set (not a
+        fabricated string) -- verified via `_naive_prefix_reach` itself,
+        the same reach-computation the allocator's own docstring relies on,
+        not a hand-typed guess (memory: verify-tool-behaviour-by-running-it).
+        """
+        from clawpm.tasks import _assign_taskless_prefixes, _naive_prefix_reach
+
+        ids = {"abcde-c", "abcdeb-", "abcdeb--"}
+        assignments, errors = _assign_taskless_prefixes(set(ids), set())
+
+        assert errors == {}, f"spurious refusal: {errors}"
+        assert set(assignments.keys()) == ids
+        assert len(set(assignments.values())) == len(ids), assignments
+        for pid, prefix in assignments.items():
+            assert prefix in _naive_prefix_reach(pid), (pid, prefix)
+
+    def test_matching_finds_a_valid_assignment_whenever_hall_condition_holds(self):
+        """CLAWP-124: a broader (not hand-picked) correctness check -- for
+        ANY set of task-less ids where a perfect assignment is known to
+        exist (verified via a brute-force reference search over each id's
+        own candidate set, independent of the production allocator), the
+        production matching must find ONE, never a spurious refusal.
+
+        This is the general property greedy could not guarantee (it is
+        provably incomplete); Kuhn's algorithm is provably complete for
+        bipartite matching whenever a perfect matching exists (Hall's
+        theorem), so this is a real correctness invariant, not a coincidence
+        of the one hand-picked counter-example above.
+        """
+        import itertools
+        from clawpm.tasks import _assign_taskless_prefixes, _naive_prefix_reach
+
+        ids = ["abcde-c", "abcdeb-", "abcdeb--", "abcdefg"]
+        reach = {pid: _naive_prefix_reach(pid) for pid in ids}
+
+        # Brute-force reference: does ANY assignment of ids to distinct
+        # candidates from their own reach sets exist? (Independent of the
+        # production algorithm -- this is what Hall's theorem's condition
+        # actually verifies for a small, concrete instance.)
+        def _has_perfect_matching() -> bool:
+            candidate_lists = [sorted(reach[pid]) for pid in ids]
+            for combo in itertools.product(*candidate_lists):
+                if len(set(combo)) == len(ids):
+                    return True
+            return False
+
+        assert _has_perfect_matching(), "test setup error: no valid assignment exists"
+
+        assignments, errors = _assign_taskless_prefixes(set(ids), set())
+        assert errors == {}, f"spurious refusal despite a valid assignment existing: {errors}"
+        assert set(assignments.keys()) == set(ids)
+        assert len(set(assignments.values())) == len(ids), assignments
+        for pid, prefix in assignments.items():
+            assert prefix in reach[pid], (pid, prefix)
+
+    def test_matching_prefers_a_free_candidate_over_stealing_an_unnecessary_one(self):
+        """CLAWP-124 (grok-4.6, PR #64 round 1): completeness (a valid,
+        collision-free assignment exists) does NOT require disturbing an
+        earlier-processed pid's shorter prefix when the current pid has its
+        own free alternative -- but a single-phase augmenting-path search
+        (try each candidate in order, steal on the first successful
+        reassignment) can do exactly that anyway, since it doesn't
+        distinguish "had to steal" from "could have used a free one
+        instead". Confirmed live (2026-09-26) against the single-phase
+        version of this function: it stole 'ABCDE' from 'abcdea' (pushing
+        it to the longer 'ABCDEA') even though 'abcdezy' -- the one doing
+        the stealing -- had its own completely free 'ABCDEZ' one step
+        further down its own candidate list.
+
+        'abcdea' sorts BEFORE 'abcdezy' in the fixed processing order
+        ('ABCDEA' < 'ABCDEZY', diverging at position 5: 'A' < 'Z'), so it is
+        assigned first and claims the shared base 'ABCDE' with nothing to
+        contest it -- the two-phase fix (prefer free candidates over
+        stealing) must leave it there untouched.
+        """
+        from clawpm.tasks import _assign_taskless_prefixes, _naive_prefix_reach
+
+        ids = {"abcdea", "abcdezy"}
+        assignments, errors = _assign_taskless_prefixes(set(ids), set())
+
+        assert errors == {}
+        assert set(assignments.keys()) == ids
+        assert len(set(assignments.values())) == len(ids), assignments
+        for pid, prefix in assignments.items():
+            assert prefix in _naive_prefix_reach(pid), (pid, prefix)
+
+        # The actual quality invariant this test exists to pin: the
+        # earlier-processed, less-flexible id keeps its own shortest
+        # (base) candidate -- nothing forced it to move.
+        assert assignments["abcdea"] == "ABCDE", assignments
+        assert assignments["abcdezy"] == "ABCDEZ", assignments
+
+
 # ---------------------------------------------------------------------------
 # CLAWP-048: cross-project prefix uniqueness (near-name-twin projects must not
 # share an ID namespace) + explicit task_prefix override + doctor detection.
@@ -154,6 +1170,90 @@ class TestPrefixUniqueness:
         _add("arb-prod", "b")  # twin takes an extended prefix
         assert _add("arb-prd", "c") == "ARB-P-001"  # arb-prd unchanged
 
+    def test_explicit_sibling_prefixes_exhaust_the_candidates_and_raise(
+        self, tmp_path, monkeypatch
+    ):
+        # Codex P1, PR #57: the last resort used to `return full`, which
+        # assumed the unstripped full id can't collide because ids are
+        # portfolio-unique -- true for id-DERIVED prefixes, false for
+        # EXPLICIT ones, which are arbitrary strings a sibling can set
+        # independent of its own id. Two siblings with explicit prefixes
+        # "ABCDE" and "ABCDE-F" exhaust every stripped candidate a new
+        # "abcde-f" project would try (base "ABCDE", extension "ABCDE-F"),
+        # leaving the final fallback `full` == "ABCDE-F" ALREADY claimed.
+        #
+        # There is no synthesised candidate to fall back to (CLAWP-119), so
+        # the allocator refuses rather than minting a claimed prefix. The
+        # message must name the remedy: an explicit `task_prefix`.
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch, "abcde-f")
+        _add_project(tmp_path, "sib-one", task_prefix="ABCDE")
+        _add_project(tmp_path, "sib-two", task_prefix="ABCDE-F")
+
+        config = load_portfolio_config(tmp_path)
+        with pytest.raises(ValueError, match="task_prefix"):
+            assign_task_prefix("abcde-f", tasks_dir, config)
+
+    def test_trailing_separator_twins_never_mint_a_doubled_separator(
+        self, tmp_path, monkeypatch
+    ):
+        # Codex P2, PR #57: the pre-CLAWP-096 last resort returned the
+        # UNSTRIPPED `full`, so project "code-" whose base "CODE" is claimed
+        # by a sibling minted "CODE--000" -- the doubled separator CLAWP-096
+        # exists to remove, which inference then pinned.
+        #
+        # Refusing satisfies this outright: nothing is minted, so nothing
+        # carries a doubled separator. Two ids differing only in trailing
+        # separators ("code-" / "code---") also cannot collapse onto one
+        # prefix, because neither produces one.
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        tasks_a = _make_portfolio(tmp_path, monkeypatch, "code-")
+        _add_project(tmp_path, "sib-one", task_prefix="CODE")
+        _add_project(tmp_path, "code---")
+        tasks_b = tmp_path / "projects" / "code---" / ".project" / "tasks"
+
+        config = load_portfolio_config(tmp_path)
+        for project_id, tasks_dir in (("code-", tasks_a), ("code---", tasks_b)):
+            with pytest.raises(ValueError, match="collision-free task prefix"):
+                assign_task_prefix(project_id, tasks_dir, config)
+
+    def test_concurrent_first_mints_cannot_select_the_same_candidate(
+        self, tmp_path, monkeypatch
+    ):
+        """Codex P1, PR #57 round 4: concurrent FIRST mints must not collide.
+
+        The fallback of the day picked its suffix with
+        ``while f"{stem}{n}" in used: n += 1`` — a scan of a portfolio
+        snapshot. Nothing pins that choice until the task file is written,
+        and ``add_task`` locks per-project task dirs, so two task-less twin
+        projects minting concurrently both saw the same snapshot and both
+        selected ``CODE2``.
+
+        That round was closed by making the candidate a pure function of the
+        project id; CLAWP-119 removes the synthesised candidate altogether,
+        which closes it more directly — there is no selected value left for
+        two callers to converge on. This test keeps the ROUND-4 PROPERTY
+        (both callers see identical pre-mint state and neither ends up with
+        the other's prefix) rather than the mechanism that satisfied it.
+        """
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        tasks_a = _make_portfolio(tmp_path, monkeypatch, "code-")
+        _add_project(tmp_path, "sib-one", task_prefix="CODE")
+        _add_project(tmp_path, "code---")
+        tasks_b = tmp_path / "projects" / "code---" / ".project" / "tasks"
+
+        config = load_portfolio_config(tmp_path)
+        # Neither project has minted yet: both calls see identical state.
+        for project_id, tasks_dir in (("code-", tasks_a), ("code---", tasks_b)):
+            with pytest.raises(ValueError):
+                assign_task_prefix(project_id, tasks_dir, config)
+
 
 class TestDoctorCollisionCheck:
     def _prefix_collisions(self, res_output):
@@ -190,3 +1290,304 @@ class TestDoctorCollisionCheck:
         cols = self._prefix_collisions(res.output)
         assert cols is not None, res.output
         assert not any(c["prefix"] == "ARB-P" and len(c["projects"]) > 1 for c in cols), cols
+
+    def test_doctor_keys_a_taskless_sibling_under_what_the_allocator_mints(
+        self, tmp_path, monkeypatch
+    ):
+        # CLAWP-096 (grok review, cli/project.py): doctor's collision map must
+        # key a still-task-less sibling under the prefix that project will
+        # ACTUALLY get, not a bare unstripped `id.upper()[:5]`.
+        #
+        # Codex P2, PR #57 round 6 corrected what "actually get" means. This
+        # test previously asserted a CODE collision between the two, on the
+        # premise that a task-less sibling derives the naive base. It does
+        # not: the naive base is only the allocator's FIRST candidate, and
+        # `assign_task_prefix` sees code-quorum's minted CODE in `used` and
+        # extends to CODE-R. Reporting CODE was a false positive — and since
+        # `prefix_collisions` feeds `has_warnings`, it failed `doctor
+        # --strict` in CI over a namespace nothing would ever mint.
+        _make_portfolio(tmp_path, monkeypatch, "code-quorum")
+        (tmp_path / "projects" / "code-quorum" / ".project" / "tasks" / "CODE-000.md").write_text(
+            "---\nid: CODE-000\n---\n", encoding="utf-8"
+        )
+        _add_project(tmp_path, "code-runner")  # task-less
+
+        # What the allocator really mints for the task-less sibling.
+        from clawpm.discovery import load_portfolio_config
+        from clawpm.tasks import assign_task_prefix
+
+        config = load_portfolio_config(tmp_path)
+        minted = assign_task_prefix(
+            "code-runner",
+            tmp_path / "projects" / "code-runner" / ".project" / "tasks",
+            config,
+        )
+        assert minted == "CODE-R", minted
+
+        res = CliRunner().invoke(main, ["--format", "json", "doctor"])
+        cols = self._prefix_collisions(res.output)
+        assert cols is not None, res.output
+        assert not any(
+            c["prefix"] == "CODE" and "code-runner" in c["projects"] for c in cols
+        ), (
+            "code-runner never mints under CODE — reporting it as a collision "
+            "fails doctor --strict and tells the operator to rename a project "
+            "that needs no rename"
+        )
+        # And it must not be dropped from the check either: whatever prefix it
+        # is keyed under, a genuine clash on THAT prefix still has to surface.
+        assert not any(
+            c["prefix"] == minted and len(c["projects"]) > 1 for c in cols
+        ), cols
+
+    def test_doctor_surfaces_allocator_refusal_instead_of_swallowing_it(
+        self, tmp_path, monkeypatch
+    ):
+        """CLAWP-119 fallout (antigravity/grok-4.5/grok-4.6, PR #57).
+
+        doctor's cross-project collision check used to catch a bare
+        ``except Exception`` around the allocator call and fall back to the
+        naive placeholder with no trace anywhere -- a diagnostic command
+        silently hiding a real, actionable refusal is exactly the failure
+        mode `expired_lease_findings` next to it already guards against.
+        Same scenario as
+        ``test_explicit_sibling_prefixes_exhaust_the_candidates_and_raise``
+        (two explicit sibling prefixes exhaust every id-derived candidate),
+        but exercised through `doctor` rather than `assign_task_prefix`
+        directly, to prove the CLI-facing surface actually reports it.
+
+        CLAWP-120 PRE-REVIEW (this round): the naive-placeholder fallback
+        this test originally pinned was itself a false-collision bug --
+        identical in shape to the one fixed above for the resolved-prefix
+        path, since a ValueError refusal means the naive base is NECESSARILY
+        claimed by whichever sibling caused the refusal (here: sib-one's
+        explicit ABCDE). Reporting that as a `prefix_collisions` entry tells
+        the operator sib-one needs renaming too, when only abcde-f does.
+        `prefix_map` has no reader besides `prefix_collisions`, so nothing
+        is lost by NOT keying the refused project into it -- the issues[]
+        entry alone is the actionable surface.
+        """
+        _make_portfolio(tmp_path, monkeypatch, "abcde-f")
+        _add_project(tmp_path, "sib-one", task_prefix="ABCDE")
+        _add_project(tmp_path, "sib-two", task_prefix="ABCDE-F")
+
+        res = CliRunner().invoke(main, ["--format", "json", "doctor"])
+        assert res.exit_code == 0, res.output
+        data = json.loads(res.output)
+        assert any(
+            i["scope"] == "prefix" and "abcde-f" in i["message"]
+            for i in data.get("issues", [])
+        ), data.get("issues")
+        # It must NOT appear in the collision map: there is no real prefix
+        # to key it under, and the naive-base fallback manufactures a
+        # collision against sib-one's perfectly valid ABCDE.
+        cols = self._prefix_collisions(res.output)
+        assert not any("abcde-f" in c["projects"] for c in cols), cols
+        # sib-one/sib-two's own explicit prefixes must still resolve clean.
+        assert not any(
+            c["prefix"] in ("ABCDE", "ABCDE-F") for c in cols
+        ), cols
+
+    def test_doctor_surfaces_unreadable_sibling_task_dir_instead_of_aborting(
+        self, tmp_path, monkeypatch
+    ):
+        """CLAWP-120 PRE-REVIEW: the allocator's own exception-handling arm in
+        doctor's collision check only caught ``ValueError`` (CLAWP-119
+        refusal). But `assign_task_prefix` -> `_portfolio_prefixes` ->
+        `resolve_existing_prefix` -> `_infer_prefix_from_tasks` does a raw
+        ``Path.iterdir()`` with no exception handling at all -- an unreadable
+        directory (Windows AV lock, a concurrent clawpm session, a broken
+        symlink) raised `OSError` straight out of `project_doctor`, aborting
+        `doctor` for the ENTIRE portfolio over one project's transient scan
+        failure. Mirrors the lease-scanning block a few lines below, which
+        already declares its blind spots (`except Exception` -> issues[]
+        warning) rather than crashing the whole command.
+
+        Patches `resolve_existing_prefix` itself (not the filesystem) so this
+        exercises ONLY the collision-check block this round actually
+        touches -- `project_doctor` has an unrelated, pre-existing unguarded
+        `Path.iterdir()` in `list_tasks` (:508, `_scan_task_files`) that
+        would swallow a filesystem-level OSError before ever reaching this
+        code, which is a real but separately-tracked gap (CLAWP-094:
+        "harden fail-open error handling ... discovery/context/research/
+        doctor"), not part of this fix's scope.
+        """
+        import clawpm.tasks as _tasks_mod
+
+        _make_portfolio(tmp_path, monkeypatch, "victim")
+        _add_project(tmp_path, "locked-sib")
+        real_resolve = _tasks_mod.resolve_existing_prefix
+
+        def _raising_resolve(settings):
+            if getattr(settings, "id", None) == "locked-sib":
+                raise OSError(13, "Permission denied", "locked-sib/.project/tasks")
+            return real_resolve(settings)
+
+        monkeypatch.setattr(_tasks_mod, "resolve_existing_prefix", _raising_resolve)
+
+        res = CliRunner().invoke(main, ["--format", "json", "doctor"])
+        assert res.exit_code == 0, res.output
+        data = json.loads(res.output)
+        # errno 13 auto-promotes OSError to PermissionError (a subclass), so
+        # check the actual raised type rather than the literal base class name.
+        assert any(
+            i["scope"] == "prefix" and "locked-sib" in i["message"]
+            and "PermissionError" in i["message"]
+            for i in data.get("issues", [])
+        ), data.get("issues")
+        # The command must complete and still report on the OTHER project.
+        cols = self._prefix_collisions(res.output)
+        assert not any("locked-sib" in c["projects"] for c in cols), cols
+        # grok-4.5, PR #57 round: the assertion above is satisfied by
+        # locked-sib's own resolve turn (`_resolve_prefix(locked-sib)` at
+        # project.py:786, which correctly names itself) REGARDLESS of
+        # whether the sibling-scan attribution fix below exists -- it
+        # doesn't actually exercise the fix. Isolate the sibling-scan path
+        # specifically: no issue may misattribute the failure to `victim`
+        # (the taskless project whose OWN mint triggered the scan), and the
+        # PortfolioPrefixScanError wording must appear for the real sibling.
+        assert not any(
+            i["scope"] == "prefix" and i["message"].startswith("victim:")
+            for i in data.get("issues", [])
+        ), data.get("issues")
+        assert any(
+            i["scope"] == "prefix"
+            and "could not evaluate prefix collisions for sibling 'locked-sib'" in i["message"]
+            for i in data.get("issues", [])
+        ), data.get("issues")
+
+
+# ---------------------------------------------------------------------------
+# CLAWP-098 predecessor (Codex P2, PR #55 round 11, discovery.py:259): a
+# registered worktree's own committed task_prefix must be honoured, not the
+# canonical checkout's. `get_tasks_dir` already redirects the task STORE
+# into the worktree; `add_task` separately resolved settings via the
+# cwd-independent `get_project(...)`, so a worktree whose own settings.toml
+# set a different task_prefix still minted IDs under the canonical
+# checkout's prefix, risking a collision when the branch merges.
+# ---------------------------------------------------------------------------
+
+
+class TestSessionScopedTaskPrefix:
+    def test_worktree_own_task_prefix_is_used_when_session_active(
+        self, isolated_portfolio, tmp_path, monkeypatch
+    ):
+        from clawpm.sessions import register_session
+        from clawpm.tasks import add_task
+
+        # Worktree carries its OWN .project/ with a task_prefix the
+        # canonical checkout does not set.
+        wt = tmp_path / "wt"
+        wt_tasks = wt / ".project" / "tasks"
+        for sub in ("done", "blocked"):
+            (wt_tasks / sub).mkdir(parents=True)
+        (wt / ".project" / "settings.toml").write_text(
+            'id = "test"\nname = "Test"\nstatus = "active"\npriority = 3\n'
+            'task_prefix = "WTPFX"\n',
+            encoding="utf-8",
+        )
+
+        register_session(
+            isolated_portfolio.root, "sess-1", "SEED",
+            isolated_portfolio.project_id, wt,
+        )
+        monkeypatch.chdir(wt)
+
+        task = add_task(
+            isolated_portfolio.config, isolated_portfolio.project_id,
+            "from worktree",
+        )
+        assert task is not None
+        # Canonical checkout has no explicit task_prefix, so the pre-fix
+        # cwd-independent lookup derived "TEST" from the project id instead.
+        assert task.id.startswith("WTPFX-"), task.id
+        # And it must have landed in the worktree's own task store.
+        assert (wt_tasks / f"{task.id}.md").exists()
+
+    def test_worktree_settings_with_foreign_id_fails_closed(
+        self, isolated_portfolio, tmp_path, monkeypatch
+    ):
+        """`ProjectSettings.load` does no id validation, unlike the
+        registry's `get_project` (which only ever returns settings whose
+        `id == project_id`). A worktree registered for THIS project but
+        whose committed settings.toml carries a DIFFERENT project's id
+        must not have that foreign task_prefix used as an explicit
+        override — that would bypass assign_task_prefix's portfolio-wide
+        collision check entirely (the cross-project prefix-collision
+        class CLAWP-048 already exists to prevent, reopened via a new
+        route). Rounds 11-12 silently fell back to the canonical settings;
+        by operator decision (2026-09-21) it now FAILS CLOSED, loudly."""
+        from clawpm.discovery import ScopedSettingsMismatchError
+        from clawpm.sessions import register_session
+        from clawpm.tasks import add_task
+
+        wt = tmp_path / "wt"
+        wt_tasks = wt / ".project" / "tasks"
+        for sub in ("done", "blocked"):
+            (wt_tasks / sub).mkdir(parents=True)
+        # Registered for "test", but its OWN settings.toml claims a
+        # different project id and prefix.
+        (wt / ".project" / "settings.toml").write_text(
+            'id = "other-project"\nname = "Other"\nstatus = "active"\n'
+            'priority = 3\ntask_prefix = "FOREIGN"\n',
+            encoding="utf-8",
+        )
+
+        register_session(
+            isolated_portfolio.root, "sess-1", "SEED",
+            isolated_portfolio.project_id, wt,
+        )
+        monkeypatch.chdir(wt)
+
+        with pytest.raises(ScopedSettingsMismatchError, match="other-project"):
+            add_task(
+                isolated_portfolio.config, isolated_portfolio.project_id,
+                "from worktree with foreign id",
+            )
+        assert not list(wt_tasks.glob("*.md"))
+
+
+class TestRefResolutionUsesSessionScopedStore:
+    """Round 9 (Codex): numeric short refs must resolve against the SAME
+    checkout ``list_tasks`` reads. ``get_project`` is the canonical checkout;
+    inside a registered worktree the task store is the worktree's."""
+
+    def _seed(self, d, ids, extra=""):
+        d.mkdir(parents=True, exist_ok=True)
+        for tid in ids:
+            (d / f"{tid}.md").write_text(f"---\nid: {tid}\n{extra}---\n", encoding="utf-8")
+
+    def test_parent_short_ref_resolves_against_worktree_spelling(
+        self, isolated_portfolio, tmp_path, monkeypatch
+    ):
+        from clawpm.sessions import register_session
+
+        # Canonical: legacy CODE--000..006 plus a normalised CODE-007.
+        self._seed(
+            isolated_portfolio.tasks_dir,
+            [f"CODE--{n:03d}" for n in range(7)] + ["CODE-007"],
+        )
+        # Worktree: its own store spells ordinal 7 the legacy way, with a child.
+        wt = tmp_path / "wt"
+        wt_tasks = wt / ".project" / "tasks"
+        for sub in ("progress", "done", "blocked"):
+            (wt_tasks / sub).mkdir(parents=True)
+        (wt / ".project" / "settings.toml").write_text(
+            'id = "test"\nname = "Test"\nstatus = "active"\npriority = 3\n',
+            encoding="utf-8",
+        )
+        self._seed(wt_tasks, ["CODE--007"])
+        self._seed(wt_tasks, ["CODE--007-001"], extra="parent: CODE--007\n")
+
+        register_session(
+            isolated_portfolio.root, "sess-1", "SEED",
+            isolated_portfolio.project_id, wt,
+        )
+        monkeypatch.chdir(wt)
+
+        res = CliRunner().invoke(
+            main, ["--format", "json", "tasks", "list", "-p", "test", "--parent", "7"]
+        )
+        assert res.exit_code == 0, res.output
+        ids = [t["id"] for t in json.loads(res.output)]
+        assert ids == ["CODE--007-001"], res.output

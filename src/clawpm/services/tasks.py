@@ -16,15 +16,18 @@ CLI boundary.
 
 from __future__ import annotations
 
+import logging
 import subprocess
 from pathlib import Path
 
 from clawpm.concurrency import LockTimeout
 from clawpm.models import SURPRISE_TAXONOMY, TaskState, WorkLogAction
-from clawpm.discovery import get_project
+from clawpm.discovery import get_project, get_repo_path
 from clawpm.tasks import change_task_state, get_task
 from clawpm.worklog import add_entry, filter_files_changed, read_entries
 from clawpm.context import expand_task_id
+
+logger = logging.getLogger(__name__)
 
 
 def transition(
@@ -199,14 +202,23 @@ def transition(
         TaskState.REJECTED: WorkLogAction.NOTE,
     }
     if state in action_map:
-        # Auto-detect git files changed
+        # Auto-detect git files changed.
+        #
+        # CLAWP-098 (Codex review, PR #55): resolve the checkout through
+        # get_repo_path, NOT get_project(...).repo_path. The task mutation
+        # above is session-scoped — run from a dispatched worktree it edits
+        # that worktree's task file — but this secondary enrichment used the
+        # cwd-independent registry path, so it diffed the MAIN checkout: the
+        # entry either omitted every file the agent had actually touched, or
+        # recorded unrelated main-checkout edits against this task. Both
+        # steps must follow the same checkout.
         files_changed = None
-        project = get_project(config, project_id)
-        if project and project.repo_path and project.repo_path.exists():
+        repo_path = get_repo_path(config, project_id)
+        if repo_path and repo_path.exists():
             try:
                 result = subprocess.run(
                     ["git", "diff", "--name-only", "HEAD"],
-                    cwd=project.repo_path,
+                    cwd=repo_path,
                     capture_output=True,
                     text=True,
                     encoding="utf-8",  # CLAWP-046: UTF-8, not cp1252
@@ -215,7 +227,7 @@ def transition(
                 )
                 if result.returncode == 0 and result.stdout.strip():
                     raw_files = [f for f in result.stdout.strip().split('\n') if f]
-                    files_changed = filter_files_changed(raw_files, project.repo_path)
+                    files_changed = filter_files_changed(raw_files, repo_path)
             except Exception as exc:
                 # files_changed enrichment is advisory; a git failure just drops
                 # it (the work-log entry is still written). Record a marker so a
@@ -270,6 +282,21 @@ def transition(
             # failed, and in a bulk batch it would abort the remaining tasks.
             # (CLAWP-067 review: intentional, not an oversight.)
             cascade_errors.append({"error_class": type(exc).__name__, "message": str(exc)})
+
+        # CLAWP-094: a frontmatter-sync failure is nested in the per-task
+        # record; lift it into cascade_errors (the marker the CLI reports as
+        # "degraded") and log it, so the durable-but-degraded unblock is visible.
+        for cr in cascade_results:
+            if cr.get("state_sync_error"):
+                logger.warning(
+                    "cascade unblock of %s: frontmatter state not synced: %s",
+                    cr["task_id"], cr["state_sync_error"],
+                )
+                cascade_errors.append({
+                    "error_class": "StateSyncError",
+                    "task_id": cr["task_id"],
+                    "message": cr["state_sync_error"],
+                })
 
         for cr in cascade_results:
             _safe_add_entry(
