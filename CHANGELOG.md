@@ -8,6 +8,7 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 
 ### Added
 
+- Doc-staleness gate (`tests/test_clawp102_readme_staleness.py`, run by the existing CI pytest step): fails when a non-hidden command or long option in `clawpm introspect` has no mention in README's `## All commands` section; README gaps it found (mission/inbox subcommands, `introspect`, `project announce`, `research link`, ~70 flags) are now documented (#85, CLAWP-102).
 - `tasks dispatch --worktree` and `agent dispatch` now support a project that lives in a repository subdirectory: the session record carries an optional repo-relative `project_prefix` (absent for root-level projects, so existing records resolve unchanged), the agent runs in the project root inside the worktree, and session-scoped resolution maps any cwd under the worktree to `<worktree>/<prefix>/.project`; the `monorepo_worktree_unsupported` refusal is removed. `agent dispatch` fails closed (nothing created) when it cannot determine the project's repo prefix, and a session prefix containing control characters is rejected (#81, CLAWP-118).
 - Opt-in explicit scope: `sessions.Scope` plus `discovery.resolve_scope`, and a keyword-only `scope=` on `get_project_dir`, `get_repo_path`, `get_scoped_project_settings`, `get_tasks_dir`, `get_task` and `touch_task_updated`; `log add` migrated as the exemplar (#75, CLAWP-122).
 
