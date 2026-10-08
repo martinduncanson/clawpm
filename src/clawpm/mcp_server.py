@@ -550,6 +550,7 @@ def tasks_state(
     surprise_tags: list[str] | None = None,
     rationale: str | None = None,
     supersedes: str | None = None,
+    resolution: str | None = None,
 ) -> dict:
     """Transition a task to a new state (open|progress|done|blocked|rejected).
 
@@ -560,7 +561,8 @@ def tasks_state(
     taxonomy), `reflect_note`, `meta_reflect` (what could have been anticipated)
     and `process_lesson` (what prediction-process change would have caught it)
     enrich that calibration event. `rationale` /
-    `supersedes` document a `rejected` won't-do decision. Returns the updated
+    `supersedes` document a `rejected` won't-do decision. `resolution` is
+    required to complete (`done`) a `kind: decision` task. Returns the updated
     task plus any cascade/teardown side-effects."""
     from clawpm.context import expand_task_id
     from clawpm.models import TaskState
@@ -590,6 +592,7 @@ def tasks_state(
             surprise_tags=tuple(surprise_tags or ()),
             rationale=rationale,
             supersedes=supersedes,
+            resolution=resolution,
         )
     except ValueError as exc:
         # transition validates the surprise taxonomy up front and raises

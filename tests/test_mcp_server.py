@@ -1094,3 +1094,31 @@ def test_wire_level_tasks_add_accepts_full_predictions(isolated_portfolio):
             assert preds["predicted_iterations"] == 2
 
     _run(scenario)
+
+
+def test_tasks_state_resolution_completes_a_decision(isolated_portfolio):
+    """CLAWP-111 (Codex r1 P2): the MCP tool must accept and forward
+    ``resolution`` — else a decision task can never be completed over MCP."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    from clawpm.tasks import add_task, get_task
+
+    pid = isolated_portfolio.project_id
+    task = add_task(isolated_portfolio.config, pid, "Pick a bus", kind="decision")
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+            missing = await _call(client, "tasks_state", {
+                "project": pid, "task_id": task.id, "new_state": "done"})
+            assert missing["ok"] is False
+            assert missing["error"] == "decision_needs_resolution"
+            done = await _call(client, "tasks_state", {
+                "project": pid, "task_id": task.id, "new_state": "done",
+                "resolution": "Kafka."})
+            assert done["ok"] is True, done
+
+    _run(scenario)
+    reloaded = get_task(isolated_portfolio.config, pid, task.id)
+    assert reloaded.resolution == "Kafka."

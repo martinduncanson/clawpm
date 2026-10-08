@@ -1127,7 +1127,11 @@ def change_task_state(
                 _write_resolution_frontmatter(_task_md, resolution.strip())
                 _resolved_this_txn = True
                 if task.parent:
-                    _parent = get_task(config, project_id, task.parent)
+                    # Forward `scope` (Codex r1 P1): a pinned worktree scope
+                    # must resolve the parent in the SAME store as the child.
+                    _parent = get_task(
+                        config, project_id, task.parent, **_scope_kw(scope)
+                    )
                     if _parent and _parent.file_path:
                         _append_decision_to_parent(
                             _parent.file_path, task_id, task.title, resolution.strip()
@@ -1233,7 +1237,10 @@ def change_task_state(
             _write_resolution_frontmatter(current_path, resolution.strip())
             _resolved_this_txn = True
             if task.parent:
-                _parent = get_task(config, project_id, task.parent)
+                # Forward `scope` (Codex r1 P1) — see the directory branch.
+                _parent = get_task(
+                    config, project_id, task.parent, **_scope_kw(scope)
+                )
                 if _parent and _parent.file_path:
                     _append_decision_to_parent(
                         _parent.file_path, task_id, task.title, resolution.strip()
@@ -3047,7 +3054,9 @@ def edit_task(
             if (
                 kind == "decision"
                 and task.state == TaskState.DONE
-                and not frontmatter.get("resolution")
+                # Parsed value, not raw YAML truthiness (Codex r1 P2):
+                # Task.from_file normalises blank / non-string to None.
+                and task.resolution is None
             ):
                 raise ValueError(
                     f"Task {task_id} is already done without a resolution. "

@@ -740,3 +740,112 @@ class TestAppendDecisionToParentUnit:
         assert "- [Pick a bus](BUS-1): Actually, Kafka." in body
         assert "RabbitMQ." not in body
         assert "Untouched." in body
+
+
+# ---------------------------------------------------------------------------
+# 5. Codex r1 fixes (PR #59)
+# ---------------------------------------------------------------------------
+
+
+def _clone_store(temp_portfolio, tmp_path):
+    """Copy the canonical ``.project`` tree to a pinned 'worktree' store."""
+    from clawpm.sessions import Scope
+
+    canonical = temp_portfolio["root"] / "projects" / "test-proj" / ".project"
+    pinned = tmp_path / "wt" / ".project"
+    shutil.copytree(canonical, pinned)
+    return canonical, pinned, Scope.pinned(pinned)
+
+
+class TestParentLookupHonoursScope:
+    """Codex r1 P1: the parent lookup in change_task_state's decision branches
+    must forward ``scope`` — else closing a decision in a pinned worktree store
+    appends the Decisions line to the CANONICAL parent."""
+
+    def test_file_form_decision_updates_pinned_parent_only(
+        self, temp_portfolio, tmp_path
+    ):
+        config = temp_portfolio["config"]
+        parent = add_task(config, "test-proj", "Parent")
+        child = add_subtask(config, "test-proj", parent.id, "Pick a bus", kind="decision")
+        assert child is not None
+        canonical, pinned, scope = _clone_store(temp_portfolio, tmp_path)
+        canon_parent = get_task(config, "test-proj", parent.id).file_path
+        before = canon_parent.read_bytes()
+
+        change_task_state(
+            config, "test-proj", child.id, TaskState.DONE, "n", False, None, None,
+            "Kafka.", scope=scope,
+        )
+
+        assert canon_parent.read_bytes() == before, "canonical parent was touched"
+        pinned_parent = get_task(config, "test-proj", parent.id, scope=scope).file_path
+        assert pinned_parent.is_relative_to(pinned)
+        assert f"- [Pick a bus]({child.id}): Kafka." in pinned_parent.read_text(
+            encoding="utf-8"
+        )
+
+    def test_directory_form_decision_updates_pinned_parent_only(
+        self, temp_portfolio, tmp_path
+    ):
+        config = temp_portfolio["config"]
+        decision = add_task(config, "test-proj", "Top decision", kind="decision")
+        real_parent = add_task(config, "test-proj", "Real parent")
+        text = decision.file_path.read_text(encoding="utf-8")
+        decision.file_path.write_text(
+            text.replace("---\n", f"---\nparent: {real_parent.id}\n", 1),
+            encoding="utf-8",
+        )
+        assert add_subtask(config, "test-proj", decision.id, "Sub") is not None
+        _canonical, pinned, scope = _clone_store(temp_portfolio, tmp_path)
+        canon_parent = get_task(config, "test-proj", real_parent.id).file_path
+        before = canon_parent.read_bytes()
+
+        change_task_state(
+            config, "test-proj", decision.id, TaskState.DONE, None, True, None, None,
+            "Go.", scope=scope,
+        )
+
+        assert canon_parent.read_bytes() == before, "canonical parent was touched"
+        pinned_parent = get_task(config, "test-proj", real_parent.id, scope=scope).file_path
+        assert pinned_parent.is_relative_to(pinned)
+        assert f"({decision.id}): Go." in pinned_parent.read_text(encoding="utf-8")
+
+
+class TestEditKindGuardUsesParsedResolution:
+    """Codex r1 P2: the done-without-resolution edit guard must use the PARSED
+    resolution (Task.from_file normalises blank / non-string to None), not raw
+    YAML truthiness."""
+
+    @pytest.mark.parametrize("raw", ['"   "', "5", "[a, b]", "true"])
+    def test_invalid_raw_resolution_is_refused(self, temp_portfolio, raw):
+        config = temp_portfolio["config"]
+        task = add_task(config, "test-proj", "Finished build work")
+        CliRunner().invoke(main, ["-p", "test-proj", "done", task.id])
+        done = get_task(config, "test-proj", task.id)
+        assert done.state == TaskState.DONE
+        done.file_path.write_text(
+            done.file_path.read_text(encoding="utf-8").replace(
+                "---\n", f"---\nresolution: {raw}\n", 1
+            ),
+            encoding="utf-8",
+        )
+        assert get_task(config, "test-proj", task.id).resolution is None
+
+        with pytest.raises(ValueError, match="resolution"):
+            edit_task(config, "test-proj", task.id, kind="decision")
+        assert get_task(config, "test-proj", task.id).kind == "build"
+
+    def test_valid_resolution_still_allows_reclassify(self, temp_portfolio):
+        config = temp_portfolio["config"]
+        task = add_task(config, "test-proj", "Finished build work")
+        CliRunner().invoke(main, ["-p", "test-proj", "done", task.id])
+        done = get_task(config, "test-proj", task.id)
+        done.file_path.write_text(
+            done.file_path.read_text(encoding="utf-8").replace(
+                "---\n", "---\nresolution: Chose X\n", 1
+            ),
+            encoding="utf-8",
+        )
+        edit_task(config, "test-proj", task.id, kind="decision")
+        assert get_task(config, "test-proj", task.id).kind == "decision"
