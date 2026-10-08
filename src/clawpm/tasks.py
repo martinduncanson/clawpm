@@ -1488,7 +1488,12 @@ def parent_ready_signal(
 # derived choice is pinned by the first minted task file, after which inference
 # keeps it stable regardless of later portfolio changes.
 
-_PREFIX_NUM_RE = re.compile(r"^([A-Z][A-Z0-9-]*?)-(\d+)(?:\.progress)?$")
+# CLAWP-133: the first character may be a digit. The allocator now hands out
+# only letter-leading prefixes (`_ensure_leading_letter`), but a project that
+# minted digit-leading ids BEFORE that fix (``2-B-000``, ``2024-000``) must
+# still have its prefix re-inferred from its own files; a letter-only regex
+# made it look taskless on every mint.
+_PREFIX_NUM_RE = re.compile(r"^([A-Z0-9][A-Z0-9-]*?)-(\d+)(?:\.progress)?$")
 
 
 def _is_subtask_shaped(prefix: str) -> bool:
@@ -1522,6 +1527,29 @@ def _desubtask_prefix(prefix: str) -> str:
         prefix = prefix[: m.start()] + m.group(1)
 
 
+def _ensure_leading_letter(prefix: str) -> str:
+    """Prefix ``P`` when ``prefix`` does not start with a letter (CLAWP-133):
+    ``2B`` -> ``P2B``, ``2024`` -> ``P2024``, ``99`` -> ``P99``.
+
+    Derived candidates must start with a letter so they stay unambiguous
+    against the short-ref grammar (``expand_task_id`` reads ``2024-001`` as a
+    subtask of parent 2024) and re-inferable by ``_PREFIX_NUM_RE``. Applied
+    only to what the allocator hands out; an explicit ``task_prefix`` or an
+    already-minted prefix is never rewritten. A prefix that already leads
+    with a letter is returned unchanged.
+    """
+    if prefix[:1].isalpha():
+        return prefix
+    return "P" + prefix
+
+
+def _normalise_derived_prefix(raw: str) -> str:
+    """The one place an id-derived slice becomes a candidate prefix: strip a
+    trailing separator (CLAWP-096), un-subtask-shape it (CLAWP-132), then
+    force a leading letter (CLAWP-133)."""
+    return _ensure_leading_letter(_desubtask_prefix(_strip_trailing_non_alnum(raw)))
+
+
 def _parse_root_task_name(name: str) -> tuple[str, str] | None:
     """Parse a top-level task file stem / directory name into
     ``(raw_prefix, normalised_prefix)``, or None when it is not a root id.
@@ -1534,9 +1562,8 @@ def _parse_root_task_name(name: str) -> tuple[str, str] | None:
     itself ends in ``-<digits>``) is a stray subtask, not evidence of a
     top-level prefix (CLAWP-048), and returns None -- checked AFTER
     normalising so a legacy-spelled subtask (``CODE--001--002`` parses as
-    ``"CODE--001-"``) is still caught. Known pre-existing gap: the regex
-    needs a LEADING LETTER, so a prefix derived from a digit-leading id is
-    never re-inferred from its own files.
+    ``"CODE--001-"``) is still caught. A leading digit is accepted
+    (CLAWP-133) so pre-fix digit-leading mints (``2024-000``) still infer.
     """
     m = _PREFIX_NUM_RE.match(name)
     if not m:
@@ -1866,7 +1893,7 @@ def _naive_prefix_placeholder(project_id: str) -> str:
     """
     full = project_id.upper()
     base = full[:5] if len(full) >= 5 else full
-    return _desubtask_prefix(_strip_trailing_non_alnum(base))
+    return _normalise_derived_prefix(base)
 
 
 class PortfolioPrefixScanError(OSError):
@@ -1929,10 +1956,10 @@ def _naive_prefix_candidates(project_id: str):
     allocator never hands out a prefix that `_infer_prefix_from_tasks`
     rejects for being subtask-shaped (a ``-<digits>`` suffix) -- the one
     invariant that function's own filter already assumes but this module did
-    not previously guarantee. LIMIT (pre-existing, not addressed here): the
-    inference regex ``_PREFIX_NUM_RE`` also requires a LEADING LETTER, so a
-    prefix derived from a digit-leading id (``2-b``, ``2024``) can still
-    never be re-inferred from its own files; that is a separate gap. A short digit-suffixed id (``"web-2"``) still has a candidate
+    not previously guarantee. A digit-LEADING id (``2-b``, ``2024``) gets a
+    ``P`` prepended to every candidate (``P2-B``, ``P2024``; CLAWP-133,
+    ``_ensure_leading_letter``) so the prefix stays unambiguous and
+    re-inferable. A short digit-suffixed id (``"web-2"``) still has a candidate
     (skipping them left such ids with none, hard-failing ``tasks add``).
     The chain is therefore never empty: it always yields at least the
     placeholder. Normalising can make adjacent slices collapse to the same
@@ -1942,7 +1969,7 @@ def _naive_prefix_candidates(project_id: str):
     full = project_id.upper()
     yield _naive_prefix_placeholder(project_id)
     for n in range(6, len(full) + 1):
-        yield _desubtask_prefix(_strip_trailing_non_alnum(full[:n]))
+        yield _normalise_derived_prefix(full[:n])
 
 
 def _naive_prefix_reach(project_id: str) -> frozenset[str]:
