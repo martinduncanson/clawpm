@@ -18,7 +18,7 @@ predictions:
     but not in README's All-commands section
   - Passes cleanly against current README (post CLAWP-097)
 priority: 6
-updated: '2026-07-10'
+updated: '2026-10-08'
 ---
 # Wire doc-staleness CI check against introspect --json output
 

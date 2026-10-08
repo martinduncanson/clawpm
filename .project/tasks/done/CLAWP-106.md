@@ -13,7 +13,7 @@ scope:
 - src/clawpm/mcp_server.py
 - src/clawpm/context.py
 - README.md
-updated: '2026-08-31'
+updated: '2026-10-08'
 ---
 # CLAWP-068 MCP server: tech-debt follow-ups from code-quorum review (PR #54)
 
