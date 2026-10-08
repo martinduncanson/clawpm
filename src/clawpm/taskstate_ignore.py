@@ -71,8 +71,6 @@ def _task_shape(project_dir: Path, folder: Path) -> tuple[str, int]:
     as they judge real tasks. With none (project init), use the project's own
     prefix and the allocator's zero-pad width.
     """
-    from .tasks import _naive_prefix_placeholder, resolve_existing_prefix
-
     for path in [*folder.glob("*.md"), *folder.glob("*/_task.md")]:
         stem = path.parent.name if path.name == "_task.md" else path.stem
         prefix, sep, num = stem.rpartition("-")
@@ -82,26 +80,95 @@ def _task_shape(project_dir: Path, folder: Path) -> tuple[str, int]:
         from .models import ProjectSettings
 
         settings = ProjectSettings.load(project_dir / ".project" / "settings.toml")
-        prefix = resolve_existing_prefix(settings) or _naive_prefix_placeholder(settings.id)
+        prefix = _allocator_prefix(project_dir, settings)
     except Exception as exc:
         logger.debug("could not derive a task prefix for %s: %r", project_dir, exc)
         prefix = "TASK"
     return prefix, _DEFAULT_WIDTH
 
 
+def _allocator_prefix(project_dir: Path, settings) -> str:
+    """The prefix the allocator will mint this project's first task under.
+
+    A prefix collision with a sibling (``CODE`` taken -> ``CODE-B``) means the
+    naive ``id[:5]`` placeholder is not what real tasks will carry, so ask the
+    allocator itself. Without a loadable portfolio, or when the allocator
+    refuses (candidates exhausted), fall back to the project's current or
+    naive prefix.
+    """
+    from .discovery import load_portfolio_config
+    from .tasks import _naive_prefix_placeholder, assign_task_prefix, resolve_existing_prefix
+
+    try:
+        config = load_portfolio_config()
+        if config is not None:
+            return assign_task_prefix(
+                settings.id,
+                project_dir / ".project" / "tasks",
+                config,
+                explicit_prefix=getattr(settings, "task_prefix", None),
+            )
+    except Exception as exc:
+        logger.debug("allocator could not resolve a prefix for %s: %r", project_dir, exc)
+    return resolve_existing_prefix(settings) or _naive_prefix_placeholder(settings.id)
+
+
+def _index_names(project_dir: Path, sub: str) -> set[str]:
+    """Task-file stems git tracks directly under the state folder *sub*.
+
+    ``check-ignore`` never reports a tracked path, so a probe naming a file
+    that is in the index -- even one deleted from disk but not yet staged as
+    removed -- would hide a blanket ignore. Failure is "no names" (debug log).
+    """
+    rel = "/".join(p for p in (".project", "tasks", sub) if p)
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_dir), "ls-files", "-z", "--", rel],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("git ls-files could not run for %s: %r", project_dir, exc)
+        return set()
+    if result.returncode != 0:
+        logger.debug(
+            "git ls-files degraded for %s: rc=%s stderr=%s",
+            project_dir, result.returncode, result.stderr.strip(),
+        )
+        return set()
+    names: set[str] = set()
+    for entry in result.stdout.split("\0"):
+        head = entry[len(rel) + 1:].split("/", 1)[0] if entry.startswith(rel + "/") else ""
+        if head:
+            names.add(head[:-3] if head.endswith(".md") else head)
+    return names
+
+
 def _probe_path(project_dir: Path, sub: str, folder: Path) -> str:
     """Relative path of a task-shaped file that does NOT exist, in the layout in use.
 
-    ``check-ignore`` never reports existing tracked files, so the number is the
-    highest of the real width that is unused on disk.
+    ``check-ignore`` never reports tracked files, so the number is the highest
+    of the real width that is neither on disk nor in the git index.
     """
     prefix, width = _task_shape(project_dir, folder)
-    num = 10**width - 1
-    while num > 0 and (
-        (folder / f"{prefix}-{num:0{width}d}.md").exists()
-        or (folder / f"{prefix}-{num:0{width}d}").exists()
-    ):
-        num -= 1
+    tracked = _index_names(project_dir, sub)
+
+    def taken(stem: str) -> bool:
+        return stem in tracked or (folder / f"{stem}.md").exists() or (folder / stem).exists()
+
+    # When the whole width is taken (GI-000..GI-999) move to the next width
+    # rather than return a real file.
+    while True:
+        num = next(
+            (n for n in range(10**width - 1, -1, -1) if not taken(f"{prefix}-{n:0{width}d}")),
+            None,
+        )
+        if num is not None:
+            break
+        width += 1
     name = f"{prefix}-{num:0{width}d}"
     split_only = (
         folder.is_dir()

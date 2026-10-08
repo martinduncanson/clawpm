@@ -278,3 +278,63 @@ def test_probe_skips_existing_numbers(tmp_path):
     (proj / ".project" / "tasks" / "GI-999.md").write_text("x", encoding="utf-8")
     rel = ti._probe_path(proj, "", proj / ".project" / "tasks")
     assert rel == ".project/tasks/GI-998.md"
+
+
+# --- CLAWP-135: probe selection ---------------------------------------------
+
+
+def _init_stderr(tmp_path, repo, project_id):
+    runner = CliRunner(mix_stderr=False) if "mix_stderr" in CliRunner.__init__.__code__.co_varnames else CliRunner()
+    result = runner.invoke(
+        main, ["--format", "json", "project", "init", "--in-repo", str(repo), "--id", project_id]
+    )
+    assert result.exit_code == 0, result.output
+    return result.stderr
+
+
+def test_init_probes_allocator_resolved_prefix_not_naive(tmp_path, monkeypatch):
+    # A sibling already owns CODE, so code-beta mints CODE-B-NNN, not CODE-NNN.
+    # Under a CODE-??? allowlist the naive probe CODE-999 is allowed while the
+    # real CODE-B-000 is ignored -- init must warn.
+    sib = tmp_path / "code-alpha"
+    (sib / ".project").mkdir(parents=True)
+    (sib / ".project" / "settings.toml").write_text(
+        'id = "code-alpha"\nname = "A"\nstatus = "active"\npriority = 3\n'
+        f'repo_path = "{sib.as_posix()}"\ntask_prefix = "CODE"\n',
+        encoding="utf-8",
+    )
+    repo = tmp_path / "code-beta"
+    repo.mkdir()
+    _git_init(repo)
+    (repo / ".gitignore").write_text(
+        ".project/tasks/*\n!.project/tasks/CODE-???.md\n", encoding="utf-8"
+    )
+    _portfolio(tmp_path, monkeypatch, tmp_path)
+    assert ".gitignore:1" in _init_stderr(tmp_path, repo, "code-beta")
+
+
+def test_probe_excludes_deleted_but_tracked_file(tmp_path, monkeypatch, repo):
+    # GI-999 is in the index but gone from disk: check-ignore never reports a
+    # tracked path, so probing it would mask the blanket ignore.
+    (repo / ".gitignore").write_text(".project/\n", encoding="utf-8")
+    _make_project(repo)
+    ghost = repo / ".project" / "tasks" / "GI-999.md"
+    ghost.write_text("---\nid: GI-999\n---\n# g\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "-f", ".project/tasks/GI-999.md"], check=True)
+    ghost.unlink()
+    msgs = _doctor_warnings(tmp_path, monkeypatch, tmp_path)
+    assert len(msgs) == 1
+    assert ".gitignore:1" in msgs[0]
+
+
+def test_probe_uses_next_width_when_every_number_is_taken(tmp_path):
+    from clawpm import taskstate_ignore as ti
+
+    proj = tmp_path / "p"
+    _make_project(proj)
+    tasks = proj / ".project" / "tasks"
+    for n in range(1000):
+        (tasks / f"GI-{n:03d}.md").write_text("x", encoding="utf-8")
+    rel = ti._probe_path(proj, "", tasks)
+    assert rel == ".project/tasks/GI-9999.md"
+    assert not (proj / rel).exists()
