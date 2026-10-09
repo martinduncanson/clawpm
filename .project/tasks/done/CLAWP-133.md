@@ -11,7 +11,7 @@ predictions:
   success_criteria:
   - taskless project 2-b mints <P>-000 then <P>-001 with inference returning <P>
 priority: 5
-updated: '2026-10-04'
+updated: '2026-10-08'
 ---
 # Digit-leading project ids get a task prefix that can never be re-inferred
 
