@@ -83,6 +83,8 @@ LEAF_KINDS = ("build", "decision")
 EXISTING_ID_PREFIX = "id:"
 # A canonical task id: no path separators or other alias syntax.
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+# Bound on the walk over an existing dependency's own completion edges.
+_MAX_DEP_WALK = 2000
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -1129,6 +1131,33 @@ def _emit_tree_locked(
                 f"Leaf ref={lf.ref!r} depends on {dep_id!r} which is rejected "
                 "(won't-do) and can never complete"
             )
+        # Transitive completion edges of the existing task (its depends and, if
+        # it is a parent, its children): reaching an ancestor of the emit root
+        # closes a cycle through the new leaf (R waits C waits X waits R).
+        if existing_ancestors:
+            seen: set[str] = set()
+            stack = [dep_id]
+            while stack:
+                cur = stack.pop()
+                if cur in seen:
+                    continue
+                seen.add(cur)
+                if len(seen) > _MAX_DEP_WALK:
+                    raise EmitValidationError(
+                        f"Leaf ref={lf.ref!r}: the dependency chain of {dep_id!r} is "
+                        f"longer than {_MAX_DEP_WALK} tasks; cannot verify it is acyclic"
+                    )
+                node = found if cur == dep_id else get_task(config, project_id, cur)
+                if node is None:
+                    continue
+                for nxt in [*node.depends, *node.children]:
+                    if nxt in existing_ancestors:
+                        raise EmitValidationError(
+                            f"Leaf ref={lf.ref!r} depends on {dep_id!r}, which "
+                            f"(through {cur!r}) waits on {nxt!r}, an ancestor of the "
+                            "emit root: that closes a dependency cycle"
+                        )
+                    stack.append(nxt)
 
     for lf in leaves_to_emit:
         for dep in lf.depends_refs:
@@ -1252,8 +1281,7 @@ def _emit_tree_locked(
     # is either minted in this emit, or an already-emitted leaf (re-emit,
     # found by leaf_key); the gate above already rejected the other cases.
     key_by_ref = {lf.ref: lf.leaf_key for lf in doc.leaves}
-    resolved_depends: dict[str, list[str]] = {}
-    for lf in leaves_to_emit:
+    def _resolve_ids(lf: LeafSpec, strict: bool) -> list[str]:
         ids: list[str] = []
         for dep in lf.depends_refs:
             if dep.startswith(EXISTING_ID_PREFIX):
@@ -1262,14 +1290,36 @@ def _emit_tree_locked(
                 dep_id = leaf_id_map[dep]
             elif key_by_ref.get(dep) in already_emitted_keys:
                 dep_id = already_emitted_keys[key_by_ref[dep]]
-            else:
+            elif strict:
                 raise EmitValidationError(
                     f"Leaf ref={lf.ref!r} depends on {dep!r} which could not be resolved"
                 )
+            else:
+                continue
             if dep_id not in ids:
                 ids.append(dep_id)
+        return ids
+
+    resolved_depends: dict[str, list[str]] = {}
+    for lf in leaves_to_emit:
+        ids = _resolve_ids(lf, True)
         if ids:
             resolved_depends[lf.ref] = ids
+
+    # Re-emit convergence: a leaf persisted by an earlier, interrupted emit may
+    # depend on an id that never landed (its sibling was re-minted on retry).
+    # Remember the freshly resolved ids so the dangling ones are repaired after
+    # promotion.
+    repair_depends: dict[str, list[str]] = {}
+    for lf in doc.leaves:
+        if (
+            lf.leaf_key in already_emitted_keys
+            and lf.ref not in rejected_refs
+            and lf.depends_refs
+        ):
+            ids = _resolve_ids(lf, False)
+            if ids:
+                repair_depends[already_emitted_keys[lf.leaf_key]] = ids
 
     # CLAWP-092: reserve every id this call minted (the new root, if any, plus
     # each leaf at every depth) in the portfolio ledger while still inside the
@@ -1462,23 +1512,38 @@ def _emit_tree_locked(
             # Promote each top-level child subtree atomically (file or dir rename).
             # Children land before the parent child-list is updated — crash-safe
             # ordering preserved from v1.
-            for cid in child_ids:
-                src_file = staging_base / f"{cid}.md"
-                src_dir = staging_base / cid
-                if src_dir.exists():
-                    # Inner node — rename entire subtree directory
-                    dst_dir = live_parent_dir / cid
-                    src_dir.rename(dst_dir)
-                    _collect_emitted_tasks(dst_dir, cid, emitted_tasks)
-                elif src_file.exists():
-                    # Leaf node — rename single file
-                    dst_file = live_parent_dir / f"{cid}.md"
-                    src_file.rename(dst_file)
-                    from .models import Task as _Task4
-                    try:
-                        emitted_tasks.append(_Task4.from_file(dst_file))
-                    except Exception:
-                        pass
+            promoted_cids: list[str] = []
+            try:
+                for cid in child_ids:
+                    src_file = staging_base / f"{cid}.md"
+                    src_dir = staging_base / cid
+                    if src_dir.exists():
+                        # Inner node — rename entire subtree directory
+                        dst_dir = live_parent_dir / cid
+                        src_dir.rename(dst_dir)
+                        _collect_emitted_tasks(dst_dir, cid, emitted_tasks)
+                        promoted_cids.append(cid)
+                    elif src_file.exists():
+                        # Leaf node — rename single file
+                        dst_file = live_parent_dir / f"{cid}.md"
+                        src_file.rename(dst_file)
+                        promoted_cids.append(cid)
+                        from .models import Task as _Task4
+                        try:
+                            emitted_tasks.append(_Task4.from_file(dst_file))
+                        except Exception:
+                            pass
+            except Exception as exc:
+                if promoted_cids:
+                    # Siblings are promoted by separate renames, so a failure
+                    # part-way leaves the earlier ones on disk (CLAWP-111-003).
+                    raise EmitValidationError(
+                        f"Promotion failed after {promoted_cids!r} landed under "
+                        f"{parent_id!r} ({type(exc).__name__}: {exc}). Re-run the same "
+                        "emit: persisted leaves are skipped by leaf_key and their "
+                        "dependencies on re-minted siblings are repaired."
+                    ) from exc
+                raise
 
             # Last: update parent's children list (after files are in place)
             if parent_task.file_path:
@@ -1488,6 +1553,30 @@ def _emit_tree_locked(
                 # Also stamp prd_ref on parent if we have one
                 if research_id:
                     _stamp_prd_ref(parent_task.file_path, research_id)
+
+        # CLAWP-111-003 — converge, then verify, dependencies. A persisted leaf
+        # whose depends name ids that don't exist (interrupted earlier emit) is
+        # rewritten to the freshly resolved ids; afterwards every depends id on
+        # everything touched must exist, or the emit fails loudly.
+        touched_files: list[tuple[str, Path | None, list[str]]] = [
+            (t.id, t.file_path, list(t.depends)) for t in emitted_tasks
+        ]
+        for fixed_id, new_ids in repair_depends.items():
+            persisted = get_task(config, project_id, fixed_id)
+            if persisted is None or persisted.file_path is None:
+                continue
+            if all(get_task(config, project_id, d) for d in persisted.depends):
+                touched_files.append((fixed_id, persisted.file_path, list(persisted.depends)))
+                continue
+            _rewrite_depends(persisted.file_path, new_ids)
+            touched_files.append((fixed_id, persisted.file_path, new_ids))
+        for tid, _tf, deps in touched_files:
+            missing = [d for d in deps if get_task(config, project_id, d) is None]
+            if missing:
+                raise EmitValidationError(
+                    f"Task {tid} depends on {missing!r}, which do not exist after "
+                    "promotion. Fix: edit the task's depends (tasks edit) or re-run the emit."
+                )
 
         # Promote PRD research file (inside the atomic set, after task files)
         promoted_research_id: str | None = None
@@ -1672,6 +1761,21 @@ def _atomic_write(path: Path, content: str) -> None:
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
+
+
+def _rewrite_depends(task_file: Path, ids: list[str]) -> None:
+    """Atomically replace a persisted task's ``depends`` (re-emit convergence)."""
+    text = task_file.read_text(encoding="utf-8")
+    fm, raw_body = split_frontmatter(text, where=str(task_file))
+    fm["depends"] = list(ids)
+    stamp_updated(fm)
+    new_text = (
+        "---\n"
+        + yaml.dump(fm, default_flow_style=False, allow_unicode=True).strip()
+        + "\n---\n"
+        + raw_body.lstrip("\n")
+    )
+    _atomic_write(task_file, new_text)
 
 
 def _stamp_prd_ref(task_file: Path, prd_ref: str) -> None:

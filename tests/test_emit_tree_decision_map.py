@@ -573,3 +573,83 @@ class TestCompletionGraph:
         for dry in (True, False):
             r = _emit(iso, _doc([_leaf(f"Z{int(dry)}", depends_refs=[f"id:{existing.id}"])]), dry_run=dry)
             assert r.dry_run is dry
+
+
+class TestExistingDependencyChains:
+    """Codex r2 (PR #99): cycles through existing tasks' own depends."""
+
+    def test_existing_dependency_waiting_on_attach_root_rejected(self, isolated_portfolio):
+        iso = isolated_portfolio
+        root = add_task(iso.config, iso.project_id, "Root R")
+        x = add_task(iso.config, iso.project_id, "Task X", depends=[root.id])
+        before = _all_md(iso.tasks_dir)
+        doc = parse_emit_document(
+            _doc([_leaf("C", depends_refs=[f"id:{x.id}"])], root={"attach_to": root.id})
+        )
+        for dry in (True, False):
+            with pytest.raises(_et.EmitValidationError, match="cycle"):
+                emit_tree(iso.config, iso.project_id, doc, dry_run=dry)
+        assert _all_md(iso.tasks_dir) == before
+
+    def test_transitive_chain_through_two_existing_tasks_rejected(self, isolated_portfolio):
+        iso = isolated_portfolio
+        root = add_task(iso.config, iso.project_id, "Root R")
+        y = add_task(iso.config, iso.project_id, "Task Y", depends=[root.id])
+        x = add_task(iso.config, iso.project_id, "Task X", depends=[y.id])
+        doc = parse_emit_document(
+            _doc([_leaf("C", depends_refs=[f"id:{x.id}"])], root={"attach_to": root.id})
+        )
+        for dry in (True, False):
+            with pytest.raises(_et.EmitValidationError, match="cycle"):
+                emit_tree(iso.config, iso.project_id, doc, dry_run=dry)
+
+    def test_unrelated_existing_chain_is_fine(self, isolated_portfolio):
+        iso = isolated_portfolio
+        root = add_task(iso.config, iso.project_id, "Root R")
+        base = add_task(iso.config, iso.project_id, "Base")
+        x = add_task(iso.config, iso.project_id, "Task X", depends=[base.id])
+        r = _emit(
+            iso, _doc([_leaf("C", depends_refs=[f"id:{x.id}"])], root={"attach_to": root.id})
+        )
+        assert [t["depends"] for t in r.emitted] == [[x.id]]
+
+
+class TestPromotionCrashConverges:
+    def test_second_rename_failure_then_retry_repairs_dangling_depends(
+        self, isolated_portfolio, monkeypatch
+    ):
+        iso = isolated_portfolio
+        first = _emit(iso, _doc([_leaf("P")]))
+        attach = {"attach_to": first.root_id}
+        raw = _doc([_leaf("A", depends_refs=["B"]), _leaf("B")], root=attach)
+
+        real_rename = Path.rename
+        calls = {"n": 0}
+
+        def flaky(self, target):
+            if self.parent.name == "_attach":
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    raise OSError("injected crash on second sibling rename")
+            return real_rename(self, target)
+
+        monkeypatch.setattr(Path, "rename", flaky)
+        with pytest.raises(_et.EmitValidationError, match="Promotion failed"):
+            _emit(iso, raw)
+        monkeypatch.setattr(Path, "rename", real_rename)
+
+        # A landed pointing at B's reserved-but-never-promoted id; staging is gone.
+        assert not [p for p in iso.tasks_dir.iterdir() if p.name.startswith(".emit-")]
+
+        second = _emit(iso, raw)
+        by_key = {_key_of(t): t for t in second.emitted if _key_of(t)}
+        assert list(by_key) == ["dm-B"]
+        b_id = by_key["dm-B"]["id"]
+        a_files = [
+            p for p in iso.tasks_dir.rglob("*.md")
+            if "leaf_key: dm-A" in p.read_text(encoding="utf-8")
+        ]
+        assert len(a_files) == 1
+        a = Task.from_file(a_files[0])
+        assert a.depends == [b_id]
+        assert get_task(iso.config, iso.project_id, b_id) is not None
