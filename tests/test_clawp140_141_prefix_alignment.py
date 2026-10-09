@@ -51,6 +51,19 @@ class TestGetProjectPrefixMatchesAllocator:
 
 
 class TestExpandFullIdsAreNotReread:
+    @pytest.fixture(autouse=True)
+    def _empty_portfolio(self, tmp_path, monkeypatch):
+        # Short refs now resolve against ids on disk, so isolate from the
+        # machine's real portfolio (a real legacy CODE--007 would win).
+        (tmp_path / "portfolio.toml").write_text(
+            f'portfolio_root = "{tmp_path.as_posix()}"\n'
+            f'project_roots = ["{(tmp_path / "projects").as_posix()}"]\n',
+            encoding="utf-8",
+        )
+        monkeypatch.delenv("CLAWPM_PROJECT_ROOTS", raising=False)
+        monkeypatch.delenv("CLAWPM_WORKSPACE", raising=False)
+        monkeypatch.setenv("CLAWPM_PORTFOLIO", str(tmp_path))
+
     @pytest.mark.parametrize("project_id", PROJECT_IDS)
     def test_minted_root_and_subtask_ids_are_stable(self, project_id):
         prefix = context.get_project_prefix(project_id)
@@ -121,6 +134,47 @@ class TestLegacyDigitLeadingProjectsKeepWorking:
         task = add_task(config, "code-quorum", "first")
         assert context.expand_task_id(task.id, "code-quorum") == task.id
         assert context.expand_task_id("0", "code-quorum") == task.id
+
+
+class TestPrefixInferenceUsesAllocatorAlphabet:
+    def test_underscore_prefix_after_collision_is_inferred_whole(self, tmp_path, monkeypatch):
+        # Codex r1 P2-a: the allocator can mint MY_PRO (underscore) when MY_PR
+        # is taken; inference must not truncate it to MY_PR.
+        _config, tasks_dir = _portfolio(tmp_path, monkeypatch, "my_project")
+        (tasks_dir / "MY_PRO-000.md").write_text("---\nid: MY_PRO-000\n---\n# t\n", encoding="utf-8")
+        (tasks_dir / "MY_PRO-001.md").write_text("---\nid: MY_PRO-001\n---\n# t\n", encoding="utf-8")
+        assert context.get_project_prefix("my_project") == "MY_PRO"
+        assert context.expand_task_id("1", "my_project") == "MY_PRO-001"
+
+    def test_dotted_prefix_is_inferred_whole(self, tmp_path, monkeypatch):
+        _config, tasks_dir = _portfolio(tmp_path, monkeypatch, "my.project")
+        (tasks_dir / "MY.PRO-000.md").write_text("---\nid: MY.PRO-000\n---\n# t\n", encoding="utf-8")
+        assert context.expand_task_id("0", "my.project") == "MY.PRO-000"
+
+
+class TestShortRefKeepsOnDiskSpelling:
+    def test_legacy_doubled_separator_files_expand_to_the_real_filename(
+        self, tmp_path, monkeypatch
+    ):
+        # Codex r1 P2-b: CODE--000/CODE--001 on disk; "1" must be CODE--001,
+        # not the normalised CODE-001 that does not exist.
+        _config, tasks_dir = _portfolio(tmp_path, monkeypatch, "code-quorum")
+        (tasks_dir / "CODE--000.md").write_text("---\nid: CODE--000\n---\n# t\n", encoding="utf-8")
+        (tasks_dir / "CODE--001.md").write_text("---\nid: CODE--001\n---\n# t\n", encoding="utf-8")
+        assert context.expand_task_id("1", "code-quorum") == "CODE--001"
+
+    def test_mixed_legacy_and_normalised_files_resolve_per_ordinal(self, tmp_path, monkeypatch):
+        _config, tasks_dir = _portfolio(tmp_path, monkeypatch, "code-quorum")
+        (tasks_dir / "CODE--000.md").write_text("---\nid: CODE--000\n---\n# t\n", encoding="utf-8")
+        (tasks_dir / "CODE--001.md").write_text("---\nid: CODE--001\n---\n# t\n", encoding="utf-8")
+        (tasks_dir / "CODE-002.md").write_text("---\nid: CODE-002\n---\n# t\n", encoding="utf-8")
+        assert context.expand_task_id("1", "code-quorum") == "CODE--001"
+        assert context.expand_task_id("2", "code-quorum") == "CODE-002"
+
+    def test_no_file_for_ordinal_falls_back_to_derived_prefix(self, tmp_path, monkeypatch):
+        _config, tasks_dir = _portfolio(tmp_path, monkeypatch, "code-quorum")
+        (tasks_dir / "CODE-000.md").write_text("---\nid: CODE-000\n---\n# t\n", encoding="utf-8")
+        assert context.expand_task_id("9", "code-quorum") == "CODE-009"
 
 
 class TestAllocatorResolvedPrefixForCollidingProjects:

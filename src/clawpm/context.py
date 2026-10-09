@@ -183,6 +183,28 @@ def _existing_prefix(project_id: str) -> str | None:
     return existing or None
 
 
+def _ref_prefix_on_disk(project_id: str, task_ref: str) -> str | None:
+    """The prefix spelling for ``task_ref``'s ordinal as it exists ON DISK
+    (``CODE--001`` stays ``CODE-``; mixed legacy + normalised projects resolve
+    per ordinal), via ``tasks.on_disk_ref_prefix``. None when the project is
+    unresolvable or has no id for that ordinal; the caller then uses the
+    derived prefix. An ambiguous ref (both spellings hold
+    the ordinal) raises ``ValueError`` -- loud, never a silent pick."""
+    from .tasks import on_disk_ref_prefix
+
+    try:
+        config = load_portfolio_config()
+        proj = get_project(config, project_id) if config else None
+    except Exception as exc:
+        logger.warning(
+            "clawpm: could not resolve project %s for short ref %s (%s: %s); "
+            "using the derived prefix",
+            project_id, task_ref, type(exc).__name__, exc,
+        )
+        return None
+    return on_disk_ref_prefix(proj, task_ref) if proj else None
+
+
 # A full task id: letter-leading prefix (may hold digits, underscores, dots and
 # hyphens: P2-B, MY_PR, ARB-P, WEB2), then -NNN and an optional -NNN subtask.
 # Hyphen-joined prefix segments must each hold a letter so a short subtask ref
@@ -229,12 +251,15 @@ def expand_task_id(task_ref: str, project_id: str, prefix: str | None = None) ->
     if subtask_match:
         parent_num = int(subtask_match.group(1))
         sub_num = int(subtask_match.group(2))
-        return f"{resolved_prefix}-{parent_num:03d}-{sub_num:03d}"
+        # An on-disk spelling of the parent ordinal wins (CLAWP-140 r1).
+        pfx = resolved_prefix if prefix else (_ref_prefix_on_disk(project_id, task_ref) or resolved_prefix)
+        return f"{pfx}-{parent_num:03d}-{sub_num:03d}"
 
     # Pure numeric - expand with project prefix
     if task_ref.isdigit():
         num = int(task_ref)
-        return f"{resolved_prefix}-{num:03d}"
+        pfx = resolved_prefix if prefix else (_ref_prefix_on_disk(project_id, task_ref) or resolved_prefix)
+        return f"{pfx}-{num:03d}"
 
     # Return as-is if unrecognized format
     return task_ref

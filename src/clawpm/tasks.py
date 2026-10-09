@@ -1746,7 +1746,7 @@ def parent_ready_signal(
 # minted digit-leading ids BEFORE that fix (``2-B-000``, ``2024-000``) must
 # still have its prefix re-inferred from its own files; a letter-only regex
 # made it look taskless on every mint.
-_PREFIX_NUM_RE = re.compile(r"^([A-Z0-9][A-Z0-9-]*?)-(\d+)(?:\.progress)?$")
+_PREFIX_NUM_RE = re.compile(r"^([A-Z0-9][A-Z0-9_.-]*?)-(\d+)(?:\.progress)?$")
 
 
 def _is_subtask_shaped(prefix: str) -> bool:
@@ -2072,11 +2072,23 @@ def resolve_ref_prefix(settings, config=None, task_ref: str | None = None) -> st
             return resolve_portfolio_prefix(settings, config)
         return _legacy_alt_prefix(settings, clean) or clean
 
+    matched = on_disk_ref_prefix(settings, task_ref)
+    return matched if matched is not None else fallback()
+
+
+def on_disk_ref_prefix(settings, task_ref: str | None) -> str | None:
+    """The prefix spelling of the id ACTUALLY on disk for a numeric
+    ``task_ref`` (``7`` / ``7-001``), else None (no file, non-numeric ref,
+    explicit ``task_prefix``, or no tasks). Both spellings holding the ordinal
+    raises ``ValueError`` (ambiguous). The match half of
+    :func:`resolve_ref_prefix`, exposed so callers can tell a real on-disk
+    match from a fallback."""
+    clean = resolve_existing_prefix(settings)
     if clean is None or task_ref is None or getattr(settings, "task_prefix", None):
-        return fallback()
+        return None
     m = re.fullmatch(r"(\d+)(?:-\d+)?", task_ref)
     if not m or not getattr(settings, "project_dir", None):
-        return fallback()
+        return None
     tasks_dir = settings.project_dir / ".project" / "tasks"
     ordinal = int(m.group(1))
     spellings = []
@@ -2089,7 +2101,7 @@ def resolve_ref_prefix(settings, config=None, task_ref: str | None = None) -> st
             f"Task reference '{task_ref}' is ambiguous: both '{clean}-{ordinal:03d}' "
             f"and '{clean}--{ordinal:03d}' exist. Use the full task id."
         )
-    return spellings[0] if spellings else fallback()
+    return spellings[0] if spellings else None
 
 
 def resolve_portfolio_prefix(settings, config) -> str | None:
