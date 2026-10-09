@@ -21,7 +21,7 @@ import subprocess
 from pathlib import Path
 
 from clawpm.concurrency import LockTimeout
-from clawpm.models import SURPRISE_TAXONOMY, TaskState, WorkLogAction
+from clawpm.models import SURPRISE_TAXONOMY, TaskComplexity, TaskState, WorkLogAction
 from clawpm.discovery import get_project, get_repo_path
 from clawpm.tasks import change_task_state, get_task
 from clawpm.worklog import add_entry, filter_files_changed, read_entries
@@ -44,6 +44,7 @@ def transition(
     surprise_tags: tuple[str, ...] = (),
     rationale: str | None = None,
     supersedes: str | None = None,
+    actual_complexity: str | None = None,
     resolution: str | None = None,
 ) -> dict:
     """Transition ONE task's state and return a structured result.
@@ -77,6 +78,20 @@ def transition(
             f"Unknown surprise tag(s): {invalid_tags}. "
             f"Valid values: {sorted(SURPRISE_TAXONOMY)}"
         )
+
+    # CLAWP-112-002 — --actual-complexity is the ONLY source of
+    # actuals.complexity (honest actuals: no passthrough of the prediction).
+    # Validated here too so any non-CLI caller (MCP) gets the same guarantee
+    # the CLI's click.Choice gives interactively.
+    actual_complexity_value: TaskComplexity | None = None
+    if actual_complexity is not None:
+        try:
+            actual_complexity_value = TaskComplexity(actual_complexity)
+        except ValueError:
+            raise ValueError(
+                f"Unknown actual_complexity {actual_complexity!r}. "
+                f"Valid values: {[c.value for c in TaskComplexity]}"
+            )
 
     # CLAWP-037 — parent rollup gate. Compute readiness up front so we can
     # either block (no --force) or proceed-and-log (--force). A missing
@@ -449,10 +464,10 @@ def transition(
             all_log_entries = read_entries(config, project=project_id)
             actuals = _compute_actuals(
                 task_id,
-                pre_transition_task.complexity,
                 all_log_entries,
                 portfolio_root=config.portfolio_root,
                 project_id=project_id,
+                actual_complexity=actual_complexity_value,
             )
             event_name = "task_done" if state == TaskState.DONE else "task_blocked"
             write_reflection_event(

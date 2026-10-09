@@ -469,6 +469,9 @@ class Actuals:
     """
 
     duration_min: int | None = None
+    # CLAWP-112-002 — honest actuals: complexity is null unless independently
+    # supplied via `clawpm done --actual-complexity`. Never a passthrough of
+    # the task's (predicted) complexity — see _compute_actuals.
     complexity: TaskComplexity | None = None
     files_changed: int | None = None
     files_touched: list[str] = field(default_factory=list)
@@ -476,6 +479,11 @@ class Actuals:
     # event. Populated by _compute_actuals from iteration_event lines in
     # the reflection JSONL. None = no iterations were captured.
     iterations: int | None = None
+    # CLAWP-112-002 — sum of min(gap_to_next, 60) minutes over consecutive
+    # work_log entries for the task, plus a flat 15-minute wrap-up credit for
+    # the final entry; clamped to duration_min when both are known. None when
+    # the task has no work_log entries. See _compute_actuals / _compute_active_min.
+    active_min: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -484,6 +492,7 @@ class Actuals:
             "files_changed": self.files_changed,
             "files_touched": self.files_touched,
             "iterations": self.iterations,
+            "active_min": self.active_min,
         }
 
 
@@ -903,6 +912,15 @@ class WorkLogEntry:
     blockers: str | None = None
     auto: bool = False  # True for auto-generated entries (state changes)
     commit_hash: str | None = None  # Git commit hash (for action=commit)
+
+    def __post_init__(self) -> None:
+        # Normalise once, at the source: every entry carries an aware-UTC ts,
+        # so no downstream sort/min/subtract ever sees a naive/aware mix
+        # (legacy "Z" lines used to load naive). Naive values are taken as UTC.
+        if self.ts.tzinfo is None:
+            self.ts = self.ts.replace(tzinfo=timezone.utc)
+        else:
+            self.ts = self.ts.astimezone(timezone.utc)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON output."""

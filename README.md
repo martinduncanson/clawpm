@@ -750,6 +750,7 @@ clawpm tasks tags --include-done
 clawpm tasks state <id> rejected --rationale "..." --supersedes <id2>
 clawpm tasks state <id> done --force --process-lesson "..." --surprise scope_drift
 clawpm block <id> --process-lesson "..." --surprise dependency
+clawpm done <id> --actual-complexity m     # independent post-hoc complexity (s|m|l|xl); omitted = actuals.complexity null, never copied from the prediction
 clawpm done <id> --force                   # complete even if subtasks are incomplete
 clawpm tasks dispatch <id> --target-dir <dir> --no-session-context
 clawpm next --batch                        # next parallel batch (shared parallel_group)
