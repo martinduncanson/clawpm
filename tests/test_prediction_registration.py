@@ -147,6 +147,26 @@ class TestAddTaskRegistersPrediction:
         assert task.predictions.prediction_id is None
         assert _reflection_events(temp_portfolio["root"], task.id) == []
 
+    def test_source_request_reuse_registers_once(self, temp_portfolio):
+        # CLAWP-101 idempotent early return: a reused task must not mint a
+        # second prediction_id or append a second prediction_registered event.
+        config = temp_portfolio["config"]
+        first = add_task(
+            config, "test", "Req task", source_request="msg-1",
+            predictions=Predictions(duration_min=30, confidence=3),
+        )
+        again = add_task(
+            config, "test", "Req task", source_request="msg-1",
+            predictions=Predictions(duration_min=99, confidence=1),
+        )
+
+        assert first is not None and again is not None
+        assert again.id == first.id
+        assert again.predictions.prediction_id == first.predictions.prediction_id
+        assert again.predictions.duration_min == 30
+        events = _reflection_events(temp_portfolio["root"], first.id)
+        assert [e["event"] for e in events] == ["prediction_registered"]
+
 
 class TestAddSubtaskRegistersPrediction:
     def test_add_subtask_mints_id_and_registers(self, temp_portfolio):

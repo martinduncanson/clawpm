@@ -2781,9 +2781,54 @@ def add_task(
     out_of_scope: list[str] | None = None,
     stop_conditions: list[str] | None = None,
     delegability: str | None = None,
+    source_request: str | None = None,
     kind: str | None = None,
 ) -> Task | None:
-    """Add a new task to a project."""
+    """Add a new task to a project (see :func:`add_task_with_status`).
+
+    With ``source_request`` set, an existing task carrying the same key is
+    returned instead of creating a second one.
+    """
+    return add_task_with_status(
+        config, project_id, title, task_id=task_id, priority=priority,
+        complexity=complexity, depends=depends, scope=scope, tags=tags,
+        description=description, predictions=predictions,
+        parallel_group=parallel_group, agent_profile=agent_profile,
+        out_of_scope=out_of_scope, stop_conditions=stop_conditions,
+        delegability=delegability, source_request=source_request, kind=kind,
+    )[0]
+
+
+def add_task_with_status(
+    config: PortfolioConfig,
+    project_id: str,
+    title: str,
+    task_id: str | None = None,
+    priority: int = 5,
+    complexity: TaskComplexity | None = None,
+    depends: list[str] | None = None,
+    scope: list[str] | None = None,
+    tags: list[str] | None = None,
+    description: str = "",
+    predictions: Predictions | None = None,
+    parallel_group: int | None = None,
+    agent_profile: str | None = None,
+    out_of_scope: list[str] | None = None,
+    stop_conditions: list[str] | None = None,
+    delegability: str | None = None,
+    source_request: str | None = None,
+    kind: str | None = None,
+) -> tuple[Task | None, bool]:
+    """Add a new task to a project; return ``(task, created)``.
+
+    ``source_request`` (CLAWP-101) is an idempotency key — the inbox message id a
+    task was materialized from — written into the frontmatter in the same atomic
+    write as the task, so a retry can find the task instead of creating a second
+    one. Omitted from the file when ``None``. The key is rechecked INSIDE the
+    creation lock, before an id is allocated, so two concurrent callers for one
+    key cannot both create: the loser gets ``(existing_task, False)``.
+    ``(None, False)`` means the project has no tasks directory.
+    """
     tasks_dir = get_tasks_dir(config, project_id)
     if not tasks_dir:
         # Registry lookup succeeded but tasks/ doesn't exist yet - or registry
@@ -2794,7 +2839,7 @@ def add_task(
             # walk so operators don't get a silent failure when inside the repo.
             project_dot_dir = find_project_dir_fallback(config, project_id)
         if not project_dot_dir:
-            return None
+            return None, False
         tasks_dir = project_dot_dir / "tasks"
         tasks_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2868,6 +2913,15 @@ def add_task(
     # for the DURATION of one local-disk add_task call is cheap; a subtly
     # incorrect "skip it sometimes" optimization is not worth its risk.
     with portfolio_prefix_lock(config.portfolio_root), file_lock(_lock_path):
+        # CLAWP-101 (PR #88 Codex r2) — idempotency recheck. A caller's own
+        # pre-check ran outside this lock, so a concurrent materialiser may have
+        # created the task since. Recheck here, before any id is allocated or
+        # reserved, so the loser reuses the winner's task.
+        if source_request:
+            _existing = _scan_source_request(tasks_dir, source_request)
+            if _existing is not None:
+                return _existing, False
+
         # Generate task ID if not provided (inside lock: scan is now serialised)
         if not task_id:
             # CLAWP-048: resolve a portfolio-unique prefix (explicit task_prefix ->
@@ -2959,6 +3013,8 @@ def add_task(
             frontmatter["stop_conditions"] = stop_conditions
         if delegability and delegability != "either":
             frontmatter["delegability"] = delegability
+        if source_request:
+            frontmatter["source_request"] = source_request
         # CLAWP-111 — kind: omit at the "build" default so plain tasks keep
         # emitting byte-identical frontmatter to before this field existed.
         if kind and kind != "build":
@@ -2991,6 +3047,20 @@ def add_task(
 ## Notes
 
 """
+
+        # CLAWP-101 (PR #88 Codex r4) — the stamp is the crash-retry key, so
+        # refuse to write a task whose own serialised frontmatter would not
+        # hand it back (e.g. a "---" inside a value ends the block early).
+        if source_request:
+            try:
+                _stamped = split_frontmatter(content)[0].get("source_request")
+            except FrontmatterError:
+                _stamped = None
+            if _stamped != source_request:
+                raise ValueError(
+                    "source_request would not survive in the task's frontmatter "
+                    "(a field value probably contains '---'); task not created"
+                )
 
         # Write file — explicit utf-8 so Unicode titles (e.g. →, –, emoji) don't
         # raise UnicodeEncodeError on Windows where the default locale is cp1252.
@@ -3040,7 +3110,57 @@ def add_task(
         # reload-under-lock contract (CLAWP-051 Finding 5). The file was just
         # written under this lock, so the read can't race another clawpm writer;
         # retry_transient covers a scanner touching the fresh file (CLAWP-051).
-        return retry_transient(Task.from_file, file_path)
+        return retry_transient(Task.from_file, file_path), True
+
+
+def find_task_by_source_request(
+    config: PortfolioConfig, project_id: str, source_request: str
+) -> Task | None:
+    """Return the task whose frontmatter ``source_request`` equals the key, in any state.
+
+    CLAWP-101 retry guard for ``inbox materialize``. Scans every task file under
+    the project's tasks dir (open, progress, done, blocked, rejected); a cheap
+    substring pre-check avoids parsing files that cannot match.
+    """
+    tasks_dir = get_tasks_dir(config, project_id)
+    if not tasks_dir or not tasks_dir.exists():
+        return None
+    return _scan_source_request(tasks_dir, source_request)
+
+
+def _scan_source_request(tasks_dir: Path, source_request: str) -> Task | None:
+    """Scan ``tasks_dir`` for the task stamped with ``source_request`` (any state).
+
+    Returning ``None`` means "absent", and callers act on that by allocating a
+    new task, so it must only be returned when every file was actually read. A
+    read that still fails after ``retry_transient`` (a held Windows sharing
+    violation, an ACL denial) raises: the caller leaves the request pending
+    rather than failing open into a duplicate. A file that vanishes mid-scan
+    (a concurrent state-change rename) restarts the scan, since the stamped task
+    may have moved to a name this pass had not yet listed.
+    """
+    for _ in range(3):
+        vanished = False
+        for path in sorted(tasks_dir.rglob("*.md")):
+            try:
+                text = retry_transient(path.read_text, "utf-8")
+            except FileNotFoundError:
+                vanished = True
+                continue
+            if source_request not in text:
+                continue
+            try:
+                fm, _fm_body = split_frontmatter(text, where=str(path))
+            except FrontmatterError:
+                continue
+            if fm.get("source_request") == source_request:
+                return Task.from_file(path)
+        if not vanished:
+            return None
+    raise OSError(
+        f"task files under {tasks_dir} kept changing during the source_request scan; "
+        "cannot establish whether the request was already materialised"
+    )
 
 
 def edit_task(
