@@ -434,3 +434,50 @@ class TestBadTags:
         monkeypatch.setattr(Research, "from_file", staticmethod(weird))
         scan = scan_research(isolated_portfolio.config, "test", tags_filter=["x"])
         assert len(scan.malformed) == 1
+
+
+# ---------------------------------------------------------------------------
+# CLAWP-138: research add surfaces LockTimeout as a structured error
+# CLAWP-139: ids of enum-invalid files stay reserved
+# ---------------------------------------------------------------------------
+
+
+def _contended(*_a, **_k):
+    from clawpm.concurrency import LockTimeout
+
+    raise LockTimeout("busy")
+
+
+class TestResearchAddLockTimeout:
+    def test_cli_reports_structured_lock_timeout(self, isolated_portfolio, monkeypatch):
+        from clawpm.cli import main
+
+        monkeypatch.setattr("clawpm.cli.research.add_research", _contended)
+        res = CliRunner().invoke(
+            main,
+            ["--format", "json", "research", "add", "-p", "test", "-t", "spike",
+             "--title", "T", "--summary", "S"],
+        )
+        assert res.exit_code == 1
+        assert isinstance(res.exception, SystemExit)
+        assert json.loads(res.stderr.strip().splitlines()[-1])["error"] == "lock_timeout"
+
+    def test_mcp_registered_tool_reports_lock_timeout(self, isolated_portfolio, monkeypatch):
+        from clawpm import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_load_config", lambda: isolated_portfolio.config)
+        monkeypatch.setattr(mcp_server, "_resolve_project", lambda p: ("test", None))
+        monkeypatch.setattr("clawpm.research.add_research", _contended)
+        spec = next(s for s in mcp_server.TOOL_SPECS if s.name == "research_add")
+        out = mcp_server._catch_unhandled(spec.fn)(title="T", summary="S")
+        assert out["ok"] is False and out["error"] == "lock_timeout"
+
+
+class TestEnumInvalidIdReserved:
+    def test_bad_enum_file_id_is_not_reissued(self, isolated_portfolio):
+        (_research_dir(isolated_portfolio) / "e.md").write_text(
+            "---\nid: test-research-dup\ntype: nonsense\nstatus: bogus\n---\n# T\n",
+            encoding="utf-8",
+        )
+        item = add_research(isolated_portfolio.config, "test", "dup", ResearchType.SPIKE)
+        assert item.id == "test-research-dup-2"
