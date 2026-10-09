@@ -268,7 +268,10 @@ class TestAddSubtaskTwoPhase:
         config = temp_portfolio["config"]
         parent = add_task(config, "test", "Parent")
 
-        def boom(_parent_path, _child_id):
+        def boom(_parent_path, _child_id, **_kwargs):
+            # **_kwargs: CLAWP-111-002 added a keyword-only `remove_fog` param
+            # to the real _child_append_text; accept-and-ignore it here so this
+            # mock's signature doesn't drift from the production one.
             raise OSError("simulated failure building parent frontmatter")
 
         monkeypatch.setattr(tasks_mod, "_child_append_text", boom)
