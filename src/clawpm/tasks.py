@@ -1045,6 +1045,69 @@ def _restore_on_error(snapshots: list[tuple[Path, bytes]]):
         raise
 
 
+def _heal_source_from_dest(src: Path, dst: Path) -> list[str]:
+    """Copy back into ``src`` every file ``dst`` holds that ``src`` lost.
+
+    A half-finished ``shutil.move`` fallback (copy landed, source delete died
+    part-way) can leave files ONLY in ``dst``. Returns the relative paths that
+    could not be restored (empty on full success)."""
+    failed: list[str] = []
+    for f in sorted(p for p in dst.rglob("*") if p.is_file()):
+        rel = f.relative_to(dst)
+        target = src / rel
+        if target.exists():
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, target)
+        except OSError as exc:
+            logger.error("Could not restore '%s' into '%s': %s", rel, src, exc)
+            failed.append(str(rel))
+    return failed
+
+
+def _move_task_entry(src: Path, dst: Path) -> None:
+    """Move a task file/dir with ONE surviving copy on failure (CLAWP-143).
+
+    ``shutil.move`` falls back to copy-then-delete; if that dies after the copy
+    landed, both ``src`` and ``dst`` exist (task open AND done). On failure this
+    removes a ``dst`` THIS call created, but only once ``src`` is whole again
+    (a directory source that lost files is healed from ``dst`` first). A ``dst``
+    that pre-existed is never touched. If the source cannot be made whole the
+    destination is kept and a RuntimeError names what to fix by hand, so the
+    failure stays loud. The original error is always re-raised or chained."""
+    dst_existed = os.path.lexists(dst)
+    try:
+        retry_transient(shutil.move, str(src), str(dst))
+    except BaseException as exc:
+        if dst_existed or not os.path.lexists(dst):
+            raise
+        if not os.path.lexists(src):
+            # Source is gone: dst is the only copy and the move effectively
+            # completed. Keep it; the caller still sees the error.
+            raise
+        if dst.is_dir() and not dst.is_symlink():
+            unrestored = _heal_source_from_dest(src, dst)
+            if unrestored:
+                raise RuntimeError(
+                    f"Moving '{src}' to '{dst}' failed ({exc!r}) and the source "
+                    f"lost {', '.join(unrestored)}; the destination was left in "
+                    "place — reconcile the two by hand."
+                ) from exc
+        try:
+            if dst.is_dir() and not dst.is_symlink():
+                shutil.rmtree(dst)
+            else:
+                dst.unlink()
+        except OSError as rm_exc:
+            raise RuntimeError(
+                f"Moving '{src}' to '{dst}' failed ({exc!r}) and the partial "
+                f"destination could not be removed ({rm_exc!r}); delete '{dst}' "
+                "by hand — the source is intact."
+            ) from exc
+        raise
+
+
 def _apply_resolution(
     config: PortfolioConfig,
     project_id: str,
@@ -1254,7 +1317,7 @@ def change_task_state(
                     return retry_transient(Task.from_file, _task_md)
 
                 # (e) Move (retry transient Windows sharing/access faults — CLAWP-051)
-                retry_transient(shutil.move, str(task_dir), str(new_dir))
+                _move_task_entry(task_dir, new_dir)
 
             # (e.1) CLAWP-086 — stamp `updated` on the relocated file. REJECTED/
             #       DECISION already stamped via their own frontmatter writer
@@ -1338,7 +1401,7 @@ def change_task_state(
                 return retry_transient(Task.from_file, current_path)
 
             # (e) Move (retry transient Windows sharing/access faults — CLAWP-051)
-            retry_transient(shutil.move, str(current_path), str(new_path))
+            _move_task_entry(current_path, new_path)
 
         # (e.1) CLAWP-086 — stamp `updated` on the relocated file. REJECTED/
         #       DECISION already stamped via their own frontmatter writer
@@ -1485,7 +1548,7 @@ def archive_done_tasks(
                 rec["skipped"] = "source_vanished"
                 results.append(rec)
                 continue
-            retry_transient(shutil.move, str(entry), str(dest))
+            _move_task_entry(entry, dest)
             # Record only AFTER the move commits — the list never reports a move
             # that didn't happen (Grok review).
             results.append(rec)
@@ -3565,7 +3628,7 @@ def split_task(
         # Move file to _task.md inside directory (retry transient Windows
         # sharing/access faults on the rename — consistent with the other moves).
         new_path = task_dir / "_task.md"
-        retry_transient(shutil.move, str(current_path), str(new_path))
+        _move_task_entry(current_path, new_path)
 
         # CLAWP-086 — splitting a leaf into a parent dir is a structural mutation.
         _stamp_updated_file(new_path)
