@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 import uuid
 from dataclasses import dataclass, field
@@ -80,6 +81,8 @@ ALLOWED_ROOT_KEYS = frozenset(
 LEAF_KINDS = ("build", "decision")
 # depends_refs entry naming an already-existing task instead of a leaf ref.
 EXISTING_ID_PREFIX = "id:"
+# A canonical task id: no path separators or other alias syntax.
+_TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -363,7 +366,13 @@ def _validate_depends_refs(leaves: list[LeafSpec], ref_set: set[str]) -> None:
             local.append(dep)
         edges[lf.ref] = local
 
-    # Kahn's algorithm over dependency edges (dep -> dependent).
+    # The completion graph also has the implicit edge "a parent completes only
+    # after all its children": without it, C under P, C -> X, X -> P passes.
+    for lf in leaves:
+        if lf.parent_ref is not None:
+            edges[lf.parent_ref].append(lf.ref)
+
+    # Kahn's algorithm over completion edges (waited-on -> waiter).
     pending = {ref: len(deps) for ref, deps in edges.items()}
     dependents: dict[str, list[str]] = {ref: [] for ref in edges}
     for ref, deps in edges.items():
@@ -381,7 +390,8 @@ def _validate_depends_refs(leaves: list[LeafSpec], ref_set: set[str]) -> None:
     if done != len(edges):
         stuck = sorted(r for r, n in pending.items() if n > 0)
         raise EmitValidationError(
-            f"Cycle detected in depends_refs graph involving: {stuck!r}"
+            "Cycle detected in the completion graph (depends_refs plus "
+            f"parent-waits-on-children) involving: {stuck!r}"
         )
 
 
@@ -1086,20 +1096,53 @@ def _emit_tree_locked(
     # CLAWP-111-003 — dependency gates (read-only, so dry-run fails identically
     # to a real emit): id:<task> entries must name an existing task, and no
     # emitted leaf may depend on a leaf the won't-do gate just dropped.
+    # The root's existing ancestor chain (attach_to only; a new root has none):
+    # a leaf waiting on one of them deadlocks, since each completes only after
+    # its children.
+    existing_ancestors: set[str] = set()
+    if doc.root.attach_to:
+        walk: str | None = doc.root.attach_to
+        while walk and walk not in existing_ancestors:
+            existing_ancestors.add(walk)
+            anc = get_task(config, project_id, walk)
+            walk = anc.parent if anc else None
+    key_by_ref_gate = {lf.ref: lf.leaf_key for lf in doc.leaves}
+
+    def _check_dep_task(lf: LeafSpec, dep_id: str) -> None:
+        # Syntax + canonical-id match: get_task accepts aliases such as
+        # "CLAWP-111/_task" that would be persisted verbatim and never satisfied.
+        found = (
+            get_task(config, project_id, dep_id) if _TASK_ID_RE.match(dep_id) else None
+        )
+        if found is None or found.id != dep_id:
+            raise EmitValidationError(
+                f"Leaf ref={lf.ref!r} depends on {dep_id!r} which is not the id of an "
+                f"existing task in project {project_id!r}"
+            )
+        if dep_id in existing_ancestors:
+            raise EmitValidationError(
+                f"Leaf ref={lf.ref!r} depends on {dep_id!r}, an ancestor of the emit "
+                "root: it cannot complete before its children"
+            )
+        if found.state == TaskState.REJECTED:
+            raise EmitValidationError(
+                f"Leaf ref={lf.ref!r} depends on {dep_id!r} which is rejected "
+                "(won't-do) and can never complete"
+            )
+
     for lf in leaves_to_emit:
         for dep in lf.depends_refs:
             if dep.startswith(EXISTING_ID_PREFIX):
-                dep_id = dep[len(EXISTING_ID_PREFIX):].strip()
-                if get_task(config, project_id, dep_id) is None:
-                    raise EmitValidationError(
-                        f"Leaf ref={lf.ref!r} depends on {dep_id!r} which does not "
-                        f"exist in project {project_id!r}"
-                    )
+                _check_dep_task(lf, dep[len(EXISTING_ID_PREFIX):].strip())
             elif dep in rejected_refs:
                 raise EmitValidationError(
                     f"Leaf ref={lf.ref!r} depends on leaf {dep!r} which matched the "
                     "won't-do ledger (rejected) and will not be emitted"
                 )
+            elif key_by_ref_gate.get(dep) in already_emitted_keys:
+                # Re-emit: resolved by leaf_key, so check the state of the task
+                # found (the title-based reject-match misses a retitled leaf).
+                _check_dep_task(lf, already_emitted_keys[key_by_ref_gate[dep]])
 
     # Dry-run exits here — all gates have fired, no writes performed
     if dry_run:

@@ -112,9 +112,11 @@ body.
   leaf in the document, or `id:<task-id>` naming a task that already exists.
   Core resolves refs to the minted task ids and writes them as `depends`. Rejected
   (all fail validation; `--dry-run` fails identically and nothing is written): an
-  unknown ref, a self-dependency, a cycle, a leaf depending on its own
-  `parent_ref` ancestor, an `id:` that does not exist, and a dependency on a leaf
-  the won't-do gate dropped. A `ref` may not start with `id:`. On a re-emit via
+  unknown ref, a self-dependency, a cycle (the check includes the implicit
+  "parent completes after its children" edge), a leaf depending on its own
+  `parent_ref` ancestor or on an existing ancestor of the `attach_to` root, an
+  `id:` that is not a canonical existing task id (aliases such as `X/_task` fail),
+  and a dependency on a rejected task or on a leaf the won't-do gate dropped. A `ref` may not start with `id:`. On a re-emit via
   `attach_to`, a ref naming an already-emitted leaf resolves through its
   `leaf_key`.
 - **`root.destination`** (string) and **`root.not_yet_specified`** (list of

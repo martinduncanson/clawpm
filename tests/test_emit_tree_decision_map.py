@@ -488,3 +488,88 @@ class TestExamples:
         ).read_text(encoding="utf-8")
         for key in ("depends_refs", "destination", "not_yet_specified", "`kind`"):
             assert key in text, key
+
+
+class TestCompletionGraph:
+    """Codex r1 (PR #99): validation runs on the real completion graph."""
+
+    def _both_fail(self, iso, doc_raw, match):
+        before = _all_md(iso.tasks_dir)
+        doc = parse_emit_document(doc_raw)
+        for dry in (True, False):
+            with pytest.raises(_et.EmitValidationError, match=match):
+                emit_tree(iso.config, iso.project_id, doc, dry_run=dry)
+        assert _all_md(iso.tasks_dir) == before
+
+    def test_existing_id_dependency_on_attach_root_rejected(self, isolated_portfolio):
+        iso = isolated_portfolio
+        root = add_task(iso.config, iso.project_id, "Attach root")
+        self._both_fail(
+            iso,
+            _doc([_leaf("A", depends_refs=[f"id:{root.id}"])], root={"attach_to": root.id}),
+            "ancestor",
+        )
+
+    def test_existing_id_dependency_on_grandparent_rejected(self, isolated_portfolio):
+        iso = isolated_portfolio
+        first = _emit(iso, _doc([_leaf("P")]))
+        p_id = _by_leaf_key(first)["dm-P"]["id"]
+        self._both_fail(
+            iso,
+            _doc(
+                [_leaf("A", depends_refs=[f"id:{first.root_id}"])],
+                root={"attach_to": p_id},
+            ),
+            "ancestor",
+        )
+
+    def test_indirect_cycle_through_parent_edge_rejected(self):
+        with pytest.raises(_et.EmitValidationError, match="[Cc]ycle"):
+            parse_emit_document(
+                _doc(
+                    [
+                        _leaf("P"),
+                        _leaf("C", parent_ref="P", depends_refs=["X"]),
+                        _leaf("X", depends_refs=["P"]),
+                    ]
+                )
+            )
+
+    def test_reemit_dependency_on_retitled_rejected_leaf_fails(self, isolated_portfolio):
+        from clawpm.models import TaskState
+        from clawpm.tasks import change_task_state
+
+        iso = isolated_portfolio
+        first = _emit(iso, _doc([_leaf("A")]))
+        a_id = _by_leaf_key(first)["dm-A"]["id"]
+        change_task_state(iso.config, iso.project_id, a_id, TaskState.REJECTED, rationale="no")
+        # Same leaf_key, different title: the title-based gate cannot see it.
+        self._both_fail(
+            iso,
+            _doc(
+                [
+                    {**_leaf("A"), "title": "Retitled A"},
+                    _leaf("B", depends_refs=["A"]),
+                ],
+                root={"attach_to": first.root_id},
+            ),
+            "rejected",
+        )
+
+    def test_path_alias_id_rejected(self, isolated_portfolio):
+        iso = isolated_portfolio
+        parent = _emit(iso, _doc([_leaf("P"), _leaf("C", parent_ref="P")]))
+        p_id = _by_leaf_key(parent)["dm-P"]["id"]
+        for alias in (f"{p_id}/_task", f"{p_id}/", "../x"):
+            self._both_fail(
+                iso,
+                _doc([_leaf("Z", depends_refs=[f"id:{alias}"])]),
+                "not the id of an existing task",
+            )
+
+    def test_valid_existing_id_dependency_still_works(self, isolated_portfolio):
+        iso = isolated_portfolio
+        existing = add_task(iso.config, iso.project_id, "Existing blocker")
+        for dry in (True, False):
+            r = _emit(iso, _doc([_leaf(f"Z{int(dry)}", depends_refs=[f"id:{existing.id}"])]), dry_run=dry)
+            assert r.dry_run is dry
