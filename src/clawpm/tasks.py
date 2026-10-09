@@ -1046,66 +1046,97 @@ def _restore_on_error(snapshots: list[tuple[Path, bytes]]):
 
 
 def _heal_source_from_dest(src: Path, dst: Path) -> list[str]:
-    """Copy back into ``src`` every file ``dst`` holds that ``src`` lost.
+    """Restore into ``src`` every entry ``dst`` holds that ``src`` lost.
 
-    A half-finished ``shutil.move`` fallback (copy landed, source delete died
-    part-way) can leave files ONLY in ``dst``. Returns the relative paths that
-    could not be restored (empty on full success)."""
+    A half-finished ``shutil.move`` fallback (copy landed with ``symlinks=True``,
+    source delete died part-way) can leave entries ONLY in ``dst``: files,
+    directories (including empty ones) and symlinks (including dangling ones).
+    Entries are judged by ``lexists`` and never followed, and symlinks are
+    restored as symlinks. Returns the relative paths that could not be restored
+    (empty on full success)."""
     failed: list[str] = []
-    for f in sorted(p for p in dst.rglob("*") if p.is_file()):
-        rel = f.relative_to(dst)
-        target = src / rel
-        if target.exists():
-            continue
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(f, target)
-        except OSError as exc:
-            logger.error("Could not restore '%s' into '%s': %s", rel, src, exc)
-            failed.append(str(rel))
+    for root, dirnames, filenames in os.walk(dst, followlinks=False):
+        rel_root = Path(root).relative_to(dst)
+        for name in sorted(dirnames + filenames):
+            entry = Path(root) / name
+            rel = rel_root / name
+            target = src / rel
+            if os.path.lexists(target):
+                continue
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if entry.is_symlink():
+                    os.symlink(os.readlink(entry), target)
+                elif entry.is_dir():
+                    target.mkdir()
+                else:
+                    shutil.copy2(entry, target)
+            except OSError as exc:
+                logger.error("Could not restore '%s' into '%s': %s", rel, src, exc)
+                failed.append(str(rel))
     return failed
+
+
+def _dest_entries_missing_from_source(src: Path, dst: Path) -> list[str]:
+    """Relative paths present (by ``lexists``) in ``dst`` but absent from ``src``.
+    Gate for deleting ``dst``: it may only go once this is empty."""
+    return [
+        str(Path(root).relative_to(dst) / name)
+        for root, dirnames, filenames in os.walk(dst, followlinks=False)
+        for name in dirnames + filenames
+        if not os.path.lexists(src / Path(root).relative_to(dst) / name)
+    ]
 
 
 def _move_task_entry(src: Path, dst: Path) -> None:
     """Move a task file/dir with ONE surviving copy on failure (CLAWP-143).
 
     ``shutil.move`` falls back to copy-then-delete; if that dies after the copy
-    landed, both ``src`` and ``dst`` exist (task open AND done). On failure this
-    removes a ``dst`` THIS call created, but only once ``src`` is whole again
-    (a directory source that lost files is healed from ``dst`` first). A ``dst``
-    that pre-existed is never touched. If the source cannot be made whole the
-    destination is kept and a RuntimeError names what to fix by hand, so the
-    failure stays loud. The original error is always re-raised or chained."""
+    landed, both ``src`` and ``dst`` exist (task open AND done). Recovery runs
+    inside EACH attempt, before ``retry_transient`` may retry, so a retry never
+    meets a leftover ``dst`` (``shutil.move`` would nest the source inside it
+    and "succeed"). Recovery removes a ``dst`` THIS call created, but only once
+    every ``dst`` entry is verifiably present in ``src`` again (a directory
+    source that lost entries is healed from ``dst`` first). A ``dst`` that
+    pre-existed is never touched. When unsure, the destination is kept and a
+    RuntimeError names what to fix by hand, so the failure stays loud. The
+    original error is otherwise re-raised."""
     dst_existed = os.path.lexists(dst)
-    try:
-        retry_transient(shutil.move, str(src), str(dst))
-    except BaseException as exc:
-        if dst_existed or not os.path.lexists(dst):
-            raise
-        if not os.path.lexists(src):
-            # Source is gone: dst is the only copy and the move effectively
-            # completed. Keep it; the caller still sees the error.
-            raise
-        if dst.is_dir() and not dst.is_symlink():
-            unrestored = _heal_source_from_dest(src, dst)
-            if unrestored:
-                raise RuntimeError(
-                    f"Moving '{src}' to '{dst}' failed ({exc!r}) and the source "
-                    f"lost {', '.join(unrestored)}; the destination was left in "
-                    "place — reconcile the two by hand."
-                ) from exc
+
+    def _attempt() -> None:
         try:
-            if dst.is_dir() and not dst.is_symlink():
-                shutil.rmtree(dst)
-            else:
-                dst.unlink()
-        except OSError as rm_exc:
-            raise RuntimeError(
-                f"Moving '{src}' to '{dst}' failed ({exc!r}) and the partial "
-                f"destination could not be removed ({rm_exc!r}); delete '{dst}' "
-                "by hand — the source is intact."
-            ) from exc
-        raise
+            shutil.move(str(src), str(dst))
+        except BaseException as exc:
+            if dst_existed or not os.path.lexists(dst):
+                raise
+            if not os.path.lexists(src):
+                # Source is gone: dst is the only copy and the move effectively
+                # completed. Keep it; the caller still sees the error.
+                raise
+            is_tree = dst.is_dir() and not dst.is_symlink()
+            if is_tree:
+                _heal_source_from_dest(src, dst)
+                missing = _dest_entries_missing_from_source(src, dst)
+                if missing:
+                    raise RuntimeError(
+                        f"Moving '{src}' to '{dst}' failed ({exc!r}) and the "
+                        f"source lost {', '.join(missing)}; the destination was "
+                        "left in place — reconcile the two by hand."
+                    ) from exc
+            try:
+                if is_tree:
+                    shutil.rmtree(dst)
+                else:
+                    dst.unlink()
+            except OSError as rm_exc:
+                raise RuntimeError(
+                    f"Moving '{src}' to '{dst}' failed ({exc!r}) and the partial "
+                    f"destination could not be removed ({rm_exc!r}); delete "
+                    f"'{dst}' by hand — the source is intact."
+                ) from exc
+            raise
+
+    retry_transient(_attempt)
 
 
 def _apply_resolution(

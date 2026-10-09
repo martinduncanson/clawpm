@@ -221,3 +221,129 @@ class TestPreexistingDestinationUntouched:
             change_task_state(config, "mv143", task.id, TaskState.DONE, force=True)
 
         assert stale.read_text(encoding="utf-8") == "pre-existing stale file\n"
+
+
+def _can_symlink(tmp_path: Path) -> bool:
+    try:
+        (tmp_path / "_probe_target").write_text("x", encoding="utf-8")
+        os.symlink(tmp_path / "_probe_target", tmp_path / "_probe_link")
+        return True
+    except (OSError, NotImplementedError):
+        return False
+
+
+def _copy_symlinks_then_delete_entries_then_raise(src, dst, *a, **k):
+    """shutil.move's real fallback copies with symlinks=True; then the source
+    delete removes a directory, a file symlink and a dangling symlink and dies."""
+    src, dst = Path(src), Path(dst)
+    shutil.copytree(src, dst, symlinks=True)
+    shutil.rmtree(src / "emptydir")
+    (src / "filelink").unlink()
+    (src / "dangling").unlink()
+    raise OSError(errno.EIO, "simulated delete failure")
+
+
+class TestSymlinkAndEmptyDirRecovery:
+    def _setup(self, tmp_path, monkeypatch):
+        if not _can_symlink(tmp_path):
+            pytest.skip("symlinks unavailable on this host")
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch)
+        config = load_portfolio_config(tmp_path)
+        parent = add_task(config, "mv143", "Parent")
+        add_subtask(config, "mv143", parent.id, "Child")
+        src = tasks_dir / parent.id
+        (src / "emptydir").mkdir()
+        (src / "target.txt").write_text("t\n", encoding="utf-8")
+        os.symlink("target.txt", src / "filelink")
+        os.symlink("no-such-target", src / "dangling")
+        return tasks_dir, config, parent, src
+
+    def test_symlinks_and_empty_dirs_are_restored_as_themselves(
+        self, tmp_path, monkeypatch
+    ):
+        tasks_dir, config, parent, src = self._setup(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            tasks_module.shutil, "move", _copy_symlinks_then_delete_entries_then_raise
+        )
+        with pytest.raises(OSError, match="simulated delete failure"):
+            change_task_state(config, "mv143", parent.id, TaskState.DONE, force=True)
+
+        assert (src / "emptydir").is_dir()
+        assert (src / "filelink").is_symlink()
+        assert os.readlink(src / "filelink") == "target.txt"
+        assert (src / "dangling").is_symlink()
+        assert os.readlink(src / "dangling") == "no-such-target"
+        assert not (tasks_dir / "done" / parent.id).exists()
+
+    def test_destination_kept_when_an_entry_cannot_be_restored(
+        self, tmp_path, monkeypatch
+    ):
+        tasks_dir, config, parent, src = self._setup(tmp_path, monkeypatch)
+        def _no_symlink(*a, **k):
+            raise OSError(errno.EPERM, "no symlink privilege")
+
+        def _move_then_lose_symlink_privilege(src_, dst, *a, **k):
+            try:
+                _copy_symlinks_then_delete_entries_then_raise(src_, dst)
+            finally:
+                # Only recovery (not the simulated copy) sees the missing privilege.
+                monkeypatch.setattr(tasks_module.os, "symlink", _no_symlink)
+
+        monkeypatch.setattr(tasks_module.shutil, "move", _move_then_lose_symlink_privilege)
+        with pytest.raises(RuntimeError, match="reconcile|by hand"):
+            change_task_state(config, "mv143", parent.id, TaskState.DONE, force=True)
+
+        dest = tasks_dir / "done" / parent.id
+        assert os.path.lexists(dest / "filelink")
+        assert os.path.lexists(dest / "dangling")
+
+
+class TestTransientRetryDoesNotNest:
+    @staticmethod
+    def _transient():
+        err = OSError("transient sharing violation")
+        err.winerror = 32  # ERROR_SHARING_VIOLATION: retry_transient retries this
+        return err
+
+    def test_transient_after_copy_recovers_before_retry(self, tmp_path, monkeypatch):
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch)
+        config = load_portfolio_config(tmp_path)
+        parent = add_task(config, "mv143", "Parent")
+        add_subtask(config, "mv143", parent.id, "Child")
+        real_move = shutil.move
+        calls = {"n": 0}
+
+        def _flaky(src, dst, *a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                shutil.copytree(src, dst)
+                raise self._transient()
+            return real_move(src, dst, *a, **k)
+
+        monkeypatch.setattr(tasks_module.shutil, "move", _flaky)
+        assert change_task_state(config, "mv143", parent.id, TaskState.DONE, force=True)
+
+        dest = tasks_dir / "done" / parent.id
+        assert calls["n"] == 2
+        assert (dest / "_task.md").exists()
+        assert not (dest / parent.id).exists(), "retry must not nest src inside dst"
+        assert not (tasks_dir / parent.id).exists()
+        assert [p for p in _copies(tasks_dir, parent.id) if p.is_dir()] == [dest]
+
+    def test_persistent_transient_after_copy_leaves_one_whole_copy(
+        self, tmp_path, monkeypatch
+    ):
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch)
+        config = load_portfolio_config(tmp_path)
+        task = add_task(config, "mv143", "Leaf")
+        src = tasks_dir / f"{task.id}.md"
+
+        def _always(src_, dst, *a, **k):
+            shutil.copy2(src_, dst)
+            raise self._transient()
+
+        monkeypatch.setattr(tasks_module.shutil, "move", _always)
+        with pytest.raises(OSError, match="transient sharing violation"):
+            change_task_state(config, "mv143", task.id, TaskState.DONE, force=True)
+
+        assert _copies(tasks_dir, task.id) == [src]
