@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import logging
-import filecmp
 import os
 import re
-import shutil
 import uuid
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
@@ -680,7 +678,7 @@ def _stamp_updated_file(file_path: Path, when: str | None = None) -> None:
     well-formed frontmatter fence is left untouched.
 
     The read is wrapped in ``retry_transient`` (Codex review): this runs right
-    after a successful ``shutil.move`` under the lock, so an un-retried read
+    after a successful move under the lock, so an un-retried read
     could hit the same transient Windows sharing/access fault the surrounding
     move/reload path already retries — raising after the move had committed and
     leaving state + work-log inconsistent.
@@ -1046,161 +1044,27 @@ def _restore_on_error(snapshots: list[tuple[Path, bytes]]):
         raise
 
 
-def _walk_entries(root: Path) -> list[tuple[Path, Path]]:
-    """Every ``(relative, absolute)`` entry under ``root``, links not followed.
-
-    FAIL CLOSED: an unreadable directory raises (``os.walk`` would otherwise
-    skip it silently, making a lossy tree look complete)."""
-    def _raise(exc: OSError) -> None:
-        raise exc
-
-    out: list[tuple[Path, Path]] = []
-    for cur, dirnames, filenames in os.walk(root, onerror=_raise, followlinks=False):
-        for name in sorted(dirnames + filenames):
-            entry = Path(cur) / name
-            out.append((entry.relative_to(root), entry))
-    return out
-
-
-def _is_dir_link(link: Path) -> bool:
-    """Kind of a symlink itself. On Windows read it from the link's own
-    attributes (a dangling directory link is still directory-kind); elsewhere
-    links have no kind, so follow the target."""
-    attrs = getattr(os.lstat(link), "st_file_attributes", None)
-    if attrs is not None:
-        return bool(attrs & 0x10)  # FILE_ATTRIBUTE_DIRECTORY
-    return os.path.isdir(link)
-
-
-def _entry_mismatch(src_entry: Path, dst_entry: Path) -> str | None:
-    """Why ``src_entry`` is not a faithful copy of ``dst_entry`` (None if it is).
-
-    Compares type, symlink target and kind (file vs directory link), and for
-    regular files size and content. Any doubt is a mismatch."""
-    if not os.path.lexists(src_entry):
-        return "missing"
-    d_link, s_link = dst_entry.is_symlink(), src_entry.is_symlink()
-    if d_link or s_link:
-        if not (d_link and s_link):
-            return "type differs"
-        if os.readlink(dst_entry) != os.readlink(src_entry):
-            return "link target differs"
-        if _is_dir_link(dst_entry) != _is_dir_link(src_entry):
-            return "link kind differs"
-        return None
-    if dst_entry.is_dir() or src_entry.is_dir():
-        return None if (dst_entry.is_dir() and src_entry.is_dir()) else "type differs"
-    if not (dst_entry.is_file() and src_entry.is_file()):
-        return "type differs"
-    if dst_entry.stat().st_size != src_entry.stat().st_size:
-        return "size differs"
-    if not filecmp.cmp(src_entry, dst_entry, shallow=False):
-        return "content differs"
-    return None
-
-
-def _restore_entry(src_entry: Path, dst_entry: Path) -> None:
-    """Recreate ``dst_entry`` at ``src_entry``. Files and links are built under a
-    temp name in the same directory and ``os.replace``d in, so a failed copy can
-    never leave a truncated file at the final name."""
-    src_entry.parent.mkdir(parents=True, exist_ok=True)
-    if dst_entry.is_symlink():
-        tmp = src_entry.with_name(src_entry.name + ".clawpm-restore-tmp")
-        link_target = os.readlink(dst_entry)
-        # Windows has file-kind and directory-kind links and the original kind
-        # is gone with the source. Trust it only when the destination link and
-        # the target as seen from the source side agree; otherwise fail closed.
-        is_dir_link = _is_dir_link(dst_entry)
-        if is_dir_link != os.path.isdir(src_entry.parent / link_target):
-            raise RuntimeError(
-                f"cannot determine whether '{src_entry}' was a directory or a "
-                "file link"
-            )
-        try:
-            os.symlink(link_target, tmp, target_is_directory=is_dir_link)
-            os.replace(tmp, src_entry)
-        finally:
-            if os.path.lexists(tmp):
-                tmp.unlink()
-    elif dst_entry.is_dir():
-        src_entry.mkdir()
-    else:
-        tmp = src_entry.with_name(src_entry.name + ".clawpm-restore-tmp")
-        try:
-            shutil.copy2(dst_entry, tmp)
-            os.replace(tmp, src_entry)
-        finally:
-            if os.path.lexists(tmp):
-                tmp.unlink()
-
-
-def _prove_source_complete(src: Path, dst: Path) -> None:
-    """Heal ``src`` from ``dst`` where entries are absent, then verify EVERY
-    ``dst`` entry (and the root) against ``src``. Raises on any mismatch, error
-    or doubt; returns only when the source is proven a faithful copy."""
-    entries = _walk_entries(dst) if dst.is_dir() and not dst.is_symlink() else []
-    # Links last: their kind is judged against the already-healed targets.
-    for rel, d_entry in sorted(entries, key=lambda e: e[1].is_symlink()):
-        target = src / rel
-        if not os.path.lexists(target):
-            _restore_entry(target, d_entry)
-    problems = []
-    for rel, d_entry in [(Path("."), dst), *entries]:
-        why = _entry_mismatch(src / rel, d_entry)
-        if why:
-            problems.append(f"{rel} ({why})")
-    if problems:
-        raise RuntimeError(f"source differs from destination: {', '.join(problems)}")
-
-
 def _move_task_entry(src: Path, dst: Path) -> None:
-    """Move a task file/dir with ONE surviving copy on failure (CLAWP-143).
+    """Move a task file/dir with one atomic rename (CLAWP-143).
 
-    ``shutil.move`` falls back to copy-then-delete; if that dies after the copy
-    landed, both ``src`` and ``dst`` exist (task open AND done). Recovery runs
-    inside EACH attempt, before ``retry_transient`` may retry, so a retry never
-    meets a leftover ``dst`` (``shutil.move`` would nest the source inside it
-    and "succeed").
-
-    Invariant: a ``dst`` THIS call created is deleted only if verification
-    PROVES ``src`` complete (``_prove_source_complete``). Any error or doubt on
-    the heal/verify path keeps BOTH copies and raises a RuntimeError naming what
-    to reconcile by hand (fail closed). A ``dst`` that pre-existed is never
-    touched. Otherwise the original error is re-raised."""
-    dst_existed = os.path.lexists(dst)
-
-    def _attempt() -> None:
-        try:
-            shutil.move(str(src), str(dst))
-        except BaseException as exc:
-            if dst_existed or not os.path.lexists(dst):
-                raise
-            if not os.path.lexists(src):
-                # Source is gone: dst is the only copy and the move effectively
-                # completed. Keep it; the caller still sees the error.
-                raise
-            try:
-                _prove_source_complete(src, dst)
-            except Exception as verify_exc:  # noqa: BLE001 - fail closed
-                raise RuntimeError(
-                    f"Moving '{src}' to '{dst}' failed ({exc!r}) and the source "
-                    f"could not be proven complete ({verify_exc!r}); BOTH copies "
-                    "were left in place — reconcile them by hand."
-                ) from exc
-            try:
-                if dst.is_dir() and not dst.is_symlink():
-                    shutil.rmtree(dst)
-                else:
-                    dst.unlink()
-            except OSError as rm_exc:
-                raise RuntimeError(
-                    f"Moving '{src}' to '{dst}' failed ({exc!r}) and the partial "
-                    f"destination could not be removed ({rm_exc!r}); delete "
-                    f"'{dst}' by hand — the source is intact."
-                ) from exc
-            raise
-
-    retry_transient(_attempt)
+    Task moves stay on one volume, so ``os.rename`` is atomic: either ``dst``
+    exists and ``src`` is gone, or nothing changed. ``shutil.move`` is avoided
+    because its copy-then-delete fallback can leave BOTH copies (task open AND
+    done). A failed rename (including a cross-device error) raises with the
+    source untouched. An existing ``dst`` is refused, never nested or merged;
+    ``retry_transient`` wraps only the atomic rename, so a retry is safe."""
+    if os.path.lexists(dst):
+        raise FileExistsError(
+            f"Refusing to move '{src}': destination '{dst}' already exists. "
+            "Reconcile the two by hand."
+        )
+    try:
+        retry_transient(os.rename, src, dst)
+    except OSError as exc:
+        exc.add_note(
+            f"Atomic move of '{src}' to '{dst}' failed; the source is untouched."
+        )
+        raise
 
 
 def _apply_resolution(
