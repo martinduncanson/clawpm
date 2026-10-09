@@ -1317,10 +1317,9 @@ def _emit_tree_locked(
         if _emitted_task.predictions.is_empty():
             continue
         try:
-            from .reflect import write_prediction_event
-            write_prediction_event(
+            from .reflect import reconcile_prediction_event
+            reconcile_prediction_event(
                 config.portfolio_root,
-                event="prediction_registered",
                 task_id=_emitted_task.id,
                 project_id=project_id,
                 prediction_id=_emitted_task.predictions.prediction_id,

@@ -255,6 +255,84 @@ def write_prediction_event(
     return ref_file
 
 
+def _normalize_prediction_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Drop ``None`` / empty-list values so a task-file block and a
+    ``Predictions.to_dict()`` snapshot of the same content compare equal."""
+    return {k: v for k, v in snapshot.items() if v is not None and v != []}
+
+
+def latest_prediction_snapshot(
+    portfolio_root: Path, task_id: str, prediction_id: str
+) -> dict[str, Any] | None:
+    """Return the ``predictions`` snapshot of the newest registered/revised
+    ledger event for ``prediction_id`` on ``task_id``, or ``None`` if the
+    ledger holds none (CLAWP-112-001).
+
+    Corrupt lines are skipped; an unreadable file raises (loud, never a
+    silent "nothing registered").
+    """
+    ref_file = _reflections_dir(portfolio_root) / f"{task_id}.jsonl"
+    if not ref_file.exists():
+        return None
+    latest: dict[str, Any] | None = None
+    for line in ref_file.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(rec, dict)
+            and rec.get("event") in ("prediction_registered", "prediction_revised")
+            and rec.get("prediction_id") == prediction_id
+            and isinstance(rec.get("predictions"), dict)
+        ):
+            latest = rec["predictions"]
+    return latest
+
+
+def reconcile_prediction_event(
+    portfolio_root: Path,
+    *,
+    task_id: str,
+    project_id: str,
+    prediction_id: str,
+    predictions: dict[str, Any],
+    filled_by: str | None = None,
+    baseline_ref: str | None = None,
+) -> str | None:
+    """Make the ledger's newest snapshot for ``prediction_id`` match
+    ``predictions``; return the event kind appended, or ``None`` if already
+    in sync (CLAWP-112-001).
+
+    The register/revise decision is made against the LEDGER, not against
+    whether the task file changed. So when a ledger append fails after the
+    task file was saved, an identical retry still sees "ledger is behind" and
+    appends the missing event — exactly once, and never a duplicate on a
+    repeated identical edit after success. Errors propagate (loud).
+    """
+    current = latest_prediction_snapshot(portfolio_root, task_id, prediction_id)
+    wanted = _normalize_prediction_snapshot(predictions)
+    if current is None:
+        kind = "prediction_registered"
+    elif _normalize_prediction_snapshot(current) != wanted:
+        kind = "prediction_revised"
+    else:
+        return None
+    write_prediction_event(
+        portfolio_root,
+        event=kind,
+        task_id=task_id,
+        project_id=project_id,
+        prediction_id=prediction_id,
+        predictions=wanted,
+        filled_by=filled_by,
+        baseline_ref=baseline_ref,
+    )
+    return kind
+
+
 def resolve_prediction_registration(
     record: dict[str, Any],
     task_created: str | None = None,

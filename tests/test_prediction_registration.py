@@ -492,3 +492,124 @@ class TestBlockedEventCarriesPredictionId:
         blocked = [e for e in events if e["event"] == "task_blocked"]
         assert len(blocked) == 1
         assert blocked[0]["prediction_id"] == task.predictions.prediction_id
+
+
+# ---------------------------------------------------------------------------
+# Codex r1 — ledger convergence + immutable prediction_id
+# ---------------------------------------------------------------------------
+
+
+def _fail_once(monkeypatch):
+    """Make the first write_prediction_event raise, then behave normally."""
+    import clawpm.reflect as reflect_mod
+
+    real = reflect_mod.write_prediction_event
+    state = {"calls": 0}
+
+    def _flaky(*args, **kwargs):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            raise OSError("simulated ledger append failure")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(reflect_mod, "write_prediction_event", _flaky)
+
+
+class TestLedgerConvergesAfterAppendFailure:
+    def test_edit_registration_retry_appends_exactly_one_event(self, temp_portfolio, monkeypatch):
+        config = temp_portfolio["config"]
+        task = add_task(config, "test", "No predictions yet")
+        _fail_once(monkeypatch)
+        preds = Predictions(confidence=4, approach="retry me")
+
+        with pytest.raises(OSError):
+            edit_task(config, "test", task.id, predictions=preds)
+        assert _reflection_events(temp_portfolio["root"], task.id) == []
+
+        edit_task(config, "test", task.id, predictions=Predictions(confidence=4, approach="retry me"))
+        edit_task(config, "test", task.id, predictions=Predictions(confidence=4, approach="retry me"))
+
+        events = _reflection_events(temp_portfolio["root"], task.id)
+        assert [e["event"] for e in events] == ["prediction_registered"]
+        stored = get_task(config, "test", task.id)
+        assert events[0]["prediction_id"] == stored.predictions.prediction_id
+
+    def test_edit_revision_retry_appends_exactly_one_revision(self, temp_portfolio, monkeypatch):
+        config = temp_portfolio["config"]
+        task = add_task(config, "test", "T", predictions=Predictions(duration_min=30, confidence=2))
+        _fail_once(monkeypatch)
+
+        with pytest.raises(OSError):
+            edit_task(config, "test", task.id, predictions=Predictions(confidence=5))
+        edit_task(config, "test", task.id, predictions=Predictions(confidence=5))
+        edit_task(config, "test", task.id, predictions=Predictions(confidence=5))
+
+        events = _reflection_events(temp_portfolio["root"], task.id)
+        assert [e["event"] for e in events] == ["prediction_registered", "prediction_revised"]
+        assert events[1]["predictions"]["confidence"] == 5
+        assert events[1]["predictions"]["duration_min"] == 30
+
+    def test_add_task_failed_append_repaired_by_identical_edit(self, temp_portfolio, monkeypatch):
+        config = temp_portfolio["config"]
+        _fail_once(monkeypatch)
+        with pytest.raises(OSError):
+            add_task(config, "test", "Orphan", task_id="ORPH-001",
+                     predictions=Predictions(duration_min=10, confidence=3))
+        stored = get_task(config, "test", "ORPH-001")
+        assert stored is not None and stored.predictions.prediction_id
+        assert _reflection_events(temp_portfolio["root"], "ORPH-001") == []
+
+        edit_task(config, "test", "ORPH-001", predictions=Predictions(confidence=3))
+
+        events = _reflection_events(temp_portfolio["root"], "ORPH-001")
+        assert [e["event"] for e in events] == ["prediction_registered"]
+        assert events[0]["prediction_id"] == stored.predictions.prediction_id
+
+    def test_repeated_identical_edits_after_success_append_nothing(self, temp_portfolio):
+        config = temp_portfolio["config"]
+        task = add_task(config, "test", "T")
+        for _ in range(3):
+            edit_task(config, "test", task.id, predictions=Predictions(confidence=4))
+        events = _reflection_events(temp_portfolio["root"], task.id)
+        assert [e["event"] for e in events] == ["prediction_registered"]
+
+    def test_emit_tree_failure_marker_visible_and_edit_repairs(self, temp_portfolio, monkeypatch):
+        import clawpm.reflect as reflect_mod
+
+        real = reflect_mod.write_prediction_event
+        monkeypatch.setattr(
+            reflect_mod, "write_prediction_event",
+            lambda *a, **k: (_ for _ in ()).throw(OSError("boom")),
+        )
+        raw = {
+            "schema_version": 1,
+            "root": {"title": "Root", "predictions": {"duration_min": 300, "confidence": 3}},
+            "leaves": [
+                {"ref": "L1", "parent_ref": None, "title": "Leaf", "leaf_key": "conv-L1"}
+            ],
+        }
+        result = emit_tree(temp_portfolio["config"], "test", parse_emit_document(raw))
+        assert [f["task_id"] for f in result.registration_failures] == [result.root_id]
+
+        monkeypatch.setattr(reflect_mod, "write_prediction_event", real)
+        edit_task(temp_portfolio["config"], "test", result.root_id,
+                  predictions=Predictions(confidence=3))
+        events = _reflection_events(temp_portfolio["root"], result.root_id)
+        assert [e["event"] for e in events] == ["prediction_registered"]
+
+
+class TestPredictionIdImmutable:
+    def test_edit_with_different_incoming_id_keeps_stored_id(self, temp_portfolio):
+        config = temp_portfolio["config"]
+        task = add_task(config, "test", "T", predictions=Predictions(duration_min=30, confidence=2))
+        original = task.predictions.prediction_id
+
+        edited = edit_task(
+            config, "test", task.id,
+            predictions=Predictions(confidence=5, prediction_id="attacker-chosen-id"),
+        )
+
+        assert edited.predictions.prediction_id == original
+        events = _reflection_events(temp_portfolio["root"], task.id)
+        assert {e["prediction_id"] for e in events} == {original}
+        assert [e["event"] for e in events] == ["prediction_registered", "prediction_revised"]

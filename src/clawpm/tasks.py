@@ -2740,10 +2740,9 @@ def add_task(
         # predictions snapshot in the reflection JSONL (separate lock file,
         # so this can't deadlock against the tasks-dir lock held above).
         if predictions and not predictions.is_empty():
-            from .reflect import write_prediction_event
-            write_prediction_event(
+            from .reflect import reconcile_prediction_event
+            reconcile_prediction_event(
                 config.portfolio_root,
-                event="prediction_registered",
                 task_id=task_id,
                 project_id=project_id,
                 prediction_id=predictions.prediction_id,
@@ -2861,7 +2860,7 @@ def edit_task(
         # (non-None, non-empty-list in `pred_dict`) overwrite the prior value;
         # everything else — including `prediction_id`, which this code path
         # never sets directly — carries forward untouched.
-        _prediction_event: tuple[str, dict[str, Any]] | None = None
+        _reconcile_predictions: dict[str, Any] | None = None
         if predictions is not None:
             existing_predictions = frontmatter.get("predictions")
             if not isinstance(existing_predictions, dict):
@@ -2872,18 +2871,21 @@ def edit_task(
                 pred_dict = predictions.to_dict()
                 merged = dict(existing_predictions)
                 for k, v in pred_dict.items():
+                    # prediction_id is immutable once stored: it is the stable
+                    # link between registration, revisions and resolution, so
+                    # an incoming Predictions object must never replace it.
+                    if k == "prediction_id":
+                        continue
                     if v is not None and v != []:
                         merged[k] = v
-                had_prediction_id = bool(existing_predictions.get("prediction_id"))
-                if not had_prediction_id:
-                    merged["prediction_id"] = uuid.uuid4().hex
+                if not merged.get("prediction_id"):
+                    merged["prediction_id"] = pred_dict.get("prediction_id") or uuid.uuid4().hex
                 frontmatter["predictions"] = merged
-                # A no-op edit (every passed value already stored) is not a
-                # revision — don't pollute the pre-registration ledger.
-                if not had_prediction_id:
-                    _prediction_event = ("prediction_registered", merged)
-                elif merged != existing_predictions:
-                    _prediction_event = ("prediction_revised", merged)
+                # The ledger decides register / revise / nothing (reconciled
+                # after the save), so an identical retry of an edit whose
+                # ledger append failed still converges, and a no-op edit
+                # after success appends nothing.
+                _reconcile_predictions = merged
         # CLAWP-054 — contract fields
         if out_of_scope is not None:
             if out_of_scope:
@@ -2944,19 +2946,17 @@ def edit_task(
             tmp_path.unlink(missing_ok=True)
             raise
 
-        # CLAWP-112-001 — the task file is now durable; record either the
-        # first registration or a revision of its predictions snapshot.
-        if _prediction_event is not None:
-            from .reflect import write_prediction_event
-            event_kind, merged_predictions = _prediction_event
-            write_prediction_event(
+        # CLAWP-112-001 — the task file is now durable; bring the ledger in
+        # line with it (registration or revision, decided from the ledger).
+        if _reconcile_predictions is not None:
+            from .reflect import reconcile_prediction_event
+            reconcile_prediction_event(
                 config.portfolio_root,
-                event=event_kind,
                 task_id=task_id,
                 project_id=project_id,
-                prediction_id=merged_predictions.get("prediction_id"),
-                predictions=merged_predictions,
-                filled_by=merged_predictions.get("filled_by"),
+                prediction_id=_reconcile_predictions["prediction_id"],
+                predictions=_reconcile_predictions,
+                filled_by=_reconcile_predictions.get("filled_by"),
                 baseline_ref=frontmatter.get("baseline_ref"),
             )
 
@@ -3414,10 +3414,9 @@ def add_subtask(
         # predictions snapshot (separate lock file from the tasks-dir lock
         # held above, so no deadlock risk).
         if predictions and not predictions.is_empty():
-            from .reflect import write_prediction_event
-            write_prediction_event(
+            from .reflect import reconcile_prediction_event
+            reconcile_prediction_event(
                 config.portfolio_root,
-                event="prediction_registered",
                 task_id=subtask_id,
                 project_id=project_id,
                 prediction_id=predictions.prediction_id,
