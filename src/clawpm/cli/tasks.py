@@ -947,6 +947,7 @@ def tasks_decompose(
          "match graduates: the subtask is created and that entry is removed "
          "from the parent, atomically. Zero or multiple matches creates "
          "nothing and errors listing the candidates.",
+)
 # CLAWP-111 — decision-kind tasks
 @click.option(
     "--kind", "kind",

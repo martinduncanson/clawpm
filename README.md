@@ -381,6 +381,8 @@ clawpm tasks state 72 73 74 done    # bulk mode (CLAWP-083): per-task isolation,
 clawpm tasks state <id> rejected --rationale "reason"   # add to won't-do ledger (reject one at a time)
 clawpm tasks add -t "Pick a DB" --kind decision                 # decision task (CLAWP-111): done requires --resolution
 clawpm done <id> --resolution "Postgres, for JSONB"        # records resolution; a decision appends a line under the parent's ## Decisions so far (optional, stored, for build tasks)
+clawpm tasks fog <root> --add "open question"      # root-map fog list (CLAWP-111-002); --drop removes an exact entry
+clawpm tasks add -t "..." --parent <root> --graduates "open q"  # graduate one fog entry (exact/prefix) into this child; 0 or many matches create nothing
 clawpm tasks split <id>             # Convert to parent directory for subtasks
 ```
 

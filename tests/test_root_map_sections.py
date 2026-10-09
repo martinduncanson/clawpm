@@ -448,3 +448,16 @@ class TestFogCommand:
         )
         assert result.exit_code == 1
         assert json.loads(result.output)["error"] == "task_not_found"
+
+
+class TestShowWiring:
+    def test_tasks_show_text_renders_map_sections(self, isolated_portfolio):
+        root = _make_root_with_fog(isolated_portfolio, ["pricing model"])
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["--format", "text", "tasks", "show", root.id, "--project", isolated_portfolio.project_id],
+        )
+        assert result.exit_code == 0, result.output
+        assert "## Not yet specified" in result.output
+        assert "pricing model" in result.output
