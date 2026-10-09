@@ -17,10 +17,10 @@ class TestGetProjectPrefix:
         "project_id,expected",
         [
             ("clawpm", "CLAWP"),
-            ("my-project", "MYPRO"),
-            ("my_project", "MYPRO"),
+            ("my-project", "MY-PR"),
+            ("my_project", "MY_PR"),
             ("ab", "AB"),
-            ("a-b-c", "ABC"),
+            ("a-b-c", "A-B-C"),
         ],
     )
     def test_prefix(self, project_id, expected):

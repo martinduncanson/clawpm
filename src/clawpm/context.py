@@ -146,16 +146,72 @@ def resolve_project(explicit: str | None = None) -> tuple[str | None, str]:
 
 
 def get_project_prefix(project_id: str) -> str:
-    """Get the task ID prefix for a project.
-    
-    Converts project ID to uppercase prefix, e.g.:
+    """Get the task ID prefix for a project (CLAWP-141).
+
+    The prefix the allocator would derive on a project's first mint, via
+    ``tasks._naive_prefix_placeholder`` (ONE source of truth), e.g.:
         - clawpm -> CLAWP
-        - my-project -> MYPRO (first 5 chars, uppercase, no hyphens)
+        - code-quorum -> CODE (trailing separator stripped)
+        - my-project -> MY-PR
+        - 2-b -> P2-B (derived prefixes lead with a letter, CLAWP-133)
+
+    A project that ALREADY minted ids keeps the prefix on its own task files:
+    a collision-resolved one (``CODE-B``) or a pre-CLAWP-133 digit-leading one
+    (``2024-001``), so existing projects' short refs still expand.
     """
-    # Remove hyphens/underscores and uppercase
-    clean = re.sub(r'[-_]', '', project_id).upper()
-    # Take first 5 chars
-    return clean[:5]
+    from .tasks import _naive_prefix_placeholder
+
+    return _existing_prefix(project_id) or _naive_prefix_placeholder(project_id)
+
+
+def _existing_prefix(project_id: str) -> str | None:
+    """The prefix the project already minted under, else None. Fail-open (the
+    derived prefix is the fallback) but marked."""
+    from .tasks import resolve_existing_prefix
+
+    try:
+        config = load_portfolio_config()
+        proj = get_project(config, project_id) if config else None
+        existing = resolve_existing_prefix(proj) if proj else None
+    except Exception as exc:
+        logger.warning(
+            "clawpm: could not read existing task prefix for project %s (%s: %s); "
+            "using the derived prefix",
+            project_id, type(exc).__name__, exc,
+        )
+        return None
+    return existing or None
+
+
+def _ref_prefix_on_disk(project_id: str, task_ref: str) -> str | None:
+    """The prefix spelling for ``task_ref``'s ordinal as it exists ON DISK
+    (``CODE--001`` stays ``CODE-``; mixed legacy + normalised projects resolve
+    per ordinal), via ``tasks.on_disk_ref_prefix``. None when the project is
+    unresolvable or has no id for that ordinal; the caller then uses the
+    derived prefix. An ambiguous ref (both spellings hold
+    the ordinal) raises ``ValueError`` -- loud, never a silent pick."""
+    from .tasks import on_disk_ref_prefix
+
+    try:
+        config = load_portfolio_config()
+        proj = get_project(config, project_id) if config else None
+    except Exception as exc:
+        logger.warning(
+            "clawpm: could not resolve project %s for short ref %s (%s: %s); "
+            "using the derived prefix",
+            project_id, task_ref, type(exc).__name__, exc,
+        )
+        return None
+    return on_disk_ref_prefix(proj, task_ref) if proj else None
+
+
+# A full task id: letter-leading prefix (may hold digits, underscores, dots and
+# hyphens: P2-B, MY_PR, ARB-P, WEB2), then -NNN and an optional -NNN subtask.
+# Hyphen-joined prefix segments must each hold a letter so a short subtask ref
+# (4-001) or a digit run never parses as part of a prefix.
+_FULL_TASK_ID_RE = re.compile(
+    r"^[A-Z][A-Z0-9_.]*(?:-[A-Z0-9_.]*[A-Z][A-Z0-9_.]*)*-\d+(?:-\d+)?$"
+)
 
 
 def expand_task_id(task_ref: str, project_id: str, prefix: str | None = None) -> str:
@@ -178,22 +234,32 @@ def expand_task_id(task_ref: str, project_id: str, prefix: str | None = None) ->
     """
     resolved_prefix = prefix if prefix else get_project_prefix(project_id)
 
-    # Already has a prefix (contains hyphen and letters before it)
-    # Match both PREFIX-NNN and PREFIX-NNN-NNN (subtask)
-    if '-' in task_ref and re.match(r'^[A-Z]+-\d+(-\d+)?$', task_ref.upper()):
-        return task_ref.upper()
+    # Already a full id: PREFIX-NNN or PREFIX-NNN-NNN (subtask), where PREFIX
+    # may contain digits and hyphens (CLAWP-140).
+    upper_ref = task_ref.upper()
+    if '-' in task_ref and _FULL_TASK_ID_RE.match(upper_ref):
+        return upper_ref
+    # A digit-leading prefix (pre-CLAWP-133 mint) makes a full id look like a
+    # short subtask ref (2024-001); the project's own prefix disambiguates.
+    if resolved_prefix[:1].isdigit() and re.match(
+        rf'^{re.escape(resolved_prefix.upper())}-\d+(-\d+)?$', upper_ref
+    ):
+        return upper_ref
 
     # Subtask short ID: "4-001" or "004-001" -> "PREFIX-004-001"
     subtask_match = re.match(r'^(\d+)-(\d+)$', task_ref)
     if subtask_match:
         parent_num = int(subtask_match.group(1))
         sub_num = int(subtask_match.group(2))
-        return f"{resolved_prefix}-{parent_num:03d}-{sub_num:03d}"
+        # An on-disk spelling of the parent ordinal wins (CLAWP-140 r1).
+        pfx = resolved_prefix if prefix else (_ref_prefix_on_disk(project_id, task_ref) or resolved_prefix)
+        return f"{pfx}-{parent_num:03d}-{sub_num:03d}"
 
     # Pure numeric - expand with project prefix
     if task_ref.isdigit():
         num = int(task_ref)
-        return f"{resolved_prefix}-{num:03d}"
+        pfx = resolved_prefix if prefix else (_ref_prefix_on_disk(project_id, task_ref) or resolved_prefix)
+        return f"{pfx}-{num:03d}"
 
     # Return as-is if unrecognized format
     return task_ref
