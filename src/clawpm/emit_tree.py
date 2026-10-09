@@ -102,6 +102,10 @@ class LeafSpec:
     agent_profile: str | None
     parallel_group: int | None
     leaf_key: str  # stable idempotency key supplied by the caller
+    # CLAWP-111-003 — decision-map leaves. depends_refs entries are leaf refs
+    # in this document or ``id:<existing-task-id>``; resolved to task ids at mint.
+    kind: str = "build"
+    depends_refs: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -121,6 +125,9 @@ class RootSpec:
     attach_to: str | None  # task ID to attach children under (None = create new root)
     title: str | None
     predictions: Predictions | None
+    # CLAWP-111-003 — map-root fields (new roots only; rejected under attach_to).
+    destination: str | None = None
+    not_yet_specified: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -256,6 +263,25 @@ def _parse_leaf(raw: Any, idx: int) -> LeafSpec:
             f"leaves[{idx}] (ref={ref!r}) parent_ref must be a string or null"
         )
 
+    kind = raw.get("kind", "build")
+    if kind not in LEAF_KINDS:
+        raise EmitValidationError(
+            f"leaves[{idx}] (ref={ref!r}) kind must be one of {list(LEAF_KINDS)}, got {kind!r}"
+        )
+
+    depends_refs = raw.get("depends_refs") or []
+    if not isinstance(depends_refs, list) or not all(
+        isinstance(d, str) and d for d in depends_refs
+    ):
+        raise EmitValidationError(
+            f"leaves[{idx}] (ref={ref!r}) depends_refs must be a list of non-empty strings"
+        )
+    if ref.startswith(EXISTING_ID_PREFIX):
+        raise EmitValidationError(
+            f"leaves[{idx}] ref={ref!r} must not start with {EXISTING_ID_PREFIX!r} "
+            "(reserved for depends_refs entries naming existing tasks)"
+        )
+
     return LeafSpec(
         ref=ref,
         parent_ref=parent_ref,
@@ -269,6 +295,8 @@ def _parse_leaf(raw: Any, idx: int) -> LeafSpec:
         agent_profile=agent_profile if isinstance(agent_profile, str) else None,
         parallel_group=pg,
         leaf_key=leaf_key,
+        kind=kind,
+        depends_refs=depends_refs,
     )
 
 
@@ -292,6 +320,69 @@ def _parse_prd(raw: Any) -> PrdSpec:
     if not isinstance(body_markdown, str):
         raise EmitValidationError("prd.body_markdown must be a string")
     return PrdSpec(title=title, type=prd_type, tags=tags, body_markdown=body_markdown)
+
+
+def _validate_depends_refs(leaves: list[LeafSpec], ref_set: set[str]) -> None:
+    """CLAWP-111-003 — validate the depends_refs graph (in-memory, no writes).
+
+    ``id:<task-id>`` entries are checked against the store later, at the gate
+    (they need the project). Every other entry must be a leaf ref in this
+    document; the dependency graph must be acyclic and no leaf may depend on
+    one of its own parent_ref ancestors (the ancestor's rollup waits on its
+    children, so that would deadlock).
+    """
+    parent_of = {lf.ref: lf.parent_ref for lf in leaves}
+    edges: dict[str, list[str]] = {}
+    for lf in leaves:
+        local: list[str] = []
+        for dep in lf.depends_refs:
+            if dep.startswith(EXISTING_ID_PREFIX):
+                if not dep[len(EXISTING_ID_PREFIX):].strip():
+                    raise EmitValidationError(
+                        f"Leaf ref={lf.ref!r} has an empty id: dependency {dep!r}"
+                    )
+                continue
+            if dep == lf.ref:
+                raise EmitValidationError(
+                    f"Leaf ref={lf.ref!r} depends on itself"
+                )
+            if dep not in ref_set:
+                raise EmitValidationError(
+                    f"Leaf ref={lf.ref!r} has depends_refs entry {dep!r} which does not "
+                    f"match any leaf ref in this document (use '{EXISTING_ID_PREFIX}<task-id>' "
+                    "for an existing task)"
+                )
+            ancestor = parent_of.get(lf.ref)
+            while ancestor is not None:
+                if ancestor == dep:
+                    raise EmitValidationError(
+                        f"Leaf ref={lf.ref!r} depends on its own ancestor {dep!r}: "
+                        "the ancestor cannot complete before its children"
+                    )
+                ancestor = parent_of.get(ancestor)
+            local.append(dep)
+        edges[lf.ref] = local
+
+    # Kahn's algorithm over dependency edges (dep -> dependent).
+    pending = {ref: len(deps) for ref, deps in edges.items()}
+    dependents: dict[str, list[str]] = {ref: [] for ref in edges}
+    for ref, deps in edges.items():
+        for dep in deps:
+            dependents[dep].append(ref)
+    queue = [r for r, n in pending.items() if n == 0]
+    done = 0
+    while queue:
+        node = queue.pop()
+        done += 1
+        for nxt in dependents[node]:
+            pending[nxt] -= 1
+            if pending[nxt] == 0:
+                queue.append(nxt)
+    if done != len(edges):
+        stuck = sorted(r for r, n in pending.items() if n > 0)
+        raise EmitValidationError(
+            f"Cycle detected in depends_refs graph involving: {stuck!r}"
+        )
 
 
 def parse_emit_document(raw: dict[str, Any]) -> EmitTreeDocument:
@@ -333,10 +424,35 @@ def parse_emit_document(raw: dict[str, Any]) -> EmitTreeDocument:
     raw_root_preds = raw_root.get("predictions") or {}
     root_preds = Predictions.from_dict(raw_root_preds) if isinstance(raw_root_preds, dict) else None
 
+    # CLAWP-111-003 — map-root fields. They describe a NEW root; an existing
+    # attach target's destination/fog is edited via tasks edit / tasks fog.
+    unknown_root = set(raw_root.keys()) - ALLOWED_ROOT_KEYS
+    if unknown_root:
+        raise EmitValidationError(
+            f"'root' has unknown keys: {sorted(unknown_root)!r}. "
+            "Check for typos — unknown keys on root are rejected."
+        )
+    destination = raw_root.get("destination")
+    if destination is not None and not isinstance(destination, str):
+        raise EmitValidationError("root.destination must be a string")
+    not_yet_specified = raw_root.get("not_yet_specified") or []
+    if not isinstance(not_yet_specified, list) or not all(
+        isinstance(s, str) for s in not_yet_specified
+    ):
+        raise EmitValidationError("root.not_yet_specified must be a list of strings")
+    if attach_to and (destination or not_yet_specified):
+        raise EmitValidationError(
+            "root.destination / root.not_yet_specified are only valid on a new root "
+            "(root.title), not with attach_to — use tasks edit / tasks fog on the "
+            "existing task"
+        )
+
     root = RootSpec(
         attach_to=attach_to if isinstance(attach_to, str) else None,
         title=root_title if isinstance(root_title, str) else None,
         predictions=root_preds,
+        destination=destination.strip() or None if destination else None,
+        not_yet_specified=[s for s in not_yet_specified if s.strip()],
     )
 
     # prd
@@ -397,6 +513,8 @@ def parse_emit_document(raw: dict[str, Any]) -> EmitTreeDocument:
             "Cycle detected in parent_ref graph: all leaves in a document must form "
             "a DAG (directed acyclic graph) rooted at leaves with parent_ref=null"
         )
+
+    _validate_depends_refs(leaves, ref_set)
 
     return EmitTreeDocument(
         schema_version=sv,
@@ -543,8 +661,11 @@ def _resolve_idempotency(
     project_id: str,
     parent_id: str,
     leaves: list[LeafSpec],
-) -> list[str]:
-    """Return leaf_keys of leaves that already exist (idempotent re-emit).
+) -> dict[str, str]:
+    """Return ``{leaf_key: task_id}`` of leaves that already exist (idempotent re-emit).
+
+    The ids (CLAWP-111-003) let a re-emitted leaf's depends_refs resolve to a
+    previously-emitted leaf; ``key in result`` membership is unchanged.
 
     Scans every location a previously-emitted child of ``parent_id`` can live —
     the live parent dir, plus ``done/``, ``blocked/``, ``rejected/``, and
@@ -584,10 +705,10 @@ def _resolve_idempotency(
 
     tasks_dir = get_tasks_dir(config, project_id)
     if not tasks_dir:
-        return []
+        return {}
 
     leaf_keys = {lf.leaf_key for lf in leaves}
-    already_emitted: list[str] = []
+    already_emitted: dict[str, str] = {}
 
     def _leaf_key_of(task_file: Path) -> str | None:
         # Fails open on a missing/unreadable/malformed file, matching this
@@ -629,13 +750,13 @@ def _resolve_idempotency(
         for f in scan_dir.glob(f"{parent_id}-*.md"):
             lk = _leaf_key_of(f)
             if lk and lk in leaf_keys:
-                already_emitted.append(lk)
+                already_emitted.setdefault(lk, f.stem)
         for d in scan_dir.glob(f"{parent_id}-*"):
             if not d.is_dir():
                 continue
             lk = _leaf_key_of(d / "_task.md")
             if lk and lk in leaf_keys:
-                already_emitted.append(lk)
+                already_emitted.setdefault(lk, d.name)
 
     return already_emitted
 
@@ -682,6 +803,8 @@ def _render_task_content(
     prd_ref: str | None = None,
     children: list[str] | None = None,
     predictions: Predictions | None = None,
+    depends: list[str] | None = None,
+    root: RootSpec | None = None,
 ) -> str:
     """Render the markdown content for a single task file.
 
@@ -726,6 +849,12 @@ def _render_task_content(
             frontmatter["agent_profile"] = leaf.agent_profile
         if leaf.parallel_group is not None:
             frontmatter["parallel_group"] = leaf.parallel_group
+        # CLAWP-111-003 — same spelling as add_task: kind omitted at its
+        # "build" default, depends only when non-empty.
+        if leaf.kind != "build":
+            frontmatter["kind"] = leaf.kind
+        if depends:
+            frontmatter["depends"] = list(depends)
         # leaf_key for idempotent re-emit
         frontmatter["leaf_key"] = leaf.leaf_key
         # predictions including success_criteria
@@ -737,6 +866,11 @@ def _render_task_content(
         pred_block = _build_predictions_block(predictions)
         if pred_block:
             frontmatter["predictions"] = pred_block
+        if root is not None:
+            if root.destination:
+                frontmatter["destination"] = root.destination
+            if root.not_yet_specified:
+                frontmatter["not_yet_specified"] = list(root.not_yet_specified)
 
     fm_yaml = yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True).strip()
     content = (
@@ -949,6 +1083,24 @@ def _emit_tree_locked(
             + ", ".join(c["predicted_id"] for c in collisions)
         )
 
+    # CLAWP-111-003 — dependency gates (read-only, so dry-run fails identically
+    # to a real emit): id:<task> entries must name an existing task, and no
+    # emitted leaf may depend on a leaf the won't-do gate just dropped.
+    for lf in leaves_to_emit:
+        for dep in lf.depends_refs:
+            if dep.startswith(EXISTING_ID_PREFIX):
+                dep_id = dep[len(EXISTING_ID_PREFIX):].strip()
+                if get_task(config, project_id, dep_id) is None:
+                    raise EmitValidationError(
+                        f"Leaf ref={lf.ref!r} depends on {dep_id!r} which does not "
+                        f"exist in project {project_id!r}"
+                    )
+            elif dep in rejected_refs:
+                raise EmitValidationError(
+                    f"Leaf ref={lf.ref!r} depends on leaf {dep!r} which matched the "
+                    "won't-do ledger (rejected) and will not be emitted"
+                )
+
     # Dry-run exits here — all gates have fired, no writes performed
     if dry_run:
         return EmitResult(
@@ -1052,6 +1204,30 @@ def _emit_tree_locked(
         next_ordinal[effective_parent_id] = ordinal + 1
         leaf_id_map[ref] = f"{effective_parent_id}-{ordinal:03d}"
 
+    # CLAWP-111-003 — resolve depends_refs now that every id is minted, still
+    # before any reservation or write so a failure leaves nothing behind. A ref
+    # is either minted in this emit, or an already-emitted leaf (re-emit,
+    # found by leaf_key); the gate above already rejected the other cases.
+    key_by_ref = {lf.ref: lf.leaf_key for lf in doc.leaves}
+    resolved_depends: dict[str, list[str]] = {}
+    for lf in leaves_to_emit:
+        ids: list[str] = []
+        for dep in lf.depends_refs:
+            if dep.startswith(EXISTING_ID_PREFIX):
+                dep_id = dep[len(EXISTING_ID_PREFIX):].strip()
+            elif dep in leaf_id_map:
+                dep_id = leaf_id_map[dep]
+            elif key_by_ref.get(dep) in already_emitted_keys:
+                dep_id = already_emitted_keys[key_by_ref[dep]]
+            else:
+                raise EmitValidationError(
+                    f"Leaf ref={lf.ref!r} depends on {dep!r} which could not be resolved"
+                )
+            if dep_id not in ids:
+                ids.append(dep_id)
+        if ids:
+            resolved_depends[lf.ref] = ids
+
     # CLAWP-092: reserve every id this call minted (the new root, if any, plus
     # each leaf at every depth) in the portfolio ledger while still inside the
     # portfolio lock held by emit_tree(), so a sibling worktree skips them.
@@ -1103,6 +1279,7 @@ def _emit_tree_locked(
                 prd_ref=research_id,
                 children=child_ids,
                 predictions=doc.root.predictions,
+                root=doc.root,
             )
             staging_parent_task = staging_parent_dir / "_task.md"
             _atomic_write(staging_parent_task, root_content)
@@ -1171,6 +1348,7 @@ def _emit_tree_locked(
                     leaf=lf,
                     baseline_ref=baseline_ref,
                     children=leaf_direct_children,
+                    depends=resolved_depends.get(ref),
                 )
                 _atomic_write(leaf_subdir / "_task.md", leaf_content)
             else:
@@ -1181,6 +1359,7 @@ def _emit_tree_locked(
                     parent_id=effective_parent_id,
                     leaf=lf,
                     baseline_ref=baseline_ref,
+                    depends=resolved_depends.get(ref),
                 )
                 staging_parent_subdir.mkdir(parents=True, exist_ok=True)
                 _atomic_write(staging_parent_subdir / f"{task_id}.md", leaf_content)

@@ -44,8 +44,15 @@ def _all_md(tasks_dir: Path) -> list[Path]:
     return sorted(p for p in tasks_dir.rglob("*.md"))
 
 
+def _key_of(task_dict: dict) -> str | None:
+    """Task.to_dict() does not expose leaf_key; _leaf() titles are "Leaf <ref>"
+    and keys "dm-<ref>", so recover the key from the title."""
+    title = task_dict.get("title") or ""
+    return f"dm-{title[len('Leaf '):]}" if title.startswith("Leaf ") else None
+
+
 def _by_leaf_key(result) -> dict[str, dict]:
-    return {t["leaf_key"]: t for t in result.emitted if t.get("leaf_key")}
+    return {_key_of(t): t for t in result.emitted if _key_of(t)}
 
 
 def _emit(iso, doc: dict, **kw):
@@ -58,7 +65,7 @@ def _emitted_tasks(iso, result) -> dict[str, Task]:
     for t in result.emitted:
         task = get_task(iso.config, iso.project_id, t["id"])
         assert task is not None, t["id"]
-        out[t.get("leaf_key") or "root"] = task
+        out[_key_of(t) or "root"] = task
     return out
 
 
@@ -260,7 +267,7 @@ class TestEmitPersistence:
                 root={"attach_to": root_id},
             ),
         )
-        assert [t["leaf_key"] for t in second.emitted] == ["dm-B"]
+        assert [_key_of(t) for t in second.emitted] == ["dm-B"]
         b = get_task(iso.config, iso.project_id, _by_leaf_key(second)["dm-B"]["id"])
         assert b.depends == [a_id]
 
@@ -441,7 +448,7 @@ class TestRoundTrip:
             main, ["--project", iso.project_id, "tasks", "emit-tree"], input=json.dumps(doc)
         )
         assert res.exit_code == 0, res.output
-        emitted = {t["leaf_key"]: t for t in json.loads(res.output)["data"]["emitted"] if t.get("leaf_key")}
+        emitted = {_key_of(t): t for t in json.loads(res.output)["data"]["emitted"] if _key_of(t)}
         assert emitted["dm-A"]["kind"] == "decision"
         assert emitted["dm-B"]["depends"] == [emitted["dm-A"]["id"]]
         # And the same task is reloadable with identical fields (to_dict round trip).
@@ -454,6 +461,8 @@ class TestExamples:
         path = EXAMPLES_DIR / "decision-map.emit.json"
         assert path.is_file()
         raw = json.loads(path.read_text(encoding="utf-8"))
+        # The example names the demo project; point it at the fixture's.
+        raw["project"] = isolated_portfolio.project_id
         runner = CliRunner()
         res = runner.invoke(
             main,
