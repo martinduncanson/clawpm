@@ -1062,7 +1062,7 @@ def worktree_path_for_branch(repo_path: Path, branch: str) -> Optional[Path]:
     try:
         result = subprocess.run(
             ["git", "-C", str(repo_path), "worktree", "list", "--porcelain", "-z"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            capture_output=True,
         )
     except OSError as exc:
         raise GitProbeError(
@@ -1071,14 +1071,17 @@ def worktree_path_for_branch(repo_path: Path, branch: str) -> Optional[Path]:
     if result.returncode != 0:
         raise GitProbeError(
             f"git worktree list in {repo_path} failed (exit {result.returncode}): "
-            f"{(result.stderr or '').strip() or '<no stderr>'}"
+            f"{(result.stderr or b'').decode('utf-8', errors='replace').strip() or '<no stderr>'}"
         )
     # -z: fields are NUL-terminated and records end with an empty field, so
     # paths are literal (without it git C-quotes spaces-adjacent specials,
     # non-ASCII and control characters). Bare/detached/prunable records carry
-    # no ``branch`` field and are simply never matched.
+    # no ``branch`` field and are simply never matched. Captured as bytes and
+    # decoded per field: text mode would translate a literal CR / CRLF inside a
+    # POSIX path to LF (CLAWP-137).
     current: Optional[Path] = None
-    for field in result.stdout.split("\0"):
+    for raw_field in result.stdout.split(b"\0"):
+        field = raw_field.decode("utf-8", errors="replace")
         if field == "":
             current = None  # record boundary
         elif field.startswith("worktree "):
