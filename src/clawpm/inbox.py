@@ -331,6 +331,9 @@ _COMPLEXITIES = ("s", "m", "l", "xl")
 _LIST_FIELDS = ("success_criteria", "scope", "depends", "tags")
 _STR_FIELDS = ("title", "description", "predict_duration", "predict_complexity",
                "predict_approach", "pre_mortem")
+_FRONTMATTER_FIELDS = ("scope", "tags", "depends", "success_criteria",
+                       "predict_approach", "pre_mortem")
+_FENCE = "---"
 
 
 class TaskRequestError(ValueError):
@@ -415,6 +418,16 @@ def _validate_task_request(payload: dict) -> None:
         v = payload.get(key)
         if v is not None and not (isinstance(v, list) and all(isinstance(i, str) for i in v)):
             raise TaskRequestError(f"{key} must be a list of strings")
+    # Fields that are serialised into the task's YAML frontmatter. The strict
+    # parser closes the block at the first "---" SUBSTRING, so one inside a value
+    # truncates the metadata and hides the source_request stamp from the
+    # crash-retry scan. Title and description sit after the closing fence: fine.
+    for key in _FRONTMATTER_FIELDS:
+        v = payload.get(key)
+        for item in (v if isinstance(v, list) else [v]):
+            if isinstance(item, str) and _FENCE in item:
+                raise TaskRequestError(
+                    f"{key} must not contain {_FENCE!r} (it would end the task's frontmatter)")
     for key, lo, hi in (("priority", 1, 10), ("confidence", 1, 5)):
         v = payload.get(key)
         if v is not None and (isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi):
@@ -529,7 +542,7 @@ def materialize_task_requests(
 
     def handle(msg: dict, payload: dict) -> None:
         msg_id = msg.get("msg_id")
-        if not _is_safe_id(msg_id):
+        if not _is_safe_id(msg_id) or _FENCE in msg_id:  # msg_id is stamped into frontmatter
             # Nothing trustworthy to reply to or reference; report and move on.
             reject(msg_id if isinstance(msg_id, str) else None, None, None,
                    f"malformed msg_id {msg_id!r}")

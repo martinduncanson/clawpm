@@ -2784,6 +2784,20 @@ def add_task_with_status(
 
 """
 
+        # CLAWP-101 (PR #88 Codex r4) — the stamp is the crash-retry key, so
+        # refuse to write a task whose own serialised frontmatter would not
+        # hand it back (e.g. a "---" inside a value ends the block early).
+        if source_request:
+            try:
+                _stamped = split_frontmatter(content)[0].get("source_request")
+            except FrontmatterError:
+                _stamped = None
+            if _stamped != source_request:
+                raise ValueError(
+                    "source_request would not survive in the task's frontmatter "
+                    "(a field value probably contains '---'); task not created"
+                )
+
         # Write file — explicit utf-8 so Unicode titles (e.g. →, –, emoji) don't
         # raise UnicodeEncodeError on Windows where the default locale is cp1252.
         file_path = tasks_dir / f"{task_id}.md"
@@ -2836,21 +2850,38 @@ def find_task_by_source_request(
 
 
 def _scan_source_request(tasks_dir: Path, source_request: str) -> Task | None:
-    """Scan ``tasks_dir`` for the task stamped with ``source_request`` (any state)."""
-    for path in sorted(tasks_dir.rglob("*.md")):
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        if source_request not in text:
-            continue
-        try:
-            fm, _ = split_frontmatter(text, where=str(path))
-        except FrontmatterError:
-            continue
-        if fm.get("source_request") == source_request:
-            return Task.from_file(path)
-    return None
+    """Scan ``tasks_dir`` for the task stamped with ``source_request`` (any state).
+
+    Returning ``None`` means "absent", and callers act on that by allocating a
+    new task, so it must only be returned when every file was actually read. A
+    read that still fails after ``retry_transient`` (a held Windows sharing
+    violation, an ACL denial) raises: the caller leaves the request pending
+    rather than failing open into a duplicate. A file that vanishes mid-scan
+    (a concurrent state-change rename) restarts the scan, since the stamped task
+    may have moved to a name this pass had not yet listed.
+    """
+    for _ in range(3):
+        vanished = False
+        for path in sorted(tasks_dir.rglob("*.md")):
+            try:
+                text = retry_transient(path.read_text, "utf-8")
+            except FileNotFoundError:
+                vanished = True
+                continue
+            if source_request not in text:
+                continue
+            try:
+                fm, _fm_body = split_frontmatter(text, where=str(path))
+            except FrontmatterError:
+                continue
+            if fm.get("source_request") == source_request:
+                return Task.from_file(path)
+        if not vanished:
+            return None
+    raise OSError(
+        f"task files under {tasks_dir} kept changing during the source_request scan; "
+        "cannot establish whether the request was already materialised"
+    )
 
 
 def edit_task(
