@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import filecmp
 import os
 import re
 import shutil
@@ -1045,47 +1046,93 @@ def _restore_on_error(snapshots: list[tuple[Path, bytes]]):
         raise
 
 
-def _heal_source_from_dest(src: Path, dst: Path) -> list[str]:
-    """Restore into ``src`` every entry ``dst`` holds that ``src`` lost.
+def _walk_entries(root: Path) -> list[tuple[Path, Path]]:
+    """Every ``(relative, absolute)`` entry under ``root``, links not followed.
 
-    A half-finished ``shutil.move`` fallback (copy landed with ``symlinks=True``,
-    source delete died part-way) can leave entries ONLY in ``dst``: files,
-    directories (including empty ones) and symlinks (including dangling ones).
-    Entries are judged by ``lexists`` and never followed, and symlinks are
-    restored as symlinks. Returns the relative paths that could not be restored
-    (empty on full success)."""
-    failed: list[str] = []
-    for root, dirnames, filenames in os.walk(dst, followlinks=False):
-        rel_root = Path(root).relative_to(dst)
+    FAIL CLOSED: an unreadable directory raises (``os.walk`` would otherwise
+    skip it silently, making a lossy tree look complete)."""
+    def _raise(exc: OSError) -> None:
+        raise exc
+
+    out: list[tuple[Path, Path]] = []
+    for cur, dirnames, filenames in os.walk(root, onerror=_raise, followlinks=False):
         for name in sorted(dirnames + filenames):
-            entry = Path(root) / name
-            rel = rel_root / name
-            target = src / rel
-            if os.path.lexists(target):
-                continue
-            try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                if entry.is_symlink():
-                    os.symlink(os.readlink(entry), target)
-                elif entry.is_dir():
-                    target.mkdir()
-                else:
-                    shutil.copy2(entry, target)
-            except OSError as exc:
-                logger.error("Could not restore '%s' into '%s': %s", rel, src, exc)
-                failed.append(str(rel))
-    return failed
+            entry = Path(cur) / name
+            out.append((entry.relative_to(root), entry))
+    return out
 
 
-def _dest_entries_missing_from_source(src: Path, dst: Path) -> list[str]:
-    """Relative paths present (by ``lexists``) in ``dst`` but absent from ``src``.
-    Gate for deleting ``dst``: it may only go once this is empty."""
-    return [
-        str(Path(root).relative_to(dst) / name)
-        for root, dirnames, filenames in os.walk(dst, followlinks=False)
-        for name in dirnames + filenames
-        if not os.path.lexists(src / Path(root).relative_to(dst) / name)
-    ]
+def _entry_mismatch(src_entry: Path, dst_entry: Path) -> str | None:
+    """Why ``src_entry`` is not a faithful copy of ``dst_entry`` (None if it is).
+
+    Compares type, symlink target and kind (file vs directory link), and for
+    regular files size and content. Any doubt is a mismatch."""
+    if not os.path.lexists(src_entry):
+        return "missing"
+    d_link, s_link = dst_entry.is_symlink(), src_entry.is_symlink()
+    if d_link or s_link:
+        if not (d_link and s_link):
+            return "type differs"
+        if os.readlink(dst_entry) != os.readlink(src_entry):
+            return "link target differs"
+        if os.path.isdir(dst_entry) != os.path.isdir(src_entry):
+            return "link kind differs"
+        return None
+    if dst_entry.is_dir() or src_entry.is_dir():
+        return None if (dst_entry.is_dir() and src_entry.is_dir()) else "type differs"
+    if not (dst_entry.is_file() and src_entry.is_file()):
+        return "type differs"
+    if dst_entry.stat().st_size != src_entry.stat().st_size:
+        return "size differs"
+    if not filecmp.cmp(src_entry, dst_entry, shallow=False):
+        return "content differs"
+    return None
+
+
+def _restore_entry(src_entry: Path, dst_entry: Path) -> None:
+    """Recreate ``dst_entry`` at ``src_entry``. Files and links are built under a
+    temp name in the same directory and ``os.replace``d in, so a failed copy can
+    never leave a truncated file at the final name."""
+    src_entry.parent.mkdir(parents=True, exist_ok=True)
+    if dst_entry.is_symlink():
+        tmp = src_entry.with_name(src_entry.name + ".clawpm-restore-tmp")
+        try:
+            os.symlink(
+                os.readlink(dst_entry), tmp,
+                target_is_directory=os.path.isdir(dst_entry),
+            )
+            os.replace(tmp, src_entry)
+        finally:
+            if os.path.lexists(tmp):
+                tmp.unlink()
+    elif dst_entry.is_dir():
+        src_entry.mkdir()
+    else:
+        tmp = src_entry.with_name(src_entry.name + ".clawpm-restore-tmp")
+        try:
+            shutil.copy2(dst_entry, tmp)
+            os.replace(tmp, src_entry)
+        finally:
+            if os.path.lexists(tmp):
+                tmp.unlink()
+
+
+def _prove_source_complete(src: Path, dst: Path) -> None:
+    """Heal ``src`` from ``dst`` where entries are absent, then verify EVERY
+    ``dst`` entry (and the root) against ``src``. Raises on any mismatch, error
+    or doubt; returns only when the source is proven a faithful copy."""
+    entries = _walk_entries(dst) if dst.is_dir() and not dst.is_symlink() else []
+    for rel, d_entry in entries:
+        target = src / rel
+        if not os.path.lexists(target):
+            _restore_entry(target, d_entry)
+    problems = []
+    for rel, d_entry in [(Path("."), dst), *entries]:
+        why = _entry_mismatch(src / rel, d_entry)
+        if why:
+            problems.append(f"{rel} ({why})")
+    if problems:
+        raise RuntimeError(f"source differs from destination: {', '.join(problems)}")
 
 
 def _move_task_entry(src: Path, dst: Path) -> None:
@@ -1095,12 +1142,13 @@ def _move_task_entry(src: Path, dst: Path) -> None:
     landed, both ``src`` and ``dst`` exist (task open AND done). Recovery runs
     inside EACH attempt, before ``retry_transient`` may retry, so a retry never
     meets a leftover ``dst`` (``shutil.move`` would nest the source inside it
-    and "succeed"). Recovery removes a ``dst`` THIS call created, but only once
-    every ``dst`` entry is verifiably present in ``src`` again (a directory
-    source that lost entries is healed from ``dst`` first). A ``dst`` that
-    pre-existed is never touched. When unsure, the destination is kept and a
-    RuntimeError names what to fix by hand, so the failure stays loud. The
-    original error is otherwise re-raised."""
+    and "succeed").
+
+    Invariant: a ``dst`` THIS call created is deleted only if verification
+    PROVES ``src`` complete (``_prove_source_complete``). Any error or doubt on
+    the heal/verify path keeps BOTH copies and raises a RuntimeError naming what
+    to reconcile by hand (fail closed). A ``dst`` that pre-existed is never
+    touched. Otherwise the original error is re-raised."""
     dst_existed = os.path.lexists(dst)
 
     def _attempt() -> None:
@@ -1113,18 +1161,16 @@ def _move_task_entry(src: Path, dst: Path) -> None:
                 # Source is gone: dst is the only copy and the move effectively
                 # completed. Keep it; the caller still sees the error.
                 raise
-            is_tree = dst.is_dir() and not dst.is_symlink()
-            if is_tree:
-                _heal_source_from_dest(src, dst)
-                missing = _dest_entries_missing_from_source(src, dst)
-                if missing:
-                    raise RuntimeError(
-                        f"Moving '{src}' to '{dst}' failed ({exc!r}) and the "
-                        f"source lost {', '.join(missing)}; the destination was "
-                        "left in place — reconcile the two by hand."
-                    ) from exc
             try:
-                if is_tree:
+                _prove_source_complete(src, dst)
+            except Exception as verify_exc:  # noqa: BLE001 - fail closed
+                raise RuntimeError(
+                    f"Moving '{src}' to '{dst}' failed ({exc!r}) and the source "
+                    f"could not be proven complete ({verify_exc!r}); BOTH copies "
+                    "were left in place — reconcile them by hand."
+                ) from exc
+            try:
+                if dst.is_dir() and not dst.is_symlink():
                     shutil.rmtree(dst)
                 else:
                     dst.unlink()

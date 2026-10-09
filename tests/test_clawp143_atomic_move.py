@@ -347,3 +347,127 @@ class TestTransientRetryDoesNotNest:
             change_task_state(config, "mv143", task.id, TaskState.DONE, force=True)
 
         assert _copies(tasks_dir, task.id) == [src]
+
+
+class TestRecoveryFailsClosed:
+    """Any error or doubt while healing/verifying keeps BOTH copies and raises."""
+
+    def _dir_task(self, tmp_path, monkeypatch):
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch)
+        config = load_portfolio_config(tmp_path)
+        parent = add_task(config, "mv143", "Parent")
+        add_subtask(config, "mv143", parent.id, "Child")
+        src = tasks_dir / parent.id
+        (src / "extra.txt").write_text("only copy\n", encoding="utf-8")
+        return tasks_dir, config, parent, src
+
+    def test_partial_copy_never_lands_at_the_final_name(self, tmp_path, monkeypatch):
+        tasks_dir, config, parent, src = self._dir_task(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            tasks_module.shutil, "move", _copy_then_partial_delete_then_raise
+        )
+
+        def _partial_copy2(s, d, *a, **k):
+            Path(d).write_bytes(b"onl")  # truncated, then the copy dies
+            raise OSError(errno.EIO, "disk full")
+
+        monkeypatch.setattr(tasks_module.shutil, "copy2", _partial_copy2)
+        with pytest.raises(RuntimeError, match="by hand"):
+            change_task_state(config, "mv143", parent.id, TaskState.DONE, force=True)
+
+        assert not (src / "extra.txt").exists(), "truncated file must not sit at the final name"
+        assert not list(src.glob("*.clawpm-restore-tmp")), "temp leftovers removed"
+        dest = tasks_dir / "done" / parent.id
+        assert (dest / "extra.txt").read_text(encoding="utf-8") == "only copy\n"
+
+    def test_unreadable_directory_during_walk_keeps_both(self, tmp_path, monkeypatch):
+        tasks_dir, config, parent, src = self._dir_task(tmp_path, monkeypatch)
+
+        def _move_then_break_walk(s, d, *a, **k):
+            try:
+                _copy_then_partial_delete_then_raise(s, d)
+            finally:
+                def _bad_walk(top, topdown=True, onerror=None, followlinks=False):
+                    if onerror is not None:
+                        onerror(PermissionError(errno.EACCES, "unreadable", str(top)))
+                    return iter(())
+
+                monkeypatch.setattr(tasks_module.os, "walk", _bad_walk)
+
+        monkeypatch.setattr(tasks_module.shutil, "move", _move_then_break_walk)
+        with pytest.raises(RuntimeError, match="by hand"):
+            change_task_state(config, "mv143", parent.id, TaskState.DONE, force=True)
+
+        assert (tasks_dir / "done" / parent.id / "extra.txt").exists()
+        assert src.exists()
+
+    def test_source_with_different_content_keeps_both(self, tmp_path, monkeypatch):
+        tasks_dir, config, parent, src = self._dir_task(tmp_path, monkeypatch)
+
+        def _copy_then_corrupt(s, d, *a, **k):
+            shutil.copytree(s, d)
+            (Path(s) / "extra.txt").write_text("DIFFERENT\n", encoding="utf-8")
+            raise OSError(errno.EIO, "boom")
+
+        monkeypatch.setattr(tasks_module.shutil, "move", _copy_then_corrupt)
+        with pytest.raises(RuntimeError, match="content differs"):
+            change_task_state(config, "mv143", parent.id, TaskState.DONE, force=True)
+
+        assert (tasks_dir / "done" / parent.id / "extra.txt").read_text(
+            encoding="utf-8"
+        ) == "only copy\n"
+
+
+class TestLinkKinds:
+    def test_directory_symlink_restored_as_directory_link(self, tmp_path, monkeypatch):
+        if not _can_symlink(tmp_path):
+            pytest.skip("symlinks unavailable on this host")
+        tasks_dir = _make_portfolio(tmp_path, monkeypatch)
+        config = load_portfolio_config(tmp_path)
+        parent = add_task(config, "mv143", "Parent")
+        add_subtask(config, "mv143", parent.id, "Child")
+        src = tasks_dir / parent.id
+        (src / "realdir").mkdir()
+        (src / "realdir" / "f.txt").write_text("x", encoding="utf-8")
+        try:
+            os.symlink("realdir", src / "dirlink", target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("directory symlinks unavailable on this host")
+
+        def _copy_then_drop_link(s, d, *a, **k):
+            shutil.copytree(s, d, symlinks=True)
+            os.rmdir(Path(s) / "dirlink")
+            raise OSError(errno.EIO, "boom")
+
+        monkeypatch.setattr(tasks_module.shutil, "move", _copy_then_drop_link)
+        with pytest.raises(OSError, match="boom"):
+            change_task_state(config, "mv143", parent.id, TaskState.DONE, force=True)
+
+        assert (src / "dirlink").is_symlink()
+        assert os.path.isdir(src / "dirlink"), "must come back as a DIRECTORY link"
+        assert not (tasks_dir / "done" / parent.id).exists()
+
+    def test_symlinked_file_form_task_keeps_link_and_target(self, tmp_path):
+        if not _can_symlink(tmp_path):
+            pytest.skip("symlinks unavailable on this host")
+        real = tmp_path / "real.md"
+        real.write_text("content\n", encoding="utf-8")
+        src = tmp_path / "T-1.md"
+        os.symlink(real, src)
+        dst = tmp_path / "done_T-1.md"
+
+        def _link_copy_then_raise(s, d, *a, **k):
+            os.symlink(os.readlink(s), d)
+            raise OSError(errno.EIO, "boom")
+
+        orig = tasks_module.shutil.move
+        tasks_module.shutil.move = _link_copy_then_raise
+        try:
+            with pytest.raises(OSError, match="boom"):
+                tasks_module._move_task_entry(src, dst)
+        finally:
+            tasks_module.shutil.move = orig
+
+        assert src.is_symlink() and os.path.samefile(src, real)
+        assert not os.path.lexists(dst)
+        assert real.read_text(encoding="utf-8") == "content\n"
