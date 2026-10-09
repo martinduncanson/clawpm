@@ -1062,6 +1062,16 @@ def _walk_entries(root: Path) -> list[tuple[Path, Path]]:
     return out
 
 
+def _is_dir_link(link: Path) -> bool:
+    """Kind of a symlink itself. On Windows read it from the link's own
+    attributes (a dangling directory link is still directory-kind); elsewhere
+    links have no kind, so follow the target."""
+    attrs = getattr(os.lstat(link), "st_file_attributes", None)
+    if attrs is not None:
+        return bool(attrs & 0x10)  # FILE_ATTRIBUTE_DIRECTORY
+    return os.path.isdir(link)
+
+
 def _entry_mismatch(src_entry: Path, dst_entry: Path) -> str | None:
     """Why ``src_entry`` is not a faithful copy of ``dst_entry`` (None if it is).
 
@@ -1075,7 +1085,7 @@ def _entry_mismatch(src_entry: Path, dst_entry: Path) -> str | None:
             return "type differs"
         if os.readlink(dst_entry) != os.readlink(src_entry):
             return "link target differs"
-        if os.path.isdir(dst_entry) != os.path.isdir(src_entry):
+        if _is_dir_link(dst_entry) != _is_dir_link(src_entry):
             return "link kind differs"
         return None
     if dst_entry.is_dir() or src_entry.is_dir():
@@ -1096,11 +1106,18 @@ def _restore_entry(src_entry: Path, dst_entry: Path) -> None:
     src_entry.parent.mkdir(parents=True, exist_ok=True)
     if dst_entry.is_symlink():
         tmp = src_entry.with_name(src_entry.name + ".clawpm-restore-tmp")
-        try:
-            os.symlink(
-                os.readlink(dst_entry), tmp,
-                target_is_directory=os.path.isdir(dst_entry),
+        link_target = os.readlink(dst_entry)
+        # Windows has file-kind and directory-kind links and the original kind
+        # is gone with the source. Trust it only when the destination link and
+        # the target as seen from the source side agree; otherwise fail closed.
+        is_dir_link = _is_dir_link(dst_entry)
+        if is_dir_link != os.path.isdir(src_entry.parent / link_target):
+            raise RuntimeError(
+                f"cannot determine whether '{src_entry}' was a directory or a "
+                "file link"
             )
+        try:
+            os.symlink(link_target, tmp, target_is_directory=is_dir_link)
             os.replace(tmp, src_entry)
         finally:
             if os.path.lexists(tmp):
@@ -1122,7 +1139,8 @@ def _prove_source_complete(src: Path, dst: Path) -> None:
     ``dst`` entry (and the root) against ``src``. Raises on any mismatch, error
     or doubt; returns only when the source is proven a faithful copy."""
     entries = _walk_entries(dst) if dst.is_dir() and not dst.is_symlink() else []
-    for rel, d_entry in entries:
+    # Links last: their kind is judged against the already-healed targets.
+    for rel, d_entry in sorted(entries, key=lambda e: e[1].is_symlink()):
         target = src / rel
         if not os.path.lexists(target):
             _restore_entry(target, d_entry)

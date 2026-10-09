@@ -381,24 +381,42 @@ class TestRecoveryFailsClosed:
         assert (dest / "extra.txt").read_text(encoding="utf-8") == "only copy\n"
 
     def test_unreadable_directory_during_walk_keeps_both(self, tmp_path, monkeypatch):
+        """One destination subdirectory cannot be listed. os.walk without a
+        raising onerror skips it silently, so the file only the destination
+        holds would go unnoticed and rmtree(dst) would destroy it."""
         tasks_dir, config, parent, src = self._dir_task(tmp_path, monkeypatch)
+        (src / "sub").mkdir()
+        (src / "sub" / "deep.txt").write_text("only in dst\n", encoding="utf-8")
+        real_walk = os.walk
 
-        def _move_then_break_walk(s, d, *a, **k):
+        def _copy_lose_deep_file_break_walk(s, d, *a, **k):
             try:
-                _copy_then_partial_delete_then_raise(s, d)
+                shutil.copytree(s, d)
+                (Path(s) / "sub" / "deep.txt").unlink()
+                raise OSError(errno.EIO, "boom")
             finally:
-                def _bad_walk(top, topdown=True, onerror=None, followlinks=False):
-                    if onerror is not None:
-                        onerror(PermissionError(errno.EACCES, "unreadable", str(top)))
-                    return iter(())
+                first = [True]  # only the recovery walk; rmtree must work normally
 
-                monkeypatch.setattr(tasks_module.os, "walk", _bad_walk)
+                def _flaky_walk(top, topdown=True, onerror=None, followlinks=False):
+                    flaky, first[0] = first[0], False
+                    for cur, dirs, files in real_walk(
+                        top, topdown, onerror, followlinks
+                    ):
+                        if flaky and Path(cur).name == "sub":
+                            if onerror is not None:
+                                onerror(PermissionError(errno.EACCES, "unreadable", cur))
+                            continue
+                        yield cur, dirs, files
 
-        monkeypatch.setattr(tasks_module.shutil, "move", _move_then_break_walk)
+                monkeypatch.setattr(tasks_module.os, "walk", _flaky_walk)
+
+        monkeypatch.setattr(tasks_module.shutil, "move", _copy_lose_deep_file_break_walk)
         with pytest.raises(RuntimeError, match="by hand"):
             change_task_state(config, "mv143", parent.id, TaskState.DONE, force=True)
 
-        assert (tasks_dir / "done" / parent.id / "extra.txt").exists()
+        assert (tasks_dir / "done" / parent.id / "sub" / "deep.txt").read_text(
+            encoding="utf-8"
+        ) == "only in dst\n"
         assert src.exists()
 
     def test_source_with_different_content_keeps_both(self, tmp_path, monkeypatch):
@@ -419,7 +437,7 @@ class TestRecoveryFailsClosed:
 
 
 class TestLinkKinds:
-    def test_directory_symlink_restored_as_directory_link(self, tmp_path, monkeypatch):
+    def _dir_link_task(self, tmp_path, monkeypatch):
         if not _can_symlink(tmp_path):
             pytest.skip("symlinks unavailable on this host")
         tasks_dir = _make_portfolio(tmp_path, monkeypatch)
@@ -433,9 +451,16 @@ class TestLinkKinds:
             os.symlink("realdir", src / "dirlink", target_is_directory=True)
         except (OSError, NotImplementedError):
             pytest.skip("directory symlinks unavailable on this host")
+        return tasks_dir, config, parent, src
+
+    def test_directory_symlink_restored_as_directory_link(self, tmp_path, monkeypatch):
+        tasks_dir, config, parent, src = self._dir_link_task(tmp_path, monkeypatch)
 
         def _copy_then_drop_link(s, d, *a, **k):
             shutil.copytree(s, d, symlinks=True)
+            # Pin the destination link to directory kind (realdir exists now).
+            os.remove(Path(d) / "dirlink")
+            os.symlink("realdir", Path(d) / "dirlink", target_is_directory=True)
             os.rmdir(Path(s) / "dirlink")
             raise OSError(errno.EIO, "boom")
 
@@ -445,7 +470,36 @@ class TestLinkKinds:
 
         assert (src / "dirlink").is_symlink()
         assert os.path.isdir(src / "dirlink"), "must come back as a DIRECTORY link"
+        assert tasks_module._is_dir_link(src / "dirlink")
         assert not (tasks_dir / "done" / parent.id).exists()
+
+    def test_directory_link_of_unknowable_kind_is_restored_or_kept_loudly(
+        self, tmp_path, monkeypatch
+    ):
+        """shutil.copytree(symlinks=True) may leave the destination link
+        file-kind on Windows, so the original kind is unknowable. Either the
+        link comes back as a directory link, or BOTH copies are kept and a
+        RuntimeError says so. Never silent loss."""
+        tasks_dir, config, parent, src = self._dir_link_task(tmp_path, monkeypatch)
+
+        def _copy_then_drop_link(s, d, *a, **k):
+            shutil.copytree(s, d, symlinks=True)
+            os.rmdir(Path(s) / "dirlink")
+            raise OSError(errno.EIO, "boom")
+
+        monkeypatch.setattr(tasks_module.shutil, "move", _copy_then_drop_link)
+        dest = tasks_dir / "done" / parent.id
+        try:
+            change_task_state(config, "mv143", parent.id, TaskState.DONE, force=True)
+        except RuntimeError:
+            assert os.path.lexists(dest / "dirlink"), "destination copy must be kept"
+            assert src.exists()
+        except OSError as exc:
+            assert "boom" in str(exc)
+            assert os.path.isdir(src / "dirlink"), "restored link must be a DIRECTORY link"
+            assert not dest.exists()
+        else:
+            pytest.fail("a failed move must raise")
 
     def test_symlinked_file_form_task_keeps_link_and_target(self, tmp_path):
         if not _can_symlink(tmp_path):
