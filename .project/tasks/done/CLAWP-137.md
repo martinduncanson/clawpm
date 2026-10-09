@@ -3,7 +3,7 @@ baseline_ref: 9f61ba9
 created: '2026-10-07'
 id: CLAWP-137
 priority: 3
-updated: '2026-10-07'
+updated: '2026-10-09'
 ---
 # worktree_path_for_branch: decode git output as bytes (CR/CRLF in paths altered by text=True)
 
