@@ -615,6 +615,31 @@ class TestPredictionIdImmutable:
         assert [e["event"] for e in events] == ["prediction_registered", "prediction_revised"]
 
 
+class TestClearingRegisteredPredictionsRejected:
+    """Codex r3: an empty Predictions() used to pop the whole block, dropping
+    the stable prediction_id while its snapshot stayed in the ledger."""
+
+    def test_clearing_registered_predictions_raises_and_leaves_file(self, temp_portfolio):
+        config = temp_portfolio["config"]
+        task = add_task(config, "test", "T", predictions=Predictions(duration_min=30, confidence=2))
+        before = task.file_path.read_bytes()
+        events_before = _reflection_events(temp_portfolio["root"], task.id)
+
+        with pytest.raises(ValueError, match=task.id):
+            edit_task(config, "test", task.id, predictions=Predictions())
+
+        assert task.file_path.read_bytes() == before
+        stored = get_task(config, "test", task.id)
+        assert stored.predictions.prediction_id == task.predictions.prediction_id
+        assert _reflection_events(temp_portfolio["root"], task.id) == events_before
+
+    def test_clearing_unregistered_predictions_still_allowed(self, temp_portfolio):
+        config = temp_portfolio["config"]
+        task = add_task(config, "test", "T")
+        edited = edit_task(config, "test", task.id, predictions=Predictions())
+        assert edited is not None and edited.predictions.is_empty()
+
+
 # ---------------------------------------------------------------------------
 # Codex r2 — truncated ledger tail + stale-snapshot race
 # ---------------------------------------------------------------------------

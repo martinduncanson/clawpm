@@ -3152,6 +3152,14 @@ def edit_task(
             if not isinstance(existing_predictions, dict):
                 existing_predictions = {}
             if predictions.is_empty():
+                # A registered prediction_id is the ledger's stable link;
+                # popping the block would orphan its snapshot and make a later
+                # set mint a new id, so refuse (callers map ValueError).
+                if existing_predictions.get("prediction_id"):
+                    raise ValueError(
+                        f"Task {task_id} has registered predictions; refusing to "
+                        "clear them (would orphan the prediction ledger entry)."
+                    )
                 frontmatter.pop("predictions", None)
             else:
                 pred_dict = predictions.to_dict()
