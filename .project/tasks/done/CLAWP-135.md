@@ -14,7 +14,7 @@ predictions:
   pitfalls: allocator prefix resolution needs portfolio config at init
   predicted_iterations: 2
 priority: 4
-updated: '2026-10-05'
+updated: '2026-10-09'
 ---
 # taskstate_ignore probe selection: allocator-resolved prefix at init, index-aware probe, exhausted width
 
