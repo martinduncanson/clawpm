@@ -69,8 +69,17 @@ ALLOWED_LEAF_KEYS = frozenset(
         "agent_profile",
         "parallel_group",
         "leaf_key",
+        # CLAWP-111-003 — decision-map leaves.
+        "kind",
+        "depends_refs",
     }
 )
+ALLOWED_ROOT_KEYS = frozenset(
+    {"attach_to", "title", "predictions", "destination", "not_yet_specified"}
+)
+LEAF_KINDS = ("build", "decision")
+# depends_refs entry naming an already-existing task instead of a leaf ref.
+EXISTING_ID_PREFIX = "id:"
 
 # ---------------------------------------------------------------------------
 # Data structures
