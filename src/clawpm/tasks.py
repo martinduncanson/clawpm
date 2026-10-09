@@ -3255,7 +3255,15 @@ def edit_fog(
             return None
 
         with guard_fs_tamper(f"Task {task_id}"):
-            text = task.file_path.read_text(encoding="utf-8")
+            raw_text = task.file_path.read_bytes().decode("utf-8")
+        # A UTF-8 BOM would hide the leading fence from split_frontmatter, and
+        # universal-newline reads would silently rewrite CRLF: strip the BOM
+        # and normalise to "\n" for processing, then restore both on write.
+        has_bom = raw_text.startswith("﻿")
+        text = raw_text[1:] if has_bom else raw_text
+        use_crlf = "\r\n" in text
+        if use_crlf:
+            text = text.replace("\r\n", "\n")
 
         frontmatter: dict
         try:
@@ -3305,9 +3313,13 @@ def edit_fog(
         # the original fence-to-body transition byte-for-byte when nothing
         # else changed (CLAWP-111-002's diff-clean contract).
         new_text = f"---\n{yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True).strip()}\n---{content}"
+        if use_crlf:
+            new_text = new_text.replace("\n", "\r\n")
+        if has_bom:
+            new_text = "﻿" + new_text
         tmp_path = task.file_path.with_suffix(".tmp")
         try:
-            tmp_path.write_text(new_text, encoding="utf-8")
+            tmp_path.write_bytes(new_text.encode("utf-8"))
             retry_transient(tmp_path.replace, task.file_path)
         except Exception:
             tmp_path.unlink(missing_ok=True)
@@ -3452,13 +3464,16 @@ class FogMatchError(ValueError):
 def _match_fog_entry(fog: list[str], text: str) -> str:
     """Match ``text`` against a fog (``not_yet_specified``) list.
 
-    Case-insensitive throughout: first an exact (case-insensitive) match, then
-    — only if no exact match exists — a case-insensitive prefix match. Exactly
-    one match at whichever tier resolves wins; zero or multiple matches at the
+    Three tiers, first to resolve wins: a LITERAL exact match, then a
+    case-insensitive exact match, then a case-insensitive prefix match. Exactly
+    one match at the resolving tier wins; zero or multiple matches at the
     resolving tier raises :class:`FogMatchError` listing the candidates (empty
     list for zero matches). This is the safety net for free-text matching
     against an arbitrary fog list — ambiguity must be surfaced, never guessed.
     """
+    literal = [f for f in fog if f == text]
+    if len(literal) == 1:
+        return literal[0]
     text_lower = text.lower()
     exact = [f for f in fog if f.lower() == text_lower]
     if len(exact) == 1:
@@ -3843,10 +3858,20 @@ def add_subtask(
                 tmp_path.unlink(missing_ok=True)
                 raise
         else:
-            commit_staged_pair(
-                (file_path, content),
-                (parent.file_path, parent_new_text),
-            )
+            try:
+                commit_staged_pair(
+                    (file_path, content),
+                    (parent.file_path, parent_new_text),
+                )
+            except Exception:
+                # CLAWP-111-002 — graduation is all-or-nothing: the child is
+                # committed first, so if the parent rename then fails the
+                # fog entry is still listed and a retry would mint a SECOND
+                # child for it. Drop the freshly-minted child (its id is new
+                # under the lock, so this file can only be ours).
+                if matched_fog is not None:
+                    file_path.unlink(missing_ok=True)
+                raise
 
         # Reload under the lock; retry_transient covers a scanner touching the
         # freshly-written child file even though the write committed (CLAWP-051).

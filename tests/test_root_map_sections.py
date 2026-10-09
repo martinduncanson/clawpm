@@ -271,6 +271,60 @@ class TestGraduatesFunction:
         reloaded_root = get_task(isolated_portfolio.config, isolated_portfolio.project_id, root.id)
         assert reloaded_root.not_yet_specified == ["Ship", "ship"]
 
+    def test_literal_exact_beats_case_insensitive_duplicate(self, isolated_portfolio):
+        """fog ["Ship", "ship"] + --graduates "ship": the literal exact entry
+        wins; case-insensitive equality is only a fallback tier."""
+        root = _make_root_with_fog(isolated_portfolio, ["Ship", "ship"])
+        child = add_subtask(
+            isolated_portfolio.config, isolated_portfolio.project_id, root.id,
+            "Ship", graduates="ship",
+        )
+        assert child is not None
+        reloaded_root = get_task(isolated_portfolio.config, isolated_portfolio.project_id, root.id)
+        assert reloaded_root.not_yet_specified == ["Ship"]
+
+    def test_parent_commit_failure_rolls_back_child_and_retry_is_clean(
+        self, isolated_portfolio, monkeypatch,
+    ):
+        """If the parent rename fails after the child was committed, the child
+        must not be left behind; a retry then creates exactly one child."""
+        from pathlib import Path
+
+        import clawpm.concurrency as concurrency
+
+        root = _make_root_with_fog(isolated_portfolio, ["pricing model"])
+        real = concurrency.retry_transient
+
+        def flaky(fn, *args, **kwargs):
+            if args and Path(args[0]).name == "_task.md":
+                raise OSError("injected parent rename failure")
+            return real(fn, *args, **kwargs)
+
+        monkeypatch.setattr(concurrency, "retry_transient", flaky)
+        with pytest.raises(OSError, match="injected"):
+            add_subtask(
+                isolated_portfolio.config, isolated_portfolio.project_id, root.id,
+                "Price it", graduates="pricing",
+            )
+        monkeypatch.setattr(concurrency, "retry_transient", real)
+
+        task_dir = get_task(
+            isolated_portfolio.config, isolated_portfolio.project_id, root.id,
+        ).file_path.parent
+        assert [p.name for p in task_dir.glob(f"{root.id}-*.md")] == []
+        still = get_task(isolated_portfolio.config, isolated_portfolio.project_id, root.id)
+        assert still.not_yet_specified == ["pricing model"]
+
+        child = add_subtask(
+            isolated_portfolio.config, isolated_portfolio.project_id, root.id,
+            "Price it", graduates="pricing",
+        )
+        assert child is not None
+        assert len(list(task_dir.glob(f"{root.id}-*.md"))) == 1
+        final = get_task(isolated_portfolio.config, isolated_portfolio.project_id, root.id)
+        assert final.not_yet_specified == []
+        assert final.children == [child.id]
+
     def test_no_child_file_left_behind_on_failed_match(self, isolated_portfolio):
         root = _make_root_with_fog(isolated_portfolio, ["pricing model"])
         root_dir = root.file_path.parent  # split into a directory by _make_root_with_fog's edit_fog calls? no -- edit_fog doesn't split.
@@ -417,6 +471,54 @@ class TestFogCommand:
         after_fm.pop("not_yet_specified", None)
         after_fm.pop("updated", None)
         assert after_fm == before_fm
+
+    @pytest.mark.parametrize("newline", ["\n", "\r\n"])
+    def test_bom_prefixed_file_keeps_frontmatter(self, isolated_portfolio, newline):
+        """A UTF-8 BOM (and CRLF) must not make the frontmatter look absent:
+        existing metadata survives, only the fog change + updated stamp differ,
+        and the BOM / line endings are preserved."""
+        from clawpm.frontmatter import split_frontmatter
+
+        task = add_task(
+            isolated_portfolio.config, isolated_portfolio.project_id, "Fog task",
+            priority=2, scope=["src/**"], tags=["alpha"],
+        )
+        assert task is not None and task.file_path is not None
+        clean = task.file_path.read_bytes().decode("utf-8").replace("\r\n", "\n")
+        before_fm, before_body = split_frontmatter(clean)
+        task.file_path.write_bytes(
+            b"\xef\xbb\xbf" + clean.replace("\n", newline).encode("utf-8")
+        )
+
+        updated = edit_fog(
+            isolated_portfolio.config, isolated_portfolio.project_id, task.id,
+            add="pricing model",
+        )
+        assert updated is not None
+
+        raw = task.file_path.read_bytes()
+        assert raw.startswith(b"\xef\xbb\xbf---")
+        text = raw[3:].decode("utf-8")
+        if newline == "\r\n":
+            assert "\n" not in text.replace("\r\n", "")
+        after_fm, after_body = split_frontmatter(text.replace("\r\n", "\n"))
+        assert after_body == before_body
+        assert after_fm.pop("not_yet_specified") == ["pricing model"]
+        after_fm.pop("updated", None)
+        before_fm.pop("updated", None)
+        assert after_fm == before_fm
+
+    def test_unparseable_frontmatter_is_refused_not_replaced(self, isolated_portfolio):
+        task = add_task(isolated_portfolio.config, isolated_portfolio.project_id, "Fog task")
+        assert task is not None and task.file_path is not None
+        broken = b"---\nid: [unclosed\n---\n# body\n"
+        task.file_path.write_bytes(broken)
+        with pytest.raises(ValueError):
+            edit_fog(
+                isolated_portfolio.config, isolated_portfolio.project_id, task.id,
+                add="x",
+            )
+        assert task.file_path.read_bytes() == broken
 
     def test_cli_add_and_drop(self, isolated_portfolio):
         task = add_task(isolated_portfolio.config, isolated_portfolio.project_id, "Fog task")
