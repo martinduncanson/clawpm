@@ -613,3 +613,70 @@ class TestPredictionIdImmutable:
         events = _reflection_events(temp_portfolio["root"], task.id)
         assert {e["prediction_id"] for e in events} == {original}
         assert [e["event"] for e in events] == ["prediction_registered", "prediction_revised"]
+
+
+# ---------------------------------------------------------------------------
+# Codex r2 — truncated ledger tail + stale-snapshot race
+# ---------------------------------------------------------------------------
+
+
+class TestLedgerTailAndStaleSnapshot:
+    def test_event_after_unterminated_tail_stays_readable(self, temp_portfolio):
+        from clawpm.reflect import latest_prediction_snapshot
+
+        config = temp_portfolio["config"]
+        task = add_task(config, "test", "T")
+        ref_file = temp_portfolio["root"] / "reflections" / f"{task.id}.jsonl"
+        ref_file.parent.mkdir(exist_ok=True)
+        ref_file.write_bytes(b'{"event": "task_done", "task_id": "x"')  # no newline
+
+        edit_task(config, "test", task.id, predictions=Predictions(confidence=4))
+
+        stored = get_task(config, "test", task.id)
+        snap = latest_prediction_snapshot(
+            temp_portfolio["root"], task.id, stored.predictions.prediction_id
+        )
+        assert snap is not None and snap["confidence"] == 4
+
+    def test_unreadable_append_raises_instead_of_claiming_success(
+        self, temp_portfolio, monkeypatch
+    ):
+        import clawpm.reflect as reflect_mod
+
+        config = temp_portfolio["config"]
+        task = add_task(config, "test", "T")
+        monkeypatch.setattr(
+            reflect_mod, "write_prediction_event", lambda *a, **k: None
+        )
+        with pytest.raises(RuntimeError, match="did not converge"):
+            edit_task(config, "test", task.id, predictions=Predictions(confidence=4))
+
+    def test_stale_snapshot_cannot_overwrite_newer_edit(self, temp_portfolio):
+        from clawpm.reflect import latest_prediction_snapshot, reconcile_prediction_event
+
+        config = temp_portfolio["config"]
+        task = add_task(
+            config, "test", "T", predictions=Predictions(duration_min=30, confidence=2)
+        )
+        stale = get_task(config, "test", task.id)  # emit's cached snapshot
+        edit_task(config, "test", task.id, predictions=Predictions(confidence=5))
+
+        result = reconcile_prediction_event(
+            temp_portfolio["root"],
+            task_id=task.id,
+            project_id="test",
+            prediction_id=stale.predictions.prediction_id,
+            predictions=stale.predictions.to_dict(),
+            task_file=stale.file_path,
+        )
+
+        assert result is None
+        current = get_task(config, "test", task.id)
+        snap = latest_prediction_snapshot(
+            temp_portfolio["root"], task.id, current.predictions.prediction_id
+        )
+        assert snap["confidence"] == 5
+        assert [e["event"] for e in _reflection_events(temp_portfolio["root"], task.id)] == [
+            "prediction_registered",
+            "prediction_revised",
+        ]

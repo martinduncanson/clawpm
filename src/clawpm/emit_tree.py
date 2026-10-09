@@ -1326,6 +1326,9 @@ def _emit_tree_locked(
                 predictions=_emitted_task.predictions.to_dict(),
                 filled_by=_emitted_task.predictions.filled_by,
                 baseline_ref=_emitted_task.baseline_ref,
+                # emit holds the portfolio-prefix lock, not the task's own, so
+                # an edit may have landed since the snapshot above: re-read.
+                task_file=_emitted_task.file_path,
             )
         except Exception as exc:
             logger.warning(

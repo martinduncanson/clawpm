@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
 import re
 import statistics
 from datetime import datetime, timezone
@@ -251,8 +252,26 @@ def write_prediction_event(
     ref_file = ref_dir / f"{task_id}.jsonl"
     # CLAWP-032: cross-platform locked append (Windows append is non-atomic).
     from .concurrency import append_jsonl_line
-    append_jsonl_line(ref_file, json.dumps(record))
+    line = json.dumps(record)
+    # A crash mid-append can leave an unterminated final row; appending directly
+    # would glue this event onto it and make BOTH unreadable. Start a fresh line.
+    if _has_unterminated_tail(ref_file):
+        line = "\n" + line
+    append_jsonl_line(ref_file, line)
     return ref_file
+
+
+def _has_unterminated_tail(path: Path) -> bool:
+    """True when ``path`` is non-empty and its last byte is not a newline."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                return False
+            fh.seek(-1, os.SEEK_END)
+            return fh.read(1) != b"\n"
+    except FileNotFoundError:
+        return False
 
 
 def _normalize_prediction_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -301,6 +320,7 @@ def reconcile_prediction_event(
     predictions: dict[str, Any],
     filled_by: str | None = None,
     baseline_ref: str | None = None,
+    task_file: Path | None = None,
 ) -> str | None:
     """Make the ledger's newest snapshot for ``prediction_id`` match
     ``predictions``; return the event kind appended, or ``None`` if already
@@ -311,26 +331,54 @@ def reconcile_prediction_event(
     task file was saved, an identical retry still sees "ledger is behind" and
     appends the missing event — exactly once, and never a duplicate on a
     repeated identical edit after success. Errors propagate (loud).
+
+    The ledger read + append run under one per-task lock, so concurrent
+    reconciles cannot both register. A caller that does not hold the task's
+    own lock (``emit_tree``) passes ``task_file``: the wanted snapshot is then
+    re-read from the CURRENT task file inside the lock, so a stale cached
+    snapshot can never overwrite a newer edit. After appending, the ledger is
+    read back; if the event is not readable (e.g. a damaged tail) this raises
+    rather than reporting convergence.
     """
-    current = latest_prediction_snapshot(portfolio_root, task_id, prediction_id)
-    wanted = _normalize_prediction_snapshot(predictions)
-    if current is None:
-        kind = "prediction_registered"
-    elif _normalize_prediction_snapshot(current) != wanted:
-        kind = "prediction_revised"
-    else:
-        return None
-    write_prediction_event(
-        portfolio_root,
-        event=kind,
-        task_id=task_id,
-        project_id=project_id,
-        prediction_id=prediction_id,
-        predictions=wanted,
-        filled_by=filled_by,
-        baseline_ref=baseline_ref,
-    )
-    return kind
+    from .concurrency import file_lock, retry_transient
+
+    lock_path = (_reflections_dir(portfolio_root) / f".{task_id}.reconcile.lock").absolute()
+    with file_lock(lock_path):
+        if task_file is not None:
+            from .models import Task
+
+            task = retry_transient(Task.from_file, task_file)
+            if task.predictions.is_empty():
+                return None
+            prediction_id = task.predictions.prediction_id
+            predictions = task.predictions.to_dict()
+            filled_by = task.predictions.filled_by
+            baseline_ref = task.baseline_ref
+        current = latest_prediction_snapshot(portfolio_root, task_id, prediction_id)
+        wanted = _normalize_prediction_snapshot(predictions)
+        if current is None:
+            kind = "prediction_registered"
+        elif _normalize_prediction_snapshot(current) != wanted:
+            kind = "prediction_revised"
+        else:
+            return None
+        write_prediction_event(
+            portfolio_root,
+            event=kind,
+            task_id=task_id,
+            project_id=project_id,
+            prediction_id=prediction_id,
+            predictions=wanted,
+            filled_by=filled_by,
+            baseline_ref=baseline_ref,
+        )
+        after = latest_prediction_snapshot(portfolio_root, task_id, prediction_id)
+        if after is None or _normalize_prediction_snapshot(after) != wanted:
+            raise RuntimeError(
+                f"prediction ledger for {task_id} did not converge after "
+                f"{kind}: appended event is not readable"
+            )
+        return kind
 
 
 def resolve_prediction_registration(
