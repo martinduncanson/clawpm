@@ -4,6 +4,7 @@ import sys
 
 import click
 
+from clawpm.concurrency import LockTimeout
 from clawpm.models import ResearchStatus, ResearchType
 from clawpm.output import output_error, output_research_list, output_success
 from clawpm.research import add_research, link_research_session, scan_research
@@ -122,18 +123,28 @@ def research_add(
     for tag in tags:
         parsed_tags.extend(t.strip() for t in tag.split(",") if t.strip())
 
-    item = add_research(
-        config,
-        project_id,
-        title,
-        ResearchType(research_type),
-        research_id=research_id,
-        tags=parsed_tags if parsed_tags else None,
-        question=question or "",
-        summary=summary or "",
-        findings=list(findings) if findings else None,
-        conclusion=conclusion or "",
-    )
+    # add_research's scan->allocate->write section holds the research file lock;
+    # a contended lock must exit as a structured error, not a traceback (CLAWP-138).
+    try:
+        item = add_research(
+            config,
+            project_id,
+            title,
+            ResearchType(research_type),
+            research_id=research_id,
+            tags=parsed_tags if parsed_tags else None,
+            question=question or "",
+            summary=summary or "",
+            findings=list(findings) if findings else None,
+            conclusion=conclusion or "",
+        )
+    except LockTimeout as exc:
+        output_error(
+            "lock_timeout",
+            f"Could not acquire the research lock (another session may be busy): {exc}",
+            fmt=fmt,
+        )
+        sys.exit(1)
 
     if not item:
         output_error("add_failed", f"Failed to add research to project '{project_id}'", fmt=fmt)

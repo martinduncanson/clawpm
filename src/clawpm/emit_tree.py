@@ -16,6 +16,7 @@ JSONL work_log is appended LAST, after promotion succeeds.
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import uuid
 from dataclasses import dataclass, field
@@ -24,6 +25,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 from .id_reservations import record_task_id
 from .frontmatter import (
@@ -133,6 +136,9 @@ class EmitResult:
     rejected: list[dict]         # leaves rejected by won't-do gate (report-back)
     constitution_violations: list[dict]  # constitution violations (report-back)
     dry_run: bool
+    # CLAWP-112-001 — tasks emitted fine but whose prediction_registered event
+    # could not be written (marker for the degraded path, never silent).
+    registration_failures: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -143,6 +149,7 @@ class EmitResult:
             "rejected": self.rejected,
             "constitution_violations": self.constitution_violations,
             "dry_run": self.dry_run,
+            "registration_failures": self.registration_failures,
         }
 
 
@@ -646,7 +653,15 @@ def _build_predictions_block(
     if sc:
         pred_dict["success_criteria"] = [c.to_yaml() for c in sc]
     cleaned = {k: v for k, v in pred_dict.items() if v is not None and v != []}
-    return cleaned or None
+    if not cleaned:
+        return None
+    # CLAWP-112-001 — emit-tree is a first-write site like `tasks add`; mint
+    # prediction_id here so it lands in the frontmatter this function builds
+    # (the post-promotion registration event reads it back off the emitted
+    # Task, so it must already be on disk by then).
+    if not cleaned.get("prediction_id"):
+        cleaned["prediction_id"] = uuid.uuid4().hex
+    return cleaned
 
 
 def _render_task_content(
@@ -1289,6 +1304,40 @@ def _emit_tree_locked(
         # Work-log failure never blocks the result
         pass
 
+    # CLAWP-112-001 — register each emitted task's predictions snapshot.
+    # Reads back off the promoted (on-disk) Task objects rather than the
+    # staging-time LeafSpec/root predictions, so the registered snapshot is
+    # exactly what actually landed — including the prediction_id minted into
+    # the frontmatter by _build_predictions_block during staging. Best-effort,
+    # like the work-log append above: the tree is already durably promoted,
+    # so a registration failure must not turn a successful emit into a
+    # reported failure.
+    registration_failures: list[dict] = []
+    for _emitted_task in emitted_tasks:
+        if _emitted_task.predictions.is_empty():
+            continue
+        try:
+            from .reflect import reconcile_prediction_event
+            reconcile_prediction_event(
+                config.portfolio_root,
+                task_id=_emitted_task.id,
+                project_id=project_id,
+                prediction_id=_emitted_task.predictions.prediction_id,
+                predictions=_emitted_task.predictions.to_dict(),
+                filled_by=_emitted_task.predictions.filled_by,
+                baseline_ref=_emitted_task.baseline_ref,
+                # emit holds the portfolio-prefix lock, not the task's own, so
+                # an edit may have landed since the snapshot above: re-read.
+                task_file=_emitted_task.file_path,
+            )
+        except Exception as exc:
+            logger.warning(
+                "prediction registration failed for %s: %s", _emitted_task.id, exc
+            )
+            registration_failures.append(
+                {"task_id": _emitted_task.id, "error": f"{type(exc).__name__}: {exc}"}
+            )
+
     # Build result — emitted_tasks was populated by _collect_emitted_tasks
     # (new-root path) or by individual file reads (attach_to path).
     # new_root_task is set only for new-root; it was already added to emitted_tasks
@@ -1303,6 +1352,7 @@ def _emit_tree_locked(
         rejected=rejected,
         constitution_violations=constitution_violations,
         dry_run=False,
+        registration_failures=registration_failures,
     )
 
 

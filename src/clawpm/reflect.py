@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
 import re
 import statistics
 from datetime import datetime, timezone
@@ -195,6 +196,247 @@ def write_iteration_event(
     from .concurrency import append_jsonl_line
     append_jsonl_line(ref_file, json.dumps(record))
     return ref_file
+
+
+def write_prediction_event(
+    portfolio_root: Path,
+    *,
+    event: str,
+    task_id: str,
+    project_id: str,
+    prediction_id: str,
+    predictions: dict[str, Any],
+    filled_by: str | None = None,
+    baseline_ref: str | None = None,
+    reason: str | None = None,
+) -> Path:
+    """Append a ``prediction_registered`` or ``prediction_revised`` event (CLAWP-112-001).
+
+    Centralises the pre-registration write path so ``tasks add``, ``tasks
+    edit`` (first-set or later revision of predictions), and ``emit-tree`` all
+    go through ONE writer instead of three near-duplicate implementations — the
+    task's own pre-mortem flags "three write sites means one gets missed" as
+    the exact failure mode this centralisation exists to prevent.
+
+    ``predictions`` is the full ``Predictions.to_dict()`` snapshot (already
+    carrying ``prediction_id``) — every revision appends a COMPLETE new
+    snapshot, never a diff, so a reader never has to reconstruct state by
+    replaying partial updates.
+
+    Uses the locked JSONL append (CLAWP-032's ``append_jsonl_line``), unlike
+    ``write_reflection_event`` below (which predates the lock and appends
+    directly) — this is invoked from ``tasks.add_task``/``add_subtask``/
+    ``edit_task`` and ``emit_tree.emit_tree``, all of which can race a
+    concurrent session writing to the same task's reflection file.
+    """
+    if event not in ("prediction_registered", "prediction_revised"):
+        raise ValueError(f"Unknown prediction event kind: {event!r}")
+
+    record: dict[str, Any] = {
+        "event": event,
+        "task_id": task_id,
+        "project_id": project_id,
+        "prediction_id": prediction_id,
+        "predictions": predictions,
+        "filled_by": filled_by,
+        "baseline_ref": baseline_ref,
+    }
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    if event == "prediction_registered":
+        record["registered_at"] = now
+    else:
+        record["revised_at"] = now
+        record["reason"] = reason
+
+    ref_dir = _reflections_dir(portfolio_root)
+    ref_file = ref_dir / f"{task_id}.jsonl"
+    # CLAWP-032: cross-platform locked append (Windows append is non-atomic).
+    from .concurrency import append_jsonl_line
+    line = json.dumps(record)
+    # A crash mid-append can leave an unterminated final row; appending directly
+    # would glue this event onto it and make BOTH unreadable. Start a fresh line.
+    if _has_unterminated_tail(ref_file):
+        line = "\n" + line
+    append_jsonl_line(ref_file, line)
+    return ref_file
+
+
+def _has_unterminated_tail(path: Path) -> bool:
+    """True when ``path`` is non-empty and its last byte is not a newline."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                return False
+            fh.seek(-1, os.SEEK_END)
+            return fh.read(1) != b"\n"
+    except FileNotFoundError:
+        return False
+
+
+def _normalize_prediction_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Drop ``None`` / empty-list values so a task-file block and a
+    ``Predictions.to_dict()`` snapshot of the same content compare equal."""
+    return {k: v for k, v in snapshot.items() if v is not None and v != []}
+
+
+def latest_prediction_snapshot(
+    portfolio_root: Path, task_id: str, prediction_id: str
+) -> dict[str, Any] | None:
+    """Return the ``predictions`` snapshot of the newest registered/revised
+    ledger event for ``prediction_id`` on ``task_id``, or ``None`` if the
+    ledger holds none (CLAWP-112-001).
+
+    Corrupt lines are skipped; an unreadable file raises (loud, never a
+    silent "nothing registered").
+    """
+    ref_file = _reflections_dir(portfolio_root) / f"{task_id}.jsonl"
+    if not ref_file.exists():
+        return None
+    latest: dict[str, Any] | None = None
+    for line in ref_file.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(rec, dict)
+            and rec.get("event") in ("prediction_registered", "prediction_revised")
+            and rec.get("prediction_id") == prediction_id
+            and isinstance(rec.get("predictions"), dict)
+        ):
+            latest = rec["predictions"]
+    return latest
+
+
+def reconcile_prediction_event(
+    portfolio_root: Path,
+    *,
+    task_id: str,
+    project_id: str,
+    prediction_id: str,
+    predictions: dict[str, Any],
+    filled_by: str | None = None,
+    baseline_ref: str | None = None,
+    task_file: Path | None = None,
+) -> str | None:
+    """Make the ledger's newest snapshot for ``prediction_id`` match
+    ``predictions``; return the event kind appended, or ``None`` if already
+    in sync (CLAWP-112-001).
+
+    The register/revise decision is made against the LEDGER, not against
+    whether the task file changed. So when a ledger append fails after the
+    task file was saved, an identical retry still sees "ledger is behind" and
+    appends the missing event — exactly once, and never a duplicate on a
+    repeated identical edit after success. Errors propagate (loud).
+
+    The ledger read + append run under one per-task lock, so concurrent
+    reconciles cannot both register. A caller that does not hold the task's
+    own lock (``emit_tree``) passes ``task_file``: the wanted snapshot is then
+    re-read from the CURRENT task file inside the lock, so a stale cached
+    snapshot can never overwrite a newer edit. After appending, the ledger is
+    read back; if the event is not readable (e.g. a damaged tail) this raises
+    rather than reporting convergence.
+    """
+    from .concurrency import file_lock, retry_transient
+
+    lock_path = (_reflections_dir(portfolio_root) / f".{task_id}.reconcile.lock").absolute()
+    with file_lock(lock_path):
+        if task_file is not None:
+            from .models import Task
+
+            task = retry_transient(Task.from_file, task_file)
+            if task.predictions.is_empty():
+                return None
+            prediction_id = task.predictions.prediction_id
+            predictions = task.predictions.to_dict()
+            filled_by = task.predictions.filled_by
+            baseline_ref = task.baseline_ref
+        current = latest_prediction_snapshot(portfolio_root, task_id, prediction_id)
+        wanted = _normalize_prediction_snapshot(predictions)
+        if current is None:
+            kind = "prediction_registered"
+        elif _normalize_prediction_snapshot(current) != wanted:
+            kind = "prediction_revised"
+        else:
+            return None
+        write_prediction_event(
+            portfolio_root,
+            event=kind,
+            task_id=task_id,
+            project_id=project_id,
+            prediction_id=prediction_id,
+            predictions=wanted,
+            filled_by=filled_by,
+            baseline_ref=baseline_ref,
+        )
+        after = latest_prediction_snapshot(portfolio_root, task_id, prediction_id)
+        if after is None or _normalize_prediction_snapshot(after) != wanted:
+            raise RuntimeError(
+                f"prediction ledger for {task_id} did not converge after "
+                f"{kind}: appended event is not readable"
+            )
+        return kind
+
+
+def resolve_prediction_registration(
+    record: dict[str, Any],
+    task_created: str | None = None,
+) -> dict[str, Any]:
+    """Resolve a ``task_done``/``task_blocked`` record's registration status.
+
+    New-style records (CLAWP-112-001 onward) carry ``prediction_id`` directly.
+    Records written before that change carry none — those are ``legacy``:
+    per the calibration-metrics spec (§2.5) they are treated as registered at
+    the task's ``created`` timestamp (passed by the caller — e.g. read from
+    the task's frontmatter, or from an earlier ``prediction_registered``
+    event) rather than left out of closure/calibration entirely.
+
+    Returns ``{"prediction_id": str | None, "legacy": bool, "registered_at": str | None}``.
+    """
+    prediction_id = record.get("prediction_id")
+    if prediction_id:
+        return {"prediction_id": prediction_id, "legacy": False, "registered_at": None}
+    return {"prediction_id": None, "legacy": True, "registered_at": task_created}
+
+
+def compute_closure(
+    n_registered: int,
+    n_resolved_non_voided: int,
+    n_voided: int = 0,
+) -> dict[str, Any]:
+    """Closure rate over a corpus of pre-registered predictions (spec §2.3).
+
+    ``closure = resolved_non_voided / registered``. ``open_predictions`` is
+    the count still awaiting a (non-voided) resolution — registered minus
+    resolved minus voided. Pure arithmetic; the caller (M4) is responsible
+    for assembling ``n_registered``/``n_resolved_non_voided``/``n_voided``
+    from the reflection JSONL corpus (``prediction_registered`` +
+    ``prediction_revised`` + ``task_done``/``task_blocked``/``void`` events).
+    """
+    if n_registered <= 0:
+        return {
+            "closure": None,
+            "registered": n_registered,
+            "resolved": n_resolved_non_voided,
+            "voided": n_voided,
+            "open_predictions": 0,
+            "void_rate": None,
+            "insufficient_data": True,
+        }
+    closure = round(n_resolved_non_voided / n_registered, 4)
+    open_predictions = max(0, n_registered - n_resolved_non_voided - n_voided)
+    void_rate = round(n_voided / n_registered, 4)
+    return {
+        "closure": closure,
+        "registered": n_registered,
+        "resolved": n_resolved_non_voided,
+        "voided": n_voided,
+        "open_predictions": open_predictions,
+        "void_rate": void_rate,
+    }
 
 
 def find_reference_tasks(
@@ -693,6 +935,12 @@ def write_reflection_event(
       ``SURPRISE_TAXONOMY`` (models.py).  Validated before calling this function
       — pass an empty list rather than None when no surprise is provided.
 
+    CLAWP-112-001: ``event`` in {"task_done", "task_blocked"} carries
+    ``predictions.prediction_id`` at the top level (``None`` for a task whose
+    predictions were never registered — pre-dates this field, or genuinely has
+    no predictions). A record with no ``prediction_id`` reads as ``legacy``
+    per ``resolve_prediction_registration``.
+
     CLAWP-111 — ``kind``: the closing task's ``Task.kind``. Recorded only
     when it's not the ("build") default, so existing reflection events and
     consumers keep their current shape.
@@ -703,6 +951,7 @@ def write_reflection_event(
         "event": event,
         "task_id": task_id,
         "project_id": project_id,
+        "prediction_id": predictions.prediction_id,
         "agent_profile": agent_profile,
         "occurred_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "predictions": predictions.to_dict(),

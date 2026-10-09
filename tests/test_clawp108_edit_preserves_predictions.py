@@ -136,7 +136,9 @@ def test_edit_single_prediction_flag_preserves_all_other_fields(temp_portfolio, 
     # Sanity: the seed really did persist every field, incl. flag-less ones.
     assert before["filled_by"] == "operator-edited"
     assert before["thrash_threshold"] == 7
-    assert len(before) == 16
+    # 16 predicted fields + the CLAWP-112-001 prediction_id minted at first write.
+    assert len(before) == 17
+    assert before["prediction_id"]
 
     result = CliRunner().invoke(
         main, ["tasks", "edit", task_id, "--project", "test", *cli_args],
@@ -195,7 +197,9 @@ def test_edit_creates_block_with_just_that_field_when_none_exists(temp_portfolio
         main, ["tasks", "edit", task.id, "--project", "test", "--hypothesis", "fresh"],
     )
     assert result.exit_code == 0, result.output
-    assert _raw_predictions(config, task.id) == {"hypothesis": "fresh"}
+    raw = _raw_predictions(config, task.id)
+    assert raw.pop("prediction_id")  # CLAWP-112-001: minted on first write
+    assert raw == {"hypothesis": "fresh"}
 
 
 def test_edit_task_overlay_preserves_unknown_frontmatter_keys(temp_portfolio):
@@ -237,4 +241,6 @@ def test_mcp_tasks_edit_still_defaults_filled_by_to_agent_when_unset(temp_portfo
     task = add_task(config, "test", "No predictions yet")
     result = mcp_server.tasks_edit(task_id=task.id, project="test", confidence=2)
     assert result["ok"] is True, result
-    assert _raw_predictions(config, task.id) == {"confidence": 2, "filled_by": "agent"}
+    raw = _raw_predictions(config, task.id)
+    assert raw.pop("prediction_id")  # CLAWP-112-001: minted on first write
+    assert raw == {"confidence": 2, "filled_by": "agent"}

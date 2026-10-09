@@ -371,6 +371,11 @@ class Predictions:
     filled_by: str | None = None  # "agent" | "operator" | "operator-edited" | "retroactive" | None
     # CLAWP-062 -- per-task thrashing threshold. None = use global env/default.
     thrash_threshold: int | None = None
+    # CLAWP-112-001 — pre-registration id (uuid4 hex), minted the first time
+    # predictions are written (tasks add / tasks edit / emit-tree) and carried
+    # unchanged through every later revision. None until minted; legacy tasks
+    # created before this field existed never get one backfilled.
+    prediction_id: str | None = None
 
     def __post_init__(self) -> None:
         # Normalise success_criteria — accept str | dict | SuccessCriterion
@@ -401,6 +406,7 @@ class Predictions:
             "predicted_iterations": self.predicted_iterations,
             "filled_by": self.filled_by,
             "thrash_threshold": self.thrash_threshold,
+            "prediction_id": self.prediction_id,
         }
 
     @classmethod
@@ -431,6 +437,7 @@ class Predictions:
             predicted_iterations=data.get("predicted_iterations"),
             filled_by=data.get("filled_by"),
             thrash_threshold=data.get("thrash_threshold"),
+            prediction_id=data.get("prediction_id"),
         )
 
     def is_empty(self) -> bool:
