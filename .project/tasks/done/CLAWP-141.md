@@ -8,7 +8,7 @@ predictions:
   files_changed: 2
   filled_by: agent
 priority: 6
-updated: '2026-10-08'
+updated: '2026-10-09'
 ---
 # get_project_prefix naive [:5] misaligned with allocator prefix (CLAWP-133 follow-up)
 

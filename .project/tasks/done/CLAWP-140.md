@@ -9,7 +9,7 @@ predictions:
   filled_by: agent
   pitfalls: ids must be tested in the shapes the allocator really mints
 priority: 5
-updated: '2026-10-08'
+updated: '2026-10-09'
 ---
 # expand_task_id regex mis-reads digit-leading / multi-hyphen full ids (CLAWP-133 follow-up)
 
