@@ -44,6 +44,7 @@ def transition(
     surprise_tags: tuple[str, ...] = (),
     rationale: str | None = None,
     supersedes: str | None = None,
+    resolution: str | None = None,
 ) -> dict:
     """Transition ONE task's state and return a structured result.
 
@@ -110,6 +111,51 @@ def transition(
     # Capture task predictions before state transition (needed for reflection)
     pre_transition_task = get_task(config, project_id, task_id)
 
+    # CLAWP-111 — a kind=="decision" task cannot be closed without a
+    # resolution. This is the SHARED choke point: both `shortcuts.done` and
+    # `tasks state` (the CLI's two DONE entry points) call this function, and
+    # the MCP server also calls it directly rather than going through either
+    # CLI handler — so gating here (rather than in each CLI command) closes
+    # the bypass the task's own pre-mortem calls out. Checked before the
+    # mutator runs so a missing resolution leaves the task untouched.
+    # change_task_state also re-validates this itself (defense in depth for a
+    # caller that bypasses this service layer entirely), but that check alone
+    # would leave the CLI-layer bypass open — this is the one both paths share.
+    if (
+        state == TaskState.DONE
+        and pre_transition_task is not None
+        and pre_transition_task.kind == "decision"
+        and not (isinstance(resolution, str) and resolution.strip())
+    ):
+        return {
+            "ok": False,
+            "task_id": task_id,
+            "error": "decision_needs_resolution",
+            "message": (
+                f"Task {task_id} is a decision (kind: decision) and requires "
+                "a non-empty --resolution to complete."
+            ),
+        }
+    # A build task's resolution is optional, but one that IS supplied must be
+    # a non-blank string: refuse loudly (task untouched) rather than store
+    # nothing and report success.
+    if (
+        state == TaskState.DONE
+        and pre_transition_task is not None
+        and pre_transition_task.kind != "decision"
+        and resolution is not None
+        and not (isinstance(resolution, str) and resolution.strip())
+    ):
+        return {
+            "ok": False,
+            "task_id": task_id,
+            "error": "invalid_resolution",
+            "message": (
+                f"Task {task_id}: --resolution must be non-blank when "
+                "supplied (omit it to complete without one)."
+            ),
+        }
+
     # Map the mutator contract to isolated failure results so one bad task does
     # not abort a bulk run (CLAWP-083). Anything OUTSIDE the contract (an
     # unexpected OSError, a genuine bug) is deliberately NOT caught — it should
@@ -119,6 +165,7 @@ def transition(
             config, project_id, task_id, state,
             note=note, force=force,
             rationale=rationale, supersedes=supersedes,
+            resolution=resolution,
         )
     except LockTimeout as exc:
         return {
@@ -420,6 +467,7 @@ def transition(
                 process_lesson=process_lesson,
                 surprise_taxonomy=list(surprise_tags) if surprise_tags else [],
                 agent_profile=pre_transition_task.agent_profile,
+                kind=pre_transition_task.kind,
             )
         except Exception as exc:
             # Never let reflection failure block the (already durable) state

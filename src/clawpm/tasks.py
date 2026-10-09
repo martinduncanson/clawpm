@@ -867,6 +867,211 @@ def _write_rejection_frontmatter(
         raise
 
 
+def _resolution_applies(task: Task, resolution: object) -> bool:
+    """True when completing ``task`` must validate and persist ``resolution``:
+    always for a decision (mandatory), and for a build task only when the
+    caller supplied one (optional, ADR D1) — ``None`` means "not supplied"."""
+    return task.kind == "decision" or resolution is not None
+
+
+def _check_resolution(task: Task, task_id: str, resolution: object) -> None:
+    """Raise ``ValueError`` unless ``resolution`` is a non-blank string. A
+    supplied-but-blank (or non-string) resolution on a build task fails as
+    loudly as a missing one on a decision, rather than being silently dropped."""
+    if isinstance(resolution, str) and resolution.strip():
+        return
+    if task.kind == "decision":
+        raise ValueError(
+            f"Task {task_id} is a decision (kind: decision) and "
+            "requires a non-empty resolution to complete. "
+            "Pass resolution='<text>' to change_task_state()."
+        )
+    raise ValueError(
+        f"Task {task_id}: resolution must be a non-empty string when "
+        "supplied (omit it to complete without one)."
+    )
+
+
+def _write_resolution_frontmatter(file_path: Path, resolution: str) -> None:
+    """Rewrite the task file's YAML frontmatter to add resolution/resolved_at
+    before a task is moved to ``done/`` (CLAWP-111; mandatory for
+    ``kind: decision``, optional for build).
+
+    Mirrors ``_write_rejection_frontmatter``: preserves all existing
+    frontmatter keys, only adds/overwrites ``resolution`` and ``resolved_at``.
+    """
+    with guard_fs_tamper(f"Task file '{file_path}'"):
+        text = file_path.read_text(encoding="utf-8")
+    # STRICT parse (Codex r3): the lenient parse above drops unparseable YAML
+    # to ``{}``, and rewriting from that would erase id/priority/predictions.
+    # Refuse (FrontmatterError, a ValueError) with the file untouched.
+    fm, body = split_frontmatter(text, where=str(file_path))
+
+    fm["resolution"] = resolution
+    stamp_updated(fm)  # CLAWP-086 — resolving a decision is a mutation.
+    fm["resolved_at"] = fm["updated"]
+
+    new_text = (
+        "---\n"
+        + yaml.dump(fm, default_flow_style=False, allow_unicode=True)
+        + "---"
+        + body
+    )
+    tmp = file_path.with_suffix(".tmp")
+    try:
+        tmp.write_text(new_text, encoding="utf-8")
+        retry_transient(tmp.replace, file_path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _append_decision_to_parent(
+    parent_path: Path, child_id: str, child_title: str, resolution: str,
+) -> None:
+    """Append a one-line pointer under the parent's ``## Decisions so far``
+    section when a ``kind: decision`` child closes (CLAWP-111).
+
+    Creates the heading if absent. IDEMPOTENT (review fix): if a line for
+    ``child_id`` already exists under the heading — a retry after a partial
+    failure, or ``done --resolution`` simply re-run on an already-closed
+    decision — it is REPLACED in place (so a corrected resolution still
+    updates) rather than duplicated.
+
+    Lenient like ``_append_child_to_parent_frontmatter``: a vanished parent
+    is skipped rather than raising, so a missing parent file can never block
+    the child's own (already durable) completion. Narrowly so (review fix):
+    only the specific "parent no longer exists" case is swallowed — the same
+    scope ``_append_child_to_parent_frontmatter`` allows (its
+    ``ConcurrentModificationError``/``FrontmatterError`` catch), not every
+    ``OSError``. A genuine read failure (permissions, disk error) propagates
+    instead of being silently dropped (fail-open != fail-silent).
+    """
+    if not parent_path.exists():
+        return
+    try:
+        text = parent_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return  # vanished in the race between the exists() check and the read
+
+    first_line = next(
+        (ln for ln in resolution.strip().splitlines() if ln.strip()), ""
+    )
+    new_line = f"- [{child_title}]({child_id}): {first_line}"
+    heading = "## Decisions so far"
+    # Matches THIS child's existing line regardless of the title text it was
+    # written with (a task can be retitled between runs) — the (id) anchor is
+    # the stable identity.
+    child_line_re = re.compile(r"^-\s*\[.*?\]\(" + re.escape(child_id) + r"\):")
+
+    lines = text.split("\n")
+    h_idx = next((i for i, l in enumerate(lines) if l.strip() == heading), None)
+    if h_idx is not None:
+        section_end = len(lines)
+        for i in range(h_idx + 1, len(lines)):
+            if lines[i].startswith("## "):
+                section_end = i
+                break
+        existing_idx = next(
+            (i for i in range(h_idx + 1, section_end) if child_line_re.match(lines[i])),
+            None,
+        )
+        if existing_idx is not None:
+            lines[existing_idx] = new_line
+        else:
+            insert_idx = section_end
+            while insert_idx > h_idx + 1 and lines[insert_idx - 1].strip() == "":
+                insert_idx -= 1
+            lines.insert(insert_idx, new_line)
+        new_text = "\n".join(lines)
+    else:
+        sep = "" if text.endswith("\n") else "\n"
+        new_text = f"{text}{sep}\n{heading}\n\n{new_line}\n"
+
+    # CLAWP-086 — gaining a decision line mutates the parent, same as gaining
+    # a child (_child_append_text). Surgical splice (not a frontmatter
+    # reserialize) so the body edit above stays the only formatting change;
+    # a parent with no well-formed fence just skips the stamp.
+    _stamped = _set_updated_line(new_text, today_utc_iso())
+    if _stamped is not None:
+        new_text = _stamped
+
+    tmp = parent_path.with_suffix(parent_path.suffix + ".tmp")
+    try:
+        tmp.write_text(new_text, encoding="utf-8")
+        retry_transient(tmp.replace, parent_path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _restore_file_bytes(path: Path, data: bytes) -> None:
+    """Atomically put ``data`` back at ``path`` byte-for-byte (binary write, so
+    no newline translation on Windows)."""
+    tmp = path.with_suffix(path.suffix + ".rollback.tmp")
+    try:
+        tmp.write_bytes(data)
+        retry_transient(tmp.replace, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+@contextmanager
+def _restore_on_error(snapshots: list[tuple[Path, bytes]]):
+    """Roll back a multi-file completion (Codex r3): on ANY exception from the
+    body, restore every ``(path, original_bytes)`` snapshot recorded so far (in
+    reverse order) and re-raise the original error. A snapshotted file that no
+    longer exists is left alone (a concurrent delete must not be resurrected).
+    If a restore itself fails the error says which files were left modified
+    (loud, not silent) and chains the original."""
+    try:
+        yield
+    except BaseException as exc:
+        stuck: list[str] = []
+        for path, data in reversed(snapshots):
+            try:
+                if path.exists():
+                    _restore_file_bytes(path, data)
+            except Exception as rb_exc:  # noqa: BLE001 - report, don't mask
+                logger.error("Rollback of '%s' failed: %s", path, rb_exc)
+                stuck.append(str(path))
+        if stuck:
+            raise RuntimeError(
+                f"Completion failed ({exc!r}) and rollback could not restore: "
+                f"{', '.join(stuck)} — fix these files by hand."
+            ) from exc
+        raise
+
+
+def _apply_resolution(
+    config: PortfolioConfig,
+    project_id: str,
+    task_id: str,
+    task: Task,
+    task_md: Path,
+    resolution: str,
+    scope: Scope | None,
+    snapshots: list[tuple[Path, bytes]],
+) -> None:
+    """Write the resolution and (decision-only) the parent's "Decisions so far"
+    line, recording each file's ORIGINAL bytes in ``snapshots`` BEFORE touching
+    it so the caller's :func:`_restore_on_error` can undo a partial run."""
+    with guard_fs_tamper(f"Task file '{task_md}'"):
+        snapshots.append((task_md, task_md.read_bytes()))
+    _write_resolution_frontmatter(task_md, resolution)
+    # The parent map's "Decisions so far" is decision-only.
+    if task.kind == "decision" and task.parent:
+        # Forward `scope` (Codex r1 P1): a pinned worktree scope must resolve
+        # the parent in the SAME store as the child.
+        _parent = get_task(config, project_id, task.parent, **_scope_kw(scope))
+        if _parent and _parent.file_path and _parent.file_path.exists():
+            snapshots.append((_parent.file_path, _parent.file_path.read_bytes()))
+            _append_decision_to_parent(
+                _parent.file_path, task_id, task.title, resolution
+            )
+
+
 def change_task_state(
     config: PortfolioConfig,
     project_id: str,
@@ -876,6 +1081,7 @@ def change_task_state(
     force: bool = False,
     rationale: str | None = None,
     supersedes: str | None = None,
+    resolution: str | None = None,
     *,
     scope: Scope | None = None,
 ) -> Task | None:
@@ -993,36 +1199,67 @@ def change_task_state(
                     )
                 _write_rejection_frontmatter(_task_md, rationale.strip(), supersedes)  # type: ignore[arg-type]
 
-            # (b) Already in correct location — skip the MOVE only; the gate (c)
-            #     and metadata write (d) above have already run. Reload so the
-            #     return reflects any frontmatter just written. Guard _task.md
-            #     here too: step (a) only checked task_dir.exists(), so a
-            #     concurrent session removing just _task.md must surface the
-            #     friendly message, not a raw FileNotFoundError (Codex/Grok).
-            if task_dir.resolve() == new_dir.resolve():
-                _task_md = task_dir / "_task.md"
-                if not _task_md.exists():
-                    raise FileNotFoundError(
-                        f"Task metadata '{_task_md}' no longer exists — "
-                        "it may have been moved by a concurrent session."
+            # (d2) CLAWP-111 — RESOLUTION: a kind=="decision" task REQUIRES a
+            #      non-empty resolution to complete; a build task ACCEPTS an
+            #      optional one (ADR D1) and must not drop it. Written INSIDE
+            #      the lock, BEFORE the no-op return, so rerunning with a
+            #      corrected resolution still updates it. Backstop only — the
+            #      primary gate lives in services.tasks.transition (shared by
+            #      shortcuts.done and tasks_state); this defends direct callers.
+            #
+            #      ALL-OR-NOTHING (Codex r3): the resolution write, the parent
+            #      line and the state move form one unit. Each file's original
+            #      bytes are snapshotted before it is touched; a failure at any
+            #      step (including the move) restores them and re-raises, so
+            #      the task stays open, the parent unchanged, and a retry
+            #      converges (the parent line is replaced, never duplicated).
+            _resolved_this_txn = False
+            _snapshots: list[tuple[Path, bytes]] = []
+            with _restore_on_error(_snapshots):
+                if new_state == TaskState.DONE and _resolution_applies(task, resolution):
+                    _check_resolution(task, task_id, resolution)
+                    _task_md = task_dir / "_task.md"
+                    if not _task_md.exists():
+                        raise FileNotFoundError(
+                            f"Task metadata '{_task_md}' no longer exists — "
+                            "it may have been moved by a concurrent session."
+                        )
+                    _apply_resolution(
+                        config, project_id, task_id, task, _task_md,
+                        resolution.strip(), scope, _snapshots,
                     )
-                # (b.1) CLAWP-086 (Codex review) — a directory task's PROGRESS
-                #       transition keeps `_task.md` in place (no `.progress.md`
-                #       rename), so the move-path stamp below never runs. Stamp
-                #       here so `start` on a decomposed parent still bumps
-                #       `updated`. REJECTED already stamped in step (d).
-                if new_state != TaskState.REJECTED:
-                    _stamp_updated_file(_task_md)
-                return retry_transient(Task.from_file, _task_md)
+                    _resolved_this_txn = True
 
-            # (e) Move (retry transient Windows sharing/access faults — CLAWP-051)
-            retry_transient(shutil.move, str(task_dir), str(new_dir))
+                # (b) Already in correct location — skip the MOVE only; the gate (c)
+                #     and metadata write (d) above have already run. Reload so the
+                #     return reflects any frontmatter just written. Guard _task.md
+                #     here too: step (a) only checked task_dir.exists(), so a
+                #     concurrent session removing just _task.md must surface the
+                #     friendly message, not a raw FileNotFoundError (Codex/Grok).
+                if task_dir.resolve() == new_dir.resolve():
+                    _task_md = task_dir / "_task.md"
+                    if not _task_md.exists():
+                        raise FileNotFoundError(
+                            f"Task metadata '{_task_md}' no longer exists — "
+                            "it may have been moved by a concurrent session."
+                        )
+                    # (b.1) CLAWP-086 (Codex review) — a directory task's PROGRESS
+                    #       transition keeps `_task.md` in place (no `.progress.md`
+                    #       rename), so the move-path stamp below never runs. Stamp
+                    #       here so `start` on a decomposed parent still bumps
+                    #       `updated`. REJECTED/DECISION already stamped above.
+                    if new_state != TaskState.REJECTED and not _resolved_this_txn:
+                        _stamp_updated_file(_task_md)
+                    return retry_transient(Task.from_file, _task_md)
 
-            # (e.1) CLAWP-086 — stamp `updated` on the relocated file. REJECTED
-            #       already stamped via _write_rejection_frontmatter before the
-            #       move (whose divergent serializer we must not disturb), so
-            #       skip it here.
-            if new_state != TaskState.REJECTED:
+                # (e) Move (retry transient Windows sharing/access faults — CLAWP-051)
+                retry_transient(shutil.move, str(task_dir), str(new_dir))
+
+            # (e.1) CLAWP-086 — stamp `updated` on the relocated file. REJECTED/
+            #       DECISION already stamped via their own frontmatter writer
+            #       before the move (whose divergent serializer we must not
+            #       disturb), so skip it here.
+            if new_state != TaskState.REJECTED and not _resolved_this_txn:
                 _stamp_updated_file(new_dir / "_task.md")
 
             # (f) Reload and return INSIDE the lock (Finding 5). Retry the read
@@ -1079,17 +1316,33 @@ def change_task_state(
         if new_state == TaskState.REJECTED:
             _write_rejection_frontmatter(current_path, rationale.strip(), supersedes)  # type: ignore[arg-type]
 
-        # (b) Already in correct location — skip the MOVE only; the gate (c) and
-        #     metadata write (d) above have already run. Reload for a fresh view.
-        if current_path.resolve() == new_path.resolve():
-            return retry_transient(Task.from_file, current_path)
+        # (d2) CLAWP-111 — DECISION: see the directory-task branch above for
+        #      full rationale. Backstop only — the primary gate lives in
+        #      services.tasks.transition.
+        #      ALL-OR-NOTHING (Codex r3) — see the directory branch.
+        _resolved_this_txn = False
+        _snapshots: list[tuple[Path, bytes]] = []
+        with _restore_on_error(_snapshots):
+            if new_state == TaskState.DONE and _resolution_applies(task, resolution):
+                _check_resolution(task, task_id, resolution)
+                _apply_resolution(
+                    config, project_id, task_id, task, current_path,
+                    resolution.strip(), scope, _snapshots,
+                )
+                _resolved_this_txn = True
 
-        # (e) Move (retry transient Windows sharing/access faults — CLAWP-051)
-        retry_transient(shutil.move, str(current_path), str(new_path))
+            # (b) Already in correct location — skip the MOVE only; the gate (c) and
+            #     metadata write (d) above have already run. Reload for a fresh view.
+            if current_path.resolve() == new_path.resolve():
+                return retry_transient(Task.from_file, current_path)
 
-        # (e.1) CLAWP-086 — stamp `updated` on the relocated file. REJECTED
-        #       already stamped via _write_rejection_frontmatter before the move.
-        if new_state != TaskState.REJECTED:
+            # (e) Move (retry transient Windows sharing/access faults — CLAWP-051)
+            retry_transient(shutil.move, str(current_path), str(new_path))
+
+        # (e.1) CLAWP-086 — stamp `updated` on the relocated file. REJECTED/
+        #       DECISION already stamped via their own frontmatter writer
+        #       before the move.
+        if new_state != TaskState.REJECTED and not _resolved_this_txn:
             _stamp_updated_file(new_path)
 
         # (f) Reload and return INSIDE the lock (Finding 5). Retry the read too:
@@ -2527,8 +2780,54 @@ def add_task(
     out_of_scope: list[str] | None = None,
     stop_conditions: list[str] | None = None,
     delegability: str | None = None,
+    source_request: str | None = None,
+    kind: str | None = None,
 ) -> Task | None:
-    """Add a new task to a project."""
+    """Add a new task to a project (see :func:`add_task_with_status`).
+
+    With ``source_request`` set, an existing task carrying the same key is
+    returned instead of creating a second one.
+    """
+    return add_task_with_status(
+        config, project_id, title, task_id=task_id, priority=priority,
+        complexity=complexity, depends=depends, scope=scope, tags=tags,
+        description=description, predictions=predictions,
+        parallel_group=parallel_group, agent_profile=agent_profile,
+        out_of_scope=out_of_scope, stop_conditions=stop_conditions,
+        delegability=delegability, source_request=source_request, kind=kind,
+    )[0]
+
+
+def add_task_with_status(
+    config: PortfolioConfig,
+    project_id: str,
+    title: str,
+    task_id: str | None = None,
+    priority: int = 5,
+    complexity: TaskComplexity | None = None,
+    depends: list[str] | None = None,
+    scope: list[str] | None = None,
+    tags: list[str] | None = None,
+    description: str = "",
+    predictions: Predictions | None = None,
+    parallel_group: int | None = None,
+    agent_profile: str | None = None,
+    out_of_scope: list[str] | None = None,
+    stop_conditions: list[str] | None = None,
+    delegability: str | None = None,
+    source_request: str | None = None,
+    kind: str | None = None,
+) -> tuple[Task | None, bool]:
+    """Add a new task to a project; return ``(task, created)``.
+
+    ``source_request`` (CLAWP-101) is an idempotency key — the inbox message id a
+    task was materialized from — written into the frontmatter in the same atomic
+    write as the task, so a retry can find the task instead of creating a second
+    one. Omitted from the file when ``None``. The key is rechecked INSIDE the
+    creation lock, before an id is allocated, so two concurrent callers for one
+    key cannot both create: the loser gets ``(existing_task, False)``.
+    ``(None, False)`` means the project has no tasks directory.
+    """
     tasks_dir = get_tasks_dir(config, project_id)
     if not tasks_dir:
         # Registry lookup succeeded but tasks/ doesn't exist yet - or registry
@@ -2539,7 +2838,7 @@ def add_task(
             # walk so operators don't get a silent failure when inside the repo.
             project_dot_dir = find_project_dir_fallback(config, project_id)
         if not project_dot_dir:
-            return None
+            return None, False
         tasks_dir = project_dot_dir / "tasks"
         tasks_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2613,6 +2912,15 @@ def add_task(
     # for the DURATION of one local-disk add_task call is cheap; a subtly
     # incorrect "skip it sometimes" optimization is not worth its risk.
     with portfolio_prefix_lock(config.portfolio_root), file_lock(_lock_path):
+        # CLAWP-101 (PR #88 Codex r2) — idempotency recheck. A caller's own
+        # pre-check ran outside this lock, so a concurrent materialiser may have
+        # created the task since. Recheck here, before any id is allocated or
+        # reserved, so the loser reuses the winner's task.
+        if source_request:
+            _existing = _scan_source_request(tasks_dir, source_request)
+            if _existing is not None:
+                return _existing, False
+
         # Generate task ID if not provided (inside lock: scan is now serialised)
         if not task_id:
             # CLAWP-048: resolve a portfolio-unique prefix (explicit task_prefix ->
@@ -2704,6 +3012,12 @@ def add_task(
             frontmatter["stop_conditions"] = stop_conditions
         if delegability and delegability != "either":
             frontmatter["delegability"] = delegability
+        if source_request:
+            frontmatter["source_request"] = source_request
+        # CLAWP-111 — kind: omit at the "build" default so plain tasks keep
+        # emitting byte-identical frontmatter to before this field existed.
+        if kind and kind != "build":
+            frontmatter["kind"] = kind
 
         if predictions and not predictions.is_empty():
             pred_dict = predictions.to_dict()
@@ -2728,6 +3042,20 @@ def add_task(
 ## Notes
 
 """
+
+        # CLAWP-101 (PR #88 Codex r4) — the stamp is the crash-retry key, so
+        # refuse to write a task whose own serialised frontmatter would not
+        # hand it back (e.g. a "---" inside a value ends the block early).
+        if source_request:
+            try:
+                _stamped = split_frontmatter(content)[0].get("source_request")
+            except FrontmatterError:
+                _stamped = None
+            if _stamped != source_request:
+                raise ValueError(
+                    "source_request would not survive in the task's frontmatter "
+                    "(a field value probably contains '---'); task not created"
+                )
 
         # Write file — explicit utf-8 so Unicode titles (e.g. →, –, emoji) don't
         # raise UnicodeEncodeError on Windows where the default locale is cp1252.
@@ -2762,7 +3090,57 @@ def add_task(
         # reload-under-lock contract (CLAWP-051 Finding 5). The file was just
         # written under this lock, so the read can't race another clawpm writer;
         # retry_transient covers a scanner touching the fresh file (CLAWP-051).
-        return retry_transient(Task.from_file, file_path)
+        return retry_transient(Task.from_file, file_path), True
+
+
+def find_task_by_source_request(
+    config: PortfolioConfig, project_id: str, source_request: str
+) -> Task | None:
+    """Return the task whose frontmatter ``source_request`` equals the key, in any state.
+
+    CLAWP-101 retry guard for ``inbox materialize``. Scans every task file under
+    the project's tasks dir (open, progress, done, blocked, rejected); a cheap
+    substring pre-check avoids parsing files that cannot match.
+    """
+    tasks_dir = get_tasks_dir(config, project_id)
+    if not tasks_dir or not tasks_dir.exists():
+        return None
+    return _scan_source_request(tasks_dir, source_request)
+
+
+def _scan_source_request(tasks_dir: Path, source_request: str) -> Task | None:
+    """Scan ``tasks_dir`` for the task stamped with ``source_request`` (any state).
+
+    Returning ``None`` means "absent", and callers act on that by allocating a
+    new task, so it must only be returned when every file was actually read. A
+    read that still fails after ``retry_transient`` (a held Windows sharing
+    violation, an ACL denial) raises: the caller leaves the request pending
+    rather than failing open into a duplicate. A file that vanishes mid-scan
+    (a concurrent state-change rename) restarts the scan, since the stamped task
+    may have moved to a name this pass had not yet listed.
+    """
+    for _ in range(3):
+        vanished = False
+        for path in sorted(tasks_dir.rglob("*.md")):
+            try:
+                text = retry_transient(path.read_text, "utf-8")
+            except FileNotFoundError:
+                vanished = True
+                continue
+            if source_request not in text:
+                continue
+            try:
+                fm, _fm_body = split_frontmatter(text, where=str(path))
+            except FrontmatterError:
+                continue
+            if fm.get("source_request") == source_request:
+                return Task.from_file(path)
+        if not vanished:
+            return None
+    raise OSError(
+        f"task files under {tasks_dir} kept changing during the source_request scan; "
+        "cannot establish whether the request was already materialised"
+    )
 
 
 def edit_task(
@@ -2782,6 +3160,7 @@ def edit_task(
     out_of_scope: list[str] | None = None,
     stop_conditions: list[str] | None = None,
     delegability: str | None = None,
+    kind: str | None = None,
 ) -> Task | None:
     """Edit task metadata (frontmatter) and optionally title/body."""
     tasks_dir = get_tasks_dir(config, project_id)
@@ -2892,6 +3271,35 @@ def edit_task(
                 frontmatter["delegability"] = delegability
             else:
                 frontmatter.pop("delegability", None)
+        # CLAWP-111 — kind: REPLACE semantics (mirrors delegability); "build"
+        # (the default) pops the key so a reclassify-back-to-build task drops
+        # the key rather than persisting an explicit "build".
+        if kind is not None:
+            # Review fix — close-gate bypass: `edit` has no --resolution flag,
+            # so retroactively reclassifying an ALREADY-done, resolution-less
+            # task as kind: decision would leave it in a state the done gate
+            # (change_task_state) can never produce on its own (done without
+            # a resolution). Refuse rather than silently create that
+            # inconsistent combination; a task can still be reclassified
+            # BEFORE it's done, or AFTER if it already carries a resolution
+            # (e.g. corrected via a hand edit).
+            if (
+                kind == "decision"
+                and task.state == TaskState.DONE
+                # Parsed value, not raw YAML truthiness (Codex r1 P2):
+                # Task.from_file normalises blank / non-string to None.
+                and task.resolution is None
+            ):
+                raise ValueError(
+                    f"Task {task_id} is already done without a resolution. "
+                    "Reclassifying it as kind: decision now would bypass the "
+                    "done-requires-resolution gate. Reopen it first (or leave "
+                    "its kind as build)."
+                )
+            if kind != "build":
+                frontmatter["kind"] = kind
+            else:
+                frontmatter.pop("kind", None)
 
         # Update title in content (first # heading)
         if title is not None:
@@ -2931,6 +3339,107 @@ def edit_task(
         tmp_path = task.file_path.with_suffix(".tmp")
         try:
             tmp_path.write_text(new_text, encoding="utf-8")
+            retry_transient(tmp_path.replace, task.file_path)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
+
+        return retry_transient(Task.from_file, task.file_path)
+
+
+def edit_fog(
+    config: PortfolioConfig,
+    project_id: str,
+    task_id: str,
+    add: str | None = None,
+    drop: str | None = None,
+) -> Task | None:
+    """Add/remove an entry in a task's fog list (``not_yet_specified``), CLAWP-111-002.
+
+    A minimal, dedicated mutator — touches ONLY the ``not_yet_specified`` key
+    (plus the mandatory ``updated`` stamp every mutator bumps), so a diff
+    against the pre-edit file shows no incidental rewrite of unrelated
+    frontmatter or body. ``add`` is idempotent (a duplicate add leaves the list
+    contents unchanged, though the file is still rewritten/timestamped like any
+    other mutator call). ``drop`` removes an EXACT match only — no prefix
+    matching here, unlike ``--graduates``, since this is a direct
+    administrative edit rather than free-text disambiguation.
+    """
+    tasks_dir = get_tasks_dir(config, project_id)
+    if not tasks_dir:
+        return None
+
+    with file_lock(tasks_dir / ".clawpm-tasks.lock"):
+        task = get_task(config, project_id, task_id)
+        if not task or not task.file_path:
+            return None
+
+        with guard_fs_tamper(f"Task {task_id}"):
+            raw_text = task.file_path.read_bytes().decode("utf-8")
+        # A UTF-8 BOM would hide the leading fence from split_frontmatter, and
+        # universal-newline reads would silently rewrite CRLF: strip the BOM
+        # and normalise to "\n" for processing, then restore both on write.
+        has_bom = raw_text.startswith("﻿")
+        text = raw_text[1:] if has_bom else raw_text
+        use_crlf = "\r\n" in text
+        if use_crlf:
+            text = text.replace("\r\n", "\n")
+
+        frontmatter: dict
+        try:
+            frontmatter, content = split_frontmatter(text, where=str(task.file_path))
+        except FrontmatterError as exc:
+            if exc.reason == "absent":
+                frontmatter, content = {}, text
+            elif exc.reason == "unterminated":
+                raise ValueError(
+                    f"Task {task_id} has an unterminated frontmatter fence; "
+                    "refusing to edit (would corrupt the file)."
+                ) from None
+            elif exc.reason == "not_a_mapping":
+                raise ValueError(
+                    f"Task {task_id} frontmatter is not a YAML mapping; "
+                    f"refusing to edit (would corrupt the file): {exc}"
+                ) from None
+            else:
+                cause = exc.__cause__ or exc
+                raise ValueError(
+                    f"Task {task_id} frontmatter is unparseable; refusing "
+                    f"to edit (would corrupt the file): {cause}"
+                ) from cause
+
+        fog_raw = frontmatter.get("not_yet_specified")
+        fog: list[str] = (
+            [s for s in fog_raw if isinstance(s, str)] if isinstance(fog_raw, list) else []
+        )
+
+        if add is not None and add not in fog:
+            fog.append(add)
+        if drop is not None and drop in fog:
+            fog = [f for f in fog if f != drop]
+
+        if fog:
+            frontmatter["not_yet_specified"] = fog
+        else:
+            frontmatter.pop("not_yet_specified", None)
+
+        stamp_updated(frontmatter)
+
+        # No "\n" between the second fence and `content`: split_frontmatter's
+        # `content` is the RAW substring after the closing "---" (not
+        # stripped), which already carries its own leading "\n" — unlike
+        # edit_task's rebuild (which inserts one unconditionally and so grows
+        # a blank line at the fence boundary on every edit), this reproduces
+        # the original fence-to-body transition byte-for-byte when nothing
+        # else changed (CLAWP-111-002's diff-clean contract).
+        new_text = f"---\n{yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True).strip()}\n---{content}"
+        if use_crlf:
+            new_text = new_text.replace("\n", "\r\n")
+        if has_bom:
+            new_text = "﻿" + new_text
+        tmp_path = task.file_path.with_suffix(".tmp")
+        try:
+            tmp_path.write_bytes(new_text.encode("utf-8"))
             retry_transient(tmp_path.replace, task.file_path)
         except Exception:
             tmp_path.unlink(missing_ok=True)
@@ -2993,15 +3502,24 @@ def split_task(
         return retry_transient(Task.from_file, new_path)
 
 
-def _child_append_text(parent_path: Path, child_id: str) -> str | None:
+def _child_append_text(
+    parent_path: Path, child_id: str, *, remove_fog: str | None = None,
+) -> str | None:
     """Compute the parent's frontmatter rewritten to include ``child_id`` in its
-    ``children`` list, or ``None`` if the append is a genuine no-op.
+    ``children`` list (and, when ``remove_fog`` is given, with that EXACT entry
+    removed from ``not_yet_specified``), or ``None`` if the whole update is a
+    genuine no-op.
 
     Pure (reads the parent, builds the new text, writes nothing) so callers can
     STAGE this alongside the child-file write and commit both together (CLAWP-071
     two-phase). Returns ``None`` ONLY for a true no-op — the parent is not a
-    directory-task ``_task.md`` (nothing to persist into) or already lists the
-    child (idempotent).
+    directory-task ``_task.md`` (nothing to persist into), or both the child is
+    already listed AND (if requested) the fog entry is already gone (idempotent).
+
+    ``remove_fog`` (CLAWP-111-002 ``--graduates``) is the ALREADY-RESOLVED
+    fog-list entry to drop — callers must have matched it (exact/prefix,
+    ambiguity-checked) against the parent's fog list BEFORE calling this, so
+    this function does no matching of its own and just removes a literal value.
 
     RAISES on an inability to BUILD the update, so the two-phase caller writes
     NEITHER file rather than orphaning the child (Codex CLAWP-071 review — do not
@@ -3024,17 +3542,74 @@ def _child_append_text(parent_path: Path, child_id: str) -> str | None:
     children = fm.get("children")
     if not isinstance(children, list):
         children = []
-    if child_id in children:
+    changed = False
+    if child_id not in children:
+        children.append(child_id)
+        fm["children"] = children
+        changed = True
+    if remove_fog is not None:
+        fog = fm.get("not_yet_specified")
+        if isinstance(fog, list) and remove_fog in fog:
+            fog = [f for f in fog if f != remove_fog]
+            if fog:
+                fm["not_yet_specified"] = fog
+            else:
+                fm.pop("not_yet_specified", None)
+            changed = True
+    if not changed:
         return None  # idempotent — already persisted
-    children.append(child_id)
-    fm["children"] = children
-    stamp_updated(fm)  # CLAWP-086 — gaining a child mutates the parent.
+    stamp_updated(fm)  # CLAWP-086 — gaining a child (or losing a fog entry) mutates the parent.
     body = raw_body.lstrip("\n")
     return (
         "---\n"
         + yaml.dump(fm, default_flow_style=False, allow_unicode=True).strip()
         + "\n---\n"
         + body
+    )
+
+
+class FogMatchError(ValueError):
+    """``--graduates`` matched zero or multiple fog entries (CLAWP-111-002).
+
+    A ``ValueError`` subclass so it flows through the CLI's existing
+    ``_mutation_errors`` mapper unchanged; ``candidates`` is also attached for
+    any caller that wants the structured list rather than parsing the message.
+    """
+
+    def __init__(self, message: str, candidates: list[str]):
+        super().__init__(message)
+        self.candidates = candidates
+
+
+def _match_fog_entry(fog: list[str], text: str) -> str:
+    """Match ``text`` against a fog (``not_yet_specified``) list.
+
+    Three tiers, first to resolve wins: a LITERAL exact match, then a
+    case-insensitive exact match, then a case-insensitive prefix match. Exactly
+    one match at the resolving tier wins; zero or multiple matches at the
+    resolving tier raises :class:`FogMatchError` listing the candidates (empty
+    list for zero matches). This is the safety net for free-text matching
+    against an arbitrary fog list — ambiguity must be surfaced, never guessed.
+    """
+    literal = [f for f in fog if f == text]
+    if len(literal) == 1:
+        return literal[0]
+    text_lower = text.lower()
+    exact = [f for f in fog if f.lower() == text_lower]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        raise FogMatchError(
+            f"'{text}' matches multiple fog entries exactly (case-insensitive): {exact}",
+            exact,
+        )
+    prefix = [f for f in fog if f.lower().startswith(text_lower)]
+    if len(prefix) == 1:
+        return prefix[0]
+    if not prefix:
+        raise FogMatchError(f"No fog entry matches '{text}'.", [])
+    raise FogMatchError(
+        f"'{text}' matches multiple fog entries as a prefix: {prefix}", prefix,
     )
 
 
@@ -3204,11 +3779,20 @@ def add_subtask(
     stop_conditions: list[str] | None = None,
     delegability: str | None = None,
     tags: list[str] | None = None,
+    graduates: str | None = None,
+    kind: str | None = None,
 ) -> Task | None:
     """Add a subtask to a parent task.
-    
+
     Auto-splits parent if not already a directory.
     Generates sequential subtask ID (PARENT-001, PARENT-002, etc.).
+
+    ``graduates`` (CLAWP-111-002): text matched against the parent's fog list
+    (``not_yet_specified``, exact-or-prefix, case-insensitive — see
+    :func:`_match_fog_entry`). On a single match, that entry is removed from
+    the parent atomically with this child's creation. On zero or multiple
+    matches, raises :class:`FogMatchError` BEFORE any mutation — no child, no
+    parent split, no parent write.
     """
     tasks_dir = get_tasks_dir(config, project_id)
     if not tasks_dir:
@@ -3258,6 +3842,18 @@ def add_subtask(
                 "are frozen history and cannot take new subtasks. Move it out of "
                 "the archive before decomposing."
             )
+
+        # CLAWP-111-002 — resolve --graduates against the PRE-split parent's fog
+        # list, and BEFORE the flat->directory split below. A 0/multiple-match
+        # failure must create nothing at all — including no split, which is
+        # itself a mutation (moves the file on disk even though content is
+        # unchanged). Matching is unaffected by the split (frontmatter is
+        # untouched by it), so resolving here and writing via the (possibly
+        # reassigned) `parent.file_path` after the split is safe.
+        matched_fog: str | None = None
+        if graduates is not None:
+            matched_fog = _match_fog_entry(parent.not_yet_specified, graduates)
+
         if parent.file_path and parent.file_path.name != "_task.md":
             parent = split_task(config, project_id, parent_id)
             if not parent:
@@ -3317,6 +3913,10 @@ def add_subtask(
             frontmatter["stop_conditions"] = stop_conditions
         if delegability and delegability != "either":
             frontmatter["delegability"] = delegability
+        # CLAWP-111 — kind: omit at the "build" default (byte-identical to
+        # pre-111 subtask files).
+        if kind and kind != "build":
+            frontmatter["kind"] = kind
 
         # CLAWP-069 — subtasks may carry their own workstream tags (no
         # propagation from the parent; each task is tagged independently).
@@ -3364,7 +3964,9 @@ def add_subtask(
         # build failure (parent vanished / unparseable). So the single-write path
         # below is taken only for the true no-op; a build failure propagates and
         # writes NEITHER file, instead of orphaning the child (Codex review).
-        parent_new_text = _child_append_text(parent.file_path, subtask_id)
+        parent_new_text = _child_append_text(
+            parent.file_path, subtask_id, remove_fog=matched_fog,
+        )
         if parent_new_text is None:
             # True no-op on the parent — single atomic child write.
             tmp_path = file_path.with_suffix(".tmp")
@@ -3376,10 +3978,20 @@ def add_subtask(
                 tmp_path.unlink(missing_ok=True)
                 raise
         else:
-            commit_staged_pair(
-                (file_path, content),
-                (parent.file_path, parent_new_text),
-            )
+            try:
+                commit_staged_pair(
+                    (file_path, content),
+                    (parent.file_path, parent_new_text),
+                )
+            except Exception:
+                # CLAWP-111-002 — graduation is all-or-nothing: the child is
+                # committed first, so if the parent rename then fails the
+                # fog entry is still listed and a retry would mint a SECOND
+                # child for it. Drop the freshly-minted child (its id is new
+                # under the lock, so this file can only be ours).
+                if matched_fog is not None:
+                    file_path.unlink(missing_ok=True)
+                raise
 
         # Reload under the lock; retry_transient covers a scanner touching the
         # freshly-written child file even though the write committed (CLAWP-051).
