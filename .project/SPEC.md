@@ -26,7 +26,7 @@ clawpm is a multi-project task and research management CLI — the persistent st
 
 ## Technical Notes
 
-- Python 3.11+, Click CLI, `src/clawpm/` (~30 modules), ~1,130 pytest tests.
+- Python 3.11+, Click CLI, `src/clawpm/` (~30 modules), ~1,857 pytest tests.
 - Task files: `.project/tasks/*.md`, YAML frontmatter; state encoded by directory (`tasks/`, `done/`, `blocked/`) + `.progress.md` suffix; work log append-only JSONL; reflections per-task JSONL under `~/clawpm/reflections/`.
 - Fork-primary development: `martinduncanson/clawpm` (fork remote) is canonical; `malphas-gh/clawpm` (origin) receives courtesy upstream PRs.
 - Windows is a first-class platform: UTF-8 stdio reconfigure (CLAWP-045/046), msvcrt cross-process locks, spaced-profile-path discipline.

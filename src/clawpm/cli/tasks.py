@@ -3,19 +3,24 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import uuid
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import click
 
-from clawpm.concurrency import LockTimeout
+from clawpm.concurrency import LockTimeout, file_lock
 from clawpm.models import PortfolioConfig, Predictions, ProjectStatus, SURPRISE_TAXONOMY, SuccessCriterion, Task, TaskComplexity, TaskState, WorkLogAction
 from clawpm.output import OutputFormat, output_error, output_json, output_success, output_task_detail, output_tasks_list
-from clawpm.discovery import discover_projects, get_project
+from clawpm.discovery import (
+    discover_projects, get_project, get_scoped_project_settings, is_task_store_canonical,
+)
 from clawpm.tasks import add_subtask, add_task, archive_done_tasks, change_task_state, distinct_tags, edit_fog, edit_task, get_task, list_tasks, split_task
 from clawpm.worklog import add_entry, filter_files_changed, read_entries
 from clawpm.context import expand_task_id
-from clawpm.cli.base import main, _mutation_errors, get_format, require_portfolio, require_project, _read_patterns_file, _FALLBACK_POLICIES
+from clawpm.cli.base import main, _mutation_errors, get_format, require_portfolio, require_project, _read_patterns_file, _FALLBACK_POLICIES, ExpandedPath
 from clawpm.services.tasks import transition_isolated
+from clawpm.sessions import stat_exists as _stat_exists
 
 # ============================================================================
 # Tasks commands
@@ -160,20 +165,36 @@ def _collect_project_tasks(
     # (Codex P2: --all-projects over a project with task_prefix="SAME" stored
     # children under SAME-001 but expanded --parent 1 to ALPHA-001 -> no match).
     # Also corrects the single-project path for divergent-prefix projects.
-    resolved_prefix = None
-    if parent or linked:
-        from clawpm.tasks import resolve_existing_prefix
-        _settings = get_project(config, project_id)
-        resolved_prefix = resolve_existing_prefix(_settings) if _settings else None
+    #
+    # CLAWP-113: resolved PER REF against the ids on disk, because a legacy
+    # project can hold both `CODE--003` and `CODE-007` (ValueError if one
+    # ordinal exists in both spellings).
+    def _ref_prefix(ref: str) -> str | None:
+        import re
+
+        from clawpm.tasks import resolve_ref_prefix
+        # A full id (CODE-003, CODE--003) never needs a prefix; skip the
+        # resolution (and its portfolio scan) entirely.
+        if not re.fullmatch(r"\d+(?:-\d+)?", ref):
+            return None
+        # Session-scoped (worktree) settings, NOT the canonical checkout's:
+        # the filter reads tasks from the scoped store, so the ref must resolve
+        # against the same ids (CLAWP-113 r9).
+        _settings = get_scoped_project_settings(config, project_id)
+        try:
+            return resolve_ref_prefix(_settings, config, ref) if _settings else None
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
+
     if parent:
-        filter_list.append(by_parent(expand_task_id(parent, project_id, resolved_prefix)))
+        filter_list.append(by_parent(expand_task_id(parent, project_id, _ref_prefix(parent))))
     if linked:
         from clawpm.links import build_link_index
         index = build_link_index(config, project_id)
         # Resolve both the expanded (task-style) id and the raw ref so --linked
         # works for research/mission ids that expand_task_id would leave alone.
         refs: set[str] = set()
-        for target in {expand_task_id(linked, project_id, resolved_prefix), linked}:
+        for target in {expand_task_id(linked, project_id, _ref_prefix(linked)), linked}:
             refs |= index.referencing_ids(target)
         filter_list.append(by_linked(refs))
 
@@ -398,18 +419,18 @@ def tasks_archive(ctx: click.Context, project_id: str | None, older_than: str, d
 @click.option("--priority", type=int, help="New priority (1-10)")
 @click.option("--complexity", "-c", type=click.Choice(["s", "m", "l", "xl"]), help="New complexity")
 @click.option("--body", "-b", help="New body content (replaces description before ## sections)")
-@click.option("--scope", "-s", "scope", multiple=True, help="File glob patterns claimed by this task (can specify multiple)")
-@click.option("--scope-file", "scope_file", default=None, type=click.Path(), help="Read scope glob patterns from file (one per line). Windows-safe: bypasses CRT argv glob-expansion. Use instead of --scope when patterns contain wildcards.")
+@click.option("--scope", "-s", "scope", multiple=True, help="File glob patterns claimed by this task (can specify multiple). Quote wildcard patterns (e.g. 'scripts/**'): an unquoted one can be expanded by a POSIX shell on any OS (including Git Bash on Windows) or by PowerShell on Linux/macOS before clawpm runs. PowerShell and cmd on Windows pass arguments through verbatim. Or use --scope-file.")
+@click.option("--scope-file", "scope_file", default=None, type=ExpandedPath(), help="Read scope glob patterns from file (one per line). Immune to shell glob-expansion. Use instead of --scope when patterns contain wildcards.")
 @click.option("--parallel-group", "parallel_group", type=int, default=None, help="Batch ordinal for parallel dispatch (CLAWP-021). Use --clear-parallel-group to remove.")
 @click.option("--clear-parallel-group", "clear_parallel_group", is_flag=True, default=False, help="Remove parallel_group from the task — opts out of batch dispatch.")
 @click.option("--tag", "tags", multiple=True, help="Workstream tags (CLAWP-069, repeatable). REPLACES the task's tag set (mirrors --scope). Use --clear-tags to remove all.")
 @click.option("--clear-tags", "clear_tags", is_flag=True, default=False, help="Remove all tags from the task.")
 # --- Prediction flags (all optional) ---
-@click.option("--predict-duration", "predict_duration", default=None, help="Predicted duration: 90, 90m, 2h, 3d, 1w")
+@click.option("--predict-duration", "predict_duration", default=None, help="Predicted duration: 90, 90m, 2h, 3d, 1w, or combined units like 2h30m")
 @click.option("--predict-complexity", "predict_complexity", type=click.Choice(["s", "m", "l", "xl"]), default=None, help="Predicted complexity")
 @click.option("--predict-files-changed", "predict_files_changed", type=int, default=None, help="Predicted number of files changed")
-@click.option("--predict-scope", "predict_scope", multiple=True, help="Predicted file glob scope (can specify multiple)")
-@click.option("--predict-scope-file", "predict_scope_file", default=None, type=click.Path(), help="Read predicted-scope patterns from file (one per line). Windows-safe alternative to --predict-scope for glob patterns.")
+@click.option("--predict-scope", "predict_scope", multiple=True, help="Predicted file glob scope (can specify multiple). Quote wildcard patterns (e.g. 'scripts/**'): an unquoted one can be expanded by a POSIX shell on any OS (including Git Bash on Windows) or by PowerShell on Linux/macOS before clawpm runs. PowerShell and cmd on Windows pass arguments through verbatim. Or use --predict-scope-file.")
+@click.option("--predict-scope-file", "predict_scope_file", default=None, type=ExpandedPath(), help="Read predicted-scope patterns from file (one per line). Alternative (immune to shell glob-expansion) to --predict-scope for glob patterns.")
 @click.option("--predict-frameworks", "predict_frameworks", multiple=True, help="Predicted frameworks/libraries to touch (can specify multiple)")
 @click.option("--predict-pitfalls", "predict_pitfalls", default=None, help="Anticipated problematic areas (free text)")
 @click.option("--hypothesis", "hypothesis", default=None, help="Goal/hypothesis: 'if I do X, then Y will improve'")
@@ -423,13 +444,20 @@ def tasks_archive(ctx: click.Context, project_id: str | None, older_than: str, d
 @click.option("--predict-iterations", "predict_iterations", type=int, default=None, help="Predicted iterate->grade->revise cycles (CLAWP-019). Default None; 1 means 'expected to land in one pass'.")
 # --- CLAWP-054 dispatch contract fields ---
 @click.option("--out-of-scope", "out_of_scope", multiple=True, help="Boundary items the executor MUST NOT touch (repeatable).")
-@click.option("--out-of-scope-file", "out_of_scope_file", default=None, type=click.Path(), help="Read out-of-scope patterns from file (one per line). Windows-safe alternative to --out-of-scope for glob patterns.")
+@click.option("--out-of-scope-file", "out_of_scope_file", default=None, type=ExpandedPath(), help="Read out-of-scope patterns from file (one per line). Alternative (immune to shell glob-expansion) to --out-of-scope for glob patterns.")
 @click.option("--stop-condition", "stop_conditions", multiple=True, help="Escape-hatch conditions (repeatable).")
 @click.option(
     "--delegability", "delegability",
     type=click.Choice(["agent", "human", "either"]),
     default=None,
     help="Who may execute this task. 'human' means auto-dispatch is REFUSED.",
+)
+# CLAWP-111 — decision-kind tasks
+@click.option(
+    "--kind", "kind",
+    type=click.Choice(["build", "decision"]),
+    default=None,
+    help="'decision' means this task IS a decision — done requires --resolution.",
 )
 @click.pass_context
 def tasks_edit(
@@ -465,6 +493,7 @@ def tasks_edit(
     out_of_scope_file: str | None = None,
     stop_conditions: tuple[str, ...] = (),
     delegability: str | None = None,
+    kind: str | None = None,
 ) -> None:
     """Edit task metadata (title, priority, complexity, body, scope)."""
     fmt = get_format(ctx)
@@ -505,8 +534,8 @@ def tasks_edit(
     ])
 
     if not any([title, priority is not None, complexity, body, scope, scope_file, has_predictions, parallel_group is not None, clear_parallel_group,
-                 out_of_scope, out_of_scope_file, stop_conditions, delegability is not None, tags, clear_tags]):
-        output_error("no_changes", "Specify at least one field to edit (--title, --priority, --complexity, --body, --scope, --scope-file, --parallel-group, --clear-parallel-group, --tag, --clear-tags, --predict-*, --out-of-scope, --out-of-scope-file, --stop-condition, or --delegability)", fmt=fmt)
+                 out_of_scope, out_of_scope_file, stop_conditions, delegability is not None, tags, clear_tags, kind is not None]):
+        output_error("no_changes", "Specify at least one field to edit (--title, --priority, --complexity, --body, --scope, --scope-file, --parallel-group, --clear-parallel-group, --tag, --clear-tags, --predict-*, --out-of-scope, --out-of-scope-file, --stop-condition, --delegability, or --kind)", fmt=fmt)
         sys.exit(1)
 
     if parallel_group is not None and clear_parallel_group:
@@ -565,6 +594,7 @@ def tasks_edit(
             out_of_scope=list(out_of_scope) if out_of_scope else None,
             stop_conditions=list(stop_conditions) if stop_conditions else None,
             delegability=delegability,
+            kind=kind,
         )
 
     if not task:
@@ -661,8 +691,12 @@ def _render_state_results(
               help="Required when state=rejected: one-line reason this idea was considered and rejected.")
 @click.option("--supersedes", "supersedes", default=None,
               help="Optional task-id that supersedes this rejected task (e.g. a replacement task).")
+# CLAWP-111 — decision-kind tasks: resolution is required when new_state is
+# 'done' on a kind: decision task.
+@click.option("--resolution", "resolution", default=None,
+              help="Outcome text. Required to complete (done) a kind: decision task; optional (stored) for build tasks.")
 @click.pass_context
-def tasks_state(ctx: click.Context, project_id: str | None, task_ids: tuple[str, ...], new_state: str, note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...], rationale: str | None, supersedes: str | None) -> None:
+def tasks_state(ctx: click.Context, project_id: str | None, task_ids: tuple[str, ...], new_state: str, note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...], rationale: str | None, supersedes: str | None, resolution: str | None) -> None:
     """Change one or many tasks' state (CLAWP-083 bulk mode).
 
     ``clawpm tasks state 72 73 74 done`` transitions each listed task with
@@ -728,6 +762,7 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_ids: tuple[str,
                 reflect_note=reflect_note, meta_reflect=meta_reflect,
                 process_lesson=process_lesson, surprise_tags=surprise_tags,
                 rationale=rationale, supersedes=supersedes,
+                resolution=resolution,
             )
         )
 
@@ -859,22 +894,22 @@ def tasks_decompose(
 @click.option("--priority", type=int, default=5, help="Priority (1-10, lower is higher)")
 @click.option("--complexity", "-c", type=click.Choice(["s", "m", "l", "xl"]), help="Complexity")
 @click.option("--depends", "-d", multiple=True, help="Dependencies (can specify multiple)")
-@click.option("--scope", multiple=True, help="File glob patterns claimed by this task (can specify multiple)")
-@click.option("--scope-file", "scope_file", default=None, type=click.Path(), help="Read scope glob patterns from file (one per line). Windows-safe: bypasses CRT argv glob-expansion. Use instead of --scope when patterns contain wildcards.")
+@click.option("--scope", multiple=True, help="File glob patterns claimed by this task (can specify multiple). Quote wildcard patterns (e.g. 'scripts/**'): an unquoted one can be expanded by a POSIX shell on any OS (including Git Bash on Windows) or by PowerShell on Linux/macOS before clawpm runs. PowerShell and cmd on Windows pass arguments through verbatim. Or use --scope-file.")
+@click.option("--scope-file", "scope_file", default=None, type=ExpandedPath(), help="Read scope glob patterns from file (one per line). Immune to shell glob-expansion. Use instead of --scope when patterns contain wildcards.")
 @click.option("--parallel-group", "parallel_group", type=int, default=None, help="Batch ordinal for parallel dispatch (CLAWP-021). Tasks sharing a group dispatch together; group N+1 waits for group N.")
 @click.option("--agent-profile", "agent_profile", default=None, help="Capability/skill profile (CLAWP-038). Recorded on the task and propagated to reflection/iteration events so calibration can segment predicted-vs-actual by profile.")
 @click.option("--tag", "tags", multiple=True, help="Cross-cutting workstream tag (CLAWP-069, repeatable, e.g. --tag concurrency --tag mcp). Normalised to lowercase.")
 @click.option("--parent", "parent_id", help="Parent task ID (creates subtask)")
 @click.option("--description", help="Task description (deprecated, use --body)")
 @click.option("--body", "-b", help="Task body content")
-@click.option("--body-file", type=click.Path(exists=True), help="Read body from file")
+@click.option("--body-file", type=ExpandedPath(exists=True), help="Read body from file")
 @click.option("--stdin", "read_stdin", is_flag=True, help="Read body from stdin")
 # --- Prediction flags (all optional) ---
-@click.option("--predict-duration", "predict_duration", default=None, help="Predicted duration: 90, 90m, 2h, 3d, 1w")
+@click.option("--predict-duration", "predict_duration", default=None, help="Predicted duration: 90, 90m, 2h, 3d, 1w, or combined units like 2h30m")
 @click.option("--predict-complexity", "predict_complexity", type=click.Choice(["s", "m", "l", "xl"]), default=None, help="Predicted complexity")
 @click.option("--predict-files-changed", "predict_files_changed", type=int, default=None, help="Predicted number of files changed")
-@click.option("--predict-scope", "predict_scope", multiple=True, help="Predicted file glob scope (can specify multiple)")
-@click.option("--predict-scope-file", "predict_scope_file", default=None, type=click.Path(), help="Read predicted-scope patterns from file (one per line). Windows-safe alternative to --predict-scope for glob patterns.")
+@click.option("--predict-scope", "predict_scope", multiple=True, help="Predicted file glob scope (can specify multiple). Quote wildcard patterns (e.g. 'scripts/**'): an unquoted one can be expanded by a POSIX shell on any OS (including Git Bash on Windows) or by PowerShell on Linux/macOS before clawpm runs. PowerShell and cmd on Windows pass arguments through verbatim. Or use --predict-scope-file.")
+@click.option("--predict-scope-file", "predict_scope_file", default=None, type=ExpandedPath(), help="Read predicted-scope patterns from file (one per line). Alternative (immune to shell glob-expansion) to --predict-scope for glob patterns.")
 @click.option("--predict-frameworks", "predict_frameworks", multiple=True, help="Predicted frameworks/libraries to touch (can specify multiple)")
 @click.option("--predict-pitfalls", "predict_pitfalls", default=None, help="Anticipated problematic areas (free text)")
 @click.option("--hypothesis", "hypothesis", default=None, help="Goal/hypothesis: 'if I do X, then Y will improve'")
@@ -895,7 +930,7 @@ def tasks_decompose(
 )
 # --- CLAWP-054 dispatch contract fields ---
 @click.option("--out-of-scope", "out_of_scope", multiple=True, help="Boundary items the executor MUST NOT touch (repeatable; file globs or named topics). Rendered verbatim in the agent preamble.")
-@click.option("--out-of-scope-file", "out_of_scope_file", default=None, type=click.Path(), help="Read out-of-scope patterns from file (one per line). Windows-safe alternative to --out-of-scope for glob patterns.")
+@click.option("--out-of-scope-file", "out_of_scope_file", default=None, type=ExpandedPath(), help="Read out-of-scope patterns from file (one per line). Alternative (immune to shell glob-expansion) to --out-of-scope for glob patterns.")
 @click.option("--stop-condition", "stop_conditions", multiple=True, help="Escape-hatch condition: if triggered, executor must STOP and report back (repeatable, free text).")
 @click.option(
     "--delegability", "delegability",
@@ -912,6 +947,12 @@ def tasks_decompose(
          "match graduates: the subtask is created and that entry is removed "
          "from the parent, atomically. Zero or multiple matches creates "
          "nothing and errors listing the candidates.",
+# CLAWP-111 — decision-kind tasks
+@click.option(
+    "--kind", "kind",
+    type=click.Choice(["build", "decision"]),
+    default=None,
+    help="'decision' means this task IS a decision — done requires --resolution. Default: build.",
 )
 @click.pass_context
 def tasks_add(
@@ -953,6 +994,7 @@ def tasks_add(
     stop_conditions: tuple[str, ...] = (),
     delegability: str | None = None,
     graduates: str | None = None,
+    kind: str | None = None,
 ) -> None:
     """Add a new task (or subtask with --parent)."""
     fmt = get_format(ctx)
@@ -1067,6 +1109,7 @@ def tasks_add(
                 delegability=delegability,
                 tags=tags_list,
                 graduates=graduates,
+                kind=kind,
             )
         else:
             deps = list(depends) if depends else None
@@ -1087,6 +1130,7 @@ def tasks_add(
                 out_of_scope=list(out_of_scope) if out_of_scope else None,
                 stop_conditions=list(stop_conditions) if stop_conditions else None,
                 delegability=delegability,
+                kind=kind,
             )
 
     if not task:
@@ -1245,11 +1289,88 @@ def tasks_emit_rubric(
             click.echo(_json_rub.dumps(payload, indent=2))
 
 
+@contextmanager
+def _dispatch_target_lock(portfolio_root: Path, target_dir: Path, fmt):
+    """Serialise dispatches that write to the same target directory.
+
+    The lock sentinel lives under ``<portfolio_root>/locks/`` keyed by a
+    digest of the normcased, resolved target path — never inside the target
+    itself, where it would appear as an untracked file in the operator's repo
+    (and, for ``--worktree``, in a checkout meant to be disposable).
+
+    Both failure modes exit the command rather than proceeding unserialised:
+    running the snapshot/write/register/rollback sequence without the lock is
+    exactly the race the lock exists to close, so degrading to "carry on
+    anyway" would reintroduce it silently — which is worse than a dispatch the
+    operator can simply re-run.
+    """
+    from clawpm.dispatch import dispatch_lock_path
+
+    # Same sentinel `teardown_dispatch_settings` takes, so a teardown of this
+    # target (completion, lease fallback, explicit) can never interleave with
+    # this command's write -> register window.
+    lock_path = dispatch_lock_path(portfolio_root, target_dir)
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        output_error(
+            "dispatch_blocked",
+            f"Could not create the dispatch lock directory {lock_path.parent} "
+            f"({type(exc).__name__}: {exc}). Refusing to dispatch "
+            f"unserialised: a concurrent dispatch to the same target could "
+            f"then clobber this one's settings.",
+            fmt=fmt,
+        )
+        sys.exit(1)
+    try:
+        with file_lock(lock_path):
+            yield
+    except LockTimeout as exc:
+        output_error(
+            "dispatch_blocked",
+            f"Another dispatch is writing to {target_dir} and did not finish "
+            f"in time ({exc}). Re-run once it completes.",
+            fmt=fmt,
+        )
+        sys.exit(1)
+
+
+def _settings_still_present(path: Path) -> bool:
+    """Whether *path* exists; an unreadable answer counts as present (the safe
+    reading — it keeps the "inspect manually" advice)."""
+    try:
+        return _stat_exists(path)
+    except OSError:
+        return True
+
+
+_UNREADABLE = object()
+
+
+def _read_bytes_or_none(path: Path):
+    """Current bytes at *path*, ``None`` if absent, a sentinel if unreadable.
+
+    Used by dispatch's rollback to decide whether the artifacts on disk are
+    still the ones this invocation wrote. An absent file and an unreadable
+    one are DIFFERENT answers: absent legitimately compares equal to "we
+    wrote no sidecar", while unreadable proves nothing and must never
+    compare equal to anything — hence a sentinel rather than ``None``, which
+    would let an EACCES read masquerade as a match and re-arm the very
+    clobber the comparison exists to prevent.
+    """
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return _UNREADABLE
+
+
 @tasks.command("dispatch")
 @click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
 @click.argument("task_id")
 @click.option(
-    "--target-dir", "target_dir", type=click.Path(), default=None,
+    "--target-dir", "target_dir", type=ExpandedPath(), default=None,
     help="Directory to write .claude/settings.local.json into. Default: current directory."
 )
 @click.option(
@@ -1294,6 +1415,13 @@ def tasks_emit_rubric(
          "the baseline_ref was stamped, and proceed with dispatch anyway. Without "
          "this flag, dispatch is blocked when drift is detected.",
 )
+@click.option(
+    "--max-iterations", "max_iterations", type=click.IntRange(min=1), default=None,
+    help="CLAWP-070: hard cap on Stop-hook rubric iterations for THIS dispatch. "
+         "After N not-ok verdicts the hook lets the agent stop with a "
+         "MAX_ITERATIONS message for operator triage. Default: uncapped "
+         "(thrashing detection still applies).",
+)
 @click.pass_context
 def tasks_dispatch(
     ctx: click.Context,
@@ -1308,6 +1436,7 @@ def tasks_dispatch(
     lease_ttl: int | None,
     fallback_policy: str,
     confirm_stale: bool,
+    max_iterations: int | None,
 ) -> None:
     """Emit hook-wired .claude/settings.local.json for a dispatched subagent (CLAWP-018).
 
@@ -1320,6 +1449,45 @@ def tasks_dispatch(
     so multiple subagents can be dispatched in parallel without colliding
     on a single .claude/settings.local.json.
     """
+    # A dispatch resolves its task in the scope of the place it will RUN
+    # (CLAWP-098, Codex P1 on PR #55 rounds 14-15). In place, that is cwd's
+    # own session (if any). For an explicit `--target-dir` the launched
+    # process runs THERE, so its ID-based hooks resolve whatever session
+    # contains that directory — the target's own worktree, or the canonical
+    # store when it is inside none — and the task (and rubric) must be read
+    # from that same store, not from the caller's, or the hooks report "task
+    # not found" / mutate a divergent copy. `resolve_scope_from` makes every
+    # session lookup below key on the target. (`--worktree` is unchanged: see
+    # the source-repo comment in the body.)
+    if target_dir is not None and not worktree:
+        from clawpm.sessions import resolve_scope_from
+
+        _scope = resolve_scope_from(Path(target_dir).resolve())
+    else:
+        _scope = nullcontext()
+    with _scope:
+        _tasks_dispatch_impl(
+            ctx, project_id, task_id, target_dir, worktree, no_session_context,
+            force, confirm_close, refute_votes, lease_ttl, fallback_policy,
+            confirm_stale, max_iterations,
+        )
+
+
+def _tasks_dispatch_impl(
+    ctx: click.Context,
+    project_id: str | None,
+    task_id: str,
+    target_dir: str | None,
+    worktree: bool,
+    no_session_context: bool,
+    force: bool,
+    confirm_close: bool | None,
+    refute_votes: int,
+    lease_ttl: int | None,
+    fallback_policy: str,
+    confirm_stale: bool,
+    max_iterations: int | None = None,
+) -> None:
     from clawpm.dispatch import (
         create_worktree,
         settings_path,
@@ -1331,6 +1499,37 @@ def tasks_dispatch(
     config = require_portfolio(ctx)
     project_id, _source = require_project(ctx, project_id)
     task_id = expand_task_id(task_id, project_id)
+
+    # CLAWP-039: opportunistic lease sweep — one of the two no-daemon expiry
+    # detectors (the other is `clawpm doctor`). A holder that died is reaped
+    # here, on the next dispatch, instead of lingering. Run on EVERY dispatch,
+    # not only leased ones (Codex P2): a dead holder from an earlier lease must
+    # be reaped even if this dispatch isn't requesting one. Cheap — a no-op
+    # when leases.jsonl is absent.
+    #
+    # BEFORE the task is loaded (Codex P2, PR #55 round 9). The sweep applies a
+    # fallback policy to expired leases, which rewrites the canonical task —
+    # even an OPEN-to-OPEN fallback restamps `updated`. Sweeping after the task
+    # was read, its SHA validated and its worktree created meant re-dispatching
+    # a task whose own lease had just expired registered the pre-fallback
+    # revision while the canonical file already held a different one, and the
+    # post-create check (existence and SHA against the STALE validated value)
+    # could not see it. Sweeping first makes everything downstream read the
+    # post-fallback revision, so there is one revision in play rather than two.
+    from clawpm.leases import sweep as _lease_sweep
+    swept = []
+    sweep_error = None
+    try:
+        # Scope to the dispatched project (Codex P2): `dispatch --project A`
+        # must not reap project B's leased tasks. Portfolio-wide reaping is
+        # `clawpm doctor`'s job, not a side effect of an A-scoped dispatch.
+        swept = _lease_sweep(config, config.portfolio_root, project_id=project_id)
+    except Exception as exc:
+        # A sweep failure must not block the dispatch (the user's actual
+        # intent), but must not be silent either — else `leases_swept: 0`
+        # hides a broken janitor (Codex/silent-failure).
+        swept = []
+        sweep_error = f"{type(exc).__name__}: {exc}"
 
     task = get_task(config, project_id, task_id)
     if not task:
@@ -1357,8 +1556,22 @@ def tasks_dispatch(
     # EXPECTED-class skips (no scope, no baseline, ts: marker, non-git) stay silent.
     if not confirm_stale:
         from clawpm.baseline import detect_scope_drift
-        _proj_for_drift = get_project(config, project_id)
-        _repo_for_drift = getattr(_proj_for_drift, "repo_path", None) if _proj_for_drift else None
+        # The drift gate must diff in the checkout the TASK was loaded from
+        # (CLAWP-098, Codex P2 on PR #55 round 13). `get_task` above is
+        # session-scoped, so an in-place dispatch from a registered worktree
+        # reads that worktree's task and baseline; diffing the canonical
+        # checkout instead reported "clean" for a worktree branch whose
+        # in-scope files had changed. `--worktree` keeps the canonical repo:
+        # that is where `create_worktree` will branch from, so it is the tree
+        # the new worktree will actually contain.
+        if worktree:
+            _proj_for_drift = get_project(config, project_id)
+            _repo_for_drift = (
+                getattr(_proj_for_drift, "repo_path", None) if _proj_for_drift else None
+            )
+        else:
+            from clawpm.discovery import get_repo_path as _get_repo_path_for_drift
+            _repo_for_drift = _get_repo_path_for_drift(config, project_id)
         _drift_result = detect_scope_drift(
             repo_path=_repo_for_drift,
             scope=getattr(task, "scope", []),
@@ -1396,8 +1609,34 @@ def tasks_dispatch(
                      f"--lease-ttl must be positive, got {lease_ttl}", fmt=fmt)
         sys.exit(1)
 
+    # Refuse a lease for a task that does not live in the CANONICAL store
+    # (Codex P1, PR #55 round 16). `leases.apply_fallback` runs its entire
+    # sweep under `suppress_session_resolution()` — deliberately, since a
+    # sweep processes whichever task's lease expired, not one the operator
+    # named in the current command, and must never inherit the caller's own
+    # worktree for an unrelated task. So a lease granted for a task that
+    # lives in a registered worktree's own store is a lease the sweep can
+    # never correctly act on: it would read/mutate the canonical copy,
+    # treating the worktree-only task as missing, and silently leave the
+    # dispatch's live hooks untorn-down. Refuse up front rather than plumb
+    # scope through the lease registry and every sweep call site — the
+    # operator can dispatch without --lease-ttl for a worktree-scoped task.
+    if lease_ttl is not None and not is_task_store_canonical(config, project_id):
+        output_error(
+            "lease_unsupported_scope",
+            f"Task {task_id!r} resolves from a registered worktree's own "
+            f"task store, not the canonical checkout. --lease-ttl is not "
+            f"supported there: crash-safety sweeps always act on the "
+            f"canonical store, so a lease on a worktree-scoped task could "
+            f"never be correctly reaped. Dispatch without --lease-ttl, or "
+            f"dispatch the canonical copy of this task.",
+            fmt=fmt,
+        )
+        sys.exit(1)
+
     project = get_project(config, project_id)
     # Resolve target directory
+    session_id: str | None = None
     if worktree:
         if not project or not project.repo_path or not project.repo_path.exists():
             output_error(
@@ -1407,8 +1646,264 @@ def tasks_dispatch(
                 fmt=fmt,
             )
             sys.exit(1)
+        # CLAWP-098 (grok + Codex review, PR #55): probe materialization
+        # via git's OWN committed tree BEFORE create_worktree ever runs,
+        # rather than creating the worktree first and checking after.
+        # create_worktree is idempotent by DIRECTORY EXISTENCE, not
+        # freshness — a create-then-check-then-cleanup-on-failure design
+        # was tried first and both Codex and grok independently caught the
+        # same bug in it: the documented recovery ("commit the task, then
+        # re-run dispatch") didn't actually work, because the retry's
+        # create_worktree just returned the SAME stale checkout (still
+        # missing the task, still at the old HEAD) instead of creating a
+        # fresh one from the new commit. Checking git's tree directly,
+        # before anything is created, sidesteps that entirely — nothing to
+        # clean up, and a retry after `git commit` naturally creates a
+        # brand-new worktree from the new HEAD.
+        #
+        # Only checked when the project git-tracks .project/ at HEAD at
+        # all (CLAWP-075's convention) — a project that doesn't never had
+        # anything here to check, and dispatch proceeds unaffected exactly
+        # as before this fix.
+        #
+        # Probed paths resolve relative to the REPO ROOT, not `-C`'s
+        # directory (antigravity review, PR #55) — for a project whose
+        # repo_path is a SUBDIRECTORY of a larger repo (a mono-repo
+        # layout), an unprefixed ".project" would probe the wrong location
+        # entirely. `git rev-parse --show-prefix` gives the path from the
+        # repo root down to repo_path (empty when repo_path IS the root),
+        # which every probed path below is prefixed with.
+        #
+        # Every probe FAILS CLOSED (Codex review, PR #55). `git cat-file
+        # -e` was used here before and only reports object existence: it
+        # cannot tell a missing path from a broken object store, an
+        # unreadable HEAD, or git missing from PATH, so any operational
+        # fault read as "`.project` isn't tracked", skipped both guards
+        # below, and could dispatch/register a stale reused checkout — the
+        # exact fail-open this gate exists to close, through the gate's own
+        # probe. `head_object_sha` raises GitProbeError on an operational
+        # failure and returns None only for a clean non-resolution; we
+        # abort on the former rather than guessing.
+        from clawpm.dispatch import (
+            GitProbeError, head_object_sha, repo_prefix, working_tree_blob_sha,
+        )
+        # Probe — and branch from — the canonical project checkout.
+        #
+        # A session-scoped variant of this (`get_repo_path(config,
+        # project_id)`, PR #55 round 7) was reverted in round 8: pointing
+        # `create_worktree` at a dispatched worktree makes re-dispatching an
+        # existing task branch fail, because `clawpm/<task>` is already
+        # checked out there. Probing one checkout while branching from
+        # another is the mismatch that motivated the change in the first
+        # place, so the two halves cannot be separated — and getting the
+        # scoping right is a distributed-state problem in its own right.
+        # CLAWP-117 settled it: one value, used by every git call below, and
+        # a branch already checked out elsewhere is detected explicitly
+        # before `create_worktree`.
+        _source_repo = project.repo_path
+        _existing_wt = _source_repo / ".clawpm-worktrees" / task_id
         try:
-            resolved_dir = create_worktree(project.repo_path, task_id)
+            _repo_prefix = repo_prefix(_source_repo)
+            _head_has_project = head_object_sha(
+                _source_repo, f"{_repo_prefix}.project"
+            ) is not None
+        except GitProbeError as exc:
+            output_error(
+                "git_probe_failed",
+                f"Could not determine whether {_source_repo} git-tracks "
+                f".project/ at HEAD: {exc}. Refusing to dispatch --worktree: "
+                f"treating this as 'not tracked' would skip the materialization "
+                f"guards and could register a stale checkout as an isolated "
+                f"worktree. Fix the repository state (or omit --worktree to "
+                f"dispatch in-place) and retry.",
+                fmt=fmt,
+            )
+            sys.exit(1)
+        # CLAWP-118: `git worktree add` checks out the whole repository, so
+        # the project root inside it is `<worktree>/<prefix>`. Everything
+        # downstream (marker, settings, agent cwd, `.project/` checks) works
+        # at that project root; the session record stores the checkout root
+        # plus the prefix. `repo_prefix` returns a trailing slash: strip it.
+        _wt_prefix = _repo_prefix.rstrip("/")
+        if _head_has_project:
+            from clawpm.tasks import _candidate_task_paths
+            _rel_candidates = _candidate_task_paths(Path(".project/tasks"), task_id)
+            # Verify the CURRENT revision, not merely that some candidate
+            # path for this id exists in HEAD (Codex review, PR #55).
+            # `tasks start` renames `T.md` -> `T.progress.md` in the working
+            # tree; until that rename is committed, HEAD still carries the
+            # old open-state `T.md`, so a bare any-candidate-exists check
+            # passed and the worktree was created at the STALE revision —
+            # losing the metadata dispatch had just loaded and rendered, and
+            # setting up conflicting transitions when the branch merges.
+            # So: find the path the task actually occupies on disk now (the
+            # same first-match order `get_task` resolves), then require THAT
+            # path to be in HEAD with byte-identical content.
+            _live_candidates = _candidate_task_paths(
+                _source_repo / ".project" / "tasks", task_id
+            )
+            try:
+                _live_path = next(
+                    (p for p in _live_candidates if _stat_exists(p)), None
+                )
+            except OSError as exc:
+                output_error(
+                    "git_probe_failed",
+                    f"Could not check for task {task_id!r} in {_source_repo}: "
+                    f"{type(exc).__name__}: {exc}. Refusing to dispatch "
+                    f"--worktree rather than assume it is absent.",
+                    fmt=fmt,
+                )
+                sys.exit(1)
+            # The blob this gate approves. Carried to the post-create check
+            # so the worktree can be verified to hold THIS revision, not
+            # merely some file for this id.
+            _validated_sha = None
+            try:
+                if _live_path is not None:
+                    _rel_live = _live_path.relative_to(_source_repo).as_posix()
+                    _head_sha = head_object_sha(
+                        _source_repo, f"{_repo_prefix}{_rel_live}"
+                    )
+                    _live_sha = working_tree_blob_sha(_live_path)
+                    _materialized = (
+                        _head_sha is not None and _head_sha == _live_sha
+                    )
+                    if _materialized:
+                        _validated_sha = _head_sha
+                    # Two distinct ways to be stale, and both must be
+                    # reported as staleness rather than as "the task isn't
+                    # committed" — the worktree WOULD get a file, just the
+                    # wrong revision of it, which is the more dangerous
+                    # outcome because nothing downstream trips over it:
+                    #   (a) same path in HEAD, different content — the task
+                    #       was edited in place and not committed;
+                    #   (b) a DIFFERENT candidate path for this id is in
+                    #       HEAD — `tasks start` renamed T.md to
+                    #       T.progress.md and the rename is uncommitted, so
+                    #       HEAD still carries the old open-state file. The
+                    #       Stop hook then finds that stale file happily and
+                    #       the agent works against superseded state.
+                    _stale_revision = not _materialized and (
+                        _head_sha is not None
+                        or any(
+                            head_object_sha(
+                                _source_repo, f"{_repo_prefix}{p.as_posix()}"
+                            ) is not None
+                            for p in _rel_candidates
+                        )
+                    )
+                else:
+                    # No on-disk copy in the main checkout at all — fall back
+                    # to the any-candidate probe, which is the right question
+                    # when there is no current revision to compare against.
+                    _materialized = any(
+                        head_object_sha(
+                            _source_repo, f"{_repo_prefix}{p.as_posix()}"
+                        ) is not None
+                        for p in _rel_candidates
+                    )
+                    _stale_revision = False
+            except GitProbeError as exc:
+                output_error(
+                    "git_probe_failed",
+                    f"Could not verify whether task {task_id!r} is materialized "
+                    f"at HEAD in {_source_repo}: {exc}. Refusing to "
+                    f"dispatch --worktree rather than assuming either answer — "
+                    f"guessing 'materialized' risks a worktree without the "
+                    f"task (hanging its Stop hook), and guessing 'not' would "
+                    f"block a legitimate dispatch. Fix the repository state "
+                    f"and retry.",
+                    fmt=fmt,
+                )
+                sys.exit(1)
+            if not _materialized:
+                # If this exact worktree already exists (e.g. dispatched
+                # earlier and reused here), name that explicitly — deleting
+                # it is NOT safe (might hold real in-progress work), so the
+                # operator needs to know a plain retry won't self-heal.
+                _extra = (
+                    f" A worktree already exists at {_existing_wt} from an "
+                    f"earlier dispatch — remove it manually (git worktree "
+                    f"remove) before retrying, or it will keep being reused "
+                    f"stale."
+                    if _existing_wt.exists() else ""
+                )
+                if _stale_revision:
+                    output_error(
+                        "task_not_materialized",
+                        f"Task {task_id!r} is committed at HEAD, but not at "
+                        f"the revision the current checkout holds "
+                        f"({_live_path} is uncommitted — either edited in "
+                        f"place, or renamed by a state transition such as "
+                        f"`tasks start`). A worktree checked out from HEAD "
+                        f"would carry the STALE revision, and — unlike a "
+                        f"missing task file — nothing downstream trips over "
+                        f"it: the Stop hook resolves the old file happily "
+                        f"and the agent works against superseded state, "
+                        f"which then conflicts when the branch merges. "
+                        f"Commit the task file first, then re-run dispatch — "
+                        f"or omit --worktree to dispatch in-place.{_extra}",
+                        fmt=fmt,
+                    )
+                else:
+                    output_error(
+                        "task_not_materialized",
+                        f"Task {task_id!r} exists in the current checkout but isn't "
+                        f"committed, and this project git-tracks .project/ — a "
+                        f"worktree checked out from HEAD would be missing this "
+                        f"task's file. Dispatching anyway would either hang the "
+                        f"Stop hook (looking for a task that isn't there) or "
+                        f"silently disable CLAWP-098's worktree isolation for "
+                        f"every task in that checkout. Commit the task file "
+                        f"first, then re-run dispatch — or omit --worktree to "
+                        f"dispatch in-place.{_extra}",
+                        fmt=fmt,
+                    )
+                sys.exit(1)
+        # CLAWP-117: `_source_repo` is computed ONCE above and is the only
+        # checkout the HEAD probe, this branch check and `create_worktree`
+        # use. If `clawpm/<task>` is already checked out somewhere other than
+        # the canonical worktree path (e.g. a dispatched worktree that was
+        # `git worktree move`d), `git worktree add` would fail with a raw git
+        # error; fail closed here and name the path instead. We do not reuse
+        # the other checkout: it carries a session/marker registered under
+        # its own path, and adopting it here would be a second, silent
+        # identity decision.
+        import os as _os
+
+        from clawpm.dispatch import worktree_path_for_branch
+
+        if not _existing_wt.exists():
+            try:
+                _branch_wt = worktree_path_for_branch(
+                    _source_repo, f"clawpm/{task_id}"
+                )
+            except GitProbeError as exc:
+                output_error(
+                    "git_probe_failed",
+                    f"Could not list worktrees of {_source_repo}: {exc}. "
+                    f"Refusing to dispatch --worktree.",
+                    fmt=fmt,
+                )
+                sys.exit(1)
+            if _branch_wt is not None and _os.path.normcase(
+                str(_branch_wt.resolve())
+            ) != _os.path.normcase(str(_existing_wt.resolve())):
+                output_error(
+                    "branch_checked_out_elsewhere",
+                    f"Branch clawpm/{task_id} is already checked out at "
+                    f"{_branch_wt}, not at {_existing_wt}. Dispatching would "
+                    f"fail (or branch from the wrong checkout). Either work "
+                    f"in {_branch_wt} (it is still the dispatched worktree "
+                    f"for this task), move it back with `git worktree move "
+                    f"{_branch_wt} {_existing_wt}`, or remove it with `git "
+                    f"worktree remove {_branch_wt}` and re-run dispatch.",
+                    fmt=fmt,
+                )
+                sys.exit(1)
+        try:
+            _wt_root = create_worktree(_source_repo, task_id)
         except subprocess.CalledProcessError as exc:
             output_error(
                 "worktree_failed",
@@ -1416,6 +1911,95 @@ def tasks_dispatch(
                 fmt=fmt,
             )
             sys.exit(1)
+        # CLAWP-118: the project root inside the checkout (the checkout root
+        # itself for a root-level project).
+        resolved_dir = _wt_root / _wt_prefix if _wt_prefix else _wt_root
+        if _wt_prefix and not _stat_exists(resolved_dir):
+            output_error(
+                "worktree_failed",
+                f"The worktree at {_wt_root} has no {_wt_prefix!r} directory, "
+                f"so project {project_id!r} has nothing tracked in HEAD to "
+                f"dispatch into. Commit the project directory (or omit "
+                f"--worktree) and retry.",
+                fmt=fmt,
+            )
+            sys.exit(1)
+        # CLAWP-098 (grok + Codex review, round 5 — independently caught by
+        # both, third confirmation this exact shape is real): the HEAD
+        # probe above proves the task is committed, but create_worktree is
+        # idempotent by DIRECTORY EXISTENCE — a leftover/stale worktree
+        # from an EARLIER, now-outdated dispatch is reused as-is, without
+        # ever refreshing its contents against the current HEAD. So the
+        # probe can pass while the REUSED checkout on disk still doesn't
+        # have the task. Re-verify against the actual filesystem right
+        # here, before write_dispatch_settings runs, and ABORT (not
+        # silently skip registration) on a mismatch — a successful-looking
+        # dispatch with isolation silently off is exactly the failure this
+        # whole gate exists to prevent.
+        if _head_has_project:
+            from clawpm.tasks import _candidate_task_paths as _ctp
+            # Compare the CONTENT, not just existence (Codex P2, PR #55
+            # round 7). The SHA comparison before create_worktree validates
+            # the SOURCE checkout against its own HEAD; it says nothing
+            # about a directory create_worktree reused unchanged. A reused
+            # worktree holding an older revision of this same task passed an
+            # existence-only check and was registered — the stale-revision
+            # dispatch the pre-create gate exists to prevent, arriving by
+            # the one route that gate can't see.
+            try:
+                _wt_path = next(
+                    (p for p in _ctp(resolved_dir / ".project" / "tasks", task_id)
+                     if _stat_exists(p)),
+                    None,
+                )
+            except OSError as exc:
+                output_error(
+                    "git_probe_failed",
+                    f"Could not check for the task file in the worktree at "
+                    f"{resolved_dir}: {type(exc).__name__}: {exc}. Refusing "
+                    f"to register it rather than assume the task is absent.",
+                    fmt=fmt,
+                )
+                sys.exit(1)
+            _wt_sha = None
+            if _wt_path is not None:
+                try:
+                    _wt_sha = working_tree_blob_sha(_wt_path)
+                except GitProbeError as exc:
+                    output_error(
+                        "git_probe_failed",
+                        f"Could not hash the task file in the worktree at "
+                        f"{resolved_dir}: {exc}. Refusing to register it "
+                        f"rather than assume it holds the right revision.",
+                        fmt=fmt,
+                    )
+                    sys.exit(1)
+            # `_validated_sha` is the revision the pre-create gate approved.
+            if _wt_path is None or (
+                _validated_sha is not None and _wt_sha != _validated_sha
+            ):
+                _why = (
+                    "still doesn't have it"
+                    if _wt_path is None
+                    else f"has a DIFFERENT revision of it ({_wt_path})"
+                )
+                output_error(
+                    "task_not_materialized",
+                    f"Task {task_id!r} is committed at HEAD, but the worktree "
+                    f"at {resolved_dir} {_why} — it's a "
+                    f"leftover checkout from an earlier dispatch that "
+                    f"create_worktree reused as-is (it does not refresh an "
+                    f"existing worktree's contents). Recover with BOTH of: "
+                    f"`git worktree remove {resolved_dir}` and "
+                    f"`git branch -D clawpm/{task_id}`, then re-run dispatch. "
+                    f"Removing the worktree alone is not enough — the "
+                    f"`clawpm/{task_id}` branch survives removal at its old "
+                    f"revision, and create_worktree checks it out again, so "
+                    f"every retry rebuilds the same stale checkout and lands "
+                    f"back here (Codex P2, PR #55 round 8).",
+                    fmt=fmt,
+                )
+                sys.exit(1)
     elif target_dir:
         resolved_dir = Path(target_dir)
         resolved_dir.mkdir(parents=True, exist_ok=True)
@@ -1446,42 +2030,366 @@ def tasks_dispatch(
 
     refute_votes = max(1, refute_votes)
 
-    # CLAWP-039: opportunistic lease sweep before granting — this is one of the
-    # two no-daemon expiry detectors (the other is `clawpm doctor`). A holder
-    # that died is reaped here, on the next dispatch, instead of lingering.
-    # Run on EVERY dispatch, not only leased ones (Codex P2): a dead holder
-    # from an earlier lease must be reaped on the next dispatch even if this one
-    # isn't requesting a lease. Cheap — a no-op when leases.jsonl is absent.
-    from clawpm.leases import sweep as _lease_sweep
-    swept = []
-    sweep_error = None
-    try:
-        # Scope to the dispatched project (Codex P2): `dispatch --project A`
-        # must not reap project B's leased tasks. Portfolio-wide reaping is
-        # `clawpm doctor`'s job, not a side effect of an A-scoped dispatch.
-        swept = _lease_sweep(config, config.portfolio_root, project_id=project_id)
-    except Exception as exc:
-        # A sweep failure must not block the dispatch (the user's actual
-        # intent), but must not be silent either — else `leases_swept: 0`
-        # hides a broken janitor (Codex/silent-failure).
-        swept = []
-        sweep_error = f"{type(exc).__name__}: {exc}"
+    # CLAWP-070: the iteration cap counts from here, so a re-dispatch after a
+    # capped run starts with a fresh budget instead of tripping immediately.
+    iteration_baseline = 0
+    if max_iterations is not None:
+        from clawpm.reflect import count_iterations_for_task
 
-    try:
-        path = write_dispatch_settings(
-            target_dir=resolved_dir,
-            task_id=task_id,
-            project_id=project_id,
-            rubric_markdown=rubric,
-            force=force,
-            portfolio_root=config.portfolio_root,
-            confirm_close=confirm_close,
-            refute_votes=refute_votes,
-            lease_heartbeat=lease_ttl is not None,
+        iteration_baseline = count_iterations_for_task(
+            config.portfolio_root, task_id, project_id
         )
-    except (FileExistsError, ValueError) as exc:
-        output_error("dispatch_blocked", str(exc), fmt=fmt)
-        sys.exit(1)
+
+    # Serialize the whole snapshot -> write -> register -> rollback sequence
+    # against another dispatch targeting the same directory (Codex P1, PR #55
+    # rounds 8 and 9).
+    #
+    # Round 8 closed this with a compare-before-restore guard; round 9 showed
+    # that is not sufficient, and the argument is correct. The bytes labelled
+    # "what this invocation wrote" are read back AFTER write_dispatch_settings
+    # returns, so a competing dispatch replacing the file in that window makes
+    # this command record the OTHER command's bytes as its own. The comparison
+    # then succeeds on a false premise and restores a stale snapshot over a
+    # dispatch that succeeded. Narrowing a race is not closing it, and no
+    # amount of re-reading makes a check-then-act atomic.
+    #
+    # The ownership comparison is KEPT inside the lock, for the writer this
+    # lock cannot see: an operator or editor touching settings.local.json
+    # mid-dispatch. The lock makes the comparison's premise true against other
+    # dispatches; the comparison keeps the rollback honest against everyone
+    # else.
+    #
+    # Keyed on the resolved target path, so dispatches to different directories
+    # never contend. The sentinel lives under the portfolio root rather than in
+    # the target: a lock file dropped in the target would show up as untracked
+    # in the operator's repo, and for --worktree it would land in a checkout
+    # whose whole point is to be disposable.
+    #
+    # The critical section is pure file and ledger I/O — every git probe runs
+    # earlier — so it is bounded. `register_session` locks sessions.jsonl, a
+    # different path, so there is no re-entry on this one.
+    with _dispatch_target_lock(config.portfolio_root, resolved_dir, fmt):
+        # Snapshot whatever dispatch state already exists at the target, so a
+        # rollback can RESTORE it rather than delete it (Codex P2, PR #55 round
+        # 7). `write_dispatch_settings` overwrites an existing settings file
+        # without a usable backup, so the earlier rollback — an unconditional
+        # teardown — turned a failed RE-dispatch into the removal of a
+        # previously working Stop hook, and then reported that nothing had been
+        # left installed. Bytes, not parsed JSON: restoring must reproduce the
+        # prior file exactly, including any operator formatting.
+        from clawpm.dispatch import (
+            PartialDispatchWrite, session_start_payload_path, settings_path,
+        )
+        _prior_settings_path = settings_path(resolved_dir)
+        _prior_sidecar_path = session_start_payload_path(resolved_dir)
+        _prior_settings = None
+        _prior_sidecar = None
+        try:
+            # `_stat_exists` so a stat FAULT reaches the handler below instead
+            # of reading as "no prior dispatch" (which would make a later
+            # rollback delete instead of restore).
+            if _stat_exists(_prior_settings_path):
+                _prior_settings = _prior_settings_path.read_bytes()
+            if _stat_exists(_prior_sidecar_path):
+                _prior_sidecar = _prior_sidecar_path.read_bytes()
+        except OSError as exc:
+            # Couldn't snapshot. Say so now rather than discovering it only if a
+            # rollback is needed — proceeding would silently downgrade the
+            # rollback back to the destructive version this fixes.
+            output_error(
+                "dispatch_blocked",
+                f"Could not read the existing dispatch settings at {resolved_dir} "
+                f"({type(exc).__name__}: {exc}). Refusing to overwrite them, "
+                f"because a failure later in this command could then not restore "
+                f"them.",
+                fmt=fmt,
+            )
+            sys.exit(1)
+
+        _partial_write = None
+        try:
+            _written = write_dispatch_settings(
+                target_dir=resolved_dir,
+                task_id=task_id,
+                project_id=project_id,
+                rubric_markdown=rubric,
+                force=force,
+                portfolio_root=config.portfolio_root,
+                confirm_close=confirm_close,
+                refute_votes=refute_votes,
+                lease_heartbeat=lease_ttl is not None,
+                max_iterations=max_iterations,
+                iteration_baseline=iteration_baseline,
+            )
+        except (FileExistsError, ValueError) as exc:
+            output_error("dispatch_blocked", str(exc), fmt=fmt)
+            sys.exit(1)
+        except PartialDispatchWrite as exc:
+            # The settings file landed (hooks are LIVE) but the writer failed
+            # afterwards — sidecar, or the dispatches.jsonl append (disk full,
+            # permissions). Codex P1, PR #55 round 13: this used to escape
+            # uncaught, exiting before session registration OR rollback and
+            # leaving armed hooks with no session mapping, so ID-based
+            # commands in that worktree fell through to the main checkout.
+            # Adopt what the writer says it wrote and take the same
+            # ownership-checked rollback as a registration failure below.
+            _written = exc.written
+            _partial_write = exc
+        except OSError as exc:
+            # Failed before anything new landed (the settings write is
+            # atomic), so there is nothing to roll back.
+            output_error(
+                "dispatch_blocked",
+                f"Could not write the dispatch settings at {resolved_dir} "
+                f"({type(exc).__name__}: {exc}). Nothing was installed.",
+                fmt=fmt,
+            )
+            sys.exit(1)
+        path = _written.path
+
+        # What THIS invocation wrote, taken from the writer rather than read
+        # back off disk (Codex P2, PR #55 round 10). The round-8 version read
+        # the file again after `write_dispatch_settings` returned, which has
+        # the same false-premise shape as the bug it was fixing: an operator
+        # or editor replacing the file in that window would have their bytes
+        # recorded as ours, the ownership comparison would pass, and the
+        # rollback would overwrite their edit with the pre-dispatch snapshot.
+        # The lock above serialises other clawpm dispatches and explicitly
+        # cannot serialise that writer, so the window had to be removed
+        # rather than narrowed. `write_dispatch_settings` writes bytes
+        # directly — no text-mode newline translation — so what it returns is
+        # exactly what is on disk.
+        _our_settings = _written.settings_bytes
+        _our_sidecar = _written.sidecar_bytes
+        _sidecar_touched = _written.sidecar_written
+
+        def _roll_back_dispatch() -> str:
+            """Undo what THIS invocation installed; return the operator-facing
+            outcome sentence. Shared by every post-write failure path (a
+            writer that failed part-way, a session registration that failed)
+            so they cannot drift apart — the recurring shape of the round
+            5-13 findings was one failure path getting the ownership-checked
+            rollback and its sibling not getting it."""
+            teardown_error = None
+            # Only roll back while the file on disk is still the one THIS
+            # command wrote (Codex P1, PR #55 round 8). A concurrent
+            # dispatch to the same directory may have replaced it and
+            # succeeded; restoring our snapshot over it — or tearing it
+            # down, when we had no snapshot — would leave that command
+            # reporting success with obsolete or missing hooks. Compare
+            # the bytes we recorded after our own write; anything else on
+            # disk (different content, or nothing at all) means the
+            # artifacts are no longer ours to undo.
+            #
+            # The sidecar term is gated on `_sidecar_touched` (Codex P2,
+            # PR #55 round 11): with `--no-session-context` against a
+            # target that already carries a rubric sidecar from an
+            # EARLIER dispatch, this invocation never writes the
+            # sidecar, so `_our_sidecar` is None while the untouched
+            # file on disk still holds that earlier sidecar's bytes.
+            # Comparing those unconditionally reads "we didn't touch
+            # it" as "someone else raced us", which poisoned
+            # `_still_ours` and refused a legitimate settings restore
+            # (leaving stale post-registration-failure settings
+            # installed instead of the working prior dispatch). A
+            # sidecar we never wrote is never ours to compare or
+            # restore.
+            _still_ours = (
+                _our_settings is not None
+                and _read_bytes_or_none(_prior_settings_path) == _our_settings
+                and (
+                    not _sidecar_touched
+                    or _read_bytes_or_none(_prior_sidecar_path) == _our_sidecar
+                )
+            )
+            _restored = _still_ours and _prior_settings is not None
+            try:
+                if not _still_ours:
+                    # Deliberately nothing: the artifacts on disk belong
+                    # to a concurrent dispatch now (see above). The
+                    # operator is told so in the outcome below.
+                    pass
+                elif _prior_settings is not None:
+                    _prior_settings_path.parent.mkdir(
+                        parents=True, exist_ok=True
+                    )
+                    _prior_settings_path.write_bytes(_prior_settings)
+                    if _sidecar_touched:
+                        if _prior_sidecar is not None:
+                            _prior_sidecar_path.write_bytes(_prior_sidecar)
+                        elif _prior_sidecar_path.exists():
+                            _prior_sidecar_path.unlink()
+                else:
+                    from clawpm.dispatch import teardown_dispatch_settings
+                    # We are already inside `_dispatch_target_lock`; the
+                    # teardown re-acquires the same sentinel. That is safe:
+                    # `file_lock` is reentrant per thread (CLAWP-066), pinned
+                    # by test_teardown_nests_inside_dispatch_rollback.
+                    #
+                    # remove_sidecar=_sidecar_touched (PR #55
+                    # PRE-REVIEW + antigravity, round 12): this
+                    # invocation never wrote the sidecar when
+                    # `_sidecar_touched` is False, so an earlier,
+                    # unrelated dispatch's sidecar at this target
+                    # isn't ours to delete.
+                    teardown_dispatch_settings(
+                        target_dir=resolved_dir,
+                        task_id=task_id,
+                        portfolio_root=config.portfolio_root,
+                        project_id=project_id,
+                        remove_sidecar=_sidecar_touched,
+                    )
+            except Exception as teardown_exc:
+                # Rollback itself failed — report BOTH, since the operator
+                # now has artifacts on disk that need manual attention
+                # (fail-open WITH a marker, CLAWP-039/041 doctrine).
+                teardown_error = f"{type(teardown_exc).__name__}: {teardown_exc}"
+            if teardown_error and not _settings_still_present(
+                _prior_settings_path
+            ):
+                # The hooks ARE gone; only the follow-up bookkeeping (the
+                # `torn_down` append to dispatches.jsonl — likely failing for
+                # the same reason the dispatch did) raised. Don't tell the
+                # operator the settings need manual attention when they don't.
+                return (
+                    f"The dispatch settings were removed, but recording that "
+                    f"in the dispatch registry failed ({teardown_error}); the "
+                    f"registry may still list this target as dispatched until "
+                    f"the underlying fault is fixed. Re-run dispatch once it is."
+                )
+            if teardown_error:
+                return (
+                    f"Rolling those settings back ALSO failed "
+                    f"({teardown_error}) — inspect "
+                    f"{_prior_settings_path} manually before retrying, or "
+                    f"commands run from that worktree will mutate the "
+                    f"main checkout."
+                )
+            if not _still_ours:
+                return (
+                    f"The dispatch settings at {_prior_settings_path} are "
+                    f"no longer the ones this command wrote — another "
+                    f"dispatch has since replaced them — so they were "
+                    f"left ALONE rather than rolled back over a "
+                    f"concurrent dispatch that may have succeeded. No "
+                    f"session was registered for THIS command; fix the "
+                    f"portfolio state and re-run dispatch, and check "
+                    f"whether the other dispatch is the one you want."
+                )
+            if _restored:
+                return (
+                    "The dispatch settings that were in place before this "
+                    "command have been restored, so the previous dispatch "
+                    "is intact. Fix the portfolio state and re-run "
+                    "dispatch."
+                )
+            return (
+                "The dispatch settings have been rolled back; nothing "
+                "was left installed. Fix the portfolio state and "
+                "re-run dispatch."
+            )
+
+        if _partial_write is not None:
+            # See the `except PartialDispatchWrite` above: settings landed,
+            # the writer then failed. No session was registered, so nothing
+            # may be left armed.
+            _outcome = _roll_back_dispatch()
+            output_error(
+                "dispatch_write_failed",
+                f"Dispatch settings were written to {resolved_dir} but the "
+                f"dispatch could not be completed: {_partial_write}. "
+                + _outcome,
+                fmt=fmt,
+            )
+            sys.exit(1)
+
+        # CLAWP-098 (review finding): register the session AFTER settings are
+        # written — same ordering rationale as the lease grant below — so a
+        # write_dispatch_settings failure (dispatch_blocked, above) doesn't leave
+        # an orphaned session registered for a dispatch that never actually
+        # happened. Register a session-scoped pointer from a fresh session_id to
+        # the worktree's actual filesystem path: without this, an ID-based
+        # mutator command (tasks state/done/block) run with cwd inside this
+        # worktree resolves its project via the portfolio registry — which is
+        # cwd-independent — straight back to the MAIN checkout, and mutates its
+        # task file instead of the worktree's own. See sessions.py.
+        if worktree:
+            from clawpm.sessions import register_session
+            from clawpm.tasks import _candidate_task_paths
+            # Re-verify materialization here (cheap; already gated once, hard,
+            # right after create_worktree above when .project/ exists but this
+            # task doesn't — see that block's comment for the full reasoning).
+            # This second check only ever matters for the OTHER case: a project
+            # that doesn't git-track .project/ at all, where the early gate
+            # never ran and there is genuinely nothing here to register against
+            # — documented, pre-existing, unaffected-by-CLAWP-098 behavior, not
+            # an error. Checked with an EXPLICIT tasks_dir against resolved_dir,
+            # not via get_task(config, ...) — cwd here is wherever the OPERATOR
+            # invoked `tasks dispatch` from, essentially never inside the
+            # worktree it just created, so a cwd-based lookup would silently
+            # fall through to the OLD registry resolution and report a false
+            # "materialized" even when the worktree's own copy is missing.
+            # `resolved_dir` is the PROJECT root inside the checkout
+            # (CLAWP-118), like the post-create check above.
+            #
+            # `_stat_exists`, not `Path.exists()` (Codex P1, PR #55 round 15):
+            # exists() reports a transient stat fault as False, which would
+            # skip session registration below while the command went on to
+            # report a successful dispatch with LIVE hooks and no session
+            # mapping — the exact fall-through-to-canonical corruption this
+            # gate exists to prevent. A fault fails the dispatch and rolls
+            # the just-installed settings back.
+            try:
+                materialized = any(
+                    _stat_exists(p)
+                    for p in _candidate_task_paths(
+                        resolved_dir / ".project" / "tasks", task_id
+                    )
+                )
+            except OSError as exc:
+                _outcome = _roll_back_dispatch()
+                output_error(
+                    "dispatch_blocked",
+                    f"Dispatch settings were written to {resolved_dir} but "
+                    f"the task file's presence there could not be verified "
+                    f"({type(exc).__name__}: {exc}), so no session could be "
+                    f"registered safely. " + _outcome,
+                    fmt=fmt,
+                )
+                sys.exit(1)
+            if materialized:
+                session_id = str(uuid.uuid4())
+                try:
+                    register_session(
+                        config.portfolio_root, session_id, task_id, project_id,
+                        _wt_root, project_prefix=_wt_prefix,
+                    )
+                except Exception as exc:
+                    # Make settings-install + session-registration transactional
+                    # (Codex review, PR #55). Appending to sessions.jsonl can fail
+                    # for reasons entirely outside this command — the file is
+                    # read-only, its lock times out under a concurrent dispatch,
+                    # the portfolio volume filled after the dispatch-registry
+                    # append. Letting that escape reported failure while leaving
+                    # an ACTIVE Stop hook and dispatch-registry entry installed
+                    # with no session mapping: the worst of both states, because
+                    # an operator who then entered the worktree got ID-based
+                    # commands silently falling through to the main checkout —
+                    # exactly CLAWP-098's original corruption, re-armed by the
+                    # fix's own failure path. Roll the artifacts back so the
+                    # dispatch fails clean and a retry starts from nothing.
+                    session_id = None
+                    _outcome = _roll_back_dispatch()
+                    output_error(
+                        "session_registration_failed",
+                        f"Dispatch settings were written to {resolved_dir} but "
+                        f"registering its session failed: {type(exc).__name__}: "
+                        f"{exc}. " + _outcome,
+                        fmt=fmt,
+                    )
+                    sys.exit(1)
+            else:
+                session_id = None
 
     # Grant the lease AFTER settings are written (so a settings failure doesn't
     # leave a lease with no heartbeat source).
@@ -1513,6 +2421,7 @@ def tasks_dispatch(
             "target_dir": resolved_dir.as_posix(),
             "settings_path": path.as_posix(),
             "worktree": worktree,
+            "session_id": session_id,
             "invocation": invocation,
             "rubric_injected": rubric is not None,
             "confirm_close": confirm_close,
@@ -1530,7 +2439,7 @@ def tasks_dispatch(
 @click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
 @click.argument("task_id", required=False)
 @click.option(
-    "--target-dir", "target_dir", type=click.Path(), default=None,
+    "--target-dir", "target_dir", type=ExpandedPath(), default=None,
     help="Directory containing .claude/settings.local.json. Default: current directory."
 )
 @click.option(
@@ -1559,15 +2468,35 @@ def tasks_teardown_dispatch(
         task_id = expand_task_id(task_id, project_id)
 
     resolved_dir = Path(target_dir) if target_dir else Path.cwd()
-    marker = read_dispatch_marker(resolved_dir)
 
-    removed = teardown_dispatch_settings(
-        resolved_dir,
-        task_id=task_id,
-        force=force,
-        portfolio_root=config.portfolio_root,
-        project_id=project_id,
-    )
+    # Teardown now takes the per-target dispatch lock (round 13), so it can
+    # wait on a dispatch in progress; surface a contended lock (or a lock
+    # directory that can't be created) as a structured error, not a traceback.
+    try:
+        marker = read_dispatch_marker(resolved_dir)
+        removed = teardown_dispatch_settings(
+            resolved_dir,
+            task_id=task_id,
+            force=force,
+            portfolio_root=config.portfolio_root,
+            project_id=project_id,
+        )
+    except LockTimeout as exc:
+        output_error(
+            "dispatch_blocked",
+            f"A dispatch is writing to {resolved_dir} and did not finish in "
+            f"time ({exc}). Re-run once it completes.",
+            fmt=fmt,
+        )
+        sys.exit(1)
+    except OSError as exc:
+        output_error(
+            "teardown_failed",
+            f"Could not tear down the dispatch at {resolved_dir} "
+            f"({type(exc).__name__}: {exc}).",
+            fmt=fmt,
+        )
+        sys.exit(1)
 
     output_success(
         "Dispatch torn down" if removed else "Nothing to tear down",

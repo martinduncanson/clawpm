@@ -405,8 +405,20 @@ def output_worklog_entries(entries: list[Any], fmt: OutputFormat = OutputFormat.
             console.print()
 
 
-def output_research_list(items: list[Any], fmt: OutputFormat = OutputFormat.JSON) -> None:
+def output_research_list(
+    items: list[Any],
+    fmt: OutputFormat = OutputFormat.JSON,
+    malformed: list[dict[str, str]] | None = None,
+    with_diagnostics: bool = False,
+) -> None:
     """Output a list of research items.
+
+    ``malformed`` (CLAWP-095) lists research files that could not be parsed.
+    JSON is ALWAYS a flat list by default (stable root type). Malformed files
+    are reported on stderr (one line each plus a count) so they are never
+    silently dropped; ``with_diagnostics=True`` opts into the stable envelope
+    ``{"research": [...], "malformed": [...], "malformed_count": N}`` (always
+    that shape, even when nothing is malformed).
 
     Each entry is annotated with ``stale_placeholder``: an open/in-progress
     entry that still carries unfilled template sections past the staleness
@@ -418,10 +430,18 @@ def output_research_list(items: list[Any], fmt: OutputFormat = OutputFormat.JSON
             data = r.to_dict()
             data["stale_placeholder"] = r.is_stale_placeholder()
             rows.append(data)
-        output_json(rows)
+        if with_diagnostics:
+            output_json(
+                {"research": rows, "malformed": malformed or [], "malformed_count": len(malformed or [])}
+            )
+        else:
+            output_json(rows)
+            if malformed:
+                _report_malformed_research_stderr(malformed)
     else:
         if not items:
             console.print("[dim]No research items found[/dim]")
+            _print_malformed_research(malformed)
             return
 
         table = Table(title="Research")
@@ -461,6 +481,27 @@ def output_research_list(items: list[Any], fmt: OutputFormat = OutputFormat.JSON
                 f"{'y' if stale_count == 1 else 'ies'} still carry placeholder "
                 f"sections past {PLACEHOLDER_STALE_DAYS} days - fill in or mark complete.[/red]"
             )
+        _print_malformed_research(malformed)
+
+
+def _report_malformed_research_stderr(malformed: list[dict[str, str]]) -> None:
+    for m in malformed:
+        print(f"research file not listed: {m['file']} ({m['reason']}): {m['message']}", file=sys.stderr)
+    print(
+        f"{len(malformed)} research file(s) could not be parsed and are NOT in the list "
+        "(use --with-diagnostics for a JSON envelope)",
+        file=sys.stderr,
+    )
+
+
+def _print_malformed_research(malformed: list[dict[str, str]] | None) -> None:
+    if not malformed:
+        return
+    console.print(
+        f"[red][!] {len(malformed)} research file(s) could not be parsed and are NOT listed above:[/red]"
+    )
+    for m in malformed:
+        console.print(f"  {m['file']} ({m['reason']}): {m['message']}", markup=False, highlight=False)
 
 
 def output_context(context: dict[str, Any], fmt: OutputFormat = OutputFormat.JSON) -> None:

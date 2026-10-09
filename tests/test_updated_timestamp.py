@@ -17,7 +17,7 @@ import pytest
 
 from clawpm.cli import main
 from clawpm.discovery import load_portfolio_config
-from clawpm.frontmatter import parse_frontmatter
+from clawpm.frontmatter import parse_frontmatter, today_utc_iso
 from clawpm.models import Task, TaskState, TaskComplexity
 from clawpm.tasks import (
     add_task,
@@ -105,7 +105,7 @@ class TestAddStampsUpdated:
         cfg = temp_portfolio["config"]
         task = add_task(cfg, "test", "First task")
         assert task is not None
-        today = date.today().isoformat()
+        today = today_utc_iso()
         assert task.updated == today
         assert task.updated == task.created
 
@@ -123,7 +123,7 @@ class TestAddStampsUpdated:
         parent = add_task(cfg, "test", "Parent")
         child = add_subtask(cfg, "test", parent.id, "Child")
         assert child is not None
-        assert child.updated == date.today().isoformat()
+        assert child.updated == today_utc_iso()
         assert child.updated == child.created
 
 
@@ -136,7 +136,7 @@ class TestMutatorsBumpUpdated:
 
         edited = edit_task(cfg, "test", task.id, priority=1)
         assert edited is not None
-        assert edited.updated == date.today().isoformat()
+        assert edited.updated == today_utc_iso()
         assert _updated_on_disk(edited.file_path) != _OLD
 
     def test_state_change_bumps_updated(self, temp_portfolio):
@@ -147,7 +147,7 @@ class TestMutatorsBumpUpdated:
         moved = change_task_state(cfg, "test", task.id, TaskState.DONE)
         assert moved is not None
         assert moved.state == TaskState.DONE
-        assert moved.updated == date.today().isoformat()
+        assert moved.updated == today_utc_iso()
 
     def test_split_bumps_updated(self, temp_portfolio):
         cfg = temp_portfolio["config"]
@@ -157,7 +157,7 @@ class TestMutatorsBumpUpdated:
         split = split_task(cfg, "test", task.id)
         assert split is not None
         assert split.file_path.name == "_task.md"
-        assert split.updated == date.today().isoformat()
+        assert split.updated == today_utc_iso()
 
     def test_dir_task_progress_stamps_updated(self, temp_portfolio):
         """A directory task's same-location PROGRESS transition still stamps."""
@@ -170,7 +170,7 @@ class TestMutatorsBumpUpdated:
         # state stays OPEN by location — but the stamp must still fire.
         moved = change_task_state(cfg, "test", task.id, TaskState.PROGRESS)
         assert moved is not None
-        assert moved.updated == date.today().isoformat()
+        assert moved.updated == today_utc_iso()
 
     def test_log_attach_bumps_updated(self, temp_portfolio):
         """`clawpm log add --task X` (log-attach) bumps the task's updated."""
@@ -185,7 +185,7 @@ class TestMutatorsBumpUpdated:
         assert result.exit_code == 0, result.output
         reloaded = get_task(cfg, "test", task.id)
         assert reloaded is not None
-        assert reloaded.updated == date.today().isoformat()
+        assert reloaded.updated == today_utc_iso()
 
     def test_crlf_file_no_mixed_endings(self, tmp_path):
         """Stamping a CRLF task file produces no doubled/mixed line endings."""
@@ -196,7 +196,7 @@ class TestMutatorsBumpUpdated:
         _stamp_updated_file(f)
         raw = f.read_bytes()
         assert b"\r\r" not in raw  # no doubled CR
-        assert f"updated: '{date.today().isoformat()}'".encode() in raw
+        assert f"updated: '{today_utc_iso()}'".encode() in raw
         # Uniform line endings, no MIX: every LF is part of a CRLF (Windows
         # write_text) OR none are (Linux LF). A mixed result (0 < crlf < lf)
         # would mean the surgical edit left a lone LF among CRLF lines.
@@ -217,7 +217,7 @@ class TestMutatorsBumpUpdated:
 
         child = add_subtask(cfg, "test", parent.id, "Sub A")
         assert child is not None
-        today = date.today().isoformat()
+        today = today_utc_iso()
         assert child.updated == today
 
         # Parent was split into a directory task; its _task.md must be bumped.
@@ -245,7 +245,7 @@ class TestMutatorsBumpUpdated:
         moved = change_task_state(cfg, "test", "test-200", TaskState.DONE)
         assert moved is not None
         done_text = (tasks_dir / "done" / "test-200.md").read_text(encoding="utf-8")
-        today = date.today().isoformat()
+        today = today_utc_iso()
         assert "# operator note: do not lose this" in done_text
         assert f"updated: '{today}'" in done_text
         assert "created: '2026-01-01'" in done_text  # untouched
@@ -261,9 +261,9 @@ class TestMutatorsBumpUpdated:
         )
         moved = change_task_state(cfg, "test", "test-201", TaskState.DONE)
         assert moved is not None
-        assert moved.updated == date.today().isoformat()
+        assert moved.updated == today_utc_iso()
         done_text = (tasks_dir / "done" / "test-201.md").read_text(encoding="utf-8")
-        assert f"updated: '{date.today().isoformat()}'" in done_text
+        assert f"updated: '{today_utc_iso()}'" in done_text
 
     def test_repeated_stamp_is_idempotent_single_line(self, temp_portfolio):
         """Two state moves leave exactly one `updated:` line (no duplicate)."""
@@ -281,6 +281,27 @@ class TestMutatorsBumpUpdated:
         spaced = _set_updated_line("---\nid: x\nupdated : '2020-01-01'\n---\n#T\n", "2026-07-04")
         assert spaced.count("updated") == 1
 
+    @pytest.mark.parametrize("eol", ["\n", "\r\n"])
+    @pytest.mark.parametrize("has_updated", [True, False])
+    def test_stamp_preserves_line_endings_byte_exact(self, tmp_path, eol, has_updated):
+        """_stamp_updated_file must not translate line endings on any platform."""
+        from clawpm.tasks import _stamp_updated_file
+
+        fm = ["---", "id: x"]
+        if has_updated:
+            fm.append("updated: '2020-01-01'")
+        fm += ["---", "", "body", ""]
+        p = tmp_path / "x.md"
+        p.write_bytes(eol.join(fm).encode("utf-8"))
+        _stamp_updated_file(p, "2026-07-04")
+        raw = p.read_bytes().decode("utf-8")
+        assert "updated: '2026-07-04'" in raw
+        assert raw.count("updated:") == 1
+        if eol == "\r\n":
+            assert "\n" not in raw.replace("\r\n", "")
+        else:
+            assert "\r" not in raw
+
     def test_reject_bumps_updated(self, temp_portfolio):
         cfg = temp_portfolio["config"]
         task = add_task(cfg, "test", "Rejectable")
@@ -291,7 +312,7 @@ class TestMutatorsBumpUpdated:
         )
         assert rejected is not None
         assert rejected.state == TaskState.REJECTED
-        assert rejected.updated == date.today().isoformat()
+        assert rejected.updated == today_utc_iso()
         assert rejected.rationale == "not worth it"
 
 
@@ -350,7 +371,7 @@ class TestOtherFrontmatterWriters:
         _rewrite_frontmatter_state(f, "done")
         fm, _ = parse_frontmatter(f.read_text(encoding="utf-8"))
         assert fm["state"] == "done"
-        assert fm["updated"] == date.today().isoformat()
+        assert fm["updated"] == today_utc_iso()
 
     def test_emit_render_sets_updated_equal_to_created(self):
         from clawpm.emit_tree import _render_task_content
@@ -363,7 +384,7 @@ class TestOtherFrontmatterWriters:
             baseline_ref="ts:2026-01-01T00:00:00+00:00",
         )
         fm, _ = parse_frontmatter(content)
-        today = date.today().isoformat()
+        today = today_utc_iso()
         assert fm["updated"] == today
         assert fm["updated"] == fm["created"]
 
@@ -372,7 +393,7 @@ class TestDoctorPrefersUpdated:
     def test_stale_updated_flagged_despite_fresh_mtime(self, temp_portfolio):
         """`updated` 8 days ago + fresh mtime → stale (proves updated wins)."""
         tasks_dir = temp_portfolio["tasks_dir"]
-        old = (date.today() - timedelta(days=8)).isoformat()
+        old = (datetime.now(timezone.utc).date() - timedelta(days=8)).isoformat()
         prog = tasks_dir / "test-001.progress.md"
         prog.write_text(
             f"---\nid: test-001\nupdated: {old}\n---\n# Prog\n", encoding="utf-8"
@@ -388,7 +409,7 @@ class TestDoctorPrefersUpdated:
     def test_fresh_updated_not_flagged_despite_stale_mtime(self, temp_portfolio):
         """`updated` today + 8-day-old mtime → NOT stale (proves updated wins)."""
         tasks_dir = temp_portfolio["tasks_dir"]
-        today = date.today().isoformat()
+        today = today_utc_iso()
         prog = tasks_dir / "test-002.progress.md"
         prog.write_text(
             f"---\nid: test-002\nupdated: {today}\n---\n# Prog\n", encoding="utf-8"
@@ -416,7 +437,7 @@ class TestDoctorPrefersUpdated:
         return bf
 
     def test_blocked_stale_uses_updated_despite_fresh_mtime(self, temp_portfolio):
-        old = (date.today() - timedelta(days=3)).isoformat()  # > 24h
+        old = (datetime.now(timezone.utc).date() - timedelta(days=3)).isoformat()  # > 24h
         bf = self._seed_blocked(temp_portfolio["tasks_dir"], old)
         # mtime fresh (just written) — if the check used mtime it'd NOT be stale.
         result = CliRunner().invoke(main, ["doctor"])
@@ -426,7 +447,7 @@ class TestDoctorPrefersUpdated:
         assert "test-051" in ids
 
     def test_blocked_fresh_updated_not_flagged_despite_stale_mtime(self, temp_portfolio):
-        today = date.today().isoformat()
+        today = today_utc_iso()
         bf = self._seed_blocked(temp_portfolio["tasks_dir"], today)
         old_ts = (datetime.now(timezone.utc) - timedelta(days=3)).timestamp()
         os.utime(bf, (old_ts, old_ts))
@@ -435,6 +456,61 @@ class TestDoctorPrefersUpdated:
         data = json.loads(result.output)
         ids = [s["task_id"] for s in data.get("stale_blocked", [])]
         assert "test-051" not in ids
+
+    def test_real_writer_stamp_matches_utc_and_reader_within_bounded_window(
+        self, temp_portfolio, monkeypatch
+    ):
+        """CLAWP-126: the writer and doctor's stale-blocked reader must agree
+        on ONE calendar-day definition (UTC), or they disagree by up to a day
+        depending on the host's UTC offset -- CLAWP-086's reader design
+        intent assumed the date-only stamp WAS a UTC calendar day (it
+        interprets it conservatively as end-of-day UTC), but the writer
+        stamped the LOCAL calendar day instead.
+
+        Uses the REAL writer path (change_task_state) with an INJECTED,
+        wildly-different "current UTC time" -- deliberately a date this test
+        can never coincidentally land on for real -- so the assertion is
+        deterministic regardless of this host's actual timezone. If the
+        writer used real local date instead of the injected UTC instant,
+        `blocked.updated` would be today's real local date, not
+        ``"2099-06-15"``, and the first assertion below would fail on ANY
+        host, not just an offset one.
+        """
+        import clawpm.frontmatter as fm_mod
+
+        fixed_instant = datetime(2099, 6, 15, 23, 30, 0, tzinfo=timezone.utc)
+        # A different calendar day for the naive (no-tz) branch: if
+        # today_utc_iso() ever regressed to a naive `datetime.now()` (dropping
+        # `timezone.utc`), this fake must make that regression VISIBLE rather
+        # than accidentally passing anyway (grok-4.5, PR #63: the original
+        # fake ignored `tz` and returned the same instant either way, so it
+        # could not have caught exactly the local-vs-UTC bug CLAWP-126 fixes).
+        fixed_naive_local = datetime(2099, 6, 16, 2, 0, 0)
+
+        class _FakeDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_instant if tz is not None else fixed_naive_local
+
+        monkeypatch.setattr(fm_mod, "datetime", _FakeDatetime)
+
+        config = temp_portfolio["config"]
+        task = add_task(config, "test", "Blockable")
+        blocked = change_task_state(config, "test", task.id, TaskState.BLOCKED)
+        assert blocked is not None
+        assert blocked.updated == "2099-06-15"
+
+        # Reproduce doctor's stale-blocked interpretation formula directly
+        # (project.py, CLAWP-086) and check it lands within a bounded,
+        # correct window of the actual (injected) block instant: never
+        # before it (a false positive) and never more than 24h after it (a
+        # delayed detection).
+        _bd = date.fromisoformat(blocked.updated)
+        reader_interpreted = datetime(
+            _bd.year, _bd.month, _bd.day, 23, 59, 59, tzinfo=timezone.utc
+        )
+        assert reader_interpreted >= fixed_instant
+        assert reader_interpreted - fixed_instant <= timedelta(hours=24)
 
     def test_legacy_no_updated_falls_back_to_mtime(self, temp_portfolio):
         """No `updated` stamp → doctor falls back to mtime (legacy behaviour)."""

@@ -9,7 +9,7 @@ import click
 from clawpm.output import output_error, output_json, output_success
 from clawpm.tasks import get_task
 from clawpm.context import expand_task_id
-from clawpm.cli.base import main, get_format, require_portfolio, require_project
+from clawpm.cli.base import main, get_format, require_portfolio, require_project, ExpandedPath
 
 # ============================================================================
 # Reflect command group — calibration capture + consumers (CLAWP-040)
@@ -137,7 +137,7 @@ def reflect_suggest(
 
 @reflect.command("history-import")
 @click.option(
-    "--source", "source_dir", default=None,
+    "--source", "source_dir", type=ExpandedPath(), default=None,
     envvar="CLAWPM_HISTORY_SOURCE",
     help="Path to history source directory (or set CLAWPM_HISTORY_SOURCE).",
 )

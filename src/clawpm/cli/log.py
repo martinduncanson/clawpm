@@ -63,14 +63,25 @@ def log_add(
     if task_id:
         task_id = expand_task_id(task_id, project_id)
 
+    # CLAWP-122: bind this command's scope ONCE here (exemplar of the explicit-
+    # scope pattern, docs/design/explicit-scope.md) and thread it to every
+    # scoped lookup below, so a cwd change mid-command cannot re-scope it.
+    from clawpm.discovery import get_repo_path, resolve_scope
+
+    scope = resolve_scope(config, project_id) if project_id else None
+
     # Auto-detect changed files from git if not manually specified
     if not files and project_id:
-        project = get_project(config, project_id)
-        if project and project.repo_path and project.repo_path.exists():
+        # Session-scoped (CLAWP-098, Codex P2 on PR #55 round 15): the
+        # PostToolUse progress hook runs THIS command inside a registered
+        # worktree without --files, so diffing the cwd-independent canonical
+        # `repo_path` logged main's changes (or none) instead of the agent's.
+        _repo = get_repo_path(config, project_id, scope=scope)
+        if _repo and _repo.exists():
             try:
                 result = subprocess.run(
                     ["git", "diff", "--name-only", "HEAD"],
-                    cwd=project.repo_path,
+                    cwd=_repo,
                     capture_output=True,
                     text=True,
                     encoding="utf-8",  # CLAWP-046: UTF-8, not cp1252
@@ -99,7 +110,7 @@ def log_add(
     # records activity against the task, so bump its `updated` stamp (best-
     # effort; the work-log entry above is the primary artefact).
     if task_id:
-        touch_task_updated(config, project_id, task_id)
+        touch_task_updated(config, project_id, task_id, scope=scope)
 
     output_success("Entry added", data=entry.to_dict(), fmt=fmt)
 
@@ -222,7 +233,11 @@ def log_commit(ctx: click.Context, project_id: str | None, limit: int, task_id: 
         output_error("project_not_found", f"Project '{project_id}' not found", fmt=fmt)
         sys.exit(1)
 
-    repo_path = proj.repo_path or proj.project_dir
+    # Session-scoped like `log add` above: commits made in a registered
+    # worktree live on ITS branch, not the canonical checkout's.
+    from clawpm.discovery import get_repo_path
+
+    repo_path = get_repo_path(config, project_id) or proj.project_dir
     if not repo_path or not repo_path.exists():
         output_error("no_repo", f"No repo path for project '{project_id}'", fmt=fmt)
         sys.exit(1)

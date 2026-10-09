@@ -193,6 +193,9 @@ class ProjectSettings:
     # from existing tasks (stability) or derived collision-free from the id.
     # Set this to disambiguate two projects whose ids share a short prefix.
     task_prefix: str | None = None
+    # CLAWP-134 — deliberately keeps .project/ task state off git; silences the
+    # doctor / init "task state is git-ignored" warning.
+    unversioned_ok: bool = False
 
     @classmethod
     def load(cls, path: Path) -> ProjectSettings:
@@ -212,6 +215,7 @@ class ProjectSettings:
             repo_path=repo_path,
             labels=data.get("labels", []),
             task_prefix=data.get("task_prefix"),
+            unversioned_ok=data.get("unversioned_ok") is True,
         )
         settings.project_dir = path.parent.parent
         return settings
@@ -227,6 +231,7 @@ class ProjectSettings:
             "labels": self.labels,
             "project_dir": str(self.project_dir) if self.project_dir else None,
             "task_prefix": self.task_prefix,
+            "unversioned_ok": self.unversioned_ok,
         }
 
 
@@ -544,6 +549,14 @@ class Task:
     # Opaque string: git short-SHA when the project is a git repo, else a
     # "ts:<ISO8601-UTC>" timestamp. None for legacy tasks (backward-compat).
     baseline_ref: str | None = None
+    # CLAWP-111 — a task can BE a decision instead of a unit of build work.
+    # kind: "build" (default) | "decision". Omitted from frontmatter when at
+    # the default, so every pre-111 task file round-trips byte-for-byte.
+    # resolution/resolved_at are set when a task closes with `done --resolution
+    # "..."` — mandatory for kind=="decision", optional for build; None until then.
+    kind: str = "build"
+    resolution: str | None = None
+    resolved_at: str | None = None
     # CLAWP-084 — runtime-only project scope for cross-project views
     # (``tasks list --all-projects``). NOT persisted: never read from
     # frontmatter (from_file omits it) and never written (writes use explicit
@@ -740,6 +753,19 @@ class Task:
             [s for s in nys_raw if isinstance(s, str)]
             if isinstance(nys_raw, list) else []
         )
+        # CLAWP-111 — kind: absent, non-string, or any value outside the
+        # vocabulary falls back to "build" (backward-compat default).
+        kind_raw = frontmatter.get("kind")
+        kind: str = kind_raw if kind_raw in ("build", "decision") else "build"
+        resolution_raw = frontmatter.get("resolution")
+        resolution: str | None = (
+            resolution_raw if isinstance(resolution_raw, str) and resolution_raw.strip()
+            else None
+        )
+        resolved_at_raw = frontmatter.get("resolved_at")
+        resolved_at: str | None = (
+            str(resolved_at_raw) if resolved_at_raw is not None else None
+        )
 
         return cls(
             id=frontmatter.get("id", path.stem.replace(".progress", "")),
@@ -770,6 +796,9 @@ class Task:
             baseline_ref=baseline_ref,
             destination=destination,
             not_yet_specified=not_yet_specified,
+            kind=kind,
+            resolution=resolution,
+            resolved_at=resolved_at,
         )
 
     @property
@@ -830,6 +859,12 @@ class Task:
             # CLAWP-111-002 — root-map fields (see field comments above)
             "destination": self.destination,
             "not_yet_specified": self.not_yet_specified,
+            # CLAWP-111 — decision-kind fields. resolution/resolved_at are None
+            # until a kind=="decision" task closes; included unconditionally so
+            # the schema is stable (mirrors rationale/supersedes above).
+            "kind": self.kind,
+            "resolution": self.resolution,
+            "resolved_at": self.resolved_at,
         }
         # CLAWP-084 — cross-project scope. Emitted ONLY when set (the
         # all-projects view sets it); single-project output stays byte-identical
@@ -1018,37 +1053,72 @@ class Research:
         """True if this open/in-progress entry is still stubbed after ``days``."""
         return is_stale_placeholder(self, days, now=now)
 
+    @staticmethod
+    def _read_frontmatter(path: Path) -> tuple[dict[str, Any], str]:
+        """Shared loader: ``(frontmatter, content)`` for a research file.
+
+        CLAWP-095: a file with NO frontmatter (absent / unterminated fence) is
+        still loaded leniently (id = stem, whole text = content) - that is a
+        legitimate hand-written note. A fenced block that exists but is
+        corrupt ("unparseable" YAML or "not_a_mapping") is NOT silently
+        degraded to empty-frontmatter: it raises FrontmatterError so
+        scan_research can surface the file as malformed.
+        """
+        text = path.read_text(encoding="utf-8")
+        try:
+            frontmatter, body = split_frontmatter(text, where=str(path))
+            return frontmatter, body.strip()
+        except FrontmatterError as exc:
+            if exc.reason in ("unparseable", "not_a_mapping"):
+                raise
+            return {}, text
+
+    @staticmethod
+    def _effective_id(frontmatter: dict[str, Any], path: Path) -> Any:
+        """The id a file resolves to: frontmatter ``id``, else the filename stem."""
+        return frontmatter.get("id", path.stem)
+
+    @classmethod
+    def peek_id(cls, path: Path) -> str | None:
+        """Effective id of a research file (same derivation as :meth:`from_file`).
+
+        Raises like ``from_file`` on unreadable/corrupt files; does not validate
+        type/status/tags.
+        """
+        frontmatter, _ = cls._read_frontmatter(path)
+        eid = cls._effective_id(frontmatter, path)
+        return None if eid is None else str(eid)
+
     @classmethod
     def from_file(cls, path: Path) -> Research:
         """Load research from markdown file with YAML frontmatter."""
-        text = path.read_text(encoding="utf-8")
-
-        # Parse frontmatter (lenient: any malformation -> {} + full text as
-        # content, matching the pre-CLAWP-079 hand-rolled behaviour). Includes
-        # CLAWP-091's "not_a_mapping" reason too — see Task.from_file's
-        # identical guard above for why raising here would be worse, not
-        # better, for the mutation-site entry points this task targets.
-        frontmatter: dict[str, Any]
-        try:
-            frontmatter, body = split_frontmatter(text, where=str(path))
-            content = body.strip()
-        except FrontmatterError:
-            frontmatter = {}
-            content = text
+        frontmatter, content = cls._read_frontmatter(path)
 
         # Extract title from first heading
-        title = frontmatter.get("id", path.stem)
+        title = cls._effective_id(frontmatter, path)
         for line in content.split("\n"):
             if line.startswith("# "):
                 title = line[2:].strip()
                 break
 
+        # `tags:` with no value is YAML null -> no tags. Any other non-list
+        # (e.g. a bare string, which would iterate as characters) is corrupt:
+        # raise so the file is surfaced as malformed, never mis-filtered.
+        tags = frontmatter.get("tags")
+        if tags is None:
+            tags = []
+        elif not isinstance(tags, list):
+            raise FrontmatterError(
+                "invalid_tags",
+                f"{path}: `tags` must be a list, got {type(tags).__name__}",
+            )
+
         return cls(
-            id=frontmatter.get("id", path.stem),
+            id=cls._effective_id(frontmatter, path),
             title=title,
             type=ResearchType(frontmatter.get("type", "investigation")),
             status=ResearchStatus(frontmatter.get("status", "open")),
-            tags=frontmatter.get("tags", []),
+            tags=tags,
             created=frontmatter.get("created"),
             content=content,
             openclaw=frontmatter.get("openclaw"),
