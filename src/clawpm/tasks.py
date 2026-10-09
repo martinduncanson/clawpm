@@ -3347,6 +3347,107 @@ def edit_task(
         return retry_transient(Task.from_file, task.file_path)
 
 
+def edit_fog(
+    config: PortfolioConfig,
+    project_id: str,
+    task_id: str,
+    add: str | None = None,
+    drop: str | None = None,
+) -> Task | None:
+    """Add/remove an entry in a task's fog list (``not_yet_specified``), CLAWP-111-002.
+
+    A minimal, dedicated mutator — touches ONLY the ``not_yet_specified`` key
+    (plus the mandatory ``updated`` stamp every mutator bumps), so a diff
+    against the pre-edit file shows no incidental rewrite of unrelated
+    frontmatter or body. ``add`` is idempotent (a duplicate add leaves the list
+    contents unchanged, though the file is still rewritten/timestamped like any
+    other mutator call). ``drop`` removes an EXACT match only — no prefix
+    matching here, unlike ``--graduates``, since this is a direct
+    administrative edit rather than free-text disambiguation.
+    """
+    tasks_dir = get_tasks_dir(config, project_id)
+    if not tasks_dir:
+        return None
+
+    with file_lock(tasks_dir / ".clawpm-tasks.lock"):
+        task = get_task(config, project_id, task_id)
+        if not task or not task.file_path:
+            return None
+
+        with guard_fs_tamper(f"Task {task_id}"):
+            raw_text = task.file_path.read_bytes().decode("utf-8")
+        # A UTF-8 BOM would hide the leading fence from split_frontmatter, and
+        # universal-newline reads would silently rewrite CRLF: strip the BOM
+        # and normalise to "\n" for processing, then restore both on write.
+        has_bom = raw_text.startswith("﻿")
+        text = raw_text[1:] if has_bom else raw_text
+        use_crlf = "\r\n" in text
+        if use_crlf:
+            text = text.replace("\r\n", "\n")
+
+        frontmatter: dict
+        try:
+            frontmatter, content = split_frontmatter(text, where=str(task.file_path))
+        except FrontmatterError as exc:
+            if exc.reason == "absent":
+                frontmatter, content = {}, text
+            elif exc.reason == "unterminated":
+                raise ValueError(
+                    f"Task {task_id} has an unterminated frontmatter fence; "
+                    "refusing to edit (would corrupt the file)."
+                ) from None
+            elif exc.reason == "not_a_mapping":
+                raise ValueError(
+                    f"Task {task_id} frontmatter is not a YAML mapping; "
+                    f"refusing to edit (would corrupt the file): {exc}"
+                ) from None
+            else:
+                cause = exc.__cause__ or exc
+                raise ValueError(
+                    f"Task {task_id} frontmatter is unparseable; refusing "
+                    f"to edit (would corrupt the file): {cause}"
+                ) from cause
+
+        fog_raw = frontmatter.get("not_yet_specified")
+        fog: list[str] = (
+            [s for s in fog_raw if isinstance(s, str)] if isinstance(fog_raw, list) else []
+        )
+
+        if add is not None and add not in fog:
+            fog.append(add)
+        if drop is not None and drop in fog:
+            fog = [f for f in fog if f != drop]
+
+        if fog:
+            frontmatter["not_yet_specified"] = fog
+        else:
+            frontmatter.pop("not_yet_specified", None)
+
+        stamp_updated(frontmatter)
+
+        # No "\n" between the second fence and `content`: split_frontmatter's
+        # `content` is the RAW substring after the closing "---" (not
+        # stripped), which already carries its own leading "\n" — unlike
+        # edit_task's rebuild (which inserts one unconditionally and so grows
+        # a blank line at the fence boundary on every edit), this reproduces
+        # the original fence-to-body transition byte-for-byte when nothing
+        # else changed (CLAWP-111-002's diff-clean contract).
+        new_text = f"---\n{yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True).strip()}\n---{content}"
+        if use_crlf:
+            new_text = new_text.replace("\n", "\r\n")
+        if has_bom:
+            new_text = "﻿" + new_text
+        tmp_path = task.file_path.with_suffix(".tmp")
+        try:
+            tmp_path.write_bytes(new_text.encode("utf-8"))
+            retry_transient(tmp_path.replace, task.file_path)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
+
+        return retry_transient(Task.from_file, task.file_path)
+
+
 def split_task(
     config: PortfolioConfig,
     project_id: str,
@@ -3401,15 +3502,24 @@ def split_task(
         return retry_transient(Task.from_file, new_path)
 
 
-def _child_append_text(parent_path: Path, child_id: str) -> str | None:
+def _child_append_text(
+    parent_path: Path, child_id: str, *, remove_fog: str | None = None,
+) -> str | None:
     """Compute the parent's frontmatter rewritten to include ``child_id`` in its
-    ``children`` list, or ``None`` if the append is a genuine no-op.
+    ``children`` list (and, when ``remove_fog`` is given, with that EXACT entry
+    removed from ``not_yet_specified``), or ``None`` if the whole update is a
+    genuine no-op.
 
     Pure (reads the parent, builds the new text, writes nothing) so callers can
     STAGE this alongside the child-file write and commit both together (CLAWP-071
     two-phase). Returns ``None`` ONLY for a true no-op — the parent is not a
-    directory-task ``_task.md`` (nothing to persist into) or already lists the
-    child (idempotent).
+    directory-task ``_task.md`` (nothing to persist into), or both the child is
+    already listed AND (if requested) the fog entry is already gone (idempotent).
+
+    ``remove_fog`` (CLAWP-111-002 ``--graduates``) is the ALREADY-RESOLVED
+    fog-list entry to drop — callers must have matched it (exact/prefix,
+    ambiguity-checked) against the parent's fog list BEFORE calling this, so
+    this function does no matching of its own and just removes a literal value.
 
     RAISES on an inability to BUILD the update, so the two-phase caller writes
     NEITHER file rather than orphaning the child (Codex CLAWP-071 review — do not
@@ -3432,17 +3542,74 @@ def _child_append_text(parent_path: Path, child_id: str) -> str | None:
     children = fm.get("children")
     if not isinstance(children, list):
         children = []
-    if child_id in children:
+    changed = False
+    if child_id not in children:
+        children.append(child_id)
+        fm["children"] = children
+        changed = True
+    if remove_fog is not None:
+        fog = fm.get("not_yet_specified")
+        if isinstance(fog, list) and remove_fog in fog:
+            fog = [f for f in fog if f != remove_fog]
+            if fog:
+                fm["not_yet_specified"] = fog
+            else:
+                fm.pop("not_yet_specified", None)
+            changed = True
+    if not changed:
         return None  # idempotent — already persisted
-    children.append(child_id)
-    fm["children"] = children
-    stamp_updated(fm)  # CLAWP-086 — gaining a child mutates the parent.
+    stamp_updated(fm)  # CLAWP-086 — gaining a child (or losing a fog entry) mutates the parent.
     body = raw_body.lstrip("\n")
     return (
         "---\n"
         + yaml.dump(fm, default_flow_style=False, allow_unicode=True).strip()
         + "\n---\n"
         + body
+    )
+
+
+class FogMatchError(ValueError):
+    """``--graduates`` matched zero or multiple fog entries (CLAWP-111-002).
+
+    A ``ValueError`` subclass so it flows through the CLI's existing
+    ``_mutation_errors`` mapper unchanged; ``candidates`` is also attached for
+    any caller that wants the structured list rather than parsing the message.
+    """
+
+    def __init__(self, message: str, candidates: list[str]):
+        super().__init__(message)
+        self.candidates = candidates
+
+
+def _match_fog_entry(fog: list[str], text: str) -> str:
+    """Match ``text`` against a fog (``not_yet_specified``) list.
+
+    Three tiers, first to resolve wins: a LITERAL exact match, then a
+    case-insensitive exact match, then a case-insensitive prefix match. Exactly
+    one match at the resolving tier wins; zero or multiple matches at the
+    resolving tier raises :class:`FogMatchError` listing the candidates (empty
+    list for zero matches). This is the safety net for free-text matching
+    against an arbitrary fog list — ambiguity must be surfaced, never guessed.
+    """
+    literal = [f for f in fog if f == text]
+    if len(literal) == 1:
+        return literal[0]
+    text_lower = text.lower()
+    exact = [f for f in fog if f.lower() == text_lower]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        raise FogMatchError(
+            f"'{text}' matches multiple fog entries exactly (case-insensitive): {exact}",
+            exact,
+        )
+    prefix = [f for f in fog if f.lower().startswith(text_lower)]
+    if len(prefix) == 1:
+        return prefix[0]
+    if not prefix:
+        raise FogMatchError(f"No fog entry matches '{text}'.", [])
+    raise FogMatchError(
+        f"'{text}' matches multiple fog entries as a prefix: {prefix}", prefix,
     )
 
 
@@ -3612,12 +3779,20 @@ def add_subtask(
     stop_conditions: list[str] | None = None,
     delegability: str | None = None,
     tags: list[str] | None = None,
+    graduates: str | None = None,
     kind: str | None = None,
 ) -> Task | None:
     """Add a subtask to a parent task.
-    
+
     Auto-splits parent if not already a directory.
     Generates sequential subtask ID (PARENT-001, PARENT-002, etc.).
+
+    ``graduates`` (CLAWP-111-002): text matched against the parent's fog list
+    (``not_yet_specified``, exact-or-prefix, case-insensitive — see
+    :func:`_match_fog_entry`). On a single match, that entry is removed from
+    the parent atomically with this child's creation. On zero or multiple
+    matches, raises :class:`FogMatchError` BEFORE any mutation — no child, no
+    parent split, no parent write.
     """
     tasks_dir = get_tasks_dir(config, project_id)
     if not tasks_dir:
@@ -3667,6 +3842,18 @@ def add_subtask(
                 "are frozen history and cannot take new subtasks. Move it out of "
                 "the archive before decomposing."
             )
+
+        # CLAWP-111-002 — resolve --graduates against the PRE-split parent's fog
+        # list, and BEFORE the flat->directory split below. A 0/multiple-match
+        # failure must create nothing at all — including no split, which is
+        # itself a mutation (moves the file on disk even though content is
+        # unchanged). Matching is unaffected by the split (frontmatter is
+        # untouched by it), so resolving here and writing via the (possibly
+        # reassigned) `parent.file_path` after the split is safe.
+        matched_fog: str | None = None
+        if graduates is not None:
+            matched_fog = _match_fog_entry(parent.not_yet_specified, graduates)
+
         if parent.file_path and parent.file_path.name != "_task.md":
             parent = split_task(config, project_id, parent_id)
             if not parent:
@@ -3777,7 +3964,9 @@ def add_subtask(
         # build failure (parent vanished / unparseable). So the single-write path
         # below is taken only for the true no-op; a build failure propagates and
         # writes NEITHER file, instead of orphaning the child (Codex review).
-        parent_new_text = _child_append_text(parent.file_path, subtask_id)
+        parent_new_text = _child_append_text(
+            parent.file_path, subtask_id, remove_fog=matched_fog,
+        )
         if parent_new_text is None:
             # True no-op on the parent — single atomic child write.
             tmp_path = file_path.with_suffix(".tmp")
@@ -3789,10 +3978,20 @@ def add_subtask(
                 tmp_path.unlink(missing_ok=True)
                 raise
         else:
-            commit_staged_pair(
-                (file_path, content),
-                (parent.file_path, parent_new_text),
-            )
+            try:
+                commit_staged_pair(
+                    (file_path, content),
+                    (parent.file_path, parent_new_text),
+                )
+            except Exception:
+                # CLAWP-111-002 — graduation is all-or-nothing: the child is
+                # committed first, so if the parent rename then fails the
+                # fog entry is still listed and a retry would mint a SECOND
+                # child for it. Drop the freshly-minted child (its id is new
+                # under the lock, so this file can only be ours).
+                if matched_fog is not None:
+                    file_path.unlink(missing_ok=True)
+                raise
 
         # Reload under the lock; retry_transient covers a scanner touching the
         # freshly-written child file even though the write committed (CLAWP-051).
