@@ -913,6 +913,15 @@ class WorkLogEntry:
     auto: bool = False  # True for auto-generated entries (state changes)
     commit_hash: str | None = None  # Git commit hash (for action=commit)
 
+    def __post_init__(self) -> None:
+        # Normalise once, at the source: every entry carries an aware-UTC ts,
+        # so no downstream sort/min/subtract ever sees a naive/aware mix
+        # (legacy "Z" lines used to load naive). Naive values are taken as UTC.
+        if self.ts.tzinfo is None:
+            self.ts = self.ts.replace(tzinfo=timezone.utc)
+        else:
+            self.ts = self.ts.astimezone(timezone.utc)
+
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON output."""
         result = {
