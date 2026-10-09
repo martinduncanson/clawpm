@@ -231,6 +231,68 @@ def output_tasks_list(tasks: list[Any], fmt: OutputFormat = OutputFormat.JSON, f
                         _print_task(task_map[child_id], indent="  └─ ")
 
 
+def _extract_named_body_section(content: str, heading: str) -> str | None:
+    """Return the text under a literal ``## {heading}`` line in raw task
+    content, or ``None`` if the heading is absent or its section is empty.
+
+    Matches the heading line case-insensitively (exact text after stripping);
+    the section runs until the next ``## `` line or end of content. Used to
+    surface "Decisions so far" (CLAWP-111-002), which has no dedicated Task
+    field of its own — CLAWP-111-001 appends it directly into the body as
+    literal markdown, so this reads back whatever it wrote there.
+    """
+    if not content:
+        return None
+    lines = content.split("\n")
+    target = f"## {heading}".strip().lower()
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip().lower() == target:
+            start = i + 1
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    for j in range(start, len(lines)):
+        if lines[j].startswith("## "):
+            end = j
+            break
+    section = "\n".join(lines[start:end]).strip()
+    return section or None
+
+
+def render_task_map_sections(task: Any) -> str:
+    """Render a root task's "map" sections (CLAWP-111-002), in fixed order:
+    ``## Destination``, ``## Decisions so far``, ``## Not yet specified``,
+    ``## Out of scope``. A section is emitted only when its backing data is
+    present; an absent field renders no section at all (not even the heading).
+
+    Pure and side-effect-free (no console/Rich concerns) so it is directly
+    unit-testable independent of ``tasks show``'s text/JSON plumbing.
+    """
+    parts: list[str] = []
+
+    destination = getattr(task, "destination", None)
+    if destination and destination.strip():
+        parts.append(f"## Destination\n\n{destination.strip()}")
+
+    decisions = _extract_named_body_section(getattr(task, "content", "") or "", "Decisions so far")
+    if decisions:
+        parts.append(f"## Decisions so far\n\n{decisions}")
+
+    not_yet_specified = getattr(task, "not_yet_specified", None) or []
+    if not_yet_specified:
+        items = "\n".join(f"- {item}" for item in not_yet_specified)
+        parts.append(f"## Not yet specified\n\n{items}")
+
+    out_of_scope = getattr(task, "out_of_scope", None) or []
+    if out_of_scope:
+        items = "\n".join(f"- {item}" for item in out_of_scope)
+        parts.append(f"## Out of scope\n\n{items}")
+
+    return "\n\n".join(parts)
+
+
 def output_task_detail(
     task: Any, fmt: OutputFormat = OutputFormat.JSON, hints: list[str] | None = None
 ) -> None:
@@ -255,6 +317,15 @@ def output_task_detail(
             subtitle=f"[{state_color}]{task.state.value}[/{state_color}] | Priority: {task.priority}",
         )
         console.print(panel)
+
+        # CLAWP-111-002 — root-map sections, printed after the raw content
+        # panel (which is left untouched — this is additive, not a rewrite of
+        # existing body rendering). Escaped: these are free-text fields that
+        # may contain Rich markup metacharacters (glob patterns, brackets).
+        map_sections = render_task_map_sections(task)
+        if map_sections:
+            console.print()
+            console.print(escape(map_sections))
 
         if task.depends:
             console.print(f"[dim]Depends on:[/dim] {', '.join(task.depends)}")

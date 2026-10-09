@@ -15,7 +15,7 @@ from clawpm.output import OutputFormat, output_error, output_json, output_succes
 from clawpm.discovery import (
     discover_projects, get_project, get_scoped_project_settings, is_task_store_canonical,
 )
-from clawpm.tasks import add_subtask, add_task, archive_done_tasks, change_task_state, distinct_tags, edit_task, get_task, list_tasks, split_task
+from clawpm.tasks import add_subtask, add_task, archive_done_tasks, change_task_state, distinct_tags, edit_fog, edit_task, get_task, list_tasks, split_task
 from clawpm.worklog import add_entry, filter_files_changed, read_entries
 from clawpm.context import expand_task_id
 from clawpm.cli.base import main, _mutation_errors, get_format, require_portfolio, require_project, _read_patterns_file, _FALLBACK_POLICIES, ExpandedPath
@@ -309,6 +309,37 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
             click.echo("[reflections_voided: true]")
 
 
+@tasks.command("fog")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
+@click.argument("task_id")
+@click.option("--add", "add_text", default=None, help="Add an entry to this task's fog list (not_yet_specified).")
+@click.option("--drop", "drop_text", default=None, help="Remove an EXACT entry from this task's fog list.")
+@click.pass_context
+def tasks_fog(ctx: click.Context, project_id: str | None, task_id: str, add_text: str | None, drop_text: str | None) -> None:
+    """Add/remove entries in a task's fog list (not_yet_specified), CLAWP-111-002.
+
+    Changes ONLY the fog list (plus the standard ``updated`` stamp) — no other
+    frontmatter or body content is touched.
+    """
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+
+    project_id, _ = require_project(ctx, project_id)
+    task_id = expand_task_id(task_id, project_id)
+
+    if add_text is None and drop_text is None:
+        raise click.UsageError("Provide --add and/or --drop.")
+
+    with _mutation_errors(fmt, "fog_failed"):
+        task = edit_fog(config, project_id, task_id, add=add_text, drop=drop_text)
+
+    if not task:
+        output_error("task_not_found", f"No task with id '{task_id}' in project '{project_id}'", fmt=fmt)
+        sys.exit(1)
+
+    output_success(f"Task {task.id} fog list updated", data=task.to_dict(), fmt=fmt)
+
+
 @tasks.command("archive")
 @click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
 @click.option(
@@ -421,6 +452,13 @@ def tasks_archive(ctx: click.Context, project_id: str | None, older_than: str, d
     default=None,
     help="Who may execute this task. 'human' means auto-dispatch is REFUSED.",
 )
+# CLAWP-111 — decision-kind tasks
+@click.option(
+    "--kind", "kind",
+    type=click.Choice(["build", "decision"]),
+    default=None,
+    help="'decision' means this task IS a decision — done requires --resolution.",
+)
 @click.pass_context
 def tasks_edit(
     ctx: click.Context,
@@ -455,6 +493,7 @@ def tasks_edit(
     out_of_scope_file: str | None = None,
     stop_conditions: tuple[str, ...] = (),
     delegability: str | None = None,
+    kind: str | None = None,
 ) -> None:
     """Edit task metadata (title, priority, complexity, body, scope)."""
     fmt = get_format(ctx)
@@ -495,8 +534,8 @@ def tasks_edit(
     ])
 
     if not any([title, priority is not None, complexity, body, scope, scope_file, has_predictions, parallel_group is not None, clear_parallel_group,
-                 out_of_scope, out_of_scope_file, stop_conditions, delegability is not None, tags, clear_tags]):
-        output_error("no_changes", "Specify at least one field to edit (--title, --priority, --complexity, --body, --scope, --scope-file, --parallel-group, --clear-parallel-group, --tag, --clear-tags, --predict-*, --out-of-scope, --out-of-scope-file, --stop-condition, or --delegability)", fmt=fmt)
+                 out_of_scope, out_of_scope_file, stop_conditions, delegability is not None, tags, clear_tags, kind is not None]):
+        output_error("no_changes", "Specify at least one field to edit (--title, --priority, --complexity, --body, --scope, --scope-file, --parallel-group, --clear-parallel-group, --tag, --clear-tags, --predict-*, --out-of-scope, --out-of-scope-file, --stop-condition, --delegability, or --kind)", fmt=fmt)
         sys.exit(1)
 
     if parallel_group is not None and clear_parallel_group:
@@ -555,6 +594,7 @@ def tasks_edit(
             out_of_scope=list(out_of_scope) if out_of_scope else None,
             stop_conditions=list(stop_conditions) if stop_conditions else None,
             delegability=delegability,
+            kind=kind,
         )
 
     if not task:
@@ -651,8 +691,12 @@ def _render_state_results(
               help="Required when state=rejected: one-line reason this idea was considered and rejected.")
 @click.option("--supersedes", "supersedes", default=None,
               help="Optional task-id that supersedes this rejected task (e.g. a replacement task).")
+# CLAWP-111 — decision-kind tasks: resolution is required when new_state is
+# 'done' on a kind: decision task.
+@click.option("--resolution", "resolution", default=None,
+              help="Outcome text. Required to complete (done) a kind: decision task; optional (stored) for build tasks.")
 @click.pass_context
-def tasks_state(ctx: click.Context, project_id: str | None, task_ids: tuple[str, ...], new_state: str, note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...], rationale: str | None, supersedes: str | None) -> None:
+def tasks_state(ctx: click.Context, project_id: str | None, task_ids: tuple[str, ...], new_state: str, note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...], rationale: str | None, supersedes: str | None, resolution: str | None) -> None:
     """Change one or many tasks' state (CLAWP-083 bulk mode).
 
     ``clawpm tasks state 72 73 74 done`` transitions each listed task with
@@ -718,6 +762,7 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_ids: tuple[str,
                 reflect_note=reflect_note, meta_reflect=meta_reflect,
                 process_lesson=process_lesson, surprise_tags=surprise_tags,
                 rationale=rationale, supersedes=supersedes,
+                resolution=resolution,
             )
         )
 
@@ -893,6 +938,23 @@ def tasks_decompose(
     default=None,
     help="Who may execute this task. 'human' means auto-dispatch is REFUSED. Default: either.",
 )
+# --- CLAWP-111-002 fog graduation ---
+@click.option(
+    "--graduates", "graduates",
+    default=None,
+    help="Requires --parent. Match this text against the parent's fog list "
+         "(not_yet_specified) — exact or case-insensitive prefix. Exactly one "
+         "match graduates: the subtask is created and that entry is removed "
+         "from the parent, atomically. Zero or multiple matches creates "
+         "nothing and errors listing the candidates.",
+)
+# CLAWP-111 — decision-kind tasks
+@click.option(
+    "--kind", "kind",
+    type=click.Choice(["build", "decision"]),
+    default=None,
+    help="'decision' means this task IS a decision — done requires --resolution. Default: build.",
+)
 @click.pass_context
 def tasks_add(
     ctx: click.Context,
@@ -932,6 +994,8 @@ def tasks_add(
     out_of_scope_file: str | None = None,
     stop_conditions: tuple[str, ...] = (),
     delegability: str | None = None,
+    graduates: str | None = None,
+    kind: str | None = None,
 ) -> None:
     """Add a new task (or subtask with --parent)."""
     fmt = get_format(ctx)
@@ -941,6 +1005,10 @@ def tasks_add(
     if confidence is not None and not (1 <= confidence <= 5):
         output_error("bad_confidence", f"--confidence must be 1-5, got {confidence}", fmt=fmt)
         sys.exit(1)
+
+    # CLAWP-111-002 — --graduates only makes sense against a parent's fog list.
+    if graduates is not None and not parent_id:
+        raise click.UsageError("--graduates requires --parent.")
 
     project_id, _ = require_project(ctx, project_id)
 
@@ -1041,6 +1109,8 @@ def tasks_add(
                 stop_conditions=list(stop_conditions) if stop_conditions else None,
                 delegability=delegability,
                 tags=tags_list,
+                graduates=graduates,
+                kind=kind,
             )
         else:
             deps = list(depends) if depends else None
@@ -1061,6 +1131,7 @@ def tasks_add(
                 out_of_scope=list(out_of_scope) if out_of_scope else None,
                 stop_conditions=list(stop_conditions) if stop_conditions else None,
                 delegability=delegability,
+                kind=kind,
             )
 
     if not task:

@@ -24,7 +24,7 @@ predictions:
     task with zero direct .project/ writes from a1
   - --dry-run previews without writing
 priority: 6
-updated: '2026-07-07'
+updated: '2026-10-09'
 ---
 # Structured inbox payload + inbox materialize: safe cross-session task handoff
 

@@ -379,6 +379,10 @@ clawpm tasks edit <id> [--title/--priority/--complexity/--body/--scope/--tag/--c
 clawpm tasks state <id> <state> [--note] [--reflect-note] [--meta-reflect]
 clawpm tasks state 72 73 74 done    # bulk mode (CLAWP-083): per-task isolation, aggregate result
 clawpm tasks state <id> rejected --rationale "reason"   # add to won't-do ledger (reject one at a time)
+clawpm tasks add -t "Pick a DB" --kind decision                 # decision task (CLAWP-111): done requires --resolution
+clawpm done <id> --resolution "Postgres, for JSONB"        # records resolution; a decision appends a line under the parent's ## Decisions so far (optional, stored, for build tasks)
+clawpm tasks fog <root> --add "open question"      # root-map fog list (CLAWP-111-002); --drop removes an exact entry
+clawpm tasks add -t "..." --parent <root> --graduates "open q"  # graduate one fog entry (exact/prefix) into this child; 0 or many matches create nothing
 clawpm tasks split <id>             # Convert to parent directory for subtasks
 ```
 
@@ -637,6 +641,9 @@ clawpm mission state <mission-id> complete
 
 # Inbox — inter-agent messaging (filesystem-first, append-only)
 clawpm inbox send --to <agent> --message "text" [--from <agent>] [--in-reply-to <msg-id>] [--stdin]
+# Structured handoff (CLAWP-101): sender only appends to the inbox; the recipient creates the task.
+clawpm inbox send --to <agent> --message "why" --task-request --title "..." [--project <id>] [--priority 1-10] [--complexity s|m|l|xl] [--body "..."] [--depends <id>] [--scope <glob>] [--tag <t>] [--success-criteria "..."] [--predict-duration 2h] [--predict-complexity m] [--predict-approach "..."] [--confidence 1-5] [--pre-mortem "..."]
+clawpm inbox materialize [--agent <agent> | --agent-id <agent>] [--project <id>] [--dry-run]
 clawpm inbox read [--agent <agent>] [--unacked] [--since 2026-01-01] [--from <agent>]
 clawpm inbox ack <msg-id>... [--agent <agent>]
 clawpm inbox thread <msg-id>
