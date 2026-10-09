@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "project": "planner-demo",
+  "root": {
+    "title": "Decision map: CSV importer for the accounts page",
+    "destination": "Users can import accounts from a CSV file, with bad rows reported and good rows saved, shipped behind a flag",
+    "not_yet_specified": [
+      "retry policy for partial failures",
+      "error UX for rejected rows"
+    ],
+    "predictions": {
+      "complexity": "m",
+      "confidence": 2,
+      "approach": "Resolve the two open decisions first; build slices depend on their resolutions. UNGROUNDED - no graph consulted.",
+      "filled_by": "agent"
+    }
+  },
+  "leaves": [
+    {
+      "ref": "D1",
+      "parent_ref": null,
+      "leaf_key": "csv-import::decide-row-validation",
+      "kind": "decision",
+      "title": "Decide: validate rows before or during the save",
+      "success_criteria": [
+        {
+          "criterion": "A resolution is recorded naming the chosen validation point and the rejected alternative",
+          "gradeable_signal": "task resolution field is non-empty when the task closes",
+          "comparator": "eq:non-empty"
+        }
+      ],
+      "scope": ["deliverable: resolution note on this task"],
+      "delegability": "human",
+      "predictions": {
+        "duration_min": 30,
+        "complexity": "s",
+        "confidence": 3,
+        "pre_mortem": "Most likely failure: the choice is made implicitly in code and never recorded.",
+        "filled_by": "agent"
+      }
+    },
+    {
+      "ref": "D2",
+      "parent_ref": null,
+      "leaf_key": "csv-import::decide-file-size-limit",
+      "kind": "decision",
+      "title": "Decide: maximum accepted file size",
+      "success_criteria": [
+        {
+          "criterion": "A resolution is recorded with the numeric limit and its reason",
+          "gradeable_signal": "task resolution field is non-empty when the task closes",
+          "comparator": "eq:non-empty"
+        }
+      ],
+      "scope": ["deliverable: resolution note on this task"],
+      "delegability": "human"
+    },
+    {
+      "ref": "B1",
+      "parent_ref": null,
+      "leaf_key": "csv-import::parse-and-validate",
+      "title": "Importer parses a CSV and reports invalid rows",
+      "depends_refs": ["D1"],
+      "success_criteria": [
+        {
+          "criterion": "A file with 2 bad rows out of 10 yields 8 valid rows and 2 reported errors",
+          "gradeable_signal": "unit test over a fixture CSV",
+          "comparator": "eq:8 valid, 2 errors"
+        }
+      ],
+      "scope": ["src/importer/**"],
+      "delegability": "agent",
+      "predictions": {
+        "duration_min": 90,
+        "complexity": "m",
+        "confidence": 3,
+        "approach": "Stream-parse, validate per the D1 resolution, collect errors. UNGROUNDED effort - no graph consulted.",
+        "filled_by": "agent"
+      }
+    },
+    {
+      "ref": "B2",
+      "parent_ref": null,
+      "leaf_key": "csv-import::upload-endpoint",
+      "title": "Upload endpoint enforces the size limit and calls the importer",
+      "depends_refs": ["D2", "B1"],
+      "success_criteria": [
+        {
+          "criterion": "A file over the D2 limit is rejected with 413 and nothing is saved",
+          "gradeable_signal": "API test posting an oversized file",
+          "comparator": "eq:413"
+        }
+      ],
+      "scope": ["src/api/accounts/import.*"],
+      "delegability": "agent"
+    }
+  ]
+}

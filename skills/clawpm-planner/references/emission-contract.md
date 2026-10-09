@@ -35,7 +35,9 @@ in `~/clawpm/portfolio.toml`) — a `.project/` dir outside those roots will fai
 ```jsonc
 "root": {
   "title": "New root task",             // creates a NEW root task
-  "predictions": { ... }                // OPTIONAL root-level predictions
+  "predictions": { ... },               // OPTIONAL root-level predictions
+  "destination": "Target state ...",    // OPTIONAL (new root only) - decision-map target
+  "not_yet_specified": ["open item"]    // OPTIONAL (new root only) - the fog list
 }
 // — OR —
 "root": { "attach_to": "PLANN-001" }    // attach leaves UNDER an existing task id
@@ -67,12 +69,12 @@ body.
 
 `ref` · `parent_ref` · `title` · `success_criteria` · `scope` · `out_of_scope` ·
 `stop_conditions` · `delegability` · `predictions` · `agent_profile` ·
-`parallel_group` · `leaf_key`
+`parallel_group` · `leaf_key` · `kind` · `depends_refs`
 
 ```jsonc
 {
   "ref": "L1",                          // REQUIRED, unique within the doc
-  "parent_ref": null,                   // MUST be null in v1 (see nesting note)
+  "parent_ref": null,                   // null = child of the root; or another leaf's ref (nesting)
   "leaf_key": "autosave::debounced-save", // stable idempotency key — SUPPLY ONE
   "title": "User edits autosave without pressing save",  // REQUIRED
   "success_criteria": [                 // the rubric (CLAWP-016/017)
@@ -96,9 +98,33 @@ body.
     "filled_by": "agent"
   },
   "agent_profile": "frontend",          // OPTIONAL routing hint for dispatch
-  "parallel_group": null                // OPTIONAL int — siblings sharing it run together
+  "parallel_group": null,               // OPTIONAL int — siblings sharing it run together
+  "kind": "decision",                   // OPTIONAL: build (default) | decision
+  "depends_refs": ["L1", "id:PLANN-004"] // OPTIONAL — leaf refs and/or existing task ids
 }
 ```
+
+### Decision-map keys (CLAWP-111-003)
+
+- **`kind`** — `build` (default, omitted from the task file) or `decision`. Any
+  other value is a validation error.
+- **`depends_refs`** — what this leaf waits on. Each entry is a `ref` of another
+  leaf in the document, or `id:<task-id>` naming a task that already exists.
+  Core resolves refs to the minted task ids and writes them as `depends`. Rejected
+  (all fail validation; `--dry-run` fails identically and nothing is written): an
+  unknown ref, a self-dependency, a cycle (the check includes the implicit
+  "parent completes after its children" edge), a leaf depending on its own
+  `parent_ref` ancestor or on an existing ancestor of the `attach_to` root, an
+  `id:` that is not a canonical existing task id (aliases such as `X/_task` fail),
+  and a dependency on a rejected task or on a leaf the won't-do gate dropped. A `ref` may not start with `id:`. On a re-emit via
+  `attach_to`, a ref naming an already-emitted leaf resolves through its
+  `leaf_key`.
+- **`root.destination`** (string) and **`root.not_yet_specified`** (list of
+  strings) — the map's target state and its "fog" list. Valid only on a new root
+  (`root.title`); under `root.attach_to` they are a validation error — edit an
+  existing task with `tasks edit` / `tasks fog`.
+
+See `examples/decision-map.emit.json`.
 
 ### Field rules that bite
 
@@ -118,11 +144,11 @@ body.
   `duration_min`, `complexity` here. When no graph grounded the effort, say so in
   `approach` ("UNGROUNDED — no graph consulted").
 
-### v1 nesting note (fail-closed)
+### Nesting note
 
-`parent_ref` **must be null**. In-document hierarchical nesting is **not
-supported in v1** — a non-null `parent_ref` is a hard validation error (tracked
-as CLAWP-064). To build depth (milestone → slice → unit), emit in **layers**:
+`parent_ref` may be null (child of the root) or the `ref` of another leaf in the
+same document (CLAWP-064); an unknown ref or a cycle is a validation error. You
+can also build depth (milestone → slice → unit) by emitting in **layers**:
 
 1. Emit the milestone parents as a new-root tree (or attach under an objective root).
 2. Then, for each milestone, emit its child slices with `root.attach_to: <milestone-id>`.
