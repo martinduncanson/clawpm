@@ -641,6 +641,9 @@ clawpm mission state <mission-id> complete
 
 # Inbox — inter-agent messaging (filesystem-first, append-only)
 clawpm inbox send --to <agent> --message "text" [--from <agent>] [--in-reply-to <msg-id>] [--stdin]
+# Structured handoff (CLAWP-101): sender only appends to the inbox; the recipient creates the task.
+clawpm inbox send --to <agent> --message "why" --task-request --title "..." [--project <id>] [--priority 1-10] [--complexity s|m|l|xl] [--body "..."] [--depends <id>] [--scope <glob>] [--tag <t>] [--success-criteria "..."] [--predict-duration 2h] [--predict-complexity m] [--predict-approach "..."] [--confidence 1-5] [--pre-mortem "..."]
+clawpm inbox materialize [--agent <agent> | --agent-id <agent>] [--project <id>] [--dry-run]
 clawpm inbox read [--agent <agent>] [--unacked] [--since 2026-01-01] [--from <agent>]
 clawpm inbox ack <msg-id>... [--agent <agent>]
 clawpm inbox thread <msg-id>

@@ -471,12 +471,12 @@ def test_worktree_list_is_read_nul_delimited(tmp_path, monkeypatch):
         "worktree C:/det\0HEAD bbb\0detached\0\0"
         f"worktree {weird}\0HEAD ccc\0branch refs/heads/clawpm/X-1\0"
         "prunable gitdir file points to non-existent location\0\0"
-    )
+    ).encode("utf-8")
     seen = {}
 
     def fake_run(cmd, **kw):
         seen["cmd"] = cmd
-        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr=b"")
 
     monkeypatch.setattr(dispatch_mod.subprocess, "run", fake_run)
     got = dispatch_mod.worktree_path_for_branch(tmp_path, "clawpm/X-1")
@@ -484,3 +484,43 @@ def test_worktree_list_is_read_nul_delimited(tmp_path, monkeypatch):
     assert str(got) == str(Path(weird))
     assert dispatch_mod.worktree_path_for_branch(tmp_path, "main") == Path("C:/main")
     assert dispatch_mod.worktree_path_for_branch(tmp_path, "nope") is None
+
+
+def test_worktree_list_preserves_cr_in_paths(tmp_path, monkeypatch):
+    """CLAWP-137: a literal CR / CRLF inside a (POSIX) worktree path must come
+    back byte-for-byte; text=True would translate it to LF."""
+    import clawpm.dispatch as dispatch_mod
+
+    cr_path = "/srv/w\rt/a\r\nb"
+    out = (
+        "worktree /srv/main\0HEAD aaa\0branch refs/heads/main\0\0"
+        f"worktree {cr_path}\0HEAD ccc\0branch refs/heads/clawpm/X-1\0\0"
+    ).encode("utf-8")
+
+    def fake_run(cmd, **kw):
+        # Mimic subprocess: text mode decodes and translates CRLF/CR -> LF.
+        if kw.get("text") or kw.get("universal_newlines"):
+            stdout = out.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+        else:
+            stdout = out
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr=b"")
+
+    monkeypatch.setattr(dispatch_mod.subprocess, "run", fake_run)
+    got = dispatch_mod.worktree_path_for_branch(tmp_path, "clawpm/X-1")
+    assert str(got) == str(Path(cr_path))
+
+
+def test_worktree_list_decodes_non_utf8_bytes_with_replacement(tmp_path, monkeypatch):
+    """Undecodable bytes in a path must not raise; they become U+FFFD."""
+    import clawpm.dispatch as dispatch_mod
+
+    out = (
+        b"worktree /srv/bad\xff\0HEAD ccc\0branch refs/heads/clawpm/X-1\0\0"
+    )
+
+    def fake_run(cmd, **kw):
+        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr=b"")
+
+    monkeypatch.setattr(dispatch_mod.subprocess, "run", fake_run)
+    got = dispatch_mod.worktree_path_for_branch(tmp_path, "clawpm/X-1")
+    assert str(got) == str(Path("/srv/bad\ufffd"))

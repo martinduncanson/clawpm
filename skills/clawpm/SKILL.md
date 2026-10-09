@@ -776,6 +776,8 @@ Storage: `~/clawpm/inbox/<agent-id>.jsonl` (created on first send).
 | `clawpm inbox read --agent <id> [--unacked\|--all]` | Read messages (default: unacked only) |
 | `clawpm inbox ack <msg-id> [<msg-id>...] [--agent <id>]` | Acknowledge messages |
 | `clawpm inbox thread <msg-id>` | Show full thread (walks in_reply_to chain across all inboxes) |
+| `clawpm inbox send --to <id> --message "..." --task-request --title "..." [--project <id>] [--success-criteria ...] [--predict-duration 2h] ...` | Hand off work as a structured `task_request` payload (sender never writes `.project/`) |
+| `clawpm inbox materialize [--agent <id>] [--project <id>] [--dry-run]` | Recipient-side: turn pending `task_request` messages into tasks via the normal add path, reply with the new task id (`in_reply_to`), ack. `--dry-run` writes nothing. Run at natural checkpoints (session start, between dispatches). Invalid requests get a `task_request_rejected` reply and are acked; unresolvable projects stay pending and are listed under `failed`. |
 
 Optional send flags: `--from <id>` (default `main`), `--in-reply-to <msg-id>`, `--project <id>`, `--task <id>`.
 Read filters: `--since <YYYY-MM-DD or ISO>`, `--from <sender>`.
