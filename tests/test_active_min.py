@@ -78,6 +78,28 @@ class TestComputeActiveMinUnit:
         assert _compute_active_min(entries) == 105
 
 
+class TestComputeActiveMinNaiveAwareMix:
+    def test_mixed_naive_and_aware_does_not_raise(self):
+        """Legacy 'Z' timestamps load naive (WorkLogEntry.from_dict strips
+        the Z) while newer entries are aware; sorting must not TypeError."""
+        entries = [
+            _entry("2026-01-01T00:30:00", WorkLogAction.PROGRESS),  # naive
+            _entry("2026-01-01T00:00:00+00:00", WorkLogAction.START),  # aware
+            _entry("2026-01-01T00:40:00", WorkLogAction.DONE),  # naive
+        ]
+        # 30 + 10 gaps, naive treated as UTC, + 15 wrap-up
+        assert _compute_active_min(entries) == 55
+
+    def test_compute_actuals_with_mixed_entries_yields_active_min(self):
+        entries = [
+            _entry("2026-01-01T00:00:00+00:00", WorkLogAction.START),
+            _entry("2026-01-01T00:20:00", WorkLogAction.PROGRESS),
+        ]
+        now = datetime(2026, 1, 1, 5, 0, tzinfo=timezone.utc)
+        actuals = _compute_actuals("T-1", entries, now=now)
+        assert actuals.active_min == 35
+
+
 class TestComputeActualsActiveMinClamp:
     def test_active_min_clamped_to_short_duration(self):
         """A single-entry task completed in 5 minutes must not report 15

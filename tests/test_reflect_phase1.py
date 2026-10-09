@@ -647,6 +647,31 @@ class TestActualComplexityCLI:
         assert record["deltas"]["complexity_actual"] == "l"
         assert record["deltas"]["complexity_match"] is False
 
+    def test_block_shortcut_forwards_actual_complexity(self, temp_portfolio):
+        """`clawpm block --actual-complexity` must be accepted and reach the
+        reflection event (the option is advertised for done/blocked)."""
+        config = temp_portfolio["config"]
+        portfolio_root = temp_portfolio["root"]
+
+        predictions = Predictions(duration_min=60, complexity=TaskComplexity.M)
+        task = add_task(
+            config, "test", "Block actual-complexity", complexity=TaskComplexity.M,
+            predictions=predictions,
+        )
+        assert task is not None
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["block", task.id, "--actual-complexity", "l", "--project", "test"],
+        )
+        assert result.exit_code == 0, result.output
+
+        ref_file = portfolio_root / "reflections" / f"{task.id}.jsonl"
+        record = json.loads(ref_file.read_text().strip().splitlines()[-1])
+        assert record["event"] == "task_blocked"
+        assert record["actuals"]["complexity"] == "l"
+
     def test_done_with_matching_actual_complexity(self, temp_portfolio):
         config = temp_portfolio["config"]
         portfolio_root = temp_portfolio["root"]

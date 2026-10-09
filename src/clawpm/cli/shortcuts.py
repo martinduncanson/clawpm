@@ -107,10 +107,13 @@ def quick_start(ctx: click.Context, project_id: str | None, task_ids: tuple[str,
 @click.option("--meta-reflect", "meta_reflect", default=None, help="What could have been anticipated that wasn't, and why?")
 @click.option("--process-lesson", "process_lesson", default=None, help="What update to your prediction PROCESS would have caught this?")
 @click.option("--surprise", "surprise_tags", multiple=True, help="Surprise taxonomy tag (repeatable): unknown_unknown, scope_drift, dependency, tooling_friction, complexity_misread, assumption_broke, external_blocker")
+@click.option("--actual-complexity", "actual_complexity", type=click.Choice(["s", "m", "l", "xl"]), default=None,
+              help="Independent post-hoc complexity assessment (CLAWP-112-002). Without this, "
+                   "actuals.complexity is null and complexity_match is null.")
 @click.pass_context
-def quick_block(ctx: click.Context, project_id: str | None, task_ids: tuple[str, ...], note: str | None, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...]) -> None:
+def quick_block(ctx: click.Context, project_id: str | None, task_ids: tuple[str, ...], note: str | None, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...], actual_complexity: str | None = None) -> None:
     """Mark one or many tasks as blocked (alias for 'tasks state <ids...> blocked')."""
-    ctx.invoke(tasks_state, project_id=project_id, task_ids=task_ids, new_state="blocked", note=note, reflect_note=reflect_note, meta_reflect=meta_reflect, process_lesson=process_lesson, surprise_tags=surprise_tags)
+    ctx.invoke(tasks_state, project_id=project_id, task_ids=task_ids, new_state="blocked", note=note, reflect_note=reflect_note, meta_reflect=meta_reflect, process_lesson=process_lesson, surprise_tags=surprise_tags, actual_complexity=actual_complexity)
 
 
 @main.command("unblock")

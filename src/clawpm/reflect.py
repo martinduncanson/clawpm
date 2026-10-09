@@ -97,11 +97,14 @@ def _compute_active_min(task_entries: list[WorkLogEntry]) -> int | None:
     """
     if not task_entries:
         return None
-    ordered = sorted(task_entries, key=lambda e: e.ts)
+    # Normalise BEFORE sorting: legacy 'Z' timestamps load naive while newer
+    # entries are aware, and comparing the two raises TypeError. Naive = UTC.
+    stamps = sorted(
+        e.ts if e.ts.tzinfo else e.ts.replace(tzinfo=timezone.utc)
+        for e in task_entries
+    )
     total = 0.0
-    for cur, nxt in zip(ordered, ordered[1:]):
-        cur_ts = cur.ts if cur.ts.tzinfo else cur.ts.replace(tzinfo=timezone.utc)
-        nxt_ts = nxt.ts if nxt.ts.tzinfo else nxt.ts.replace(tzinfo=timezone.utc)
+    for cur_ts, nxt_ts in zip(stamps, stamps[1:]):
         gap_min = max(0.0, (nxt_ts - cur_ts).total_seconds() / 60)
         total += min(gap_min, 60.0)
     total += 15.0
