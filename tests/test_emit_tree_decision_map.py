@@ -19,7 +19,8 @@ import pytest
 from click.testing import CliRunner
 
 from clawpm.cli import main
-from clawpm.emit_tree import EmitValidationError, emit_tree, parse_emit_document
+from clawpm import emit_tree as _et
+from clawpm.emit_tree import emit_tree, parse_emit_document
 from clawpm.models import Task
 from clawpm.tasks import add_task, get_task, list_tasks
 
@@ -91,25 +92,25 @@ class TestParse:
         assert doc.leaves[1].depends_refs == ["A"]
 
     def test_invalid_kind_rejected(self):
-        with pytest.raises(EmitValidationError, match="kind"):
+        with pytest.raises(_et.EmitValidationError, match="kind"):
             parse_emit_document(_doc([_leaf("A", kind="spike")]))
 
     def test_depends_refs_must_be_list_of_strings(self):
-        with pytest.raises(EmitValidationError, match="depends_refs"):
+        with pytest.raises(_et.EmitValidationError, match="depends_refs"):
             parse_emit_document(_doc([_leaf("A", depends_refs="B")]))
-        with pytest.raises(EmitValidationError, match="depends_refs"):
+        with pytest.raises(_et.EmitValidationError, match="depends_refs"):
             parse_emit_document(_doc([_leaf("A", depends_refs=[1])]))
 
     def test_unknown_depends_ref_rejected(self):
-        with pytest.raises(EmitValidationError, match="NOPE"):
+        with pytest.raises(_et.EmitValidationError, match="NOPE"):
             parse_emit_document(_doc([_leaf("A", depends_refs=["NOPE"])]))
 
     def test_self_dependency_rejected(self):
-        with pytest.raises(EmitValidationError, match="itself"):
+        with pytest.raises(_et.EmitValidationError, match="itself"):
             parse_emit_document(_doc([_leaf("A", depends_refs=["A"])]))
 
     def test_two_node_cycle_rejected(self):
-        with pytest.raises(EmitValidationError, match="[Cc]ycle"):
+        with pytest.raises(_et.EmitValidationError, match="[Cc]ycle"):
             parse_emit_document(
                 _doc([_leaf("A", depends_refs=["B"]), _leaf("B", depends_refs=["A"])])
             )
@@ -117,7 +118,7 @@ class TestParse:
     def test_depending_on_own_ancestor_rejected(self):
         # A child that depends on its parent deadlocks: the parent's rollup
         # waits on its children.
-        with pytest.raises(EmitValidationError, match="ancestor"):
+        with pytest.raises(_et.EmitValidationError, match="ancestor"):
             parse_emit_document(
                 _doc(
                     [
@@ -132,21 +133,21 @@ class TestParse:
         assert doc.leaves[0].depends_refs == ["id:TEST-009"]
 
     def test_leaf_ref_with_id_prefix_rejected(self):
-        with pytest.raises(EmitValidationError, match="id:"):
+        with pytest.raises(_et.EmitValidationError, match="id:"):
             parse_emit_document(_doc([_leaf("id:A")]))
 
     def test_destination_must_be_string(self):
-        with pytest.raises(EmitValidationError, match="destination"):
+        with pytest.raises(_et.EmitValidationError, match="destination"):
             parse_emit_document(_doc([_leaf("A")], root={"title": "R", "destination": 3}))
 
     def test_not_yet_specified_must_be_list_of_strings(self):
-        with pytest.raises(EmitValidationError, match="not_yet_specified"):
+        with pytest.raises(_et.EmitValidationError, match="not_yet_specified"):
             parse_emit_document(
                 _doc([_leaf("A")], root={"title": "R", "not_yet_specified": "fog"})
             )
 
     def test_map_keys_rejected_under_attach_to(self):
-        with pytest.raises(EmitValidationError, match="attach_to"):
+        with pytest.raises(_et.EmitValidationError, match="attach_to"):
             parse_emit_document(
                 _doc([_leaf("A")], root={"attach_to": "TEST-001", "destination": "x"})
             )
@@ -287,7 +288,7 @@ class TestGateFailuresWriteNothing:
         before = self._snapshot(iso)
         doc = parse_emit_document(_doc([_leaf("A", depends_refs=["id:TEST-404"])]))
         for dry in (True, False):
-            with pytest.raises(EmitValidationError, match="TEST-404"):
+            with pytest.raises(_et.EmitValidationError, match="TEST-404"):
                 emit_tree(iso.config, iso.project_id, doc, dry_run=dry)
         assert self._snapshot(iso) == before
         assert not [p for p in iso.tasks_dir.iterdir() if p.name.startswith(".emit-")]
@@ -310,7 +311,7 @@ class TestGateFailuresWriteNothing:
                 ]
             )
         )
-        with pytest.raises(EmitValidationError, match="rejected"):
+        with pytest.raises(_et.EmitValidationError, match="rejected"):
             emit_tree(iso.config, iso.project_id, doc)
         assert self._snapshot(iso) == before
 
