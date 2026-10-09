@@ -414,9 +414,16 @@ class TestAddSubtask:
         assert sub.parent == parent.id
         # Scope persisted identically.
         assert sub.scope == flat.scope == ["src/**"]
-        # Predictions persisted identically (not silently dropped).
+        # Predictions persisted identically (not silently dropped). Exclude
+        # prediction_id: CLAWP-112-001 mints a fresh uuid4 per task at
+        # registration time, so two independently-created tasks legitimately
+        # get different ids even with identical predicted content.
         assert sub.predictions is not None and not sub.predictions.is_empty()
-        assert sub.predictions.to_dict() == flat.predictions.to_dict()
+        sub_dict = sub.predictions.to_dict()
+        flat_dict = flat.predictions.to_dict()
+        sub_dict.pop("prediction_id", None)
+        flat_dict.pop("prediction_id", None)
+        assert sub_dict == flat_dict
         # Spot-check the specific fields the audit flagged.
         assert sub.predictions.confidence == 4
         assert sub.predictions.duration_min == 120

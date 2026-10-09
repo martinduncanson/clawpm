@@ -129,7 +129,12 @@ def _read_reflection_jsonl(portfolio_root: Path, task_id: str) -> list[dict]:
         line = line.strip()
         if not line:
             continue
-        events.append(json.loads(line))
+        record = json.loads(line)
+        # CLAWP-112-001: pre-registration events share the file but are not
+        # dispatch outcomes; these checks assert on outcome events only.
+        if record.get("event") in ("prediction_registered", "prediction_revised"):
+            continue
+        events.append(record)
     return events
 
 

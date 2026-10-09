@@ -6,8 +6,9 @@ import logging
 import os
 import re
 import shutil
+import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -3019,7 +3020,11 @@ def add_task_with_status(
         if kind and kind != "build":
             frontmatter["kind"] = kind
 
+        # CLAWP-112-001 — mint prediction_id the first time predictions are
+        # written for this task, so pre-registration is tamper-evident.
         if predictions and not predictions.is_empty():
+            if not predictions.prediction_id:
+                predictions.prediction_id = uuid.uuid4().hex
             pred_dict = predictions.to_dict()
             # Strip None / empty-list values to keep the file clean
             frontmatter["predictions"] = {
@@ -3085,6 +3090,21 @@ def add_task_with_status(
         except Exception:
             tmp_path.unlink(missing_ok=True)
             raise
+
+        # CLAWP-112-001 — the task file is now durable; register the
+        # predictions snapshot in the reflection JSONL (separate lock file,
+        # so this can't deadlock against the tasks-dir lock held above).
+        if predictions and not predictions.is_empty():
+            from .reflect import reconcile_prediction_event
+            reconcile_prediction_event(
+                config.portfolio_root,
+                task_id=task_id,
+                project_id=project_id,
+                prediction_id=predictions.prediction_id,
+                predictions=predictions.to_dict(),
+                filled_by=predictions.filled_by,
+                baseline_ref=_baseline_ref,
+            )
 
         # Reload and return INSIDE the lock — consistent with change_task_state's
         # reload-under-lock contract (CLAWP-051 Finding 5). The file was just
@@ -3236,25 +3256,50 @@ def edit_task(
             frontmatter.pop("parallel_group", None)
         elif parallel_group is not None:
             frontmatter["parallel_group"] = parallel_group
+        # CLAWP-112-001 / CLAWP-108 — MERGE the new predictions onto the
+        # existing block instead of wholesale-replacing it. The prior
+        # behaviour rebuilt `frontmatter["predictions"]` from ONLY the fields
+        # passed to this edit call, so e.g. `tasks edit --hypothesis X` (a
+        # `Predictions` object with every other field None) silently nulled
+        # duration/complexity/confidence/pre_mortem/scope/filled_by — a
+        # data-loss bug (CLAWP-108). Only fields explicitly set on this edit
+        # (non-None, non-empty-list in `pred_dict`) overwrite the prior value;
+        # everything else — including `prediction_id`, which this code path
+        # never sets directly — carries forward untouched.
+        _reconcile_predictions: dict[str, Any] | None = None
         if predictions is not None:
+            existing_predictions = frontmatter.get("predictions")
+            if not isinstance(existing_predictions, dict):
+                existing_predictions = {}
             if predictions.is_empty():
+                # A registered prediction_id is the ledger's stable link;
+                # popping the block would orphan its snapshot and make a later
+                # set mint a new id, so refuse (callers map ValueError).
+                if existing_predictions.get("prediction_id"):
+                    raise ValueError(
+                        f"Task {task_id} has registered predictions; refusing to "
+                        "clear them (would orphan the prediction ledger entry)."
+                    )
                 frontmatter.pop("predictions", None)
             else:
-                # CLAWP-108 — MERGE, don't replace. The caller's Predictions
-                # carries only the fields it set (None / [] = "not passed"),
-                # so overlay those onto the existing block. Replacing it
-                # wholesale silently nulled every field the edit didn't name
-                # (duration, confidence, pre_mortem, filled_by, ...). Working
-                # on the raw mapping also keeps keys the dataclass doesn't
-                # model. A list field that IS passed still replaces just
-                # that one list.
-                existing = frontmatter.get("predictions")
-                merged = dict(existing) if isinstance(existing, dict) else {}
-                merged.update({
-                    k: v for k, v in predictions.to_dict().items()
-                    if v is not None and v != []
-                })
+                pred_dict = predictions.to_dict()
+                merged = dict(existing_predictions)
+                for k, v in pred_dict.items():
+                    # prediction_id is immutable once stored: it is the stable
+                    # link between registration, revisions and resolution, so
+                    # an incoming Predictions object must never replace it.
+                    if k == "prediction_id":
+                        continue
+                    if v is not None and v != []:
+                        merged[k] = v
+                if not merged.get("prediction_id"):
+                    merged["prediction_id"] = pred_dict.get("prediction_id") or uuid.uuid4().hex
                 frontmatter["predictions"] = merged
+                # The ledger decides register / revise / nothing (reconciled
+                # after the save), so an identical retry of an edit whose
+                # ledger append failed still converges, and a no-op edit
+                # after success appends nothing.
+                _reconcile_predictions = merged
         # CLAWP-054 — contract fields
         if out_of_scope is not None:
             if out_of_scope:
@@ -3343,6 +3388,20 @@ def edit_task(
         except Exception:
             tmp_path.unlink(missing_ok=True)
             raise
+
+        # CLAWP-112-001 — the task file is now durable; bring the ledger in
+        # line with it (registration or revision, decided from the ledger).
+        if _reconcile_predictions is not None:
+            from .reflect import reconcile_prediction_event
+            reconcile_prediction_event(
+                config.portfolio_root,
+                task_id=task_id,
+                project_id=project_id,
+                prediction_id=_reconcile_predictions["prediction_id"],
+                predictions=_reconcile_predictions,
+                filled_by=_reconcile_predictions.get("filled_by"),
+                baseline_ref=frontmatter.get("baseline_ref"),
+            )
 
         return retry_transient(Task.from_file, task.file_path)
 
@@ -3928,7 +3987,12 @@ def add_subtask(
         # CLAWP-037 — children created via `tasks decompose` carry their own
         # success_criteria (and other predictions) so each subtask is a
         # verifiable goal, and the parent rolls up only when all pass.
+        # CLAWP-112-001 — mint prediction_id the first time predictions are
+        # written for this subtask (this is a `tasks add` code path too, via
+        # `--parent`, so it must register just like add_task does).
         if predictions and not predictions.is_empty():
+            if not predictions.prediction_id:
+                predictions.prediction_id = uuid.uuid4().hex
             pred_dict = predictions.to_dict()
             frontmatter["predictions"] = {
                 k: v for k, v in pred_dict.items()
@@ -3992,6 +4056,20 @@ def add_subtask(
                 if matched_fog is not None:
                     file_path.unlink(missing_ok=True)
                 raise
+
+        # CLAWP-112-001 — the subtask file is now durable; register the
+        # predictions snapshot (separate lock file from the tasks-dir lock
+        # held above, so no deadlock risk).
+        if predictions and not predictions.is_empty():
+            from .reflect import reconcile_prediction_event
+            reconcile_prediction_event(
+                config.portfolio_root,
+                task_id=subtask_id,
+                project_id=project_id,
+                prediction_id=predictions.prediction_id,
+                predictions=predictions.to_dict(),
+                filled_by=predictions.filled_by,
+            )
 
         # Reload under the lock; retry_transient covers a scanner touching the
         # freshly-written child file even though the write committed (CLAWP-051).
