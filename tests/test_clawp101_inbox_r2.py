@@ -11,11 +11,9 @@ same ``$`` hole closed in every other validator regex of the module.
 from __future__ import annotations
 
 import threading
-import time
 
 import pytest
 
-import clawpm.inbox as inbox_mod
 import clawpm.tasks as tasks_mod
 from clawpm.inbox import (
     materialize_task_requests,
@@ -50,22 +48,6 @@ def test_concurrent_materializers_create_one_task(isolated_portfolio, monkeypatc
         return found
 
     monkeypatch.setattr(tasks_mod, "find_task_by_source_request", gated_find)
-
-    # Inbox READS are unlocked, so on Windows a read can hit a concurrent locked
-    # append (PermissionError, no winerror). That is an inbox-reader limitation
-    # independent of the duplicate-task race under test: retry the read here so
-    # this test isolates the add_task recheck.
-    real_read = inbox_mod._read_events
-
-    def patient_read(path):
-        for _ in range(200):
-            try:
-                return real_read(path)
-            except PermissionError:
-                time.sleep(0.005)
-        return real_read(path)
-
-    monkeypatch.setattr(inbox_mod, "_read_events", patient_read)
 
     results: list = [None, None]
     errors: list = []
