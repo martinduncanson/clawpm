@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
 import yaml
 
-from .frontmatter import FrontmatterError, split_frontmatter
+from .concurrency import file_lock
+from .frontmatter import FrontmatterError, parse_frontmatter, split_frontmatter
 from .models import (
     Research,
     ResearchType,
@@ -19,7 +22,11 @@ from .models import (
 )
 from .discovery import get_project_dir
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
+    "ResearchScan",
+    "scan_research",
     "PLACEHOLDER_STALE_DAYS",
     "has_placeholder_sections",
     "is_stale_placeholder",
@@ -40,59 +47,119 @@ def get_research_dir(config: PortfolioConfig, project_id: str) -> Path | None:
     return None
 
 
+@dataclass
+class ResearchScan:
+    """Result of scanning a research dir: parsed items plus unreadable files.
+
+    ``malformed`` entries are ``{"file", "file_path", "reason", "message"}``.
+    """
+
+    items: list[Research] = field(default_factory=list)
+    malformed: list[dict[str, str]] = field(default_factory=list)
+
+
+def _malformed_entry(file: Path, exc: Exception) -> dict[str, str]:
+    reason = getattr(exc, "reason", None) or type(exc).__name__
+    return {
+        "file": file.name,
+        "file_path": str(file),
+        "reason": str(reason),
+        "message": str(exc),
+    }
+
+
+def scan_research(
+    config: PortfolioConfig,
+    project_id: str,
+    status_filter: ResearchStatus | None = None,
+    tags_filter: list[str] | None = None,
+) -> ResearchScan:
+    """Scan a project's research files, surfacing (not dropping) bad ones.
+
+    Malformed files are reported regardless of ``status_filter``/``tags_filter``
+    (their status/tags cannot be read), and each one is logged at WARNING.
+    """
+    scan = ResearchScan()
+    research_dir = get_research_dir(config, project_id)
+    if not research_dir or not research_dir.exists():
+        return scan
+
+    for file in sorted(research_dir.glob("*.md")):
+        try:
+            item = Research.from_file(file)
+        except Exception as exc:  # noqa: BLE001 - recorded, never dropped
+            entry = _malformed_entry(file, exc)
+            scan.malformed.append(entry)
+            logger.warning("malformed research file skipped: %s (%s)", file, entry["reason"])
+            continue
+
+        try:
+            if status_filter is not None and item.status != status_filter:
+                continue
+            if tags_filter and not all(tag in item.tags for tag in tags_filter):
+                continue
+        except Exception as exc:  # noqa: BLE001 - recorded, never crash the listing
+            entry = _malformed_entry(file, exc)
+            scan.malformed.append(entry)
+            logger.warning("research file skipped while filtering: %s (%s)", file, entry["reason"])
+            continue
+        scan.items.append(item)
+
+    # Sort by created date descending, then by ID
+    scan.items.sort(key=lambda r: (r.created or "", r.id), reverse=True)
+    return scan
+
+
 def list_research(
     config: PortfolioConfig,
     project_id: str,
     status_filter: ResearchStatus | None = None,
     tags_filter: list[str] | None = None,
 ) -> list[Research]:
-    """List all research items for a project."""
-    research_dir = get_research_dir(config, project_id)
-    if not research_dir or not research_dir.exists():
-        return []
-
-    items: list[Research] = []
-
-    for file in research_dir.glob("*.md"):
-        try:
-            item = Research.from_file(file)
-
-            # Apply status filter
-            if status_filter is not None and item.status != status_filter:
-                continue
-
-            # Apply tags filter (must have ALL specified tags)
-            if tags_filter:
-                if not all(tag in item.tags for tag in tags_filter):
-                    continue
-
-            items.append(item)
-        except Exception:
-            # Skip malformed items
-            continue
-
-    # Sort by created date descending, then by ID
-    items.sort(key=lambda r: (r.created or "", r.id), reverse=True)
-
-    return items
+    """List research items (flat list; malformed files are logged, see
+    :func:`scan_research` to get them back as data)."""
+    return scan_research(config, project_id, status_filter, tags_filter).items
 
 
 def get_research(config: PortfolioConfig, project_id: str, research_id: str) -> Research | None:
-    """Get a specific research item by ID."""
+    """Get a specific research item by ID (malformed files are logged, not matched)."""
     research_dir = get_research_dir(config, project_id)
     if not research_dir or not research_dir.exists():
         return None
 
-    # Check all files for matching ID
     for file in research_dir.glob("*.md"):
         try:
             item = Research.from_file(file)
-            if item.id == research_id:
-                return item
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "malformed research file skipped while looking up %r: %s (%s)",
+                research_id, file, getattr(exc, "reason", type(exc).__name__),
+            )
             continue
+        if item.id == research_id:
+            return item
 
     return None
+
+
+def _existing_ids(research_dir: Path) -> set[str]:
+    """Effective ids of every research file (same derivation as the reader).
+
+    Unreadable/corrupt files cannot be reserved, so each is logged at WARNING.
+    """
+    ids: set[str] = set()
+    for file in research_dir.glob("*.md"):
+        try:
+            eid = Research.peek_id(file)
+        except Exception as exc:  # noqa: BLE001 - logged, never silent
+            logger.warning(
+                "research file skipped during id allocation (its id is not reserved): %s (%s)",
+                file, getattr(exc, "reason", type(exc).__name__),
+            )
+            continue
+        if eid is not None:
+            ids.add(eid)
+    return ids
 
 
 def _render_open_body(question: str) -> str:
@@ -169,56 +236,69 @@ def add_research(
     # Create research directory if needed
     research_dir.mkdir(parents=True, exist_ok=True)
 
-    today = date.today().isoformat()
+    # Scan -> allocate -> write is one critical section (CLAWP-051/066/067
+    # file_lock, reentrant per-thread): two writers must not both scan the same
+    # ids and mint the same one. file_lock needs an absolute path; LockTimeout
+    # propagates (as in tasks.py). The sentinel is not *.md so scans ignore it.
+    with file_lock(research_dir.resolve() / ".clawpm-research.lock"):
+        today = date.today().isoformat()
 
-    # Generate research ID if not provided
-    if not research_id:
-        # Use date + slugified title
-        slug = title.lower()
-        slug = "".join(c if c.isalnum() else "-" for c in slug)
-        slug = "-".join(filter(None, slug.split("-")))[:50]
-        slug = slug.rstrip("-")
-        research_id = f"{project_id}-research-{slug}"
+        # Generate research ID if not provided
+        if not research_id:
+            # Use date + slugified title
+            slug = title.lower()
+            slug = "".join(c if c.isalnum() else "-" for c in slug)
+            slug = "-".join(filter(None, slug.split("-")))[:50]
+            slug = slug.rstrip("-")
+            base_id = f"{project_id}-research-{slug}"
+            # Unique the frontmatter id (not just the filename): get_research
+            # resolves by id, so a collision would shadow the later entry.
+            taken = _existing_ids(research_dir)
+            research_id = base_id
+            n = 2
+            while research_id in taken:
+                research_id = f"{base_id}-{n}"
+                n += 1
 
-    # Build frontmatter
-    frontmatter: dict = {
-        "id": research_id,
-        "type": research_type.value,
-        "status": ResearchStatus.OPEN.value,
-        "created": today,
-    }
+        # Build frontmatter
+        frontmatter: dict = {
+            "id": research_id,
+            "type": research_type.value,
+            "status": ResearchStatus.OPEN.value,
+            "created": today,
+        }
 
-    if tags:
-        frontmatter["tags"] = tags
+        if tags:
+            frontmatter["tags"] = tags
 
-    # Single-shot when a verdict/content is supplied; progressive otherwise.
-    if summary or findings or conclusion:
-        body = _render_single_shot_body(question, summary, findings, conclusion)
-    else:
-        body = _render_open_body(question)
+        # Single-shot when a verdict/content is supplied; progressive otherwise.
+        if summary or findings or conclusion:
+            body = _render_single_shot_body(question, summary, findings, conclusion)
+        else:
+            body = _render_open_body(question)
 
-    # Build content
-    content = f"""---
+        # Build content
+        content = f"""---
 {yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True).strip()}
 ---
 # {title}
 
 {body}"""
 
-    # Generate filename
-    filename = f"{today}_{research_id.replace(f'{project_id}-research-', '')}.md"
-    file_path = research_dir / filename
-
-    # Ensure unique filename
-    counter = 1
-    while file_path.exists():
-        filename = f"{today}_{research_id.replace(f'{project_id}-research-', '')}_{counter}.md"
+        # Generate filename
+        filename = f"{today}_{research_id.replace(f'{project_id}-research-', '')}.md"
         file_path = research_dir / filename
-        counter += 1
 
-    file_path.write_text(content, encoding="utf-8")
+        # Ensure unique filename
+        counter = 1
+        while file_path.exists():
+            filename = f"{today}_{research_id.replace(f'{project_id}-research-', '')}_{counter}.md"
+            file_path = research_dir / filename
+            counter += 1
 
-    return Research.from_file(file_path)
+        file_path.write_text(content, encoding="utf-8")
+
+        return Research.from_file(file_path)
 
 
 def link_research_session(

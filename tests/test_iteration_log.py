@@ -346,6 +346,9 @@ class TestEvalStopWritesIteration:
             for line in ref_file.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
+        # CLAWP-112-001: the pre-registration event shares this file.
+        assert events[0]["event"] == "prediction_registered"
+        events = [e for e in events if e["event"] != "prediction_registered"]
         assert len(events) == 2
         assert all(e["event"] == "iteration_event" for e in events)
 

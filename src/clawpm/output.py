@@ -231,6 +231,68 @@ def output_tasks_list(tasks: list[Any], fmt: OutputFormat = OutputFormat.JSON, f
                         _print_task(task_map[child_id], indent="  └─ ")
 
 
+def _extract_named_body_section(content: str, heading: str) -> str | None:
+    """Return the text under a literal ``## {heading}`` line in raw task
+    content, or ``None`` if the heading is absent or its section is empty.
+
+    Matches the heading line case-insensitively (exact text after stripping);
+    the section runs until the next ``## `` line or end of content. Used to
+    surface "Decisions so far" (CLAWP-111-002), which has no dedicated Task
+    field of its own — CLAWP-111-001 appends it directly into the body as
+    literal markdown, so this reads back whatever it wrote there.
+    """
+    if not content:
+        return None
+    lines = content.split("\n")
+    target = f"## {heading}".strip().lower()
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip().lower() == target:
+            start = i + 1
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    for j in range(start, len(lines)):
+        if lines[j].startswith("## "):
+            end = j
+            break
+    section = "\n".join(lines[start:end]).strip()
+    return section or None
+
+
+def render_task_map_sections(task: Any) -> str:
+    """Render a root task's "map" sections (CLAWP-111-002), in fixed order:
+    ``## Destination``, ``## Decisions so far``, ``## Not yet specified``,
+    ``## Out of scope``. A section is emitted only when its backing data is
+    present; an absent field renders no section at all (not even the heading).
+
+    Pure and side-effect-free (no console/Rich concerns) so it is directly
+    unit-testable independent of ``tasks show``'s text/JSON plumbing.
+    """
+    parts: list[str] = []
+
+    destination = getattr(task, "destination", None)
+    if destination and destination.strip():
+        parts.append(f"## Destination\n\n{destination.strip()}")
+
+    decisions = _extract_named_body_section(getattr(task, "content", "") or "", "Decisions so far")
+    if decisions:
+        parts.append(f"## Decisions so far\n\n{decisions}")
+
+    not_yet_specified = getattr(task, "not_yet_specified", None) or []
+    if not_yet_specified:
+        items = "\n".join(f"- {item}" for item in not_yet_specified)
+        parts.append(f"## Not yet specified\n\n{items}")
+
+    out_of_scope = getattr(task, "out_of_scope", None) or []
+    if out_of_scope:
+        items = "\n".join(f"- {item}" for item in out_of_scope)
+        parts.append(f"## Out of scope\n\n{items}")
+
+    return "\n\n".join(parts)
+
+
 def output_task_detail(
     task: Any, fmt: OutputFormat = OutputFormat.JSON, hints: list[str] | None = None
 ) -> None:
@@ -255,6 +317,15 @@ def output_task_detail(
             subtitle=f"[{state_color}]{task.state.value}[/{state_color}] | Priority: {task.priority}",
         )
         console.print(panel)
+
+        # CLAWP-111-002 — root-map sections, printed after the raw content
+        # panel (which is left untouched — this is additive, not a rewrite of
+        # existing body rendering). Escaped: these are free-text fields that
+        # may contain Rich markup metacharacters (glob patterns, brackets).
+        map_sections = render_task_map_sections(task)
+        if map_sections:
+            console.print()
+            console.print(escape(map_sections))
 
         if task.depends:
             console.print(f"[dim]Depends on:[/dim] {', '.join(task.depends)}")
@@ -334,8 +405,20 @@ def output_worklog_entries(entries: list[Any], fmt: OutputFormat = OutputFormat.
             console.print()
 
 
-def output_research_list(items: list[Any], fmt: OutputFormat = OutputFormat.JSON) -> None:
+def output_research_list(
+    items: list[Any],
+    fmt: OutputFormat = OutputFormat.JSON,
+    malformed: list[dict[str, str]] | None = None,
+    with_diagnostics: bool = False,
+) -> None:
     """Output a list of research items.
+
+    ``malformed`` (CLAWP-095) lists research files that could not be parsed.
+    JSON is ALWAYS a flat list by default (stable root type). Malformed files
+    are reported on stderr (one line each plus a count) so they are never
+    silently dropped; ``with_diagnostics=True`` opts into the stable envelope
+    ``{"research": [...], "malformed": [...], "malformed_count": N}`` (always
+    that shape, even when nothing is malformed).
 
     Each entry is annotated with ``stale_placeholder``: an open/in-progress
     entry that still carries unfilled template sections past the staleness
@@ -347,10 +430,18 @@ def output_research_list(items: list[Any], fmt: OutputFormat = OutputFormat.JSON
             data = r.to_dict()
             data["stale_placeholder"] = r.is_stale_placeholder()
             rows.append(data)
-        output_json(rows)
+        if with_diagnostics:
+            output_json(
+                {"research": rows, "malformed": malformed or [], "malformed_count": len(malformed or [])}
+            )
+        else:
+            output_json(rows)
+            if malformed:
+                _report_malformed_research_stderr(malformed)
     else:
         if not items:
             console.print("[dim]No research items found[/dim]")
+            _print_malformed_research(malformed)
             return
 
         table = Table(title="Research")
@@ -390,6 +481,27 @@ def output_research_list(items: list[Any], fmt: OutputFormat = OutputFormat.JSON
                 f"{'y' if stale_count == 1 else 'ies'} still carry placeholder "
                 f"sections past {PLACEHOLDER_STALE_DAYS} days - fill in or mark complete.[/red]"
             )
+        _print_malformed_research(malformed)
+
+
+def _report_malformed_research_stderr(malformed: list[dict[str, str]]) -> None:
+    for m in malformed:
+        print(f"research file not listed: {m['file']} ({m['reason']}): {m['message']}", file=sys.stderr)
+    print(
+        f"{len(malformed)} research file(s) could not be parsed and are NOT in the list "
+        "(use --with-diagnostics for a JSON envelope)",
+        file=sys.stderr,
+    )
+
+
+def _print_malformed_research(malformed: list[dict[str, str]] | None) -> None:
+    if not malformed:
+        return
+    console.print(
+        f"[red][!] {len(malformed)} research file(s) could not be parsed and are NOT listed above:[/red]"
+    )
+    for m in malformed:
+        console.print(f"  {m['file']} ({m['reason']}): {m['message']}", markup=False, highlight=False)
 
 
 def output_context(context: dict[str, Any], fmt: OutputFormat = OutputFormat.JSON) -> None:

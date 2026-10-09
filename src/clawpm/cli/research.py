@@ -4,9 +4,10 @@ import sys
 
 import click
 
+from clawpm.concurrency import LockTimeout
 from clawpm.models import ResearchStatus, ResearchType
 from clawpm.output import output_error, output_research_list, output_success
-from clawpm.research import add_research, link_research_session, list_research
+from clawpm.research import add_research, link_research_session, scan_research
 from clawpm.cli.base import main, get_format, require_portfolio, require_project
 
 # ============================================================================
@@ -24,9 +25,26 @@ def research() -> None:
 @click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
 @click.option("--status", "-s", type=click.Choice(["open", "complete", "stale"]), help="Filter by status")
 @click.option("--tags", "-t", multiple=True, help="Filter by tags (must have all)")
+@click.option(
+    "--with-diagnostics",
+    is_flag=True,
+    help="JSON only: emit {research, malformed, malformed_count} instead of a flat array "
+    "(malformed files are otherwise reported on stderr).",
+)
 @click.pass_context
-def research_list(ctx: click.Context, project_id: str | None, status: str | None, tags: tuple[str, ...]) -> None:
-    """List research items."""
+def research_list(
+    ctx: click.Context,
+    project_id: str | None,
+    status: str | None,
+    tags: tuple[str, ...],
+    with_diagnostics: bool,
+) -> None:
+    """List research items.
+
+    JSON output is a flat array. Unparseable research files are reported on
+    stderr (never silently dropped); use --with-diagnostics for a stable JSON
+    envelope that includes them.
+    """
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
     
@@ -35,8 +53,10 @@ def research_list(ctx: click.Context, project_id: str | None, status: str | None
     status_filter = ResearchStatus(status) if status else None
     tags_filter = list(tags) if tags else None
 
-    items = list_research(config, project_id, status_filter=status_filter, tags_filter=tags_filter)
-    output_research_list(items, fmt=fmt)
+    scan = scan_research(config, project_id, status_filter=status_filter, tags_filter=tags_filter)
+    output_research_list(
+        scan.items, fmt=fmt, malformed=scan.malformed, with_diagnostics=with_diagnostics
+    )
 
 
 @research.command("add")
@@ -103,18 +123,28 @@ def research_add(
     for tag in tags:
         parsed_tags.extend(t.strip() for t in tag.split(",") if t.strip())
 
-    item = add_research(
-        config,
-        project_id,
-        title,
-        ResearchType(research_type),
-        research_id=research_id,
-        tags=parsed_tags if parsed_tags else None,
-        question=question or "",
-        summary=summary or "",
-        findings=list(findings) if findings else None,
-        conclusion=conclusion or "",
-    )
+    # add_research's scan->allocate->write section holds the research file lock;
+    # a contended lock must exit as a structured error, not a traceback (CLAWP-138).
+    try:
+        item = add_research(
+            config,
+            project_id,
+            title,
+            ResearchType(research_type),
+            research_id=research_id,
+            tags=parsed_tags if parsed_tags else None,
+            question=question or "",
+            summary=summary or "",
+            findings=list(findings) if findings else None,
+            conclusion=conclusion or "",
+        )
+    except LockTimeout as exc:
+        output_error(
+            "lock_timeout",
+            f"Could not acquire the research lock (another session may be busy): {exc}",
+            fmt=fmt,
+        )
+        sys.exit(1)
 
     if not item:
         output_error("add_failed", f"Failed to add research to project '{project_id}'", fmt=fmt)

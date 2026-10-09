@@ -15,7 +15,7 @@ from clawpm.announce import AnnounceEncodingError, find_existing_marker_file, wr
 from clawpm.tasks import list_tasks
 from clawpm.worklog import get_last_entry
 from clawpm.cli.shortcuts import agent_context
-from clawpm.cli.base import main, get_format, require_portfolio, require_project
+from clawpm.cli.base import main, get_format, require_portfolio, require_project, ExpandedPath
 
 # ============================================================================
 # Project commands (singular)
@@ -37,7 +37,7 @@ def project_context(ctx: click.Context, project_id: str | None) -> None:
 
 
 @project.command("init")
-@click.option("--in-repo", "-r", "repo_path", type=click.Path(exists=True), default=".", help="Repository path")
+@click.option("--in-repo", "-r", "repo_path", type=ExpandedPath(exists=True), default=".", help="Repository path")
 @click.option("--id", "project_id", help="Project ID (defaults to directory name)")
 @click.option("--name", "project_name", help="Project name")
 @click.pass_context
@@ -112,6 +112,13 @@ labels = []
         announce_msg = f"; announce skipped (target is not UTF-8: {exc})"
     except OSError as exc:
         announce_msg = f"; announce skipped ({exc})"
+
+    # CLAWP-134: warn (stderr, so JSON stdout stays parseable) when git would
+    # ignore the new project's task files.
+    from clawpm.taskstate_ignore import ignored_task_state_warning
+    _ignore_warning = ignored_task_state_warning(repo, require_tasks=False)
+    if _ignore_warning:
+        click.echo(f"[WARNING] {_ignore_warning}", err=True)
 
     output_success(f"Project initialized at {project_dir}{announce_msg}", fmt=fmt)
 
@@ -263,6 +270,46 @@ def project_doctor(
     - Code-vs-tracking drift (commits authored after the last work_log entry)
     - Missing clawpm-requirement marker in repo agent docs (CLAUDE.md/AGENTS.md/README.md)
     """
+    # Whole detect+apply body runs canonically (CLAWP-098, Codex P1 on PR #55
+    # round 16): `projects_to_check` is built from `discover_projects`/
+    # `get_project` — both cwd-independent, always the CANONICAL checkout —
+    # but the body's task lookups (`list_tasks`, and `doctor_apply`'s
+    # `cascade_unblock_dependents`) go through the session-scoped
+    # `get_tasks_dir` chokepoint. Run from inside a registered worktree, that
+    # mismatch let doctor combine the canonical project's blocked-task list
+    # with the WORKTREE's dependency state, then mutate the worktree copy
+    # while reporting the canonical issue remediated. Doctor is portfolio-wide
+    # housekeeping — like `leases.apply_fallback` — never scoped to whatever
+    # worktree happens to be cwd; suppress for the whole body, the same
+    # pattern that function already uses.
+    from clawpm.sessions import suppress_session_resolution
+
+    with suppress_session_resolution():
+        _project_doctor_impl(
+            ctx, project_id, strict, commits_drift_threshold, check_codex,
+            apply_mode, assume_yes, dry_run, no_apply_drift, no_apply_cascade,
+            no_apply_stale_blocked, no_apply_half_rename, check_encoding,
+        )
+
+
+def _project_doctor_impl(
+    ctx: click.Context,
+    project_id: str | None,
+    strict: bool = False,
+    commits_drift_threshold: int = 5,
+    check_codex: bool = False,
+    apply_mode: bool = False,
+    assume_yes: bool = False,
+    dry_run: bool = False,
+    no_apply_drift: bool = False,
+    no_apply_cascade: bool = False,
+    no_apply_stale_blocked: bool = False,
+    no_apply_half_rename: bool = False,
+    check_encoding: bool = False,
+) -> None:
+    """The actual doctor body — split out of :func:`project_doctor` purely so
+    it can run inside ``suppress_session_resolution()`` without re-indenting
+    several hundred lines. Not meant to be called directly."""
     import json as _json_doc
     from datetime import date, datetime, timezone, timedelta
 
@@ -341,6 +388,20 @@ def project_doctor(
                 "project": proj.id,
                 "message": f"repo_path does not exist: {proj.repo_path}",
             })
+
+        # --- CLAWP-134: git-ignored task state ---
+        # A blanket `.project/` ignore keeps every task file off git forever.
+        # Skipped when settings.toml sets `unversioned_ok = true`.
+        if not proj.unversioned_ok:
+            from clawpm.taskstate_ignore import find_ignored_task_state, format_warning
+            _ignored_by = find_ignored_task_state(proj.project_dir)
+            if _ignored_by:
+                issues.append({
+                    "level": "warning",
+                    "scope": "project",
+                    "project": proj.id,
+                    "message": format_warning(_ignored_by),
+                })
 
         # --- CLAWP-082: dangling wiki-link check ---
         # A [[id]] whose target is not a known task/research/mission id in this
@@ -755,15 +816,92 @@ def project_doctor(
 
     # --- Phase 1.6 Check c: Cross-project prefix collisions (CLAWP-048) ---
     # Use each project's RESOLVED prefix (explicit task_prefix -> inferred from
-    # existing tasks -> [:5] for the as-yet-unminted), so the check reflects the
-    # IDs actually being minted: a task_prefix override clears a false collision,
-    # and an inferred/derived prefix surfaces a real one the naive [:5] missed.
-    from clawpm.tasks import resolve_existing_prefix as _resolve_prefix
+    # existing tasks -> the naive first-mint placeholder for the as-yet-unminted),
+    # so the check reflects the IDs actually being minted: a task_prefix override
+    # clears a false collision, and an inferred/derived prefix surfaces a real one
+    # the naive placeholder missed. The placeholder itself must come from
+    # ``_naive_prefix_placeholder`` (CLAWP-096), not a bare ``id.upper()[:5]`` --
+    # that bare slice can end in a trailing separator (``"code-quorum"`` ->
+    # ``"CODE-"``) that ``assign_task_prefix`` no longer actually mints, which
+    # would key this map under a prefix nothing ever gets and hide the real
+    # collision it derives instead (``"CODE"``).
+    # For a task-less project, ask the ALLOCATOR what it would mint rather
+    # than assuming the naive base (Codex P2, PR #57 round 6). The naive
+    # placeholder is only the allocator's FIRST candidate: when a sibling has
+    # already minted under it, `assign_task_prefix` sees it in `used` and
+    # extends instead ("code-runner" -> CODE-R, not CODE). Reporting the base
+    # here manufactured a collision for a namespace the allocator will never
+    # use — and because `prefix_collisions` feeds `has_warnings`, that false
+    # positive failed `doctor --strict` in CI and told the operator to rename
+    # a project that needed no rename.
+    #
+    # `assign_task_prefix` is a pure function of the project id and the other
+    # projects' prefixes, so iteration order does not affect the result.
+    from clawpm.tasks import assign_task_prefix as _assign_prefix
+    from clawpm.tasks import resolve_portfolio_prefix as _resolve_prefix
+    from clawpm.tasks import PortfolioPrefixScanError as _PrefixScanError
 
     prefix_map: dict[str, list[str]] = {}
     all_projects = discover_projects(config)
     for proj in all_projects:
-        prefix = _resolve_prefix(proj) or proj.id.upper()[:5]
+        try:
+            prefix = _resolve_prefix(proj, config)
+            if prefix is None:
+                prefix = _assign_prefix(
+                    proj.id,
+                    (proj.project_dir / ".project" / "tasks")
+                    if getattr(proj, "project_dir", None) else Path("."),
+                    config,
+                )
+        except (ValueError, OSError) as _prefix_exc:
+            # ValueError: the allocator refuses when every id-derived
+            # candidate is claimed by an explicit sibling prefix (CLAWP-119:
+            # no synthesised fallback). OSError: a task dir couldn't be
+            # scanned (locked/unreadable -- Windows AV, a concurrent clawpm
+            # session, a broken symlink) -- reachable both from resolving
+            # THIS project's own prefix (`_resolve_prefix` above) and from
+            # `_assign_prefix` scanning every SIBLING's tasks dir
+            # internally, so both calls share this one guard. Mirrors the
+            # lease-scanning block below, which already declares its blind
+            # spots rather than implying "clean" on a failed check. Both
+            # are real, actionable conditions -- surface as an issue rather
+            # than silently swallowing them.
+            #
+            # Do NOT fall back to the naive base here (round-6 fix,
+            # reverted): there is no real prefix in either case, and
+            # inserting one into prefix_map reproduces exactly the
+            # false-collision bug fixed above for the resolved-prefix path
+            # -- a ValueError refusal means the naive base is necessarily
+            # claimed by whichever sibling caused the refusal, so keying
+            # this project under it manufactures a collision entry between
+            # a project that will NEVER mint that prefix and a sibling
+            # whose prefix is perfectly valid. `prefix_map` has no reader
+            # besides `prefix_collisions` (see module docstring context),
+            # so nothing needs this project to "still appear in the map" --
+            # the issues[] entry above is the only actionable surface, and
+            # skipping the map entry here doesn't drop it from the check.
+            #
+            # Attribution (Codex P2 + grok-4.5 + antigravity, PR #57): an
+            # OSError raised while `_assign_prefix` scans a SIBLING's tasks
+            # dir is NOT about `proj` -- `proj` may be perfectly healthy and
+            # simply happened to be the taskless project whose mint
+            # triggered the portfolio scan that touched the broken sibling.
+            # `assign_all_prefixes` wraps that case as
+            # `PortfolioPrefixScanError` (carrying the sibling's own id), so
+            # only the plain-`OSError` case below -- proj's OWN resolve,
+            # where `proj.id` really is the failing project -- gets the
+            # `{proj.id}: ...` prefix.
+            if isinstance(_prefix_exc, _PrefixScanError):
+                message = str(_prefix_exc)
+            elif isinstance(_prefix_exc, OSError):
+                message = f"{proj.id}: {type(_prefix_exc).__name__}: {_prefix_exc}"
+            else:
+                message = f"{proj.id}: {_prefix_exc}"
+            issues.append({
+                "level": "warning", "scope": "prefix",
+                "message": message,
+            })
+            continue
         prefix_map.setdefault(prefix, []).append(proj.id)
     prefix_collisions = [
         {"prefix": pfx, "projects": pids}
@@ -989,9 +1127,10 @@ def project_doctor(
             for a in applied:
                 click.echo(f"{prefix} [{a['class']}] {a.get('target')} -> {a['result']}")
             for s in apply_skipped:
-                click.echo(
-                    f"[SKIPPED] [{s['class']}] {s.get('target')} -> {s['reason']}"
-                )
+                # CLAWP-094: attempts that errored are no longer in applied[];
+                # keep them loud in text mode.
+                tag = "[ERROR]" if s.get("outcome") == "error" else "[SKIPPED]"
+                click.echo(f"{tag} [{s['class']}] {s.get('target')} -> {s['reason']}")
 
     if strict and has_warnings:
         sys.exit(1)

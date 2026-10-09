@@ -1,0 +1,899 @@
+"""Session-scoped worktree resolution for dispatched subagents (CLAWP-098).
+
+BUG this closes: any ID-based mutator command (``tasks state <id>``,
+``done <id>``, ``block <id>`` — and, transitively, every other command that
+resolves a task's directory via ``discovery.get_project_dir``) finds its
+project's filesystem location by scanning the GLOBAL portfolio registry
+(``~/clawpm/portfolio.toml``'s ``project_roots``) for a directory matching
+the project id. That scan is 100% independent of cwd. ``tasks dispatch
+--worktree`` mints a git worktree under ``<repo>/.clawpm-worktrees/<task>/``
+but never registers it as its own portfolio project — it's just a checkout.
+So an ID-based mutator run with cwd inside that worktree still resolves via
+the registry straight back to the MAIN checkout's ``repo_path``, and mutates
+the task file THERE instead of in the worktree the agent is actually sitting
+in. See ``.project/tasks/CLAWP-098.md`` for the full incident writeup.
+
+FIX (adapted from agenticq's AgentCard identity model — a durable agent_id
+plus a per-instance session_id, with all coordination state kept in a place
+every instance can see): when ``tasks dispatch --worktree`` mints a worktree,
+it also mints a ``session_id`` and appends a ``registered`` event here,
+mapping that session_id to the worktree's actual filesystem path. This
+mirrors the append-only JSONL ledger pattern already used for
+``leases.jsonl`` / ``dispatches.jsonl`` (written through
+``concurrency.append_jsonl_line`` for Windows append atomicity), replayed to
+reconstruct current state rather than mutated in place.
+
+``discovery.get_project_dir`` consults :func:`find_session_for_cwd` BEFORE
+falling through to the portfolio-registry scan: when cwd is inside an active
+session's registered worktree path for the project being resolved, it
+short-circuits to that worktree's own ``.project/`` directory. When cwd
+matches no active session (normal single-checkout usage — including every
+other command that isn't running inside a dispatched worktree), the lookup
+returns ``None`` and today's registry-based behaviour is completely
+unaffected. This is also why ``tasks list`` / ``next`` / ``reflect`` (which
+all resolve through the same ``get_project_dir`` chokepoint) are safe: they
+only see session-scoped resolution when their cwd is actually inside a
+registered worktree, which is exactly the case where that resolution is
+correct.
+
+SESSION LIFETIME (revised after Codex review, PR #55): a session is NOT
+released when its dispatch's ``.claude/settings.local.json`` is torn down.
+An earlier version did release there, and Codex caught the resulting
+regression: dispatch-settings teardown and worktree lifetime are different
+things. A bulk ``tasks state A B done`` run with cwd inside A's dispatched
+worktree tears down A's settings — and, under the old design, released A's
+session — mid-loop; task B, processed next in the SAME invocation with the
+SAME cwd, would then find no active session for that path and silently fall
+through to the portfolio registry (the main checkout) instead. Same hazard
+for an operator who keeps working inside an already-torn-down worktree.
+
+Instead, :func:`active_sessions` treats a session as active iff BOTH the
+ledger says so (no ``released`` event — ``release_session`` /
+``release_sessions_for_task`` remain available as library API for a future
+caller that genuinely knows the worktree itself is gone, e.g. a
+``worktree remove`` integration) AND its ``worktree_path`` still exists on
+disk. Directory existence is the correct lifecycle boundary — it needs no
+explicit ledger write to detect, is immune to the mid-invocation release
+hazard above, and self-heals the moment ``git worktree remove`` actually
+deletes the checkout. A crashed dispatch whose worktree is never removed
+leaves its session record in the ledger forever, but harmlessly: the same
+task_id always resolves to the same worktree path (``create_worktree``
+scopes the path by task_id), so a stale-but-still-correct entry never
+misdirects a different dispatch — the same "inert leftover, not corruption"
+tradeoff ``dispatches.jsonl`` already accepts with no reaping of its own.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import contextvars
+import json
+import logging
+import os
+import stat
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+from .concurrency import append_jsonl_line, retry_transient
+
+logger = logging.getLogger(__name__)
+
+SESSION_REGISTRY_FILENAME = "sessions.jsonl"
+
+# CLAWP-098 (Codex round-3 P1, PR #55): the cwd-based redirect is deliberately
+# coarse — it matches on (cwd, project_id) only, not task_id, because a
+# bulk `tasks state A B done` run from inside A's worktree must resolve
+# BOTH A's and B's explicitly-named lookups against that worktree (see
+# discovery.get_project_dir's docstring; test_bulk_state_from_worktree_only_
+# touches_worktree_copies covers this). But that coarseness leaks into
+# INCIDENTAL background processing that happens to run during the same
+# invocation without the operator ever naming the task: the portfolio-wide
+# lease-fallback sweep (leases.apply_fallback) reads and transitions
+# whichever task's lease expired, regardless of what the operator actually
+# asked for. Run from inside worktree A, an unrelated task B's expired
+# lease would get read AND transitioned inside A's checkout instead of B's
+# canonical location — silently forking B's state into a worktree that has
+# nothing to do with it, and marking B's lease reassigned even though its
+# authoritative copy was never touched.
+#
+# `suppress_session_resolution()` is the escape hatch: portfolio-wide
+# housekeeping that resolves a task NOT explicitly named by the operator
+# wraps its own get_task/change_task_state calls in it, forcing pure
+# registry-based (today's, cwd-independent) resolution for that one
+# operation regardless of the ambient cwd. contextvars (stdlib, thread- and
+# asyncio-task-local) rather than a plain module global so a suppressed
+# scope in one call stack can never leak into a concurrent one.
+_suppress_session_resolution: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "clawpm_suppress_session_resolution", default=False
+)
+
+
+@contextlib.contextmanager
+def suppress_session_resolution():
+    """Disable session-scoped ``get_project_dir`` redirection for this call
+    stack. See the module-level comment above ``_suppress_session_resolution``
+    for why this exists and who should use it — NOT a general escape hatch
+    for "I don't want the redirect here"; only for code resolving a task the
+    operator did not explicitly name in the current command."""
+    token = _suppress_session_resolution.set(True)
+    try:
+        yield
+    finally:
+        _suppress_session_resolution.reset(token)
+
+
+# CLAWP-098 (Codex P1, PR #55 round 15): a command that will RUN somewhere
+# other than its own cwd — `tasks dispatch --target-dir X` — must resolve its
+# task in the scope of THAT place, because the process it launches there will.
+# `resolve_scope_from(X)` makes session lookup use X instead of the process
+# cwd for the duration of the block: X inside a registered worktree resolves
+# that worktree's store; X inside none resolves the canonical store. Distinct
+# from `suppress_session_resolution`, which can only ever mean "canonical".
+_scope_cwd_override: "contextvars.ContextVar[Optional[Path]]" = contextvars.ContextVar(
+    "clawpm_scope_cwd_override", default=None
+)
+
+
+@contextlib.contextmanager
+def resolve_scope_from(path: Path):
+    """Resolve sessions as if the process cwd were *path* (see above)."""
+    token = _scope_cwd_override.set(Path(path))
+    try:
+        yield
+    finally:
+        _scope_cwd_override.reset(token)
+
+
+def scope_cwd() -> Path:
+    """The directory session-scoped resolution keys on: the active
+    :func:`resolve_scope_from` override if any, else the process cwd.
+    Raises ``OSError`` exactly like ``Path.cwd()``."""
+    override = _scope_cwd_override.get()
+    return override if override is not None else Path.cwd()
+
+
+# CLAWP-122: the two ambient mechanisms above (``suppress_session_resolution``
+# = "canonical", ``resolve_scope_from`` = "as if cwd were X") as an explicit
+# VALUE a command resolves once at its entry point and passes down, instead of
+# every callee re-deriving it from cwd/contextvars. Opt-in: every resolver that
+# accepts ``scope=`` treats ``None`` as today's ambient behaviour. See
+# docs/design/explicit-scope.md.
+@dataclass(frozen=True)
+class Scope:
+    """Where session-scoped resolution should look.
+
+    ``target is None`` -> CANONICAL: never redirect to a worktree (same answer
+    as inside ``suppress_session_resolution()``). Otherwise BOUND: look up the
+    session for ``target`` rather than for the process cwd (same answer as
+    inside ``resolve_scope_from(target)``). Neither mode consults the cwd or
+    the contextvars, so a bound scope stays put if cwd changes mid-command.
+
+    ``pinned_project_dir`` (CLAWP-115) is a third, session-free mode: the task
+    store IS that ``.project/`` directory. ``get_project_dir`` returns it
+    verbatim, with no session lookup and no registry fallback, so a command
+    that already validated one specific store (the agent-dispatch verdict sync)
+    cannot be redirected anywhere else. Only the project dir (and so the tasks
+    dir) is pinned; repo path and settings resolution stay canonical.
+    """
+
+    target: Optional[Path] = None
+    pinned_project_dir: Optional[Path] = None
+
+    def __post_init__(self) -> None:
+        if self.target is not None and self.pinned_project_dir is not None:
+            raise ValueError("a Scope is bound to a target OR pinned to a store, not both")
+        # Codex r1 P2 (PR #75): a relative target would be re-resolved against
+        # whatever cwd is current at each lookup, so the "frozen" scope would
+        # move with cwd. Capture an absolute path once, for every construction
+        # path (factory or direct). Raises OSError only if cwd is unavailable
+        # AND the target is relative; callers that must fail open
+        # (``discovery.resolve_scope``) pass an already-resolved path.
+        if self.target is not None:
+            object.__setattr__(self, "target", Path(self.target).absolute())
+        if self.pinned_project_dir is not None:
+            object.__setattr__(
+                self, "pinned_project_dir", Path(self.pinned_project_dir).absolute()
+            )
+
+    @property
+    def is_canonical(self) -> bool:
+        return self.target is None and self.pinned_project_dir is None
+
+    @classmethod
+    def canonical(cls) -> "Scope":
+        return cls(None)
+
+    @classmethod
+    def bound(cls, target: Path) -> "Scope":
+        return cls(Path(target))
+
+    @classmethod
+    def pinned(cls, project_dir: Path) -> "Scope":
+        return cls(None, Path(project_dir))
+
+
+def resolve_path_or_none(
+    path: Path,
+    fallback: str = "Session-scoped resolution skipped for this call.",
+) -> Optional[Path]:
+    """``Path(path).resolve()`` that logs and returns ``None`` on ``OSError``.
+
+    antigravity review, PR #55 (round 4: log level, not just the fallback
+    itself): an unresolvable cwd (permission error, a network drive that
+    dropped mid-call) must fall open to "no session matched" like every other
+    miss, not crash every caller of get_project_dir — including read-only
+    commands (tasks list/next/reflect) that share this chokepoint. Logged at
+    ERROR for the same reason every other fail-open branch in this module is:
+    CLAWP-039/041's fail-open-needs-a-marker doctrine. Shared with
+    ``discovery.resolve_scope`` (Codex r1 P2, PR #75) so an explicit target
+    gets the identical logged fallback; *fallback* names the consequence.
+    """
+    try:
+        return Path(path).resolve()
+    except OSError as exc:
+        logger.error("Failed to resolve cwd %s: %s. %s", path, exc, fallback)
+        return None
+
+
+_REGISTERED = "registered"
+_RELEASED = "released"
+
+
+def _registry_path(portfolio_root: Path) -> Path:
+    return portfolio_root / SESSION_REGISTRY_FILENAME
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def stat_is_dir(path: Path) -> bool:
+    """``os.stat``-based directory check that does NOT swallow ``OSError``
+    the way ``Path.is_dir()`` does (Codex review, PR #55): per the stdlib
+    docs, ``Path.is_dir()``/``is_file()``/``exists()`` catch ``OSError``
+    internally and just return ``False`` on any stat failure (permission
+    denied, an unavailable network volume, ...) — every ``except OSError``
+    this module (and ``discovery._session_scoped_project_dir``) wrapped
+    around an ``is_dir()`` call was therefore dead code: the exception it
+    was meant to catch and log at ERROR never reached it.
+
+    Raises ``FileNotFoundError`` (a normal "the path doesn't exist" case —
+    callers typically want that treated the same as ``False``, silently)
+    or another ``OSError`` for a genuine stat fault callers should log
+    before falling open.
+    """
+    return stat.S_ISDIR(os.stat(path).st_mode)
+
+
+def stat_exists(path: Path) -> bool:
+    """Whether *path* exists, WITHOUT swallowing a stat fault.
+
+    ``Path.exists()`` catches ``OSError`` (all of it on some Python versions,
+    a subset on others) and answers ``False``, so a permission failure or an
+    unavailable volume reads as "absent". For the gates that decide whether
+    isolation is armed, or whether an existing file may be overwritten,
+    "absent" and "could not tell" are different answers with different safe
+    reactions (CLAWP-098, Codex rounds 14-15). Missing / not-a-directory is
+    ``False``; any other ``OSError`` propagates.
+    """
+    try:
+        os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return True
+
+
+@dataclass
+class SessionRecord:
+    """Reconstructed session state, replayed from the registry."""
+
+    session_id: str
+    task_id: str
+    project_id: str
+    worktree_path: Path
+    active: bool
+    # CLAWP-118: repo-relative posix path of the project inside the worktree
+    # checkout (``packages/foo``); empty for a project at the repo root.
+    # ``worktree_path`` stays the checkout ROOT.
+    project_prefix: str = ""
+
+    @property
+    def project_root(self) -> Path:
+        """The project's root inside the worktree (``worktree_path`` itself
+        for a root-level project). Not resolved; callers resolve as needed."""
+        if not self.project_prefix:
+            return self.worktree_path
+        return self.worktree_path / self.project_prefix
+
+
+def normalise_project_prefix(value: object) -> Optional[str]:
+    """Canonical form of a project prefix (posix, no surrounding slashes), or
+    ``None`` when *value* is not a safe repo-relative path (non-str, absolute,
+    drive-qualified, or containing ``..``). ``""`` and ``"."`` mean "repo root".
+    Pure; never raises."""
+    if not isinstance(value, str):
+        return None
+    # Control characters (NUL included) make later Path operations raise
+    # ValueError, which the OSError-only guards downstream do not catch.
+    if any(ord(c) < 32 or ord(c) == 127 for c in value):
+        return None
+    text = value.replace("\\", "/")
+    if text.startswith("/"):
+        return None
+    parts = [p for p in text.split("/") if p not in ("", ".")]
+    if any(p == ".." for p in parts):
+        return None
+    # Drive check runs on the NORMALISED first component: "./C:/x" collapses
+    # to "C:/x", which a Windows join treats as absolute.
+    if parts and len(parts[0]) >= 2 and parts[0][1] == ":":
+        return None
+    return "/".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Writers
+# ---------------------------------------------------------------------------
+
+
+def register_session(
+    portfolio_root: Path,
+    session_id: str,
+    task_id: str,
+    project_id: str,
+    worktree_path: Path,
+    project_prefix: str = "",
+) -> None:
+    """Append a ``registered`` event mapping *session_id* to *worktree_path*.
+
+    Called by ``tasks dispatch --worktree`` right after the worktree is
+    created. Idempotent-ish: re-dispatching the same task (worktree already
+    exists, ``create_worktree`` short-circuits) simply appends another
+    ``registered`` event for a fresh session_id pointing at the same path —
+    harmless, since resolution only needs ANY active session whose path
+    matches, not a unique one.
+    """
+    event = {
+        "action": _REGISTERED,
+        "session_id": session_id,
+        "task_id": task_id,
+        "project_id": project_id,
+        "worktree_path": str(Path(worktree_path).resolve()),
+        "ts": _now_iso(),
+    }
+    prefix = normalise_project_prefix(project_prefix)
+    if prefix is None:
+        raise ValueError(f"unsafe project_prefix {project_prefix!r}")
+    if prefix:
+        # Only when non-empty: root-level ledgers stay byte-identical.
+        event["project_prefix"] = prefix
+    append_jsonl_line(_registry_path(portfolio_root), json.dumps(event, ensure_ascii=False))
+
+
+class SessionRebindError(OSError):
+    """The ledger could not be updated with a relocated worktree's path."""
+
+
+def persist_relocated_worktree(
+    portfolio_root: Path,
+    worktree: Path,
+    task_id: Optional[str],
+    project_id: Optional[str],
+) -> int:
+    """CLAWP-117: before a teardown removes the dispatch marker of *worktree*,
+    move every ACTIVE ledger record of (*task_id*, *project_id*) whose
+    recorded path is gone onto *worktree*'s current path.
+
+    Returns the number of records moved (0 = nothing to do). Does nothing when
+    any active record's path is still a live directory (the session is
+    legitimately elsewhere) or when the ledger is degraded (no trustworthy
+    records to correct; the marker fallback owns that case). Records are
+    moved by appending a ``registered`` event with the same session id, the
+    same locked append every other writer uses; replay lets the later event
+    win. Raises :class:`SessionRebindError` (after an ERROR log) when an
+    append fails, so the caller can keep the marker. Never called on a read
+    path.
+    """
+    if not isinstance(task_id, str) or not task_id:
+        return 0
+    if not isinstance(project_id, str) or not project_id:
+        return 0
+    sessions, degraded = _load_ledger(portfolio_root)
+    if degraded or not _task_has_stale_session_only(sessions, task_id, project_id):
+        return 0
+    # *worktree* is the dir holding the dispatch marker = the PROJECT root
+    # (CLAWP-118). The checkout root a record stores is that dir minus the
+    # record's project prefix, so derive it per record and validate it before
+    # appending anything (a mismatch must not leave a partial rewrite).
+    marker_dir = Path(worktree).resolve()
+    stale_paths = {
+        os.path.normcase(str(s.worktree_path))
+        for s in sessions.values()
+        if s.active and s.task_id == task_id and s.project_id == project_id
+    }
+    pending: list[tuple[SessionRecord, str]] = []
+    for s in sessions.values():
+        if not (s.active and s.task_id == task_id and s.project_id == project_id):
+            continue
+        if os.path.normcase(str(s.worktree_path)) not in stale_paths:
+            continue
+        new_path = str(marker_dir)
+        if s.project_prefix:
+            want = s.project_prefix.split("/")
+            have = marker_dir.parts[-len(want):] if len(marker_dir.parts) > len(want) else ()
+            if [os.path.normcase(p) for p in have] != [os.path.normcase(p) for p in want]:
+                logger.error(
+                    "Cannot persist relocated worktree %s for session %s (task "
+                    "%s, project %s): its path does not end in the recorded "
+                    "project prefix %r. Keeping the dispatch marker; teardown "
+                    "is aborted.",
+                    marker_dir, s.session_id, task_id, project_id, s.project_prefix,
+                )
+                raise SessionRebindError(
+                    f"relocated worktree {marker_dir} does not end in the "
+                    f"recorded project prefix {s.project_prefix!r} for session "
+                    f"{s.session_id}"
+                )
+            new_path = str(marker_dir.parents[len(want) - 1])
+        pending.append((s, new_path))
+    moved = 0
+    for s, new_path in pending:
+        event = {
+            "action": _REGISTERED,
+            "session_id": s.session_id,
+            "task_id": task_id,
+            "project_id": project_id,
+            "worktree_path": new_path,
+            "ts": _now_iso(),
+        }
+        if s.project_prefix:
+            event["project_prefix"] = s.project_prefix
+        try:
+            append_jsonl_line(
+                _registry_path(portfolio_root), json.dumps(event, ensure_ascii=False)
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to persist relocated worktree %s for session %s "
+                "(task %s, project %s): %s. Keeping the dispatch marker; "
+                "teardown is aborted.",
+                new_path, s.session_id, task_id, project_id, exc,
+            )
+            raise SessionRebindError(
+                f"could not record relocated worktree {new_path} for session "
+                f"{s.session_id}: {exc}"
+            ) from exc
+        moved += 1
+    return moved
+
+
+def release_session(portfolio_root: Path, session_id: str) -> None:
+    """Append a ``released`` event retiring *session_id*. Idempotent at the
+    registry level — replaying multiple releases for the same id is
+    harmless (the record is simply not-active either way)."""
+    event = {
+        "action": _RELEASED,
+        "session_id": session_id,
+        "ts": _now_iso(),
+    }
+    append_jsonl_line(_registry_path(portfolio_root), json.dumps(event, ensure_ascii=False))
+
+
+def release_sessions_for_task(portfolio_root: Path, task_id: str, project_id: str) -> int:
+    """Release every currently-active session for *(task_id, project_id)*.
+
+    Called from dispatch teardown so a completed/torn-down dispatch's
+    session pointer doesn't outlive the dispatch it belongs to. Returns the
+    number of sessions released (0 if none were active — safe to call
+    unconditionally from teardown paths that don't know whether a session
+    was ever registered, e.g. non-worktree dispatches).
+    """
+    released = 0
+    for record in _replay(portfolio_root).values():
+        if record.active and record.task_id == task_id and record.project_id == project_id:
+            release_session(portfolio_root, record.session_id)
+            released += 1
+    return released
+
+
+# ---------------------------------------------------------------------------
+# Replay
+# ---------------------------------------------------------------------------
+
+
+def _replay(portfolio_root: Path) -> dict[str, SessionRecord]:
+    """Session state per session_id; see :func:`_load_ledger`."""
+    return _load_ledger(portfolio_root)[0]
+
+
+def _load_ledger(portfolio_root: Path) -> tuple[dict[str, SessionRecord], bool]:
+    """Reconstruct current session state per session_id from the log.
+
+    Returns ``(sessions, degraded)``. ``degraded`` is True when the ledger
+    EXISTS but could not be trusted (stat/read fault, or non-blank content
+    with not one valid event) as opposed to merely absent or empty. CLAWP-114:
+    callers use it to try the local dispatch-marker fallback instead of
+    silently resolving through the main-checkout registry.
+
+    Corrupted lines are skipped (defensive — a half-written line must not
+    nuke resolution for every other registered session). A whole-file read
+    failure falls back to "no active sessions", which is fail-OPEN (every
+    caller of ``find_session_for_cwd`` treats an empty result as "fall
+    through to the registry lookup") but must not be fail-SILENT (CLAWP-098
+    review finding — this repo's own fail-open-needs-a-marker doctrine, see
+    CLAWP-039/041): a silently swallowed read failure here means an ID-based
+    mutator run from inside a dispatched worktree quietly regresses to the
+    exact main-checkout corruption this module exists to prevent, with
+    nothing in the logs to explain why. Log it.
+    """
+    path = _registry_path(portfolio_root)
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return {}, False
+    except OSError as exc:
+        # Codex P1, PR #55 (round 6): Path.exists() catches OSError
+        # internally and returns False (same dead-code shape already fixed
+        # for is_dir() in stat_is_dir()'s docstring above) — a permission or
+        # unavailable-volume fault on this pre-read check would silently
+        # fall through as "no registry", never reaching the except OSError
+        # below that DOES log. Stat directly so a genuine fault is
+        # distinguished from "file doesn't exist yet" and logged the same
+        # way as every other fail-open path in this function.
+        logger.error(
+            "Failed to stat session registry %s: %s. Session-scoped project "
+            "resolution is DISABLED until this clears — ID-based mutator "
+            "commands run from inside a dispatched worktree will fall "
+            "through to the portfolio registry (main-checkout) lookup.",
+            path, exc,
+        )
+        return {}, True
+    sessions: dict[str, SessionRecord] = {}
+    valid_events = 0
+    try:
+        # errors="replace" (antigravity review, PR #55), not "strict": a
+        # single invalid byte ANYWHERE in the file must not take down every
+        # OTHER session's replay — that would be strictly worse than the
+        # per-line JSONDecodeError handling below, since one bad byte can
+        # sit in the middle of an otherwise-healthy multi-KB append-only
+        # file. A replaced byte lands inside whichever line it corrupted;
+        # that one line then fails json.loads() below and is skipped same
+        # as any other malformed line, while every other line still parses.
+        #
+        # retry_transient (grok review, PR #55): register_session/
+        # release_session write through concurrency.append_jsonl_line,
+        # which takes an exclusive lock for the duration of its write. A
+        # plain unlocked read racing that write is exactly the Windows
+        # sharing-violation shape (winerror 5/32/33) this repo already has
+        # a bounded retry for (CLAWP-032/051) — without it, a concurrent
+        # `tasks dispatch --worktree` (the INTENDED way to use this
+        # feature, likely to run in parallel with other dispatches) could
+        # transiently disable session resolution for every OTHER already-
+        # registered worktree, not just the one racing this read.
+        raw = retry_transient(lambda: path.read_text(encoding="utf-8", errors="replace"))
+    except OSError as exc:
+        # error, not warning (Codex P1, PR #55): this is the fail-open path
+        # that most directly recreates CLAWP-098's original corruption —
+        # every ID-based mutator run from inside a dispatched worktree will
+        # silently mutate the MAIN checkout again until this clears. A
+        # genuinely hard fail-closed (raise out of get_project_dir) would
+        # take down read-only commands too (tasks list/next/reflect share
+        # this chokepoint) over what should be a rare, narrow corruption —
+        # judged worse than a loud, high-severity log. Escalate here if that
+        # tradeoff needs revisiting.
+        logger.error(
+            "Failed to read session registry %s: %s. Session-scoped project "
+            "resolution is DISABLED until this clears — ID-based mutator "
+            "commands run from inside a dispatched worktree will fall "
+            "through to the portfolio registry (main-checkout) lookup.",
+            path, exc,
+        )
+        return {}, True
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict):
+            # A syntactically-valid JSON line that isn't an object (a bare
+            # list/string/number/null) — same "corrupted line, skip only
+            # this one" contract as the JSONDecodeError above, just a
+            # different way a line can fail to be a real event (antigravity
+            # review, PR #55: unguarded `.get()` would otherwise raise
+            # AttributeError and abort replay for every OTHER session too).
+            continue
+        action = ev.get("action")
+        session_id = ev.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        if action not in (_REGISTERED, _RELEASED):
+            continue
+        if action == _REGISTERED:
+            task_id = ev.get("task_id")
+            project_id = ev.get("project_id")
+            worktree_path = ev.get("worktree_path")
+            # Codex review, PR #55: a syntactically-valid line whose fields
+            # have the WRONG TYPE (e.g. worktree_path: 42) previously passed
+            # the truthiness checks below straight into Path(worktree_path),
+            # which raises TypeError uncaught -- aborting replay for every
+            # OTHER session, not just this malformed one. Require str for
+            # every field (also covers empty-string, replacing the old
+            # `not x` truthiness checks) before constructing the record.
+            if (
+                not isinstance(task_id, str) or not task_id
+                or not isinstance(project_id, str) or not project_id
+                or not isinstance(worktree_path, str) or not worktree_path
+            ):
+                continue
+            # CLAWP-118: optional project prefix; absent = repo-root project.
+            # Present but unsafe -> skip THIS event (never raise), loudly.
+            prefix = normalise_project_prefix(ev.get("project_prefix", ""))
+            if prefix is None:
+                logger.error(
+                    "Session registry %s: skipping the event for session %s: "
+                    "unsafe project_prefix %r.",
+                    path, session_id, ev.get("project_prefix"),
+                )
+                continue
+            # Count an event only once it fully validates (Codex r1, PR #78):
+            # a registration with bad fields yields no usable session, so it
+            # must not mask a degraded ledger.
+            valid_events += 1
+            sessions[session_id] = SessionRecord(
+                session_id=session_id,
+                task_id=task_id,
+                project_id=project_id,
+                worktree_path=Path(worktree_path),
+                active=True,
+                project_prefix=prefix,
+            )
+        elif action == _RELEASED:
+            valid_events += 1
+            record = sessions.get(session_id)
+            if record:
+                record.active = False
+    if valid_events == 0 and raw.strip():
+        # CLAWP-114: every line was corrupt, so the "empty" set is a parse
+        # failure, not an empty ledger. Same fail-open-with-a-marker contract
+        # as the read faults above.
+        logger.error(
+            "Session registry %s has content but no valid session events. "
+            "Treating it as unavailable: session-scoped resolution falls back "
+            "to the local dispatch marker, else the portfolio registry.",
+            path,
+        )
+        return sessions, True
+    return sessions, False
+
+
+def active_sessions(portfolio_root: Path) -> list[SessionRecord]:
+    """Sessions whose latest event leaves them active AND whose worktree
+    still exists on disk.
+
+    The directory-existence check (Codex review, PR #55) is what makes
+    session liveness track the worktree's actual lifetime instead of the
+    dispatch-settings teardown moment — see the module docstring's "SESSION
+    LIFETIME" section for why that distinction matters. A worktree removed
+    out from under a still-``registered`` session (``git worktree remove``,
+    a crashed dispatch's directory manually cleaned up, ...) naturally stops
+    being returned here — no explicit ``released`` event needed.
+    """
+    return _live_sessions(_replay(portfolio_root))
+
+
+def _live_sessions(sessions: dict[str, SessionRecord]) -> list[SessionRecord]:
+    result: list[SessionRecord] = []
+    for s in sessions.values():
+        if not s.active:
+            continue
+        try:
+            if not stat_is_dir(s.worktree_path):
+                continue
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            # Codex review, PR #55 (round 5): stat_is_dir (unlike
+            # Path.is_dir()) actually raises for a genuine fault here, so
+            # this branch is now reachable. Log at ERROR before treating
+            # like "not there" — same severity as _replay's whole-file
+            # fail-open, since a transient stat fault (Windows sharing/AV,
+            # a flaky network volume) dropping an otherwise-live, already-
+            # decided-active session is the same silent-regression shape.
+            logger.error(
+                "Failed to stat session worktree %s: %s. Treating session "
+                "%s as inactive for this call.",
+                s.worktree_path, exc, s.session_id,
+            )
+            continue
+        result.append(s)
+    return result
+
+
+def find_session_for_cwd(
+    portfolio_root: Path, cwd: Path, project_id: Optional[str] = None
+) -> Optional[SessionRecord]:
+    """Return the most specific active session whose worktree contains *cwd*.
+
+    ``cwd`` may be the worktree root itself or any subdirectory beneath it.
+    When ``project_id`` is given, only sessions for that project are
+    considered — the caller already knows which project it's resolving and
+    must never cross-match a different project's worktree just because cwd
+    happens to be nested under it.
+
+    Returns ``None`` when the registry is absent/empty or no active
+    session's worktree path contains cwd — the normal case for every command
+    NOT running inside a dispatched worktree, which is the overwhelming
+    majority of usage. Callers must treat ``None`` as "fall through to the
+    existing portfolio-registry lookup", never as an error.
+
+    Path comparison case-normalises via ``os.path.normcase`` (grok review,
+    PR #55) — the same normalisation ``concurrency.file_lock`` already
+    applies for its lock-path keys. Windows filesystems are case-insensitive
+    but ``pathlib.Path`` equality and ``in .parents`` are NOT, so a
+    case-mismatched cwd (a different drive-letter spelling, a shell that
+    preserves different casing than the one that minted the worktree) would
+    otherwise silently miss an active session and fail open to exactly the
+    main-checkout corruption this module exists to prevent. The
+    case-normalised strings are then wrapped back in ``Path`` and compared
+    via equality / ``in .parents`` (antigravity review, PR #55), not raw
+    string ``.startswith(wt + os.sep)`` — a Windows drive root resolves with
+    a trailing separator (``"W:\\"``), which made the string-concat version
+    double up separators and silently miss every path nested under a
+    worktree that happened to sit at a drive root.
+    """
+    resolved_cwd = resolve_path_or_none(cwd)
+    if resolved_cwd is None:
+        return None
+    cwd_norm = Path(os.path.normcase(str(resolved_cwd)))
+    best: Optional[SessionRecord] = None
+    best_depth = -1
+    sessions, degraded = _load_ledger(portfolio_root)
+    for record in _live_sessions(sessions):
+        if project_id is not None and record.project_id != project_id:
+            continue
+        try:
+            wt = record.worktree_path.resolve()
+        except OSError as exc:
+            # grok review, PR #55 (round 5): log at ERROR — same fail-open
+            # class as every other guard in this module, just triggered by
+            # a TOCTOU race (active_sessions already confirmed this exact
+            # path was a directory moments ago via stat_is_dir).
+            logger.error(
+                "Failed to resolve candidate session worktree %s (session "
+                "%s): %s. Skipping this candidate for this call.",
+                record.worktree_path, record.session_id, exc,
+            )
+            continue
+        wt_norm = Path(os.path.normcase(str(wt)))
+        if cwd_norm != wt_norm and wt_norm not in cwd_norm.parents:
+            continue
+        depth = len(wt.parts)
+        if depth > best_depth:
+            best = record
+            best_depth = depth
+    if best is None:
+        # Degraded ledger (CLAWP-114): the marker stands in for it. Healthy
+        # ledger (CLAWP-117): the marker still identifies a RELOCATED
+        # worktree, but only when the ledger's record of it has gone stale.
+        best = _marker_fallback_session(
+            resolved_cwd, project_id, None if degraded else sessions
+        )
+    return best
+
+
+def _task_has_stale_session_only(
+    sessions: dict[str, SessionRecord], task_id: str, project_id: str
+) -> bool:
+    """CLAWP-117: True when *task_id* has at least one ACTIVE ledger session
+    for *project_id* and none of them records a live (or unverifiable)
+    worktree directory.
+
+    A recorded path that is still a live directory means the session is
+    legitimately active there, so a marker elsewhere must never rebind it.
+    A stat fault is "unknown", which is also treated as not stale. Never
+    raises.
+    """
+    found = False
+    for s in sessions.values():
+        if not s.active or s.task_id != task_id or s.project_id != project_id:
+            continue
+        found = True
+        try:
+            if stat_is_dir(s.worktree_path):
+                return False
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            logger.error(
+                "Failed to stat session worktree %s: %s. Not treating session "
+                "%s as stale (no relocation rebind).",
+                s.worktree_path, exc, s.session_id,
+            )
+            return False
+    return found
+
+
+def _marker_fallback_session(
+    cwd: Path,
+    project_id: Optional[str],
+    sessions: Optional[dict[str, SessionRecord]] = None,
+) -> Optional[SessionRecord]:
+    """CLAWP-114: scope to the dispatched worktree *cwd* sits in, using the
+    dispatch marker (``.claude/settings.local.json``) instead of the unusable
+    ledger. The marker travels with the checkout, so it needs no ledger.
+
+    Called when no live session matches cwd. With *sessions* ``None`` the
+    ledger is degraded and the marker is trusted outright; with the healthy
+    ledger passed in (CLAWP-117) the marker is trusted only when its
+    (task, project) has active records and every recorded path is gone, i.e.
+    the worktree was relocated (never while a recorded path is still live).
+    Walks cwd and its ancestors; the
+    nearest marker whose ``project_id`` equals *project_id* wins. A marker for
+    another project is skipped, never matched (a worktree of project B is not
+    a scope for resolving project A — cross-project isolation), and with no
+    *project_id* nothing is matched at all. No marker -> ``None``: today's
+    registry behaviour, so read-only commands in the main checkout still work.
+    A marker file that cannot be read is logged and skipped (fail-open WITH a
+    marker). Never raises.
+
+    The result is a synthetic record (session id ``marker:<task_id>``); it is
+    never written to the ledger.
+    """
+    if project_id is None:
+        return None
+    # Lazy: dispatch imports this module at load time.
+    from .dispatch import inspect_dispatch_marker, settings_path
+
+    for candidate in (cwd, *cwd.parents):
+        try:
+            marker, problem = inspect_dispatch_marker(candidate)
+        except (OSError, ValueError) as exc:
+            logger.error(
+                "Failed to read dispatch marker under %s: %s. Skipping it for "
+                "the local-worktree fallback.",
+                candidate, exc,
+            )
+            continue
+        if problem is not None:
+            # The plain reader maps damage to None, so surface it here.
+            logger.error(
+                "Dispatch marker %s is damaged: %s. Skipping it for the "
+                "local-worktree fallback.",
+                settings_path(candidate), problem,
+            )
+            continue
+        if marker is None or marker.get("project_id") != project_id:
+            continue
+        task_id = marker.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            continue
+        if sessions is None:
+            logger.warning(
+                "Session registry unavailable: scoping to the dispatched "
+                "worktree %s via its dispatch marker (task %s, project %s) "
+                "instead of the portfolio registry.",
+                candidate, task_id, project_id,
+            )
+        elif _task_has_stale_session_only(sessions, task_id, project_id):
+            logger.warning(
+                "Dispatched worktree %s was relocated (the ledger's recorded "
+                "path for task %s, project %s is gone): scoping to it via its "
+                "dispatch marker. The ledger is not rewritten.",
+                candidate, task_id, project_id,
+            )
+        else:
+            # Nearest matching marker decides: no session to recover (or the
+            # recorded path is live), so keep today's registry behaviour.
+            return None
+        return SessionRecord(
+            session_id=f"marker:{task_id}",
+            task_id=task_id,
+            project_id=project_id,
+            worktree_path=candidate,
+            active=True,
+        )
+    return None

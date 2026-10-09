@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import re
+import subprocess
 from pathlib import Path
 
 from .discovery import load_portfolio_config, get_project, is_git_repo, init_project_from_repo
-from .models import ProjectSettings
+from .models import ProjectSettings, Task, TaskState
 
+logger = logging.getLogger(__name__)
 
 CONTEXT_FILE = Path.home() / ".clawpm-context"
 
@@ -32,8 +36,16 @@ def detect_project_from_cwd() -> ProjectSettings | None:
         if settings_file.exists():
             try:
                 return ProjectSettings.load(settings_file)
-            except Exception:
-                pass
+            except Exception as exc:
+                # CLAWP-094: stays fail-open by design (a corrupt settings.toml
+                # must not make every command in that tree unusable, and the
+                # walk may still find a valid parent project) -- but it is no
+                # longer fail-SILENT: leave a degraded-path marker.
+                logger.warning(
+                    "clawpm: ignoring unreadable project settings %s (%s: %s); "
+                    "continuing project detection in parent directories",
+                    settings_file, type(exc).__name__, exc,
+                )
         current = current.parent
     
     return None
@@ -86,9 +98,15 @@ def get_context_project() -> str | None:
         content = CONTEXT_FILE.read_text(encoding="utf-8").strip()
         if content:
             return content
-    except Exception:
-        pass
-    
+    except (OSError, UnicodeDecodeError) as exc:
+        # CLAWP-094: fail-open (a damaged context file just means "no sticky
+        # project") but marked, not silent. Only I/O/decoding errors are
+        # expected from read_text; anything else is a bug and propagates.
+        logger.warning(
+            "clawpm: ignoring unreadable context file %s (%s: %s)",
+            CONTEXT_FILE, type(exc).__name__, exc,
+        )
+
     return None
 
 
@@ -128,16 +146,72 @@ def resolve_project(explicit: str | None = None) -> tuple[str | None, str]:
 
 
 def get_project_prefix(project_id: str) -> str:
-    """Get the task ID prefix for a project.
-    
-    Converts project ID to uppercase prefix, e.g.:
+    """Get the task ID prefix for a project (CLAWP-141).
+
+    The prefix the allocator would derive on a project's first mint, via
+    ``tasks._naive_prefix_placeholder`` (ONE source of truth), e.g.:
         - clawpm -> CLAWP
-        - my-project -> MYPRO (first 5 chars, uppercase, no hyphens)
+        - code-quorum -> CODE (trailing separator stripped)
+        - my-project -> MY-PR
+        - 2-b -> P2-B (derived prefixes lead with a letter, CLAWP-133)
+
+    A project that ALREADY minted ids keeps the prefix on its own task files:
+    a collision-resolved one (``CODE-B``) or a pre-CLAWP-133 digit-leading one
+    (``2024-001``), so existing projects' short refs still expand.
     """
-    # Remove hyphens/underscores and uppercase
-    clean = re.sub(r'[-_]', '', project_id).upper()
-    # Take first 5 chars
-    return clean[:5]
+    from .tasks import _naive_prefix_placeholder
+
+    return _existing_prefix(project_id) or _naive_prefix_placeholder(project_id)
+
+
+def _existing_prefix(project_id: str) -> str | None:
+    """The prefix the project already minted under, else None. Fail-open (the
+    derived prefix is the fallback) but marked."""
+    from .tasks import resolve_existing_prefix
+
+    try:
+        config = load_portfolio_config()
+        proj = get_project(config, project_id) if config else None
+        existing = resolve_existing_prefix(proj) if proj else None
+    except Exception as exc:
+        logger.warning(
+            "clawpm: could not read existing task prefix for project %s (%s: %s); "
+            "using the derived prefix",
+            project_id, type(exc).__name__, exc,
+        )
+        return None
+    return existing or None
+
+
+def _ref_prefix_on_disk(project_id: str, task_ref: str) -> str | None:
+    """The prefix spelling for ``task_ref``'s ordinal as it exists ON DISK
+    (``CODE--001`` stays ``CODE-``; mixed legacy + normalised projects resolve
+    per ordinal), via ``tasks.on_disk_ref_prefix``. None when the project is
+    unresolvable or has no id for that ordinal; the caller then uses the
+    derived prefix. An ambiguous ref (both spellings hold
+    the ordinal) raises ``ValueError`` -- loud, never a silent pick."""
+    from .tasks import on_disk_ref_prefix
+
+    try:
+        config = load_portfolio_config()
+        proj = get_project(config, project_id) if config else None
+    except Exception as exc:
+        logger.warning(
+            "clawpm: could not resolve project %s for short ref %s (%s: %s); "
+            "using the derived prefix",
+            project_id, task_ref, type(exc).__name__, exc,
+        )
+        return None
+    return on_disk_ref_prefix(proj, task_ref) if proj else None
+
+
+# A full task id: letter-leading prefix (may hold digits, underscores, dots and
+# hyphens: P2-B, MY_PR, ARB-P, WEB2), then -NNN and an optional -NNN subtask.
+# Hyphen-joined prefix segments must each hold a letter so a short subtask ref
+# (4-001) or a digit run never parses as part of a prefix.
+_FULL_TASK_ID_RE = re.compile(
+    r"^[A-Z][A-Z0-9_.]*(?:-[A-Z0-9_.]*[A-Z][A-Z0-9_.]*)*-\d+(?:-\d+)?$"
+)
 
 
 def expand_task_id(task_ref: str, project_id: str, prefix: str | None = None) -> str:
@@ -160,22 +234,176 @@ def expand_task_id(task_ref: str, project_id: str, prefix: str | None = None) ->
     """
     resolved_prefix = prefix if prefix else get_project_prefix(project_id)
 
-    # Already has a prefix (contains hyphen and letters before it)
-    # Match both PREFIX-NNN and PREFIX-NNN-NNN (subtask)
-    if '-' in task_ref and re.match(r'^[A-Z]+-\d+(-\d+)?$', task_ref.upper()):
-        return task_ref.upper()
+    # Already a full id: PREFIX-NNN or PREFIX-NNN-NNN (subtask), where PREFIX
+    # may contain digits and hyphens (CLAWP-140).
+    upper_ref = task_ref.upper()
+    if '-' in task_ref and _FULL_TASK_ID_RE.match(upper_ref):
+        return upper_ref
+    # A digit-leading prefix (pre-CLAWP-133 mint) makes a full id look like a
+    # short subtask ref (2024-001); the project's own prefix disambiguates.
+    if resolved_prefix[:1].isdigit() and re.match(
+        rf'^{re.escape(resolved_prefix.upper())}-\d+(-\d+)?$', upper_ref
+    ):
+        return upper_ref
 
     # Subtask short ID: "4-001" or "004-001" -> "PREFIX-004-001"
     subtask_match = re.match(r'^(\d+)-(\d+)$', task_ref)
     if subtask_match:
         parent_num = int(subtask_match.group(1))
         sub_num = int(subtask_match.group(2))
-        return f"{resolved_prefix}-{parent_num:03d}-{sub_num:03d}"
+        # An on-disk spelling of the parent ordinal wins (CLAWP-140 r1).
+        pfx = resolved_prefix if prefix else (_ref_prefix_on_disk(project_id, task_ref) or resolved_prefix)
+        return f"{pfx}-{parent_num:03d}-{sub_num:03d}"
 
     # Pure numeric - expand with project prefix
     if task_ref.isdigit():
         num = int(task_ref)
-        return f"{resolved_prefix}-{num:03d}"
+        pfx = resolved_prefix if prefix else (_ref_prefix_on_disk(project_id, task_ref) or resolved_prefix)
+        return f"{pfx}-{num:03d}"
 
     # Return as-is if unrecognized format
     return task_ref
+
+
+def build_agent_context(config, project_id: str, source: str = "explicit", log_limit: int = 5) -> dict | None:
+    """Assemble the full agent-resume context for a project (CLAWP-068).
+
+    Returns the same dict the ``clawpm context`` command renders — project
+    metadata, truncated spec, in-progress / next / blocked tasks (with
+    wiki-link backlinks), open counts, recent work-log, git status, and open
+    issues — or ``None`` when the project can't be resolved. Extracted from the
+    CLI command so the ``context`` MCP tool and the CLI share ONE
+    implementation and can never drift (the tool wraps this core function
+    directly rather than shelling out).
+
+    ``get_project`` and the git enrichment mirror the CLI exactly.
+    """
+    from .tasks import get_next_task, list_tasks
+    from .worklog import tail_entries
+    from .links import build_link_index
+
+    proj = get_project(config, project_id)
+    if not proj:
+        return None
+
+    context: dict = {
+        "project": {
+            "id": proj.id,
+            "name": proj.name,
+            "status": proj.status.value,
+            "priority": proj.priority,
+            "labels": proj.labels,
+            "repo_path": str(proj.repo_path) if proj.repo_path else None,
+        },
+        "source": source,
+    }
+
+    # Read spec if exists (truncated for LLM consumption)
+    if proj.project_dir:
+        spec_file = proj.project_dir / ".project" / "SPEC.md"
+        if spec_file.exists():
+            # errors="replace": SPEC.md is user-authored foreign input, same
+            # rationale as the git-status/issues.jsonl reads below — an
+            # invalid-UTF-8 byte shouldn't crash context building (antigravity
+            # review, pre-existing gap carried over from cli/shortcuts.py).
+            spec_content = spec_file.read_text(encoding="utf-8", errors="replace")
+            if len(spec_content) > 2000:
+                context["spec"] = spec_content[:2000] + "\n\n[...truncated...]"
+            else:
+                context["spec"] = spec_content
+
+    # CLAWP-082 — derived link index once; attach backlinks to every task dict.
+    _link_index = build_link_index(config, project_id)
+
+    def _with_backlinks(t: Task) -> dict:
+        d = t.to_dict()
+        d["linked_from"] = _link_index.linked_from(t.id)
+        return d
+
+    in_progress = list_tasks(config, project_id, state_filter=TaskState.PROGRESS)
+    context["in_progress"] = [_with_backlinks(t) for t in in_progress]
+
+    if not in_progress:
+        next_task = get_next_task(config, project_id)
+        if next_task:
+            context["next_task"] = _with_backlinks(next_task)
+
+    blocked = list_tasks(config, project_id, state_filter=TaskState.BLOCKED)
+    context["blockers"] = [_with_backlinks(t) for t in blocked]
+
+    open_tasks = list_tasks(config, project_id, state_filter=TaskState.OPEN)
+    context["open_count"] = len(open_tasks)
+
+    recent_entries = tail_entries(config, project=project_id, limit=log_limit)
+    context["recent_work"] = [e.to_dict() for e in recent_entries]
+
+    # Git status if repo_path exists (same enrichment the CLI does; direct git,
+    # not a clawpm shell-out).
+    if proj.repo_path and proj.repo_path.exists():
+        git_status: dict = {}
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=proj.repo_path, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=5,
+            )
+            if result.returncode == 0:
+                git_status["branch"] = result.stdout.strip()
+
+            result = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=proj.repo_path, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=5,
+            )
+            if result.returncode == 0:
+                changes = [line for line in result.stdout.strip().split("\n") if line]
+                git_status["uncommitted_count"] = len(changes)
+                if changes:
+                    git_status["uncommitted"] = changes[:10]
+                    if len(changes) > 10:
+                        git_status["uncommitted"].append(f"... and {len(changes) - 10} more")
+
+            result = subprocess.run(
+                ["git", "log", "--oneline", "-3"],
+                cwd=proj.repo_path, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=5,
+            )
+            if result.returncode == 0:
+                git_status["recent_commits"] = [line for line in result.stdout.strip().split("\n") if line]
+        except Exception as exc:
+            # Best-effort enrichment (git may be absent, repo_path may be stale,
+            # etc.) — swallow rather than fail the whole context call, but flag
+            # it so a caller (an MCP host in particular, which never sees this
+            # process's stderr) can tell "degraded" apart from "no git repo"
+            # (CLAWP-068 review F9).
+            git_status["error"] = str(exc)
+
+        if git_status:
+            context["git"] = git_status
+
+    # Open issues
+    if proj.project_dir:
+        issues_file = proj.project_dir / ".agent" / "issues.jsonl"
+        if issues_file.exists():
+            try:
+                open_issues = []
+                with open(issues_file, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            issue = json.loads(line)
+                            if not issue.get("fixed"):
+                                open_issues.append({
+                                    "type": issue.get("type"),
+                                    "severity": issue.get("severity"),
+                                    "summary": (issue.get("actual") or issue.get("context", ""))[:100],
+                                })
+                if open_issues:
+                    context["open_issues"] = open_issues[:5]
+            except Exception as exc:
+                # Same rationale as the git-status catch above: flag a parse
+                # failure instead of silently reading as "no open issues"
+                # (CLAWP-068 review F9).
+                context["open_issues_error"] = str(exc)
+
+    return context
