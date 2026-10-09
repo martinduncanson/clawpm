@@ -379,6 +379,8 @@ clawpm tasks edit <id> [--title/--priority/--complexity/--body/--scope/--tag/--c
 clawpm tasks state <id> <state> [--note] [--reflect-note] [--meta-reflect]
 clawpm tasks state 72 73 74 done    # bulk mode (CLAWP-083): per-task isolation, aggregate result
 clawpm tasks state <id> rejected --rationale "reason"   # add to won't-do ledger (reject one at a time)
+clawpm tasks add -t "Pick a DB" --kind decision                 # decision task (CLAWP-111): done requires --resolution
+clawpm done <id> --resolution "Postgres, for JSONB"        # records resolution; a decision appends a line under the parent's ## Decisions so far (optional, stored, for build tasks)
 clawpm tasks split <id>             # Convert to parent directory for subtasks
 ```
 
