@@ -951,7 +951,9 @@ def _compute_deltas(
         deltas["complexity_actual"] = actual_c
 
     # Iterations ratio (CLAWP-019): predicted vs grader-cycle count.
-    # Only meaningful when both sides set; missing data → None.
+    # Only meaningful when both sides set; missing data → None. A predicted 0
+    # is set but is no usable denominator, so the ratio stays None (the raw
+    # values below still carry it).
     if predictions.predicted_iterations and actuals.iterations is not None:
         deltas["iterations_ratio"] = round(
             actuals.iterations / predictions.predicted_iterations, 4
@@ -996,6 +998,8 @@ def resolve_axes(
     if kind != "decision":
         predicted = predictions.duration_min
         actual_val, source = _actual_duration_and_source(actuals.to_dict())
+        # Truthiness is deliberate here: spec 2.1 makes a zero on either side
+        # unresolvable (predicted is the ratio denominator; a 0 actual is noise).
         if predicted and actual_val:
             ratio = actual_val / predicted
             duration = "correct" if 0.5 <= ratio <= 2.0 else "incorrect"
@@ -1009,7 +1013,8 @@ def resolve_axes(
     else:
         axes["scope"] = "unresolvable"
 
-    if predictions.predicted_iterations and actuals.iterations is not None:
+    # 0 is a real prediction ("no revision cycles"); only None is missing.
+    if predictions.predicted_iterations is not None and actuals.iterations is not None:
         axes["iterations"] = (
             "correct" if actuals.iterations <= predictions.predicted_iterations else "incorrect"
         )

@@ -105,6 +105,40 @@ class TestResolveAxes:
         assert _axes(preds, Actuals(iterations=3))["iterations"] == "incorrect"
         assert _axes(preds, Actuals())["iterations"] == "unresolvable"
 
+    # A predicted 0 is a real prediction ("no revision cycles expected"), not a
+    # missing one: only None means missing (Codex PR #102 P2).
+    def test_iterations_zero_prediction_is_scored_not_skipped(self):
+        preds = Predictions(predicted_iterations=0)
+        assert _axes(preds, Actuals(iterations=1))["iterations"] == "incorrect"
+        assert _axes(preds, Actuals(iterations=0))["iterations"] == "correct"
+        assert _axes(preds, Actuals())["iterations"] == "unresolvable"
+
+    def test_iterations_zero_actual_is_scored_against_a_positive_prediction(self):
+        assert _axes(Predictions(predicted_iterations=2), Actuals(iterations=0))["iterations"] == "correct"
+
+    def test_iterations_zero_prediction_miss_makes_held_incorrect(self):
+        assert _axes(Predictions(predicted_iterations=0), Actuals(iterations=1))["held"] == "incorrect"
+
+    def test_zero_denominator_ratios_degrade_to_none_not_error(self):
+        # duration/files_changed/iterations predicted as 0 can't form a ratio;
+        # the ratio is None while the raw values still ride along.
+        preds = Predictions(duration_min=0, files_changed=0, predicted_iterations=0)
+        acts = Actuals(duration_min=5, files_changed=2, iterations=1)
+        deltas = _compute_deltas(preds, acts)
+        assert deltas["duration_ratio"] is None
+        assert deltas["files_changed_ratio"] is None
+        assert deltas["iterations_ratio"] is None
+        assert deltas["iterations_predicted"] == 0 and deltas["iterations_actual"] == 1
+
+    def test_duration_zero_prediction_is_unresolvable(self):
+        assert _axes(Predictions(duration_min=0), Actuals(active_min=10))["duration"] == "unresolvable"
+
+    def test_zero_prediction_survives_the_predictions_round_trip(self):
+        p = Predictions(duration_min=0, files_changed=0, predicted_iterations=0, confidence=None)
+        back = Predictions.from_dict(p.to_dict())
+        assert (back.duration_min, back.files_changed, back.predicted_iterations) == (0, 0, 0)
+        assert not back.is_empty()
+
     def test_complexity_unresolvable_without_independent_actual(self):
         axes = _axes(Predictions(complexity=TaskComplexity.M), Actuals())
         assert axes["complexity"] == "unresolvable"
@@ -207,6 +241,23 @@ class TestMissNudge:
         for c in SIX:
             assert c in warnings[0]["message"]
         assert list(p.tasks_dir.joinpath("done").glob(f"{task.id}*"))  # still closed
+
+    def test_zero_iteration_prediction_missed_nudges(self, isolated_portfolio, stub_actuals):
+        p = isolated_portfolio
+        stub_actuals(iterations=1)
+        task = self._task(p, predicted_iterations=0)
+        r = _done(["done", task.id, "--project", "test"])
+        assert r.exit_code == 0, r.output
+        warnings = json.loads(r.stdout)["data"]["warnings"]
+        assert len(warnings) == 1 and warnings[0]["code"] == "miss_category_missing"
+
+    def test_zero_iteration_prediction_met_is_silent(self, isolated_portfolio, stub_actuals):
+        p = isolated_portfolio
+        stub_actuals(iterations=0)
+        task = self._task(p, predicted_iterations=0)
+        r = _done(["done", task.id, "--project", "test"])
+        assert r.exit_code == 0, r.output
+        assert "warnings" not in json.loads(r.stdout)["data"]
 
     def test_text_mode_nudge_goes_to_stderr_single_line(self, isolated_portfolio, stub_actuals):
         p = isolated_portfolio
