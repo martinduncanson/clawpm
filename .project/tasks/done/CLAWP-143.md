@@ -3,7 +3,7 @@ baseline_ref: fad7ec5
 created: '2026-10-09'
 id: CLAWP-143
 priority: 5
-updated: '2026-10-09'
+updated: '2026-10-11'
 ---
 # state-change move is non-atomic: shutil.move copy-then-delete failure leaves open+done copies (file and dir forms)
 
