@@ -83,6 +83,10 @@ def test_concurrent_append_and_read_never_raise(isolated_portfolio, monkeypatch)
     n = 40
     errors: list[BaseException] = []
     done = threading.Event()
+    # Set when any reader exits or errors, and again in the final cleanup: the
+    # writer's barrier wait polls it, so a failing run releases the lock and
+    # stops at once instead of waiting out the barrier timeout per append.
+    cancel = threading.Event()
     collided = threading.Event()
     collisions: list[int] = []
     unforced: list[int] = []
@@ -99,8 +103,13 @@ def test_concurrent_append_and_read_never_raise(isolated_portfolio, monkeypatch)
             collided.clear()
             with real_locked_append(*args, **kwargs) as fh:
                 yield fh
-                if not collided.wait(10):
-                    unforced.append(1)
+                deadline = time.monotonic() + 10
+                while not collided.wait(0.05):
+                    if cancel.is_set():
+                        return
+                    if time.monotonic() >= deadline:
+                        unforced.append(1)
+                        return
 
         def counting_read_once(path):
             try:
@@ -116,6 +125,8 @@ def test_concurrent_append_and_read_never_raise(isolated_portfolio, monkeypatch)
     def writer() -> None:
         try:
             for i in range(n):
+                if cancel.is_set():
+                    break
                 send_message(root, to="a2", message=f"m{i}", from_agent="a1")
         except BaseException as exc:  # pragma: no cover - surfaced below
             errors.append(exc)
@@ -129,14 +140,24 @@ def test_concurrent_append_and_read_never_raise(isolated_portfolio, monkeypatch)
                 time.sleep(0)
         except BaseException as exc:  # pragma: no cover - surfaced below
             errors.append(exc)
+        finally:
+            cancel.set()
 
     threads = [threading.Thread(target=writer)] + [
         threading.Thread(target=reader) for _ in range(3)
     ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(60)
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+    finally:
+        # Every worker must be gone before the monkeypatch/fixture teardown.
+        cancel.set()
+        for t in threads:
+            if t.is_alive():
+                t.join(30)
+    assert not any(t.is_alive() for t in threads), "worker outlived the test"
     assert not errors, errors
     if sys.platform == "win32":
         assert not unforced, "a writer released its lock before any reader collided"
