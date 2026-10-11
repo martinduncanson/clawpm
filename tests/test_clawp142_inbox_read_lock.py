@@ -9,12 +9,14 @@ it. ``retry_transient`` cannot catch that (it keys off ``winerror``), so
 
 from __future__ import annotations
 
+import contextlib
 import sys
 import threading
 import time
 
 import pytest
 
+import clawpm.concurrency as concurrency_mod
 import clawpm.inbox as inbox_mod
 from clawpm.concurrency import locked_append
 from clawpm.inbox import read_inbox, send_message
@@ -76,11 +78,40 @@ def test_read_gives_up_on_permanently_denied_file(tmp_path, monkeypatch):
         t.join(10)
 
 
-def test_concurrent_append_and_read_never_raise(isolated_portfolio):
+def test_concurrent_append_and_read_never_raise(isolated_portfolio, monkeypatch):
     root = isolated_portfolio.root
     n = 40
     errors: list[BaseException] = []
     done = threading.Event()
+    collided = threading.Event()
+    collisions: list[int] = []
+    unforced: list[int] = []
+
+    if sys.platform == "win32":
+        # Force the overlap: each append holds its byte-0 lock until a reader
+        # has actually been denied, so the retry path runs on every append
+        # instead of depending on scheduler luck.
+        real_locked_append = concurrency_mod.locked_append
+        real_read_once = inbox_mod._read_events_once
+
+        @contextlib.contextmanager
+        def barrier_append(*args, **kwargs):
+            collided.clear()
+            with real_locked_append(*args, **kwargs) as fh:
+                yield fh
+                if not collided.wait(10):
+                    unforced.append(1)
+
+        def counting_read_once(path):
+            try:
+                return real_read_once(path)
+            except PermissionError:
+                collisions.append(1)
+                collided.set()
+                raise
+
+        monkeypatch.setattr(concurrency_mod, "locked_append", barrier_append)
+        monkeypatch.setattr(inbox_mod, "_read_events_once", counting_read_once)
 
     def writer() -> None:
         try:
@@ -107,4 +138,7 @@ def test_concurrent_append_and_read_never_raise(isolated_portfolio):
     for t in threads:
         t.join(60)
     assert not errors, errors
+    if sys.platform == "win32":
+        assert not unforced, "a writer released its lock before any reader collided"
+        assert len(collisions) >= n
     assert len(read_inbox(root, "a2")) == n
