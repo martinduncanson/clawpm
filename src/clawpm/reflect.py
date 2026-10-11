@@ -83,19 +83,55 @@ def _reflections_dir(portfolio_root: Path) -> Path:
     return d
 
 
+def _compute_active_min(task_entries: list[WorkLogEntry]) -> int | None:
+    """Sum capped gaps between consecutive work_log entries for one task.
+
+    ``active_min`` = sum over consecutive entries (sorted by ``ts``) of
+    ``min(gap_to_next, 60)`` minutes, plus a flat 15-minute wrap-up credit
+    for the final entry. Capping each gap at 60 minutes keeps idle/away
+    time between logged actions from inflating "active" time; the flat
+    15-minute credit models wrap-up work after the last logged action.
+
+    Returns ``None`` when there are no entries for the task (nothing to
+    measure) — distinct from ``0``, which would claim zero active work.
+    """
+    if not task_entries:
+        return None
+    # Normalise BEFORE sorting: legacy 'Z' timestamps load naive while newer
+    # entries are aware, and comparing the two raises TypeError. Naive = UTC.
+    stamps = sorted(
+        e.ts if e.ts.tzinfo else e.ts.replace(tzinfo=timezone.utc)
+        for e in task_entries
+    )
+    total = 0.0
+    for cur_ts, nxt_ts in zip(stamps, stamps[1:]):
+        gap_min = max(0.0, (nxt_ts - cur_ts).total_seconds() / 60)
+        total += min(gap_min, 60.0)
+    total += 15.0
+    return int(round(total))
+
+
 def _compute_actuals(
     task_id: str,
-    task_complexity: TaskComplexity | None,
     log_entries: list[WorkLogEntry],
     portfolio_root: Path | None = None,
     project_id: str | None = None,
+    actual_complexity: TaskComplexity | None = None,
+    now: datetime | None = None,
 ) -> Actuals:
     # Inner name for the cross-project filter below.
     _project_id_hint = project_id
     """Derive Actuals from work_log entries for a given task.
 
     - duration_min: elapsed minutes between the first ``start`` log entry and now
-    - complexity: the task's current complexity field (if set)
+    - active_min: capped-gap-sum + wrap-up credit over the task's own work_log
+      entries (see ``_compute_active_min``); clamped to ``duration_min`` when
+      both are known, since active time cannot exceed wall-clock elapsed time
+    - complexity: CLAWP-112-002 — honest actuals. This is NEVER derived from
+      the task's (predicted) complexity field; it is ``None`` unless an
+      independent ``actual_complexity`` is supplied (``clawpm done
+      --actual-complexity``). The old behaviour silently copied the
+      prediction forward, making ``complexity_match`` tautologically true.
     - files_changed: deduplicated count of unique files across all log entries
     - files_touched: sorted deduplicated list of those files
 
@@ -114,12 +150,24 @@ def _compute_actuals(
     duration_min: int | None = None
     if start_entries:
         first_start = start_entries[0].ts
-        now = datetime.now(timezone.utc)
+        # `now` is a parameter (not always a fresh datetime.now() call) purely
+        # so tests can replay a real historical corpus event deterministically
+        # — production callers never pass it.
+        effective_now = now if now is not None else datetime.now(timezone.utc)
         # Ensure both are timezone-aware for the subtraction
         if first_start.tzinfo is None:
             first_start = first_start.replace(tzinfo=timezone.utc)
-        delta = now - first_start
+        delta = effective_now - first_start
         duration_min = max(0, int(delta.total_seconds() / 60))
+
+    active_min = _compute_active_min(task_entries)
+    if active_min is not None and duration_min is not None:
+        # The capped gap-sum alone is always <= (last_entry - first_start) <=
+        # duration_min, but the flat 15-minute wrap-up credit can push a
+        # single-entry task's total above a very short duration_min. Clamp so
+        # the documented invariant (active_min <= duration_min) holds
+        # unconditionally rather than only in the common case.
+        active_min = min(active_min, duration_min)
 
     # Files: deduplicated union from all log entries' files_changed
     all_files: set[str] = set()
@@ -148,10 +196,11 @@ def _compute_actuals(
 
     return Actuals(
         duration_min=duration_min,
-        complexity=task_complexity,
+        complexity=actual_complexity,
         files_changed=files_changed_count,
         files_touched=files_touched,
         iterations=iterations,
+        active_min=active_min,
     )
 
 
@@ -462,8 +511,9 @@ def find_reference_tasks(
       - +2 per framework intersection
       - +1 per success-criteria-text Jaccard-overlap step (tokenised on
         whitespace, lowercased, stop-words ignored)
-      - +1 baseline if the candidate has actuals.duration_min set
-        (otherwise its calibration value is zero — skip)
+      - +1 baseline if the candidate has an actual duration (``active_min``
+        or, failing that, wall-clock ``duration_min``) set — otherwise its
+        calibration value is zero, skip
 
     Returns top-k results ordered by score desc, each as a dict carrying
     task_id, similarity_score, predicted vs actual duration, and the
@@ -549,7 +599,8 @@ def find_reference_tasks(
             continue
 
         actuals = done_record.get("actuals") or {}
-        if actuals.get("duration_min") is None:
+        actual_duration, duration_source = _actual_duration_and_source(actuals)
+        if actual_duration is None:
             # No real actuals = no calibration value
             continue
 
@@ -581,13 +632,16 @@ def find_reference_tasks(
         if score <= 0:
             continue
 
-        deltas = done_record.get("deltas") or {}
+        ratio, _ = _duration_ratio_and_source(done_record)
         candidates.append({
             "task_id": done_record.get("task_id", ref_file.stem),
             "similarity_score": score,
             "predicted_duration_min": predictions.get("duration_min"),
-            "actual_duration_min": actuals.get("duration_min"),
-            "duration_ratio": deltas.get("duration_ratio"),
+            # CLAWP-112-002 — prefers actuals.active_min over wall-clock
+            # duration_min; duration_source says which was used.
+            "actual_duration_min": actual_duration,
+            "duration_source": duration_source,
+            "duration_ratio": ratio,
             "complexity_predicted": predictions.get("complexity"),
             "complexity_actual": actuals.get("complexity"),
             "iterations_predicted": predictions.get("predicted_iterations"),
@@ -1041,26 +1095,47 @@ def _iter_done_events(portfolio_root: Path, project_id: str | None = None):
             yield rec
 
 
-def _duration_ratio(rec: dict) -> float | None:
-    """actual/predicted duration for a done record; None if not computable.
+def _actual_duration_and_source(actuals: dict) -> tuple["int | float | None", "str | None"]:
+    """Pick the actual-duration value to score against, and say which it was.
 
-    Codex round-7 P2: a zero ratio (task started + completed within the same
-    minute → ``actuals.duration_min == 0``) is treated as noise, not signal,
-    and excluded from the corpus. Including it would (a) pull bucket medians
-    toward 0 and (b) crash ``_interpret_ratio`` with a divide-by-zero when
-    converting the inverse for the "Nx faster" message.
+    CLAWP-112-002: ``active_min`` (work_log-derived) is preferred over the
+    wall-clock ``duration_min`` whenever it is present, since a task parked
+    for days between log entries otherwise scores a wildly inflated ratio.
+    Returns ``(None, None)`` when neither is set.
     """
-    deltas = rec.get("deltas") or {}
-    r = deltas.get("duration_ratio")
-    if r is not None and r > 0:
-        return r
+    active = actuals.get("active_min")
+    if active is not None:
+        return active, "active"
+    wall = actuals.get("duration_min")
+    if wall is not None:
+        return wall, "wallclock"
+    return None, None
+
+
+def _duration_ratio_and_source(rec: dict) -> tuple["float | None", "str | None"]:
+    """actual/predicted duration for a done record, and which actual it used.
+
+    Always recomputed from ``predictions``/``actuals`` (not the ``deltas``
+    ``duration_ratio`` written at event time, which is wall-clock-only) so
+    ``active_min`` — added to ``actuals`` after older events were written —
+    is picked up wherever it is present without a corpus rewrite.
+
+    Codex round-7 P2: a zero/negative ratio (e.g. a task started + completed
+    within the same minute → ``duration_min == 0``) is treated as noise, not
+    signal, and excluded. Including it would (a) pull bucket medians toward 0
+    and (b) crash ``_interpret_ratio`` with a divide-by-zero when converting
+    the inverse for the "Nx faster" message.
+    """
     preds = rec.get("predictions") or {}
     acts = rec.get("actuals") or {}
     p = preds.get("duration_min")
-    a = acts.get("duration_min")
-    if p and a:  # both truthy (excludes a == 0 and a is None)
-        return round(a / p, 4)
-    return None
+    actual_val, source = _actual_duration_and_source(acts)
+    if not p or not actual_val:
+        return None, None
+    ratio = round(actual_val / p, 4)
+    if ratio <= 0:
+        return None, None
+    return ratio, source
 
 
 def _bucket_stats(ratios: list[float]) -> dict:
@@ -1076,8 +1151,9 @@ def _bucket_stats(ratios: list[float]) -> dict:
 def _interpret_ratio(median_ratio: float | None) -> str:
     if median_ratio is None:
         return "No usable predicted-vs-actual duration pairs yet."
-    # Defensive guard: _duration_ratio already excludes zero ratios, but
-    # keep this branch so a malformed corpus row can't crash the command.
+    # Defensive guard: _duration_ratio_and_source already excludes zero
+    # ratios, but keep this branch so a malformed corpus row can't crash
+    # the command.
     if median_ratio <= 0:
         return (
             f"Median actual/predicted = {median_ratio}: non-positive — likely "
@@ -1114,14 +1190,17 @@ def summarize_calibration(
     by_complexity: dict[str, list[float]] = {}
     by_confidence: dict[str, list[float]] = {}
     by_profile: dict[str, list[float]] = {}
+    source_counts = {"active": 0, "wallclock": 0}
 
     for rec in done:
-        r = _duration_ratio(rec)
+        r, source = _duration_ratio_and_source(rec)
         if r is None:
             dirty += 1
             continue
         preds = rec.get("predictions") or {}
         usable.append(r)
+        if source in source_counts:
+            source_counts[source] += 1
         cx = preds.get("complexity") or "unknown"
         cf = preds.get("confidence")
         cf_key = str(cf) if cf is not None else "unset"
@@ -1131,12 +1210,25 @@ def summarize_calibration(
         by_profile.setdefault(ap, []).append(r)
 
     overall = _bucket_stats(usable)
+    # CLAWP-112-002 — which actual-duration source dominated this corpus:
+    # "active" (active_min, work_log-derived) whenever it was used for at
+    # least as many usable rows as wallclock (ties favour the honest signal),
+    # "wallclock" when the corpus is wallclock-only, None when nothing was
+    # usable at all. duration_source_counts gives the exact split.
+    if source_counts["active"] >= source_counts["wallclock"] and source_counts["active"] > 0:
+        duration_source = "active"
+    elif source_counts["wallclock"] > 0:
+        duration_source = "wallclock"
+    else:
+        duration_source = None
     return {
         "project_id": project_id or "ALL",
         "total_done": len(done),
         "with_usable_duration": len(usable),
         "dirty_flagged": dirty,
         "overall": overall,
+        "duration_source": duration_source,
+        "duration_source_counts": source_counts,
         "by_complexity": {
             k: _bucket_stats(v) for k, v in sorted(by_complexity.items())
         },

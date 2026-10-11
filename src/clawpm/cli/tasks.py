@@ -691,12 +691,16 @@ def _render_state_results(
               help="Required when state=rejected: one-line reason this idea was considered and rejected.")
 @click.option("--supersedes", "supersedes", default=None,
               help="Optional task-id that supersedes this rejected task (e.g. a replacement task).")
+@click.option("--actual-complexity", "actual_complexity", type=click.Choice(["s", "m", "l", "xl"]), default=None,
+              help="Independent post-hoc complexity assessment, recorded on 'done'/'blocked' transitions "
+                   "(CLAWP-112-002). Without this, actuals.complexity is null and complexity_match is null — "
+                   "it is never copied from the prediction.")
 # CLAWP-111 — decision-kind tasks: resolution is required when new_state is
 # 'done' on a kind: decision task.
 @click.option("--resolution", "resolution", default=None,
               help="Outcome text. Required to complete (done) a kind: decision task; optional (stored) for build tasks.")
 @click.pass_context
-def tasks_state(ctx: click.Context, project_id: str | None, task_ids: tuple[str, ...], new_state: str, note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...], rationale: str | None, supersedes: str | None, resolution: str | None) -> None:
+def tasks_state(ctx: click.Context, project_id: str | None, task_ids: tuple[str, ...], new_state: str, note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...], rationale: str | None, supersedes: str | None, actual_complexity: str | None, resolution: str | None) -> None:
     """Change one or many tasks' state (CLAWP-083 bulk mode).
 
     ``clawpm tasks state 72 73 74 done`` transitions each listed task with
@@ -762,6 +766,7 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_ids: tuple[str,
                 reflect_note=reflect_note, meta_reflect=meta_reflect,
                 process_lesson=process_lesson, surprise_tags=surprise_tags,
                 rationale=rationale, supersedes=supersedes,
+                actual_complexity=actual_complexity,
                 resolution=resolution,
             )
         )

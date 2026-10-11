@@ -8,7 +8,7 @@ predictions:
   files_changed: 2
   filled_by: agent
 priority: 5
-updated: '2026-10-08'
+updated: '2026-10-11'
 ---
 # Windows inbox reads unlocked: PermissionError when a locked append lands mid-read (CLAWP-101 follow-up)
 
