@@ -339,6 +339,57 @@ class TestFindReferenceTasks:
         assert len(results) == 3
 
 
+class TestFindReferenceTasksActiveMin:
+    """CLAWP-112-002: find_reference_tasks prefers actuals.active_min over
+    wall-clock duration_min, and reports which source it used."""
+
+    def _seed_raw(self, root, task_id, *, duration_min_predicted, duration_min_actual,
+                   active_min=None, project_id="test", complexity="m"):
+        rec = {
+            "event": "task_done",
+            "task_id": task_id,
+            "project_id": project_id,
+            "predictions": {"complexity": complexity, "duration_min": duration_min_predicted},
+            "actuals": {
+                "duration_min": duration_min_actual,
+                "complexity": complexity,
+                "active_min": active_min,
+            },
+            "deltas": {},
+        }
+        (root / "reflections" / f"{task_id}.jsonl").write_text(
+            json.dumps(rec) + "\n", encoding="utf-8"
+        )
+
+    def test_prefers_active_min_over_wallclock(self, temp_portfolio):
+        root = temp_portfolio["root"]
+        # Wall-clock duration_min is wildly inflated (parked for days);
+        # active_min is the honest signal and must win.
+        self._seed_raw(
+            root, "TEST-001",
+            duration_min_predicted=60, duration_min_actual=6000, active_min=30,
+        )
+        results = find_reference_tasks(root, project_id="test", complexity="m")
+        assert len(results) == 1
+        r = results[0]
+        assert r["actual_duration_min"] == 30
+        assert r["duration_source"] == "active"
+        assert r["duration_ratio"] == 0.5  # 30/60, not 100.0
+
+    def test_falls_back_to_wallclock_when_no_active_min(self, temp_portfolio):
+        root = temp_portfolio["root"]
+        self._seed_raw(
+            root, "TEST-002",
+            duration_min_predicted=60, duration_min_actual=90,
+        )
+        results = find_reference_tasks(root, project_id="test", complexity="m")
+        assert len(results) == 1
+        r = results[0]
+        assert r["actual_duration_min"] == 90
+        assert r["duration_source"] == "wallclock"
+        assert r["duration_ratio"] == 1.5
+
+
 # ---------------------------------------------------------------------------
 # CLI integration: tasks add surfaces suggestions
 # ---------------------------------------------------------------------------

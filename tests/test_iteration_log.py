@@ -243,7 +243,6 @@ class TestActualsAndDeltas:
             )
         actuals = _compute_actuals(
             "TEST-001",
-            task_complexity=None,
             log_entries=[],
             portfolio_root=root,
         )
@@ -252,7 +251,6 @@ class TestActualsAndDeltas:
     def test_actuals_iterations_none_when_no_jsonl(self, temp_portfolio):
         actuals = _compute_actuals(
             "TEST-001",
-            task_complexity=None,
             log_entries=[],
             portfolio_root=temp_portfolio["root"],
         )
@@ -261,7 +259,7 @@ class TestActualsAndDeltas:
     def test_actuals_iterations_none_without_portfolio_root(self, temp_portfolio):
         """Backwards compat: when called without portfolio_root, iterations stays None."""
         actuals = _compute_actuals(
-            "TEST-001", task_complexity=None, log_entries=[],
+            "TEST-001", log_entries=[],
         )
         assert actuals.iterations is None
 
