@@ -21,6 +21,8 @@ cat <file>.json | clawpm tasks emit-tree               # emit for real
 | `software-autosave.reemit-attach.json` | re-emit of the same software tree via `attach_to` | software | — | idempotency: matching `leaf_key` is skipped, only the new leaf emits |
 | `software-multilevel.emit.json` | "Collaborative comments on notes" | software | l | **multi-level** tree (CLAWP-064 in-document `parent_ref`): root -> A -> A.1, plus sibling B; each leaf with rubric + scope/out_of_scope/stop/delegability; whole tree promotes atomically |
 
+| `decision-map.emit.json` | "CSV importer for the accounts page" | software | m | **decision map** (CLAWP-111-003): root `destination` + `not_yet_specified`, two `kind: decision` leaves, build leaves with `depends_refs` on them |
+
 ## Validation transcript (live CLI, 2026-06-12)
 
 ### 1. Software dry-run — validates
