@@ -35,7 +35,7 @@ from typing import Any
 
 import yaml
 
-from .frontmatter import FrontmatterError, split_frontmatter, stamp_updated
+from .frontmatter import FrontmatterError, split_frontmatter, stamp_updated, strip_bom
 from .tasks import cascade_unblock_dependents
 
 logger = logging.getLogger(__name__)
@@ -87,7 +87,7 @@ def _rewrite_frontmatter_state(file_path: Path, new_state: str) -> None:
             new_text = (
                 "---\n"
                 + yaml.safe_dump(_synth, default_flow_style=False, sort_keys=False)
-                + f"---\n\n{text}"
+                + f"---\n\n{strip_bom(text)}"
             )
         elif exc.reason == "unterminated":
             # Malformed; refuse to silently break the file.

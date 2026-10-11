@@ -114,3 +114,71 @@ class TestBomRoundTrip:
         assert split_frontmatter(text.replace("\r\n", "\n"))[0]["state"] == "open"
         if nl == "\r\n":
             assert "\n" not in text.replace("\r\n", "")
+
+
+# Files with a BOM but no frontmatter: the synthesise-frontmatter write path must
+# not carry the peeled BOM into the body (CLAWP-144 Codex r2): the invariant is
+# zero or one leading BOM after any write and a body that never starts with one.
+_SYNTH_BODIES = {
+    "heading": b"# Real task\n",
+    "heading-crlf": b"# Real task\r\n",
+    "bom-only": b"",
+}
+
+
+@pytest.fixture(params=sorted(_SYNTH_BODIES))
+def bom_nofm_task(request, isolated_portfolio):
+    task = add_task(
+        isolated_portfolio.config, isolated_portfolio.project_id, "Bom synth",
+    )
+    assert task is not None and task.file_path is not None
+    task.file_path.write_bytes(BOM + _SYNTH_BODIES[request.param])
+    return isolated_portfolio, task, request.param
+
+
+def _assert_one_clean_bom(path, expect_title):
+    raw = path.read_bytes()
+    assert raw.count(BOM) <= 1, "BOM duplicated by the write"
+    text = raw.decode("utf-8").removeprefix("\ufeff")
+    assert "\ufeff" not in text, "body carries a stray BOM"
+    if expect_title is not None:
+        assert Task.from_file(path).title == expect_title
+    return raw
+
+
+class TestSynthesisedFrontmatterBom:
+    def _expected_title(self, kind):
+        return "Real task" if kind.startswith("heading") else None
+
+    def test_edit_fog_synthesise_keeps_single_bom(self, bom_nofm_task):
+        from clawpm.tasks import edit_fog
+
+        pf, task, kind = bom_nofm_task
+        assert edit_fog(pf.config, pf.project_id, task.id, add="x") is not None
+        raw = _assert_one_clean_bom(task.file_path, self._expected_title(kind))
+        assert raw.startswith(BOM + b"---")
+        # Second write is idempotent on the BOM / body shape.
+        assert edit_fog(pf.config, pf.project_id, task.id, add="x") is not None
+        raw2 = _assert_one_clean_bom(task.file_path, self._expected_title(kind))
+        assert raw2.startswith(BOM + b"---")
+        assert raw2.split(b"---", 2)[2] == raw.split(b"---", 2)[2]
+
+    def test_edit_task_synthesise_drops_peeled_bom_from_body(self, bom_nofm_task):
+        pf, task, kind = bom_nofm_task
+        assert edit_task(pf.config, pf.project_id, task.id, priority=3) is not None
+        _assert_one_clean_bom(task.file_path, self._expected_title(kind))
+        assert edit_task(pf.config, pf.project_id, task.id, priority=3) is not None
+        _assert_one_clean_bom(task.file_path, self._expected_title(kind))
+
+    def test_doctor_state_rewrite_synthesise_drops_peeled_bom(self, bom_nofm_task):
+        from clawpm.doctor_apply import _rewrite_frontmatter_state
+
+        pf, task, kind = bom_nofm_task
+        _rewrite_frontmatter_state(task.file_path, "open")
+        _assert_one_clean_bom(task.file_path, self._expected_title(kind))
+
+    def test_read_path_title_ignores_bom_without_frontmatter(self, bom_nofm_task):
+        pf, task, kind = bom_nofm_task
+        expect = self._expected_title(kind)
+        if expect is not None:
+            assert Task.from_file(task.file_path).title == expect

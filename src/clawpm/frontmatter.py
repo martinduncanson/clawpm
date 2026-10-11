@@ -47,6 +47,17 @@ _FENCE = "---"
 _BOM = "﻿"
 
 
+def strip_bom(text: str) -> str:
+    """``text`` without ONE leading UTF-8 BOM (CLAWP-144).
+
+    Every absent-frontmatter fallback that keeps the raw text as the body must
+    peel the BOM the parsers ignore, or a writer that synthesises a fence ends
+    up with the BOM at the head of the body (hiding its first heading) and,
+    where the caller restores its own BOM, a second one at the head of the file.
+    """
+    return text.removeprefix(_BOM)
+
+
 def today_utc_iso() -> str:
     """Today's UTC calendar date, ISO-formatted (CLAWP-126).
 

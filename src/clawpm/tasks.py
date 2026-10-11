@@ -27,6 +27,7 @@ from .frontmatter import (
     require_mapping,
     split_frontmatter,
     stamp_updated,
+    strip_bom,
     today_utc_iso,
 )
 from .models import Task, TaskState, TaskComplexity, Predictions, PortfolioConfig, normalize_tags
@@ -3254,7 +3255,7 @@ def edit_task(
             frontmatter, content = split_frontmatter(text, where=str(task.file_path))
         except FrontmatterError as exc:
             if exc.reason == "absent":
-                frontmatter, content = {}, text
+                frontmatter, content = {}, strip_bom(text)
             elif exc.reason == "unterminated":
                 raise ValueError(
                     f"Task {task_id} has an unterminated frontmatter fence; "
@@ -3481,7 +3482,7 @@ def edit_fog(
         # keep it, and universal-newline reads would silently rewrite CRLF:
         # remember both, normalise to "\n" for processing, restore on write.
         has_bom = raw_text.startswith("﻿")
-        text = raw_text
+        text = strip_bom(raw_text)
         use_crlf = "\r\n" in text
         if use_crlf:
             text = text.replace("\r\n", "\n")
@@ -3491,7 +3492,7 @@ def edit_fog(
             frontmatter, content = split_frontmatter(text, where=str(task.file_path))
         except FrontmatterError as exc:
             if exc.reason == "absent":
-                frontmatter, content = {}, text
+                frontmatter, content = {}, strip_bom(text)
             elif exc.reason == "unterminated":
                 raise ValueError(
                     f"Task {task_id} has an unterminated frontmatter fence; "
