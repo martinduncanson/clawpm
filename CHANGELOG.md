@@ -26,6 +26,7 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 
 ### Fixed
 
+- Task files that start with a UTF-8 BOM are no longer read as frontmatter-less: the frontmatter parsers ignore the BOM, and the `updated` and `state` line writers keep it (#101, CLAWP-144).
 - State-change, archive and split moves are now single atomic renames and never leave two copies of a task: a failed or cross-device rename raises with the source untouched, and an existing destination is refused instead of nested or overwritten (#98, CLAWP-143).
 - Inbox reads on Windows no longer raise `PermissionError` when a locked append lands mid-read: `_read_events` waits out the writer's byte-0 lock (bounded, Windows only), and the PR #88 race test no longer needs its read-retry workaround (#97, CLAWP-142).
 - `context.get_project_prefix` now delegates to the allocator's derivation (`code-quorum` -> `CODE`, `my-project` -> `MY-PR`, `2-b` -> `P2-B`) instead of a separate naive `[:5]`, and `expand_task_id` recognises digit-containing and multi-hyphen full ids (`P2-B-001`, `MY_PR-007-002`) plus a project's own pre-CLAWP-133 digit-leading prefix (`2024-001`), which keeps working; a project that already minted ids (collision `CODE-B` or digit-leading) expands short refs under its on-disk prefix, keeping each id's exact on-disk spelling (legacy `CODE--001`) and underscore/dot prefixes (`MY_PRO`) (#95, CLAWP-140, CLAWP-141).
