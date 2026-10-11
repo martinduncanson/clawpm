@@ -18,7 +18,7 @@ from test_agent_dispatch import temp_portfolio_with_repo  # noqa: F401
 
 
 def _done(root, tid, pred_min, act_min, complexity="m", confidence=3,
-          profile=None, project="test"):
+          profile=None, project="test", active_min=None):
     write_reflection_event(
         root,
         event="task_done",
@@ -32,6 +32,7 @@ def _done(root, tid, pred_min, act_min, complexity="m", confidence=3,
         actuals=Actuals(
             duration_min=act_min,
             complexity=TaskComplexity(complexity) if complexity else None,
+            active_min=active_min,
         ),
         agent_profile=profile,
     )
@@ -72,6 +73,44 @@ class TestSummarize:
         assert a["total_done"] == 1
         allp = summarize_calibration(tmp_path, project_id=None)
         assert allp["total_done"] == 2
+
+
+class TestDurationSource:
+    """CLAWP-112-002: summarize prefers active_min over wall-clock
+    duration_min, and reports which source it actually used."""
+
+    def test_all_active_min_reports_active(self, tmp_path):
+        # predicted 100, active_min 50 -> ratio 0.5 (ignores a wildly
+        # inflated wall-clock duration_min that would give ratio 20.0)
+        for i in range(3):
+            _done(tmp_path, f"A-{i}", 100, 2000, active_min=50)
+        summary = summarize_calibration(tmp_path, project_id="test")
+        assert summary["duration_source"] == "active"
+        assert summary["duration_source_counts"] == {"active": 3, "wallclock": 0}
+        assert summary["overall"]["median_ratio"] == 0.5
+
+    def test_all_wallclock_reports_wallclock(self, tmp_path):
+        # No active_min set (legacy events) -> falls back to duration_min.
+        for i in range(3):
+            _done(tmp_path, f"W-{i}", 100, 50)
+        summary = summarize_calibration(tmp_path, project_id="test")
+        assert summary["duration_source"] == "wallclock"
+        assert summary["duration_source_counts"] == {"active": 0, "wallclock": 3}
+        assert summary["overall"]["median_ratio"] == 0.5
+
+    def test_majority_active_reports_active(self, tmp_path):
+        for i in range(3):
+            _done(tmp_path, f"A-{i}", 100, 2000, active_min=50)
+        _done(tmp_path, "W-0", 100, 50)  # 1 wallclock-only row
+        summary = summarize_calibration(tmp_path, project_id="test")
+        assert summary["duration_source_counts"] == {"active": 3, "wallclock": 1}
+        assert summary["duration_source"] == "active"
+
+    def test_no_usable_rows_reports_none(self, tmp_path):
+        _done(tmp_path, "D-0", 100, None)  # dirty: no actual at all
+        summary = summarize_calibration(tmp_path, project_id="test")
+        assert summary["with_usable_duration"] == 0
+        assert summary["duration_source"] is None
 
 
 class TestSuggest:
