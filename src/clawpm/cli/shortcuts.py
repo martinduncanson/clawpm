@@ -50,10 +50,14 @@ def quick_add(ctx: click.Context, project_id: str | None, title: str, priority: 
 # CLAWP-111 — decision-kind tasks: required to complete a kind: decision task.
 @click.option("--resolution", "resolution", default=None,
               help="Outcome text. Required to complete (done) a kind: decision task; optional (stored) for build tasks.")
+# CLAWP-112-003 — root cause of a missed prediction (single pick, validated).
+@click.option("--miss-category", "miss_category", default=None,
+              help="Why the prediction method failed: wrong_signal, wrong_weight, missed_variable, "
+                   "operator_override, noise, structural. 'noise' = inside expected variance, no lesson.")
 @click.pass_context
-def quick_done(ctx: click.Context, project_id: str | None, task_ids: tuple[str, ...], note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...], actual_complexity: str | None = None, resolution: str | None = None) -> None:
+def quick_done(ctx: click.Context, project_id: str | None, task_ids: tuple[str, ...], note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...], actual_complexity: str | None = None, resolution: str | None = None, miss_category: str | None = None) -> None:
     """Mark one or many tasks as done (alias for 'tasks state <ids...> done')."""
-    ctx.invoke(tasks_state, project_id=project_id, task_ids=task_ids, new_state="done", note=note, force=force, reflect_note=reflect_note, meta_reflect=meta_reflect, process_lesson=process_lesson, surprise_tags=surprise_tags, actual_complexity=actual_complexity, resolution=resolution)
+    ctx.invoke(tasks_state, project_id=project_id, task_ids=task_ids, new_state="done", note=note, force=force, reflect_note=reflect_note, meta_reflect=meta_reflect, process_lesson=process_lesson, surprise_tags=surprise_tags, actual_complexity=actual_complexity, resolution=resolution, miss_category=miss_category)
 
 
 @main.command("start")
