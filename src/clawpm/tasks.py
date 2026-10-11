@@ -623,6 +623,11 @@ def _set_updated_line(text: str, stamp: str) -> str | None:
     serialises the date-shaped string elsewhere, so ``Task.from_file`` reads it
     back as a ``str``.
     """
+    # CLAWP-144 — a BOM hides the opening fence; peel it off and put it back so
+    # a BOM-prefixed file is stamped (and stays byte-identical elsewhere).
+    if text.startswith("﻿"):
+        stamped = _set_updated_line(text[1:], stamp)
+        return None if stamped is None else "﻿" + stamped
     if not text.startswith("---"):
         return None
     lines = text.split("\n")
@@ -725,6 +730,9 @@ def _sync_state_line(file_path: Path, new_state: str) -> bool:
     here is not itself atomic against concurrent mutators).
     """
     raw = retry_transient(lambda: file_path.read_bytes()).decode("utf-8")
+    # CLAWP-144 — peel a BOM off so the fence is visible; restored on write.
+    bom = "﻿" if raw.startswith("﻿") else ""
+    raw = raw[len(bom):]
     if not raw.startswith("---"):
         return False
     crlf = "\r\n" in raw
@@ -768,7 +776,7 @@ def _sync_state_line(file_path: Path, new_state: str) -> bool:
         raise ValueError("state rewrite did not read back as the new state")
     tmp = file_path.with_suffix(file_path.suffix + ".tmp")
     try:
-        tmp.write_bytes(out.encode("utf-8"))
+        tmp.write_bytes((bom + out).encode("utf-8"))
         retry_transient(tmp.replace, file_path)
     except Exception:
         tmp.unlink(missing_ok=True)
@@ -3469,11 +3477,11 @@ def edit_fog(
 
         with guard_fs_tamper(f"Task {task_id}"):
             raw_text = task.file_path.read_bytes().decode("utf-8")
-        # A UTF-8 BOM would hide the leading fence from split_frontmatter, and
-        # universal-newline reads would silently rewrite CRLF: strip the BOM
-        # and normalise to "\n" for processing, then restore both on write.
+        # split_frontmatter tolerates a BOM (CLAWP-144), but this write must
+        # keep it, and universal-newline reads would silently rewrite CRLF:
+        # remember both, normalise to "\n" for processing, restore on write.
         has_bom = raw_text.startswith("﻿")
-        text = raw_text[1:] if has_bom else raw_text
+        text = raw_text
         use_crlf = "\r\n" in text
         if use_crlf:
             text = text.replace("\r\n", "\n")
