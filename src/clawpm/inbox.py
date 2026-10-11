@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import sys
+import time
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
@@ -95,8 +97,34 @@ def _append_event(path: Path, event: dict) -> None:
     append_jsonl_line(path, json.dumps(event, ensure_ascii=False))
 
 
+# CLAWP-142: on Windows `locked_append` holds a mandatory byte-0 lock on the data
+# file itself, so a reader on another handle gets PermissionError (errno 13, no
+# winerror) until the append finishes. `retry_transient` keys off winerror and
+# cannot see it; the append holds the lock for milliseconds, so wait it out. The
+# bound keeps a genuinely denied file failing loudly instead of spinning.
+_READ_LOCK_WAIT = 5.0
+
+
 def _read_events(path: Path) -> list[dict]:
-    """Read all events from a JSONL file. Skips malformed lines."""
+    """Read all events from a JSONL file. Skips malformed lines.
+
+    On Windows a read that collides with a locked append is retried from the
+    start (bounded by ``_READ_LOCK_WAIT``); POSIX locks are advisory, so a
+    ``PermissionError`` there is a real ACL fault and propagates immediately.
+    """
+    deadline = time.monotonic() + _READ_LOCK_WAIT
+    delay = 0.005
+    while True:
+        try:
+            return _read_events_once(path)
+        except PermissionError:
+            if sys.platform != "win32" or time.monotonic() >= deadline:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.1)
+
+
+def _read_events_once(path: Path) -> list[dict]:
     if not path.exists():
         return []
     events: list[dict] = []
