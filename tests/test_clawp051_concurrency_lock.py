@@ -672,7 +672,7 @@ class TestStateTransitionSerialization:
         task = add_task(config, project_id, "Task to split")
         assert task is not None
 
-        real_move = tasks_module.shutil.move
+        real_move = tasks_module.os.rename
         calls = {"n": 0}
 
         def _flaky_move(src, dst, *a, **k):
@@ -683,7 +683,7 @@ class TestStateTransitionSerialization:
                 raise err
             return real_move(src, dst, *a, **k)
 
-        monkeypatch.setattr(tasks_module.shutil, "move", _flaky_move)
+        monkeypatch.setattr(tasks_module.os, "rename", _flaky_move)
 
         result = split_task(config, project_id, task.id)
         assert result is not None

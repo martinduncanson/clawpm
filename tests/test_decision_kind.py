@@ -1045,7 +1045,7 @@ class TestCompletionIsAllOrNothing:
             if fail_at == "move":
                 def boom(*a, **k):
                     raise FileExistsError("destination exists")
-                m.setattr(tasks_mod.shutil, "move", boom)
+                m.setattr(tasks_mod.os, "rename", boom)
                 exc = FileExistsError
             elif fail_at == "parent":
                 def boom(*a, **k):

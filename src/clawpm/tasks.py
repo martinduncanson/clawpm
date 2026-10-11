@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-import shutil
 import uuid
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
@@ -679,7 +678,7 @@ def _stamp_updated_file(file_path: Path, when: str | None = None) -> None:
     well-formed frontmatter fence is left untouched.
 
     The read is wrapped in ``retry_transient`` (Codex review): this runs right
-    after a successful ``shutil.move`` under the lock, so an un-retried read
+    after a successful move under the lock, so an un-retried read
     could hit the same transient Windows sharing/access fault the surrounding
     move/reload path already retries — raising after the move had committed and
     leaving state + work-log inconsistent.
@@ -1045,6 +1044,29 @@ def _restore_on_error(snapshots: list[tuple[Path, bytes]]):
         raise
 
 
+def _move_task_entry(src: Path, dst: Path) -> None:
+    """Move a task file/dir with one atomic rename (CLAWP-143).
+
+    Task moves stay on one volume, so ``os.rename`` is atomic: either ``dst``
+    exists and ``src`` is gone, or nothing changed. ``shutil.move`` is avoided
+    because its copy-then-delete fallback can leave BOTH copies (task open AND
+    done). A failed rename (including a cross-device error) raises with the
+    source untouched. An existing ``dst`` is refused, never nested or merged;
+    ``retry_transient`` wraps only the atomic rename, so a retry is safe."""
+    if os.path.lexists(dst):
+        raise FileExistsError(
+            f"Refusing to move '{src}': destination '{dst}' already exists. "
+            "Reconcile the two by hand."
+        )
+    try:
+        retry_transient(os.rename, src, dst)
+    except OSError as exc:
+        exc.add_note(
+            f"Atomic move of '{src}' to '{dst}' failed; the source is untouched."
+        )
+        raise
+
+
 def _apply_resolution(
     config: PortfolioConfig,
     project_id: str,
@@ -1254,7 +1276,7 @@ def change_task_state(
                     return retry_transient(Task.from_file, _task_md)
 
                 # (e) Move (retry transient Windows sharing/access faults — CLAWP-051)
-                retry_transient(shutil.move, str(task_dir), str(new_dir))
+                _move_task_entry(task_dir, new_dir)
 
             # (e.1) CLAWP-086 — stamp `updated` on the relocated file. REJECTED/
             #       DECISION already stamped via their own frontmatter writer
@@ -1338,7 +1360,7 @@ def change_task_state(
                 return retry_transient(Task.from_file, current_path)
 
             # (e) Move (retry transient Windows sharing/access faults — CLAWP-051)
-            retry_transient(shutil.move, str(current_path), str(new_path))
+            _move_task_entry(current_path, new_path)
 
         # (e.1) CLAWP-086 — stamp `updated` on the relocated file. REJECTED/
         #       DECISION already stamped via their own frontmatter writer
@@ -1485,7 +1507,7 @@ def archive_done_tasks(
                 rec["skipped"] = "source_vanished"
                 results.append(rec)
                 continue
-            retry_transient(shutil.move, str(entry), str(dest))
+            _move_task_entry(entry, dest)
             # Record only AFTER the move commits — the list never reports a move
             # that didn't happen (Grok review).
             results.append(rec)
@@ -3565,7 +3587,7 @@ def split_task(
         # Move file to _task.md inside directory (retry transient Windows
         # sharing/access faults on the rename — consistent with the other moves).
         new_path = task_dir / "_task.md"
-        retry_transient(shutil.move, str(current_path), str(new_path))
+        _move_task_entry(current_path, new_path)
 
         # CLAWP-086 — splitting a leaf into a parent dir is a structural mutation.
         _stamp_updated_file(new_path)
