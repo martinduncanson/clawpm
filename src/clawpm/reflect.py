@@ -180,7 +180,14 @@ def _compute_actuals(
                     all_files.add(clean)
 
     files_touched = sorted(all_files)
-    files_changed_count = len(files_touched) if files_touched else None
+    # Zero vs unknown: an entry whose files_changed is a list (even empty, e.g.
+    # every diffed file was filtered as a build artifact) means the diff was
+    # measured and found nothing -> 0. Only "no entry carried a files list" is
+    # unmeasured -> None. (CLAWP-112-003, spec 2.1: zero is known, not missing.)
+    files_measured = any(e.files_changed is not None for e in task_entries)
+    files_changed_count = (
+        len(files_touched) if files_touched or files_measured else None
+    )
 
     iterations: int | None = None
     if portfolio_root is not None:
@@ -192,7 +199,7 @@ def _compute_actuals(
         ic = count_iterations_for_task(
             portfolio_root, task_id, project_id=_project_id_hint
         )
-        iterations = ic if ic > 0 else None
+        iterations = ic
 
     return Actuals(
         duration_min=duration_min,

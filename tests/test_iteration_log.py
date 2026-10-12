@@ -248,13 +248,15 @@ class TestActualsAndDeltas:
         )
         assert actuals.iterations == 4
 
-    def test_actuals_iterations_none_when_no_jsonl(self, temp_portfolio):
+    def test_actuals_iterations_zero_when_no_jsonl(self, temp_portfolio):
+        # CLAWP-112-003: a counted 0 is a known value, not a missing one (only
+        # "no portfolio_root" leaves iterations None; see the next test).
         actuals = _compute_actuals(
             "TEST-001",
             log_entries=[],
             portfolio_root=temp_portfolio["root"],
         )
-        assert actuals.iterations is None
+        assert actuals.iterations == 0
 
     def test_actuals_iterations_none_without_portfolio_root(self, temp_portfolio):
         """Backwards compat: when called without portfolio_root, iterations stays None."""
