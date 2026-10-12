@@ -44,6 +44,18 @@ from typing import Any
 import yaml
 
 _FENCE = "---"
+_BOM = "﻿"
+
+
+def strip_bom(text: str) -> str:
+    """``text`` without ONE leading UTF-8 BOM (CLAWP-144).
+
+    Every absent-frontmatter fallback that keeps the raw text as the body must
+    peel the BOM the parsers ignore, or a writer that synthesises a fence ends
+    up with the BOM at the head of the body (hiding its first heading) and,
+    where the caller restores its own BOM, a second one at the head of the file.
+    """
+    return text.removeprefix(_BOM)
 
 
 def today_utc_iso() -> str:
@@ -153,7 +165,10 @@ def parse_frontmatter(text: str) -> tuple[Any, str]:
     - No leading fence, or an unterminated fence -> ``({}, text)``.
 
     ``body`` is the raw substring after the closing fence -- NOT stripped.
+    A leading UTF-8 BOM is ignored (CLAWP-144) and not part of the returned
+    text.
     """
+    text = text.removeprefix(_BOM)
     if text.startswith(_FENCE):
         parts = text.split(_FENCE, 2)
         if len(parts) >= 3:
@@ -219,7 +234,12 @@ def split_frontmatter(text: str, *, where: str | None = None) -> tuple[dict[str,
       original :class:`yaml.YAMLError`),
     - ``"not_a_mapping"`` if the fenced YAML parses but to a non-mapping
       (CLAWP-091; see :func:`require_mapping`).
+
+    A leading UTF-8 BOM is ignored (CLAWP-144): it would otherwise hide the
+    opening fence and make a BOM-prefixed file look frontmatter-less. Callers
+    that rewrite the file and want the BOM kept must re-prepend it themselves.
     """
+    text = text.removeprefix(_BOM)
     if not text.startswith(_FENCE):
         raise FrontmatterError("absent", "no frontmatter fence")
     parts = text.split(_FENCE, 2)

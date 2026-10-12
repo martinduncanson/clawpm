@@ -41,7 +41,7 @@ from typing import Any
 import yaml
 
 from .discovery import get_project_dir
-from .frontmatter import FrontmatterError, split_frontmatter, stamp_updated
+from .frontmatter import FrontmatterError, split_frontmatter, stamp_updated, strip_bom
 from .models import PortfolioConfig, Task, TaskState
 from .tasks import list_tasks
 
@@ -137,7 +137,7 @@ class Mission:
             content = body.strip()
         except FrontmatterError:
             frontmatter = {}
-            content = text
+            content = strip_bom(text)
         title = frontmatter.get("title", path.stem)
         for line in content.split("\n"):
             if line.startswith("# "):

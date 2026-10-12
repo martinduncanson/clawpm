@@ -26,6 +26,7 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 
 ### Fixed
 
+- Task files that start with a UTF-8 BOM are no longer read as frontmatter-less: the frontmatter parsers ignore the BOM, and the `updated` and `state` line writers keep it (#101, CLAWP-144).
 - The CLAWP-142 inbox stress test now forces a reader/writer overlap on every append (event barrier while the writer holds the byte-0 lock) instead of relying on scheduling, so the read-retry path is always exercised (#100, CLAWP-145).
 - State-change, archive and split moves are now single atomic renames and never leave two copies of a task: a failed or cross-device rename raises with the source untouched, and an existing destination is refused instead of nested or overwritten (#98, CLAWP-143).
 - Inbox reads on Windows no longer raise `PermissionError` when a locked append lands mid-read: `_read_events` waits out the writer's byte-0 lock (bounded, Windows only), and the PR #88 race test no longer needs its read-retry workaround (#97, CLAWP-142).
