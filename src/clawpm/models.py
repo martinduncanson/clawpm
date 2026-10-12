@@ -16,7 +16,7 @@ if sys.version_info >= (3, 11):
 else:
     import tomli as tomllib
 
-from .frontmatter import FrontmatterError, split_frontmatter
+from .frontmatter import FrontmatterError, split_frontmatter, strip_bom
 
 
 class ProjectStatus(str, Enum):
@@ -652,7 +652,7 @@ class Task:
             content = body.strip()
         except FrontmatterError:
             frontmatter = {}
-            content = text
+            content = strip_bom(text)
 
         # Extract title from first heading
         title = frontmatter.get("id", path.stem)
@@ -1108,7 +1108,7 @@ class Research:
         except FrontmatterError as exc:
             if exc.reason in ("unparseable", "not_a_mapping"):
                 raise
-            return {}, text
+            return {}, strip_bom(text)
 
     @staticmethod
     def _effective_id(frontmatter: dict[str, Any], path: Path) -> Any:

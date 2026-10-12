@@ -3,7 +3,7 @@ baseline_ref: 00fe5f9
 created: '2026-10-09'
 id: CLAWP-144
 priority: 5
-updated: '2026-10-09'
+updated: '2026-10-12'
 ---
 # BOM-prefixed task files: Task.from_file / split_frontmatter treat them as frontmatter-less (repo-wide)
 

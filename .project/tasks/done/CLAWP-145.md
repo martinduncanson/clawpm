@@ -3,7 +3,7 @@ baseline_ref: bf52f5f
 created: '2026-10-11'
 id: CLAWP-145
 priority: 5
-updated: '2026-10-11'
+updated: '2026-10-12'
 ---
 # CLAWP-142 stress test: force a reader/writer overlap
 
