@@ -10,7 +10,7 @@ from pathlib import Path
 import click
 
 from clawpm.concurrency import LockTimeout, file_lock
-from clawpm.models import PortfolioConfig, Predictions, ProjectStatus, SURPRISE_TAXONOMY, SuccessCriterion, Task, TaskComplexity, TaskState, WorkLogAction
+from clawpm.models import MISS_CATEGORIES, PortfolioConfig, Predictions, ProjectStatus, SURPRISE_TAXONOMY, SuccessCriterion, Task, TaskComplexity, TaskState, WorkLogAction
 from clawpm.output import OutputFormat, output_error, output_json, output_success, output_task_detail, output_tasks_list
 from clawpm.discovery import (
     discover_projects, get_project, get_scoped_project_settings, is_task_store_canonical,
@@ -628,10 +628,24 @@ def _render_state_results(
         # empty set (Grok review).
         output_error("no_tasks", "No task ids to process.", fmt=fmt)
         sys.exit(2)
+    # CLAWP-112-003 — non-blocking advisories (e.g. the unclassified-miss
+    # nudge). JSON carries them in data.warnings; text mode echoes to stderr so
+    # stdout stays parseable and agent-driven closes are never interactive.
+    def _echo_warnings(r: dict) -> None:
+        if fmt == OutputFormat.JSON:
+            return
+        for w in (r.get("data") or {}).get("warnings") or []:
+            click.echo(f"{r['task_id']}: {w['message']}", err=True)
+
     if not batch:
         r = results[0]
         if r.get("ok"):
-            output_success(r["message"], data=r["data"], fmt=fmt)
+            data = r["data"]
+            if fmt != OutputFormat.JSON and data.get("warnings"):
+                # Echoed once to stderr below, not also dumped into stdout.
+                data = {k: v for k, v in data.items() if k != "warnings"}
+            output_success(r["message"], data=data, fmt=fmt)
+            _echo_warnings(r)
         else:
             output_error(r["error"], r["message"], fmt=fmt)
             sys.exit(1)
@@ -669,6 +683,7 @@ def _render_state_results(
                 degraded = [k for k in marker_keys if (r.get("data") or {}).get(k)]
                 if degraded:
                     click.echo(f"     (degraded: {', '.join(degraded)})")
+                _echo_warnings(r)
             else:
                 click.echo(f"FAIL {r['task_id']}: {r['error']} - {r['message']}")
         click.echo(f"{len(succeeded)}/{len(results)} succeeded, {len(failed)} failed")
@@ -699,8 +714,13 @@ def _render_state_results(
 # 'done' on a kind: decision task.
 @click.option("--resolution", "resolution", default=None,
               help="Outcome text. Required to complete (done) a kind: decision task; optional (stored) for build tasks.")
+# CLAWP-112-003 — root cause of a missed prediction (single pick, validated).
+@click.option("--miss-category", "miss_category", default=None,
+              help=f"Why the prediction method failed (one of: {', '.join(sorted(MISS_CATEGORIES))}). "
+                   "'noise' = inside expected variance, no lesson. Recorded on the reflection event; "
+                   "a missed prediction closed without it prints a one-line reminder.")
 @click.pass_context
-def tasks_state(ctx: click.Context, project_id: str | None, task_ids: tuple[str, ...], new_state: str, note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...], rationale: str | None, supersedes: str | None, actual_complexity: str | None, resolution: str | None) -> None:
+def tasks_state(ctx: click.Context, project_id: str | None, task_ids: tuple[str, ...], new_state: str, note: str | None, force: bool, reflect_note: str | None, meta_reflect: str | None, process_lesson: str | None, surprise_tags: tuple[str, ...], rationale: str | None, supersedes: str | None, actual_complexity: str | None, resolution: str | None, miss_category: str | None = None) -> None:
     """Change one or many tasks' state (CLAWP-083 bulk mode).
 
     ``clawpm tasks state 72 73 74 done`` transitions each listed task with
@@ -719,6 +739,15 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_ids: tuple[str,
             "bad_surprise_tag",
             f"Unknown surprise tag(s): {invalid_tags}. "
             f"Valid values: {sorted(SURPRISE_TAXONOMY)}",
+            fmt=fmt,
+        )
+        sys.exit(1)
+
+    if miss_category is not None and miss_category not in MISS_CATEGORIES:
+        output_error(
+            "bad_miss_category",
+            f"Unknown miss category {miss_category!r}. "
+            f"Valid values: {sorted(MISS_CATEGORIES)}",
             fmt=fmt,
         )
         sys.exit(1)
@@ -768,6 +797,7 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_ids: tuple[str,
                 rationale=rationale, supersedes=supersedes,
                 actual_complexity=actual_complexity,
                 resolution=resolution,
+                miss_category=miss_category,
             )
         )
 

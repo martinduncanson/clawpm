@@ -180,7 +180,14 @@ def _compute_actuals(
                     all_files.add(clean)
 
     files_touched = sorted(all_files)
-    files_changed_count = len(files_touched) if files_touched else None
+    # Zero vs unknown: an entry whose files_changed is a list (even empty, e.g.
+    # every diffed file was filtered as a build artifact) means the diff was
+    # measured and found nothing -> 0. Only "no entry carried a files list" is
+    # unmeasured -> None. (CLAWP-112-003, spec 2.1: zero is known, not missing.)
+    files_measured = any(e.files_changed is not None for e in task_entries)
+    files_changed_count = (
+        len(files_touched) if files_touched or files_measured else None
+    )
 
     iterations: int | None = None
     if portfolio_root is not None:
@@ -192,7 +199,7 @@ def _compute_actuals(
         ic = count_iterations_for_task(
             portfolio_root, task_id, project_id=_project_id_hint
         )
-        iterations = ic if ic > 0 else None
+        iterations = ic
 
     return Actuals(
         duration_min=duration_min,
@@ -951,7 +958,9 @@ def _compute_deltas(
         deltas["complexity_actual"] = actual_c
 
     # Iterations ratio (CLAWP-019): predicted vs grader-cycle count.
-    # Only meaningful when both sides set; missing data → None.
+    # Only meaningful when both sides set; missing data → None. A predicted 0
+    # is set but is no usable denominator, so the ratio stays None (the raw
+    # values below still carry it).
     if predictions.predicted_iterations and actuals.iterations is not None:
         deltas["iterations_ratio"] = round(
             actuals.iterations / predictions.predicted_iterations, 4
@@ -962,6 +971,74 @@ def _compute_deltas(
     deltas["iterations_actual"] = actuals.iterations
 
     return deltas
+
+
+def resolve_axes(
+    predictions: Predictions,
+    actuals: Actuals,
+    deltas: dict[str, Any],
+    kind: str | None = None,
+) -> dict[str, Any]:
+    """Resolve each calibration axis plus the derived binary ``held`` outcome.
+
+    CLAWP-112-003, calibration-metrics-spec §2.1. Deterministic, no model call.
+    Each axis is ``correct`` / ``incorrect`` / ``unresolvable``:
+
+    - ``duration``: ``r = actual / predicted`` with ``active_min`` preferred over
+      wall-clock (``duration_source`` says which); correct inside 0.5x-2.0x.
+      Unresolvable when either side is missing or zero, and for ``kind:
+      decision`` tasks (HITL-contaminated).
+    - ``scope``: correct when ``files_scope`` was predicted and nothing overran.
+    - ``iterations``: correct when ``iterations_actual <= predicted_iterations``.
+    - ``complexity``: scored only from ``deltas["complexity_match"]``, which is
+      non-null only when an independent ``--actual-complexity`` was supplied.
+
+    ``held`` is ``correct`` when every resolvable axis is correct, ``incorrect``
+    when any resolvable axis is incorrect, ``unresolvable`` when none resolves.
+    The duration-debiased variant and everything bucket-based belong to the
+    metrics module (M4), which imports this function.
+    """
+    axes: dict[str, Any] = {}
+
+    duration = "unresolvable"
+    source: str | None = None
+    if kind != "decision":
+        predicted = predictions.duration_min
+        actual_val, source = _actual_duration_and_source(actuals.to_dict())
+        # Truthiness is deliberate here: spec 2.1 makes a zero on either side
+        # unresolvable (predicted is the ratio denominator; a 0 actual is noise).
+        if predicted and actual_val:
+            ratio = actual_val / predicted
+            duration = "correct" if 0.5 <= ratio <= 2.0 else "incorrect"
+        else:
+            source = None
+    axes["duration"] = duration
+    axes["duration_source"] = source
+
+    if predictions.files_scope:
+        axes["scope"] = "incorrect" if deltas.get("files_scope_overrun") else "correct"
+    else:
+        axes["scope"] = "unresolvable"
+
+    # 0 is a real prediction ("no revision cycles"); only None is missing.
+    if predictions.predicted_iterations is not None and actuals.iterations is not None:
+        axes["iterations"] = (
+            "correct" if actuals.iterations <= predictions.predicted_iterations else "incorrect"
+        )
+    else:
+        axes["iterations"] = "unresolvable"
+
+    match = deltas.get("complexity_match")
+    axes["complexity"] = "unresolvable" if match is None else ("correct" if match else "incorrect")
+
+    resolved = [axes[a] for a in ("duration", "scope", "iterations", "complexity") if axes[a] != "unresolvable"]
+    if not resolved:
+        axes["held"] = "unresolvable"
+    elif "incorrect" in resolved:
+        axes["held"] = "incorrect"
+    else:
+        axes["held"] = "correct"
+    return axes
 
 
 def write_reflection_event(
@@ -977,6 +1054,7 @@ def write_reflection_event(
     surprise_taxonomy: list[str] | None = None,
     agent_profile: str | None = None,
     kind: str | None = None,
+    miss_category: str | None = None,
 ) -> Path:
     """Compute deltas and append one JSON line to ~/clawpm/reflections/<task-id>.jsonl.
 
@@ -998,6 +1076,11 @@ def write_reflection_event(
     CLAWP-111 — ``kind``: the closing task's ``Task.kind``. Recorded only
     when it's not the ("build") default, so existing reflection events and
     consumers keep their current shape.
+
+    CLAWP-112-003 — ``miss_category``: single-pick root cause from
+    ``MISS_CATEGORIES`` (models.py), validated by the caller; ``None`` when not
+    given (legacy events carry no value, and are never backfilled). Orthogonal
+    to ``surprise_taxonomy``; both may be set on the same event.
     """
     deltas = _compute_deltas(predictions, actuals)
 
@@ -1015,6 +1098,7 @@ def write_reflection_event(
         "meta_reflection": meta_reflection,
         "process_lesson": process_lesson,
         "surprise_taxonomy": surprise_taxonomy if surprise_taxonomy is not None else [],
+        "miss_category": miss_category,
     }
     if kind and kind != "build":
         record["kind"] = kind

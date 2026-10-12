@@ -21,7 +21,7 @@ import subprocess
 from pathlib import Path
 
 from clawpm.concurrency import LockTimeout
-from clawpm.models import SURPRISE_TAXONOMY, TaskComplexity, TaskState, WorkLogAction
+from clawpm.models import MISS_CATEGORIES, SURPRISE_TAXONOMY, TaskComplexity, TaskState, WorkLogAction
 from clawpm.discovery import get_project, get_repo_path
 from clawpm.tasks import change_task_state, get_task
 from clawpm.worklog import add_entry, filter_files_changed, read_entries
@@ -46,6 +46,7 @@ def transition(
     supersedes: str | None = None,
     actual_complexity: str | None = None,
     resolution: str | None = None,
+    miss_category: str | None = None,
 ) -> dict:
     """Transition ONE task's state and return a structured result.
 
@@ -77,6 +78,14 @@ def transition(
         raise ValueError(
             f"Unknown surprise tag(s): {invalid_tags}. "
             f"Valid values: {sorted(SURPRISE_TAXONOMY)}"
+        )
+
+    # CLAWP-112-003 — miss_category is a closed vocabulary; same backstop as the
+    # surprise tags so a non-CLI caller cannot write a free-text root cause.
+    if miss_category is not None and miss_category not in MISS_CATEGORIES:
+        raise ValueError(
+            f"Unknown miss_category {miss_category!r}. "
+            f"Valid values: {sorted(MISS_CATEGORIES)}"
         )
 
     # CLAWP-112-002 — --actual-complexity is the ONLY source of
@@ -216,6 +225,7 @@ def transition(
     # marker, matching the cascade/teardown error handling below).
     log_errors: list[dict] = []
     reflection_errors: list[dict] = []
+    warnings: list[dict] = []
     lease_errors: list[dict] = []
     files_changed_errors: list[dict] = []
     parent_ready_errors: list[dict] = []
@@ -460,7 +470,9 @@ def transition(
         })
     if state in (TaskState.DONE, TaskState.BLOCKED) and pre_transition_task:
         try:
-            from clawpm.reflect import write_reflection_event, _compute_actuals
+            from clawpm.reflect import (
+                write_reflection_event, _compute_actuals, _compute_deltas, resolve_axes,
+            )
             all_log_entries = read_entries(config, project=project_id)
             actuals = _compute_actuals(
                 task_id,
@@ -470,6 +482,22 @@ def transition(
                 actual_complexity=actual_complexity_value,
             )
             event_name = "task_done" if state == TaskState.DONE else "task_blocked"
+            # CLAWP-112-003 — nudge, never block: a missed prediction with no
+            # root cause gets a one-line reminder; the close proceeds regardless.
+            if state == TaskState.DONE and miss_category is None:
+                _preds = pre_transition_task.predictions
+                _axes = resolve_axes(
+                    _preds, actuals, _compute_deltas(_preds, actuals),
+                    kind=pre_transition_task.kind,
+                )
+                if _axes["held"] == "incorrect":
+                    warnings.append({
+                        "code": "miss_category_missing",
+                        "message": (
+                            "Prediction missed and no --miss-category given; consider: "
+                            + ", ".join(sorted(MISS_CATEGORIES))
+                        ),
+                    })
             write_reflection_event(
                 config.portfolio_root,
                 event=event_name,
@@ -483,6 +511,7 @@ def transition(
                 surprise_taxonomy=list(surprise_tags) if surprise_tags else [],
                 agent_profile=pre_transition_task.agent_profile,
                 kind=pre_transition_task.kind,
+                miss_category=miss_category,
             )
         except Exception as exc:
             # Never let reflection failure block the (already durable) state
@@ -521,6 +550,8 @@ def transition(
         data["log_errors"] = log_errors
     if reflection_errors:
         data["reflection_errors"] = reflection_errors
+    if warnings:
+        data["warnings"] = warnings
     if lease_errors:
         data["lease_errors"] = lease_errors
     if files_changed_errors:

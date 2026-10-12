@@ -68,6 +68,18 @@ SURPRISE_TAXONOMY: frozenset[str] = frozenset({
     "external_blocker",
 })
 
+# CLAWP-112-003 — why the prediction METHOD failed (single-pick root cause),
+# orthogonal to SURPRISE_TAXONOMY (multi-pick phenomenon tags). ``noise`` is a
+# valid answer: inside expected variance, no lesson.
+MISS_CATEGORIES: frozenset[str] = frozenset({
+    "wrong_signal",
+    "wrong_weight",
+    "missed_variable",
+    "operator_override",
+    "noise",
+    "structural",
+})
+
 
 def normalize_tags(raw: Any) -> list[str]:
     """Normalise a tags value into a clean list of tag strings.
