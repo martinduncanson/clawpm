@@ -51,5 +51,9 @@ from _review_common import parse_verdict, extract_findings
 body = open(r'$Out', encoding='utf-8', errors='replace').read()
 print('CLEAN' if (parse_verdict(body, tag='codex-local', nonce='$nonce') == 'CLEAN' and not extract_findings(body)) else 'FINDINGS')
 ").Trim()
+if ($LASTEXITCODE -ne 0 -or $verdict -notin @('CLEAN', 'FINDINGS')) {
+    Write-Output "CODEX_GATE: ERROR verdict parser failed (rc=$LASTEXITCODE, got '$verdict'); read $Out by hand"
+    exit 2
+}
 $null = python "$scripts\log_findings.py" --engine codex --model $Model --review-id $ReviewId --body-file $Out --verdict $verdict
 Write-Output "CODEX_GATE: $verdict (log rc=$LASTEXITCODE) out=$Out"
