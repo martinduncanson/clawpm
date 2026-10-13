@@ -71,6 +71,7 @@ from clawpm.cli import resume as _resume  # noqa: E402,F401
 from clawpm.cli import use as _use  # noqa: E402,F401
 from clawpm.cli import introspect as _introspect  # noqa: E402,F401
 from clawpm.cli import mcp as _mcp  # noqa: E402,F401
+from clawpm.cli import sessions as _sessions  # noqa: E402,F401
 from clawpm.cli import pr as _pr  # noqa: E402,F401
 
 # Re-exports: symbols that moved into group modules but are still referenced

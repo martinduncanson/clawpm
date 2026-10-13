@@ -897,3 +897,101 @@ def _marker_fallback_session(
             active=True,
         )
     return None
+
+
+def resolve_write_root(cwd: Path) -> dict:
+    """CLAWP-147-003 (G4): the dispatched worker's write root, from its marker.
+
+    The root is the nearest directory at or above *cwd* whose
+    ``.claude/settings.local.json`` carries a dispatch marker. The marker
+    stores no path of its own (it travels with the checkout, so a stored path
+    would go stale on a move); its location IS the root. Unlike
+    :func:`_marker_fallback_session` this is not scoped to a project and never
+    consults the ledger: a fence hook needs the answer for whatever worktree it
+    is running in.
+
+    Returns a dict with ``ok``. On success: ``root`` (absolute, resolved),
+    ``task_id`` and ``project_id``. Otherwise ``reason`` is
+    ``no_dispatch_marker`` (no marker anywhere above cwd: nothing to fence) or
+    ``marker_unusable`` (a marker file is there but cannot yield an
+    unambiguous root; ``detail`` says why). A damaged nearest marker never
+    falls through to an outer one, since a wider root would fence less than
+    the worker's real boundary; that includes a present-but-null marker key
+    (only an ABSENT key or file means "keep walking"). Never raises on bad
+    content; ``resolve`` / stat faults come back as ``marker_unusable``.
+
+    Fail closed: ANY unexpected exception while resolving, walking, reading or
+    parsing (``RuntimeError`` from a symlink loop on Python 3.11,
+    ``RecursionError`` from absurdly nested JSON, ...) also comes back as
+    ``marker_unusable``, with the exception class in ``detail``.
+    ``no_dispatch_marker`` is returned only when the walk completed cleanly.
+    ``KeyboardInterrupt`` / ``SystemExit`` still propagate.
+    """
+    try:
+        return _resolve_write_root(cwd)
+    except Exception as exc:
+        return unusable_write_root(exc)
+
+
+def unusable_write_root(exc: BaseException) -> dict:
+    """The ``marker_unusable`` result for an unexpected *exc* (see above)."""
+    return {
+        "ok": False,
+        "reason": "marker_unusable",
+        "detail": f"unexpected {type(exc).__name__}: {str(exc)[:200]}",
+    }
+
+
+def _resolve_write_root(cwd: Path) -> dict:
+    # Lazy: dispatch imports this module at load time.
+    from .dispatch import inspect_dispatch_marker, settings_path
+
+    resolved = resolve_path_or_none(cwd)
+    if resolved is None:
+        return {
+            "ok": False,
+            "reason": "marker_unusable",
+            "detail": f"cannot resolve {cwd}",
+        }
+    for candidate in (resolved, *resolved.parents):
+        try:
+            marker, problem = inspect_dispatch_marker(
+                candidate, null_is_damaged=True
+            )
+        except (OSError, ValueError) as exc:
+            return {
+                "ok": False,
+                "reason": "marker_unusable",
+                "detail": f"cannot read {settings_path(candidate)}: {exc}",
+            }
+        if problem is not None:
+            return {
+                "ok": False,
+                "reason": "marker_unusable",
+                "detail": f"{settings_path(candidate)}: {problem}",
+            }
+        if marker is None:
+            continue
+        task_id = marker.get("task_id")
+        if not isinstance(task_id, str) or not task_id.strip():
+            return {
+                "ok": False,
+                "reason": "marker_unusable",
+                "detail": f"{settings_path(candidate)}: marker has no task_id",
+            }
+        # The dispatch writer always writes both ids, so a marker without a
+        # usable project_id is damaged; do not vouch for its root.
+        project_id = marker.get("project_id")
+        if not isinstance(project_id, str) or not project_id.strip():
+            return {
+                "ok": False,
+                "reason": "marker_unusable",
+                "detail": f"{settings_path(candidate)}: marker has no project_id",
+            }
+        return {
+            "ok": True,
+            "root": str(candidate),
+            "task_id": task_id,
+            "project_id": project_id,
+        }
+    return {"ok": False, "reason": "no_dispatch_marker"}
