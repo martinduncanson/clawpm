@@ -421,3 +421,108 @@ def test_no_marker_anywhere_still_exits_1(tmp_path):
     res = _run(plain)
     assert res.exit_code == 1
     assert json.loads(res.stdout)["reason"] == "no_dispatch_marker"
+
+
+# Output failures are part of the fail-closed region: a dead pipe must not
+# escape as a traceback (exit 1 = "nothing to fence"). If the resolver said
+# ok=true but the answer could not be delivered, the result is exit 3. A genuine
+# no-marker state stays exit 1 even when its message cannot be written: the
+# state is "nothing to fence" whether or not anyone hears about it.
+#
+# These call main.main(standalone_mode=False) with sys.stdout/sys.stderr
+# replaced directly: CliRunner flushes its own stream after the command, which
+# a dead stream would break, and standalone mode would let click's own EPIPE
+# handler mask an escaping exception.
+
+
+class _DeadStream:
+    def __init__(self, exc):
+        self._exc = exc
+
+    def write(self, *a, **kw):
+        raise self._exc
+
+    def flush(self, *a, **kw):
+        raise self._exc
+
+    def isatty(self):
+        return False
+
+
+class _FlushOnlyDeadStream(_DeadStream):
+    # Writes are buffered happily; the failure only surfaces on flush.
+    def write(self, *a, **kw):
+        return 0
+
+
+_DEAD_EXCS = [
+    BrokenPipeError(32, "Broken pipe"),
+    OSError(22, "Invalid argument"),
+    ValueError("I/O operation on closed file"),
+]
+
+
+def _exit_code(monkeypatch, fmt: str, cwd: Path, *, stdout, stderr) -> int:
+    import io
+
+    monkeypatch.setattr(sys, "stdout", stdout if stdout is not None else io.StringIO())
+    monkeypatch.setattr(sys, "stderr", stderr if stderr is not None else io.StringIO())
+    try:
+        main.main(
+            ["--format", fmt, "sessions", "write-root", "--cwd", str(cwd)],
+            standalone_mode=False, prog_name="clawpm",
+        )
+    except SystemExit as e:
+        return e.code
+    return 0
+
+
+@pytest.mark.parametrize("exc", _DEAD_EXCS, ids=lambda e: type(e).__name__)
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_ok_result_with_dead_stdout_exits_3_not_traceback(tmp_path, monkeypatch, exc, fmt):
+    wt = tmp_path / "wt"
+    _write_marker(wt)
+    code = _exit_code(monkeypatch, fmt, wt, stdout=_DeadStream(exc), stderr=_DeadStream(exc))
+    assert code == 3
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_ok_result_with_deferred_flush_failure_exits_3(tmp_path, monkeypatch, fmt):
+    wt = tmp_path / "wt"
+    _write_marker(wt)
+    dead = _FlushOnlyDeadStream(BrokenPipeError(32, "Broken pipe"))
+    assert _exit_code(monkeypatch, fmt, wt, stdout=dead, stderr=None) == 3
+
+
+def test_ok_result_with_dead_stdout_leaves_a_stderr_note(tmp_path, monkeypatch):
+    import io
+
+    wt = tmp_path / "wt"
+    _write_marker(wt)
+    err = io.StringIO()
+    code = _exit_code(
+        monkeypatch, "json", wt, stdout=_DeadStream(BrokenPipeError(32, "x")), stderr=err
+    )
+    assert code == 3
+    assert "marker_unusable" in err.getvalue()
+
+
+@pytest.mark.parametrize("exc", _DEAD_EXCS, ids=lambda e: type(e).__name__)
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_marker_unusable_with_dead_output_exits_3(tmp_path, monkeypatch, exc, fmt):
+    wt = tmp_path / "wt"
+    _write_marker(wt, body=b"{not json")
+    # text mode writes the reason to stderr, json mode to stdout: kill both.
+    code = _exit_code(monkeypatch, fmt, wt, stdout=_DeadStream(exc), stderr=_DeadStream(exc))
+    assert code == 3
+
+
+@pytest.mark.parametrize("exc", _DEAD_EXCS, ids=lambda e: type(e).__name__)
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_no_marker_with_dead_output_still_exits_1(tmp_path, monkeypatch, exc, fmt):
+    # Deliberate: the state is genuinely "nothing to fence", so exit 1 survives
+    # an undeliverable message. Only a clean SystemExit(1), never a traceback.
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    code = _exit_code(monkeypatch, fmt, plain, stdout=_DeadStream(exc), stderr=_DeadStream(exc))
+    assert code == 1

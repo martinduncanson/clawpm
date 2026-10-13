@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -40,7 +41,8 @@ def sessions_write_root(ctx, cwd) -> None:
     Exit codes: 0 root found; 1 not inside a dispatched worktree (ok=false,
     reason no_dispatch_marker: nothing to fence); 3 a marker is present but
     cannot yield an unambiguous root, or resolving hit any unexpected error
-    (ok=false, reason marker_unusable).
+    (ok=false, reason marker_unusable). A resolved root that cannot be written
+    (closed pipe) also exits 3, never 0 or 1.
     """
     from clawpm.sessions import resolve_write_root, unusable_write_root
 
@@ -51,13 +53,39 @@ def sessions_write_root(ctx, cwd) -> None:
         result = resolve_write_root(Path(cwd) if cwd else Path.cwd())
     except Exception as exc:
         result = unusable_write_root(exc)
-    if fmt == OutputFormat.JSON:
-        print(json.dumps(result, indent=2))
-    elif result["ok"]:
-        print(result["root"])
-    else:
-        detail = result.get("detail")
-        print(result["reason"] + (f": {detail}" if detail else ""), file=sys.stderr)
     if result["ok"]:
-        return
-    sys.exit(EXIT_NO_FENCE if result["reason"] == "no_dispatch_marker" else EXIT_MARKER_UNUSABLE)
+        code = 0
+    elif result["reason"] == "no_dispatch_marker":
+        code = EXIT_NO_FENCE
+    else:
+        code = EXIT_MARKER_UNUSABLE
+    # Output is inside the fail-closed region too: a dead pipe must not escape
+    # as a traceback (exit 1). A root we resolved but could not deliver is
+    # marker_unusable (3); a genuine no-marker state stays 1.
+    try:
+        if fmt == OutputFormat.JSON:
+            print(json.dumps(result, indent=2))
+        elif result["ok"]:
+            print(result["root"])
+        else:
+            detail = result.get("detail")
+            print(result["reason"] + (f": {detail}" if detail else ""), file=sys.stderr)
+        # Flush now so a deferred failure is caught here, not at interpreter exit.
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        if code == 0:
+            code = EXIT_MARKER_UNUSABLE
+        if code == EXIT_MARKER_UNUSABLE:
+            try:
+                print("marker_unusable: could not write result", file=sys.stderr)
+                sys.stderr.flush()
+            except Exception:
+                pass
+        # Unflushed bytes would fail again at exit and replace our code with 120.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except Exception:
+            pass
+    if code:
+        sys.exit(code)
