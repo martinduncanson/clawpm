@@ -897,3 +897,67 @@ def _marker_fallback_session(
             active=True,
         )
     return None
+
+
+def resolve_write_root(cwd: Path) -> dict:
+    """CLAWP-147-003 (G4): the dispatched worker's write root, from its marker.
+
+    The root is the nearest directory at or above *cwd* whose
+    ``.claude/settings.local.json`` carries a dispatch marker. The marker
+    stores no path of its own (it travels with the checkout, so a stored path
+    would go stale on a move); its location IS the root. Unlike
+    :func:`_marker_fallback_session` this is not scoped to a project and never
+    consults the ledger: a fence hook needs the answer for whatever worktree it
+    is running in.
+
+    Returns a dict with ``ok``. On success: ``root`` (absolute, resolved),
+    ``task_id`` and ``project_id``. Otherwise ``reason`` is
+    ``no_dispatch_marker`` (no marker anywhere above cwd: nothing to fence) or
+    ``marker_unusable`` (a marker file is there but cannot yield an
+    unambiguous root; ``detail`` says why). A damaged nearest marker never
+    falls through to an outer one, since a wider root would fence less than
+    the worker's real boundary. Never raises on bad content; ``resolve`` /
+    stat faults come back as ``marker_unusable``.
+    """
+    # Lazy: dispatch imports this module at load time.
+    from .dispatch import inspect_dispatch_marker, settings_path
+
+    resolved = resolve_path_or_none(cwd)
+    if resolved is None:
+        return {
+            "ok": False,
+            "reason": "marker_unusable",
+            "detail": f"cannot resolve {cwd}",
+        }
+    for candidate in (resolved, *resolved.parents):
+        try:
+            marker, problem = inspect_dispatch_marker(candidate)
+        except (OSError, ValueError) as exc:
+            return {
+                "ok": False,
+                "reason": "marker_unusable",
+                "detail": f"cannot read {settings_path(candidate)}: {exc}",
+            }
+        if problem is not None:
+            return {
+                "ok": False,
+                "reason": "marker_unusable",
+                "detail": f"{settings_path(candidate)}: {problem}",
+            }
+        if marker is None:
+            continue
+        task_id = marker.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            return {
+                "ok": False,
+                "reason": "marker_unusable",
+                "detail": f"{settings_path(candidate)}: marker has no task_id",
+            }
+        project_id = marker.get("project_id")
+        return {
+            "ok": True,
+            "root": str(candidate),
+            "task_id": task_id,
+            "project_id": project_id if isinstance(project_id, str) else None,
+        }
+    return {"ok": False, "reason": "no_dispatch_marker"}
