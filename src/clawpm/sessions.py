@@ -953,11 +953,19 @@ def resolve_write_root(cwd: Path) -> dict:
                 "reason": "marker_unusable",
                 "detail": f"{settings_path(candidate)}: marker has no task_id",
             }
+        # The dispatch writer always writes both ids, so a marker without a
+        # usable project_id is damaged; do not vouch for its root.
         project_id = marker.get("project_id")
+        if not isinstance(project_id, str) or not project_id:
+            return {
+                "ok": False,
+                "reason": "marker_unusable",
+                "detail": f"{settings_path(candidate)}: marker has no project_id",
+            }
         return {
             "ok": True,
             "root": str(candidate),
             "task_id": task_id,
-            "project_id": project_id if isinstance(project_id, str) else None,
+            "project_id": project_id,
         }
     return {"ok": False, "reason": "no_dispatch_marker"}

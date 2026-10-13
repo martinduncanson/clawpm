@@ -135,6 +135,36 @@ def test_marker_without_usable_task_id_is_unusable(tmp_path, task_id):
     assert json.loads(res.stdout)["reason"] == "marker_unusable"
 
 
+@pytest.mark.parametrize(
+    "marker",
+    [
+        {"task_id": "CLAWP-1", "version": 1},
+        {"task_id": "CLAWP-1", "project_id": None},
+        {"task_id": "CLAWP-1", "project_id": 7},
+        {"task_id": "CLAWP-1", "project_id": ""},
+    ],
+    ids=["missing", "null", "non-string", "empty"],
+)
+def test_marker_without_usable_project_id_is_unusable(tmp_path, marker):
+    # The dispatch writer always writes both ids, so a marker lacking a
+    # non-empty string project_id is damaged, not a root a fence can trust.
+    outer = tmp_path / "outer"
+    inner = outer / "inner"
+    _write_marker(outer)
+    _write_marker(inner, body=json.dumps({CLAWPM_MARKER_KEY: marker}).encode("utf-8"))
+    direct = resolve_write_root(inner)
+    assert direct["ok"] is False
+    assert direct["reason"] == "marker_unusable"
+    assert "project_id" in direct["detail"]
+    assert "root" not in direct  # no fall-through to the outer root
+    res = _run(inner)
+    assert res.exit_code == 3
+    out = json.loads(res.stdout)
+    assert out["reason"] == "marker_unusable"
+    assert "project_id" in out["detail"]
+    assert "root" not in out
+
+
 def test_dotdot_segments_resolve_to_same_root(tmp_path):
     wt = tmp_path / "wt"
     _write_marker(wt)
