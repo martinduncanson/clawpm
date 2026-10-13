@@ -551,6 +551,8 @@ clawpm lease sweep [--dry-run]
 
 # Dispatched worker's write root (from the dispatch marker; for a harness write-fence hook)
 clawpm sessions write-root [--cwd <dir>]  # JSON {ok, root, task_id, project_id}; exit 0 found, 1 not in a dispatched worktree (ok=false, reason no_dispatch_marker), 3 marker unusable (ok=false, reason marker_unusable)
+# Pre-merge head attestation (read-only; prints the merge line, never runs it)
+clawpm pr verify <N> [--expect-head <full-sha>] [--repo owner/name] [--remote fork]
 
 # Tournament selection
 clawpm judge tournament \
