@@ -63,16 +63,20 @@ def sessions_write_root(ctx, cwd) -> None:
     # as a traceback (exit 1). A root we resolved but could not deliver is
     # marker_unusable (3); a genuine no-marker state stays 1.
     try:
+        # Touch only the stream that carries the result: a broken stream we never
+        # wrote to (e.g. stderr closed at launch) must not fail a delivered result.
         if fmt == OutputFormat.JSON:
+            carrier = sys.stdout
             print(json.dumps(result, indent=2))
         elif result["ok"]:
+            carrier = sys.stdout
             print(result["root"])
         else:
+            carrier = sys.stderr
             detail = result.get("detail")
-            print(result["reason"] + (f": {detail}" if detail else ""), file=sys.stderr)
+            print(result["reason"] + (f": {detail}" if detail else ""), file=carrier)
         # Flush now so a deferred failure is caught here, not at interpreter exit.
-        sys.stdout.flush()
-        sys.stderr.flush()
+        carrier.flush()
     except Exception:
         if code == 0:
             code = EXIT_MARKER_UNUSABLE

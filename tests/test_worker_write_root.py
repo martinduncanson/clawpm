@@ -526,3 +526,89 @@ def test_no_marker_with_dead_output_still_exits_1(tmp_path, monkeypatch, exc, fm
     plain.mkdir()
     code = _exit_code(monkeypatch, fmt, plain, stdout=_DeadStream(exc), stderr=_DeadStream(exc))
     assert code == 1
+
+
+# Only the stream that carries the result may fail the command. JSON mode and
+# text-ok mode write to stdout; text error mode writes to stderr. A broken
+# stream the command never wrote to (a hook launched with stderr closed) must
+# not downgrade a delivered ok result to exit 3.
+
+
+class _HealthyStdout:
+    def __init__(self):
+        self.parts = []
+
+    def write(self, s, *a, **kw):
+        self.parts.append(s)
+        return len(s)
+
+    def flush(self, *a, **kw):
+        pass
+
+    def isatty(self):
+        return False
+
+    def getvalue(self):
+        return "".join(self.parts)
+
+
+def _exit_code_none_ok(monkeypatch, fmt: str, cwd: Path, *, stdout, stderr) -> int:
+    # Like _exit_code, but stderr may legitimately be None (closed at launch).
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", stderr)
+    try:
+        main.main(
+            ["--format", fmt, "sessions", "write-root", "--cwd", str(cwd)],
+            standalone_mode=False, prog_name="clawpm",
+        )
+    except SystemExit as e:
+        return e.code
+    return 0
+
+
+@pytest.mark.parametrize("exc", _DEAD_EXCS, ids=lambda e: type(e).__name__)
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_ok_result_with_healthy_stdout_ignores_dead_stderr(tmp_path, monkeypatch, exc, fmt):
+    wt = tmp_path / "wt"
+    _write_marker(wt)
+    out = _HealthyStdout()
+    code = _exit_code_none_ok(monkeypatch, fmt, wt, stdout=out, stderr=_DeadStream(exc))
+    assert code == 0
+    if fmt == "json":
+        assert json.loads(out.getvalue())["ok"] is True
+    else:
+        assert out.getvalue().strip() == str(wt.resolve())
+
+
+@pytest.mark.parametrize("fmt", ["json", "text"])
+def test_ok_result_with_healthy_stdout_ignores_missing_stderr(tmp_path, monkeypatch, fmt):
+    wt = tmp_path / "wt"
+    _write_marker(wt)
+    out = _HealthyStdout()
+    code = _exit_code_none_ok(monkeypatch, fmt, wt, stdout=out, stderr=None)
+    assert code == 0
+    assert out.getvalue().strip()
+
+
+@pytest.mark.parametrize("exc", _DEAD_EXCS, ids=lambda e: type(e).__name__)
+def test_marker_unusable_text_mode_with_dead_stdout_still_exits_3(tmp_path, monkeypatch, exc):
+    # The result (a reason line) goes to stderr here; stdout was never written.
+    # A healthy stderr carries the result and the code is 3 regardless.
+    import io
+
+    wt = tmp_path / "wt"
+    _write_marker(wt, body=b"{not json")
+    err = io.StringIO()
+    code = _exit_code_none_ok(monkeypatch, "text", wt, stdout=_DeadStream(exc), stderr=err)
+    assert code == 3
+    assert "marker_unusable" in err.getvalue()
+
+
+@pytest.mark.parametrize("exc", _DEAD_EXCS, ids=lambda e: type(e).__name__)
+def test_no_marker_json_mode_with_dead_stderr_still_exits_1(tmp_path, monkeypatch, exc):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    out = _HealthyStdout()
+    code = _exit_code_none_ok(monkeypatch, "json", plain, stdout=out, stderr=_DeadStream(exc))
+    assert code == 1
+    assert json.loads(out.getvalue())["reason"] == "no_dispatch_marker"
