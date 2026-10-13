@@ -708,13 +708,18 @@ def read_dispatch_marker(target_dir: Path) -> Optional[dict]:
     return inspect_dispatch_marker(target_dir)[0]
 
 
-def inspect_dispatch_marker(target_dir: Path) -> tuple[Optional[dict], Optional[str]]:
+def inspect_dispatch_marker(
+    target_dir: Path, *, null_is_damaged: bool = False
+) -> tuple[Optional[dict], Optional[str]]:
     """Like :func:`read_dispatch_marker`, but also say WHY there is no marker.
 
     Returns ``(marker, problem)``. ``problem`` is None for a marker, a missing
     file, or a valid settings file with no clawpm block (all ordinary). It is a
     short description when the file is present but damaged: unparseable JSON,
     a non-object top level, or a clawpm key whose value is not an object.
+    By default an explicit JSON ``null`` under the clawpm key counts as no
+    marker (teardown leaves such a file alone); ``null_is_damaged=True`` makes
+    it a problem instead, for callers that must not walk past a present key.
     Never raises on bad content; OS errors propagate as in the plain reader.
     """
     path = settings_path(target_dir)
@@ -737,6 +742,8 @@ def inspect_dispatch_marker(target_dir: Path) -> tuple[Optional[dict], Optional[
         return None, "top level is not a JSON object"
     marker = data.get(CLAWPM_MARKER_KEY)
     if marker is None:
+        if null_is_damaged and CLAWPM_MARKER_KEY in data:
+            return None, f"{CLAWPM_MARKER_KEY!r} is null"
         return None, None
     if not isinstance(marker, dict):
         return None, f"{CLAWPM_MARKER_KEY!r} is not a JSON object"

@@ -916,8 +916,9 @@ def resolve_write_root(cwd: Path) -> dict:
     ``marker_unusable`` (a marker file is there but cannot yield an
     unambiguous root; ``detail`` says why). A damaged nearest marker never
     falls through to an outer one, since a wider root would fence less than
-    the worker's real boundary. Never raises on bad content; ``resolve`` /
-    stat faults come back as ``marker_unusable``.
+    the worker's real boundary; that includes a present-but-null marker key
+    (only an ABSENT key or file means "keep walking"). Never raises on bad
+    content; ``resolve`` / stat faults come back as ``marker_unusable``.
     """
     # Lazy: dispatch imports this module at load time.
     from .dispatch import inspect_dispatch_marker, settings_path
@@ -931,7 +932,9 @@ def resolve_write_root(cwd: Path) -> dict:
         }
     for candidate in (resolved, *resolved.parents):
         try:
-            marker, problem = inspect_dispatch_marker(candidate)
+            marker, problem = inspect_dispatch_marker(
+                candidate, null_is_damaged=True
+            )
         except (OSError, ValueError) as exc:
             return {
                 "ok": False,
@@ -947,7 +950,7 @@ def resolve_write_root(cwd: Path) -> dict:
         if marker is None:
             continue
         task_id = marker.get("task_id")
-        if not isinstance(task_id, str) or not task_id:
+        if not isinstance(task_id, str) or not task_id.strip():
             return {
                 "ok": False,
                 "reason": "marker_unusable",
@@ -956,7 +959,7 @@ def resolve_write_root(cwd: Path) -> dict:
         # The dispatch writer always writes both ids, so a marker without a
         # usable project_id is damaged; do not vouch for its root.
         project_id = marker.get("project_id")
-        if not isinstance(project_id, str) or not project_id:
+        if not isinstance(project_id, str) or not project_id.strip():
             return {
                 "ok": False,
                 "reason": "marker_unusable",

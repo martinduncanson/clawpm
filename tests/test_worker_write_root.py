@@ -165,6 +165,96 @@ def test_marker_without_usable_project_id_is_unusable(tmp_path, marker):
     assert "root" not in out
 
 
+def _marker_file(marker) -> bytes:
+    return json.dumps({CLAWPM_MARKER_KEY: marker}).encode("utf-8")
+
+
+_GOOD = {"task_id": "CLAWP-1", "project_id": "test"}
+
+# Every shape an inner settings file can take, with a VALID outer marker above
+# it. "outer" shapes are ordinary "no marker here, keep walking"; "unusable"
+# shapes are damaged and must stop the walk (exit 3, never the outer root).
+_INNER_SHAPES = [
+    # (id, body, expected) ; body None = no settings file at all
+    ("file-missing", None, "outer"),
+    ("key-absent", b'{"permissions": {}}', "outer"),
+    ("empty-file", b"", "unusable"),
+    ("whitespace-file", b"  \r\n", "unusable"),
+    ("bom-prefixed", b"\xef\xbb\xbf" + _marker_file(_GOOD), "unusable"),
+    ("non-utf8", b"\xff\xfe{\x00", "unusable"),
+    ("malformed-json", b"{not json", "unusable"),
+    ("top-list", b"[1, 2]", "unusable"),
+    ("top-string", b'"x"', "unusable"),
+    ("top-null", b"null", "unusable"),
+    ("top-int", b"7", "unusable"),
+    ("key-null", _marker_file(None), "unusable"),
+    ("key-list", _marker_file([_GOOD]), "unusable"),
+    ("key-string", _marker_file("x"), "unusable"),
+    ("key-int", _marker_file(0), "unusable"),
+    ("key-false", _marker_file(False), "unusable"),
+    ("key-true", _marker_file(True), "unusable"),
+    ("key-empty-object", _marker_file({}), "unusable"),
+    ("task-missing", _marker_file({"project_id": "test"}), "unusable"),
+    ("task-null", _marker_file({"task_id": None, "project_id": "test"}), "unusable"),
+    ("task-int", _marker_file({"task_id": 7, "project_id": "test"}), "unusable"),
+    ("task-empty", _marker_file({"task_id": "", "project_id": "test"}), "unusable"),
+    ("task-blank", _marker_file({"task_id": "  ", "project_id": "test"}), "unusable"),
+    ("project-missing", _marker_file({"task_id": "CLAWP-1"}), "unusable"),
+    ("project-null", _marker_file({"task_id": "CLAWP-1", "project_id": None}), "unusable"),
+    ("project-int", _marker_file({"task_id": "CLAWP-1", "project_id": 7}), "unusable"),
+    ("project-empty", _marker_file({"task_id": "CLAWP-1", "project_id": ""}), "unusable"),
+    ("project-blank", _marker_file({"task_id": "CLAWP-1", "project_id": "\t"}), "unusable"),
+]
+
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [pytest.param(b, e, id=i) for i, b, e in _INNER_SHAPES],
+)
+def test_inner_settings_shape_never_yields_a_wrong_root(tmp_path, body, expected):
+    outer = tmp_path / "outer"
+    inner = outer / "inner"
+    inner.mkdir(parents=True)
+    _write_marker(outer, task_id="CLAWP-OUTER")
+    if body is not None:
+        _write_marker(inner, body=body)
+    direct = resolve_write_root(inner)
+    res = _run(inner)
+    out = json.loads(res.stdout)
+    if expected == "outer":
+        assert direct["ok"] is True
+        assert Path(direct["root"]) == outer.resolve()
+        assert res.exit_code == 0
+        assert Path(out["root"]) == outer.resolve()
+    else:
+        assert direct["ok"] is False
+        assert direct["reason"] == "marker_unusable"
+        assert "root" not in direct
+        assert res.exit_code == 3
+        assert out["reason"] == "marker_unusable"
+        assert "root" not in out
+
+
+def test_settings_path_that_is_a_directory_is_unusable(tmp_path):
+    outer = tmp_path / "outer"
+    inner = outer / "inner"
+    _write_marker(outer)
+    (inner / ".claude" / "settings.local.json").mkdir(parents=True)
+    res = _run(inner)
+    assert res.exit_code == 3
+    assert json.loads(res.stdout)["reason"] == "marker_unusable"
+
+
+def test_null_marker_key_alone_is_unusable_not_no_fence(tmp_path):
+    # No outer marker either: a present-but-null key is still damaged (3),
+    # not "no marker anywhere" (1).
+    wt = tmp_path / "wt"
+    _write_marker(wt, body=_marker_file(None))
+    res = _run(wt)
+    assert res.exit_code == 3
+    assert "null" in json.loads(res.stdout)["detail"]
+
+
 def test_dotdot_segments_resolve_to_same_root(tmp_path):
     wt = tmp_path / "wt"
     _write_marker(wt)
