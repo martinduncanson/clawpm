@@ -29,6 +29,7 @@ class FakeEnv:
         self.runs = [{"name": "test", "status": "completed", "conclusion": "success", "head_sha": HEAD}]
         self.run_total = None
         self.statuses = []
+        self.status_total = None
         self.remote_sha = HEAD
         self.calls = []
         self.override = {}
@@ -53,8 +54,9 @@ class FakeEnv:
         if args[0] == "gh" and "check-runs" in args[2]:
             total = self.run_total if self.run_total is not None else len(self.runs)
             return _cp(json.dumps({"total_count": total, "check_runs": self.runs}))
-        if args[0] == "gh" and args[2].endswith("/status"):
-            return _cp(json.dumps({"statuses": self.statuses}))
+        if args[0] == "gh" and "/status" in args[2]:
+            total = self.status_total if self.status_total is not None else len(self.statuses)
+            return _cp(json.dumps({"total_count": total, "statuses": self.statuses}))
         raise AssertionError(f"unexpected subprocess call: {args}")
 
 
@@ -87,9 +89,12 @@ def test_remote_branch_head_differs_from_pr_head():
     assert OTHER in " ".join(res["head"]["reasons"]) and HEAD in " ".join(res["head"]["reasons"])
 
 
-def test_branch_missing_on_remote_is_not_ok():
-    res = _verify(FakeEnv(remote_sha=None))
-    assert res["ok"] is False and "not found" in res["head"]["reasons"][0]
+def test_branch_missing_on_remote_is_a_loud_error_not_a_failed_fact():
+    # Deleted branch / PR head living in another repo: the facts cannot be established.
+    with pytest.raises(PrVerifyError) as ei:
+        _verify(FakeEnv(remote_sha=None))
+    assert ei.value.code == "remote_branch_missing"
+    assert "fork" in ei.value.message and "feat/x" in ei.value.message
 
 
 def test_pending_ci_is_not_ok_and_named():
@@ -146,6 +151,48 @@ def test_truncated_check_listing_is_a_loud_error():
     assert ei.value.code == "ci_incomplete_listing"
 
 
+def test_truncated_status_listing_is_a_loud_error():
+    sts = [{"context": f"ci/{i}", "state": "success"} for i in range(30)]
+    with pytest.raises(PrVerifyError) as ei:
+        _verify(FakeEnv(statuses=sts, status_total=31))
+    assert ei.value.code == "ci_incomplete_listing"
+
+
+def test_status_listing_requests_a_full_page():
+    env = FakeEnv()
+    _verify(env)
+    status_calls = [c for c in env.calls if c[0] == "gh" and "/status" in c[2]]
+    assert status_calls and all("per_page=100" in c[2] for c in status_calls)
+
+
+@pytest.mark.parametrize("total", [None, "3", True])
+def test_status_response_without_int_total_count_is_gh_bad_json(total):
+    env = FakeEnv()
+
+    def call(args, **kw):
+        if args[0] == "gh" and "/status" in args[2]:
+            doc = {"statuses": []}
+            if total is not None:
+                doc["total_count"] = total
+            return _cp(json.dumps(doc))
+        return env(args, **kw)
+
+    with pytest.raises(PrVerifyError) as ei:
+        _verify(call)
+    assert ei.value.code == "gh_bad_json"
+
+
+def test_neutral_and_skipped_stay_green_but_are_listed_non_gating():
+    env = FakeEnv(runs=[
+        {"name": "test", "status": "completed", "conclusion": "success", "head_sha": HEAD},
+        {"name": "lint", "status": "completed", "conclusion": "skipped", "head_sha": HEAD},
+        {"name": "docs", "status": "completed", "conclusion": "neutral", "head_sha": HEAD},
+    ])
+    res = _verify(env)
+    assert res["ok"] is True
+    assert res["ci"]["skipped_or_neutral"] == ["lint=skipped", "docs=neutral"]
+
+
 def test_gh_missing_is_a_loud_error():
     env = FakeEnv(override={"gh": FileNotFoundError("gh")})
     with pytest.raises(PrVerifyError) as ei:
@@ -199,6 +246,13 @@ def test_cli_failed_fact_exit_1_with_ok_false():
     r = _invoke(FakeEnv(), "--expect-head", OTHER)
     assert r.exit_code == 1
     assert json.loads(r.stdout)["ok"] is False
+
+
+def test_cli_missing_remote_branch_exit_2_structured_error():
+    r = _invoke(FakeEnv(remote_sha=None))
+    assert r.exit_code == 2
+    assert json.loads(r.stderr)["error"] == "remote_branch_missing"
+    assert '"ok": true' not in r.stdout
 
 
 def test_cli_gh_missing_exit_2_structured_error_no_partial_pass():

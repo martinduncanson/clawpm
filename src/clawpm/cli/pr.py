@@ -31,7 +31,8 @@ def pr_verify_cmd(ctx, pr_number, expect_head, repo, remote):
     Prints each fact plus the exact ``gh pr merge ... --match-head-commit <FULL sha>``
     line when all hold (it is only printed, never run). Exit 0 = all four facts
     hold; exit 1 = a fact failed; exit 2 = the facts could not be established
-    (gh missing/unauthenticated, unparseable output).
+    (gh missing/unauthenticated, unparseable output, truncated CI listing, branch
+    missing from the remote).
     """
     fmt = get_format(ctx)
     try:

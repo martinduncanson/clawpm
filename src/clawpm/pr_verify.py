@@ -12,7 +12,8 @@ every one holds.
 
 This module is read-only: it never merges, comments or writes to the remote.
 Anything that stops it proving a fact (gh missing, unauthenticated, unparseable
-JSON, a check run reported for a different SHA, a truncated check listing) raises
+JSON, a check run reported for a different SHA, a truncated check or status
+listing, a branch missing from the remote) raises
 :class:`PrVerifyError` -- a loud failure, never a partial pass.
 """
 
@@ -92,13 +93,17 @@ def _resolve_repo(repo: str | None, remote: str) -> str:
     return f"{parsed[0]}/{parsed[1]}"
 
 
-def _remote_head(remote: str, branch: str) -> str | None:
+def _remote_head(remote: str, branch: str) -> str:
     out = _run(["git", "ls-remote", remote, f"refs/heads/{branch}"])
     for line in out.splitlines():
         sha, _, ref = line.partition("\t")
         if ref.strip() == f"refs/heads/{branch}" and _FULL_SHA.match(sha.strip()):
             return sha.strip()
-    return None
+    # A deleted branch, or a PR whose head lives in another repo: nothing to attest against.
+    raise PrVerifyError(
+        "remote_branch_missing",
+        f"branch '{branch}' not found on remote '{remote}' (deleted, or the PR head is in another repo)",
+    )
 
 
 def _local_head(branch: str) -> str | None:
@@ -113,11 +118,9 @@ def _local_head(branch: str) -> str | None:
     return sha if proc.returncode == 0 and _FULL_SHA.match(sha) else None
 
 
-def _check_head(pr_head: str, remote_head: str | None, expect: str | None) -> dict[str, Any]:
+def _check_head(pr_head: str, remote_head: str, expect: str | None) -> dict[str, Any]:
     reasons = []
-    if remote_head is None:
-        reasons.append("branch not found on the remote")
-    elif remote_head != pr_head:
+    if remote_head != pr_head:
         reasons.append(f"remote branch head {remote_head} != PR head {pr_head}")
     if expect is not None and expect != pr_head:
         reasons.append(f"expected head {expect} != PR head {pr_head}")
@@ -130,6 +133,19 @@ def _check_head(pr_head: str, remote_head: str | None, expect: str | None) -> di
     }
 
 
+def _complete_listing(doc: dict[str, Any], key: str, what: str) -> list[Any]:
+    """``doc[key]`` only if the listing is provably whole (``total_count`` == len)."""
+    items, total = doc.get(key), doc.get("total_count")
+    if not isinstance(items, list) or not isinstance(total, int) or isinstance(total, bool):
+        raise PrVerifyError("gh_bad_json", f"{what} response lacks {key}/total_count")
+    if total > len(items):
+        raise PrVerifyError(
+            "ci_incomplete_listing",
+            f"{what} listing truncated ({len(items)} of {total}); refusing a partial verdict",
+        )
+    return items
+
+
 def _check_ci(repo: str, sha: str) -> dict[str, Any]:
     """CI state tied to ``sha`` by querying the commit's own check-runs/status.
 
@@ -137,23 +153,19 @@ def _check_ci(repo: str, sha: str) -> dict[str, Any]:
     cannot prove which commit was checked; the commit-scoped REST endpoints
     can, and each check run echoes its ``head_sha`` which we cross-check.
     """
-    runs_doc = _gh_json(["api", f"repos/{repo}/commits/{sha}/check-runs?per_page={_CHECKS_PER_PAGE}"])
-    runs = runs_doc.get("check_runs")
-    total = runs_doc.get("total_count")
-    if not isinstance(runs, list) or not isinstance(total, int):
-        raise PrVerifyError("gh_bad_json", "check-runs response lacks check_runs/total_count")
-    if total > len(runs):
-        raise PrVerifyError(
-            "ci_incomplete_listing",
-            f"check-runs listing truncated ({len(runs)} of {total}); refusing a partial verdict",
-        )
-    status_doc = _gh_json(["api", f"repos/{repo}/commits/{sha}/status"])
-    statuses = status_doc.get("statuses")
-    if not isinstance(statuses, list):
-        raise PrVerifyError("gh_bad_json", "commit status response lacks statuses")
+    runs = _complete_listing(
+        _gh_json(["api", f"repos/{repo}/commits/{sha}/check-runs?per_page={_CHECKS_PER_PAGE}"]),
+        "check_runs", "check-runs",
+    )
+    statuses = _complete_listing(
+        _gh_json(["api", f"repos/{repo}/commits/{sha}/status?per_page={_CHECKS_PER_PAGE}"]),
+        "statuses", "commit status",
+    )
 
     failing: list[str] = []
     pending: list[str] = []
+    # Green by GitHub's own merge gate, so non-gating here; surfaced so a human can see them.
+    soft: list[str] = []
     for run in runs:
         if not isinstance(run, dict):
             raise PrVerifyError("gh_bad_json", "check run entry is not an object")
@@ -167,6 +179,8 @@ def _check_ci(repo: str, sha: str) -> dict[str, Any]:
             pending.append(name)
         elif run.get("conclusion") not in _GREEN_CONCLUSIONS:
             failing.append(f"{name}={run.get('conclusion')}")
+        elif run.get("conclusion") != "success":
+            soft.append(f"{name}={run.get('conclusion')}")
     for st in statuses:
         if not isinstance(st, dict):
             raise PrVerifyError("gh_bad_json", "commit status entry is not an object")
@@ -184,7 +198,10 @@ def _check_ci(repo: str, sha: str) -> dict[str, Any]:
         reasons.append(f"pending: {', '.join(pending)}")
     if failing:
         reasons.append(f"failing: {', '.join(failing)}")
-    return {"ok": not reasons, "sha": sha, "checks": n_checks, "pending": pending, "failing": failing, "reasons": reasons}
+    return {
+        "ok": not reasons, "sha": sha, "checks": n_checks, "pending": pending, "failing": failing,
+        "skipped_or_neutral": soft, "reasons": reasons,
+    }
 
 
 def _check_mergeable(state: str | None, mergeable: str | None) -> dict[str, Any]:
