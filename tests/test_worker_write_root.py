@@ -298,3 +298,126 @@ def test_defaults_to_process_cwd(tmp_path, monkeypatch):
     res = CliRunner().invoke(main, ["sessions", "write-root"])
     assert res.exit_code == 0
     assert Path(json.loads(res.stdout)["root"]) == wt.resolve()
+
+
+# Fail-closed safety net: the CLI contract is exit 1 = "nothing to fence" and
+# exit 3 = "marker unusable". An unhandled exception exits 1 with a traceback,
+# which a hook cannot tell apart from "no fence", so ANY unexpected error while
+# resolving must surface as marker_unusable / exit 3.
+
+
+def _assert_unusable_cli(res, needle: str) -> None:
+    assert res.exit_code == 3, (res.exit_code, res.output, res.exception)
+    out = json.loads(res.stdout)
+    assert out["ok"] is False
+    assert out["reason"] == "marker_unusable"
+    assert needle in out["detail"]
+    assert "root" not in out
+
+
+def test_resolve_runtime_error_symlink_loop_is_unusable(tmp_path, monkeypatch):
+    # Python 3.11 raises RuntimeError (not OSError) from Path.resolve() on a
+    # symlink loop.
+    wt = tmp_path / "wt"
+    _write_marker(wt)
+
+    def boom(self, *a, **kw):
+        raise RuntimeError("Symlink loop from 'x'")
+
+    monkeypatch.setattr(Path, "resolve", boom)
+    direct = resolve_write_root(wt)
+    assert direct["ok"] is False
+    assert direct["reason"] == "marker_unusable"
+    assert "RuntimeError" in direct["detail"]
+    _assert_unusable_cli(_run(wt), "RuntimeError")
+
+
+def test_deeply_nested_json_marker_is_unusable(tmp_path):
+    wt = tmp_path / "wt"
+    depth = 200000
+    body = (
+        b'{"' + CLAWPM_MARKER_KEY.encode() + b'": '
+        + b"[" * depth + b"]" * depth + b"}"
+    )
+    _write_marker(wt, body=body)
+    direct = resolve_write_root(wt)
+    assert direct["ok"] is False
+    assert direct["reason"] == "marker_unusable"
+    assert "root" not in direct
+    res = _run(wt)
+    assert res.exit_code == 3, (res.exit_code, res.output, res.exception)
+    assert json.loads(res.stdout)["reason"] == "marker_unusable"
+
+
+def test_json_recursion_error_is_unusable(tmp_path, monkeypatch):
+    wt = tmp_path / "wt"
+    _write_marker(wt)
+
+    def boom(*a, **kw):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    # Scoped: the test itself parses the CLI output with json.loads afterwards.
+    with monkeypatch.context() as m:
+        m.setattr(json, "loads", boom)
+        direct = resolve_write_root(wt)
+        res = _run(wt)
+    assert direct["ok"] is False
+    assert direct["reason"] == "marker_unusable"
+    assert "RecursionError" in direct["detail"]
+    _assert_unusable_cli(res, "RecursionError")
+
+
+def test_error_in_an_outer_directory_does_not_become_no_fence(tmp_path, monkeypatch):
+    # The walk must complete cleanly for exit 1: an exception mid-walk is 3.
+    import clawpm.dispatch as dispatch
+
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    real = dispatch.inspect_dispatch_marker
+    calls = []
+
+    def flaky(candidate, **kw):
+        calls.append(candidate)
+        if len(calls) == 2:
+            raise RuntimeError("Symlink loop")
+        return real(candidate, **kw)
+
+    monkeypatch.setattr(dispatch, "inspect_dispatch_marker", flaky)
+    res = _run(plain)
+    _assert_unusable_cli(res, "RuntimeError")
+
+
+@pytest.mark.parametrize(
+    "exc", [ValueError("v"), KeyError("k"), AttributeError("a"), RuntimeError("r")]
+)
+def test_cli_never_exits_1_when_resolver_itself_raises(tmp_path, monkeypatch, exc):
+    import clawpm.sessions as sessions_mod
+
+    def boom(cwd):
+        raise exc
+
+    monkeypatch.setattr(sessions_mod, "resolve_write_root", boom)
+    res = _run(tmp_path)
+    _assert_unusable_cli(res, type(exc).__name__)
+
+
+def test_cli_text_format_when_resolver_raises(tmp_path, monkeypatch):
+    import clawpm.sessions as sessions_mod
+
+    def boom(cwd):
+        raise AttributeError("a")
+
+    monkeypatch.setattr(sessions_mod, "resolve_write_root", boom)
+    res = CliRunner().invoke(
+        main, ["--format", "text", "sessions", "write-root", "--cwd", str(tmp_path)]
+    )
+    assert res.exit_code == 3
+    assert "marker_unusable" in res.output
+
+
+def test_no_marker_anywhere_still_exits_1(tmp_path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    res = _run(plain)
+    assert res.exit_code == 1
+    assert json.loads(res.stdout)["reason"] == "no_dispatch_marker"

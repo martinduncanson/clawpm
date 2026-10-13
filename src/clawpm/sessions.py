@@ -919,7 +919,30 @@ def resolve_write_root(cwd: Path) -> dict:
     the worker's real boundary; that includes a present-but-null marker key
     (only an ABSENT key or file means "keep walking"). Never raises on bad
     content; ``resolve`` / stat faults come back as ``marker_unusable``.
+
+    Fail closed: ANY unexpected exception while resolving, walking, reading or
+    parsing (``RuntimeError`` from a symlink loop on Python 3.11,
+    ``RecursionError`` from absurdly nested JSON, ...) also comes back as
+    ``marker_unusable``, with the exception class in ``detail``.
+    ``no_dispatch_marker`` is returned only when the walk completed cleanly.
+    ``KeyboardInterrupt`` / ``SystemExit`` still propagate.
     """
+    try:
+        return _resolve_write_root(cwd)
+    except Exception as exc:
+        return unusable_write_root(exc)
+
+
+def unusable_write_root(exc: BaseException) -> dict:
+    """The ``marker_unusable`` result for an unexpected *exc* (see above)."""
+    return {
+        "ok": False,
+        "reason": "marker_unusable",
+        "detail": f"unexpected {type(exc).__name__}: {str(exc)[:200]}",
+    }
+
+
+def _resolve_write_root(cwd: Path) -> dict:
     # Lazy: dispatch imports this module at load time.
     from .dispatch import inspect_dispatch_marker, settings_path
 

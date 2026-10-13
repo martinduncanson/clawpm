@@ -39,12 +39,18 @@ def sessions_write_root(ctx, cwd) -> None:
 
     Exit codes: 0 root found; 1 not inside a dispatched worktree (ok=false,
     reason no_dispatch_marker: nothing to fence); 3 a marker is present but
-    cannot yield an unambiguous root (ok=false, reason marker_unusable).
+    cannot yield an unambiguous root, or resolving hit any unexpected error
+    (ok=false, reason marker_unusable).
     """
-    from clawpm.sessions import resolve_write_root
+    from clawpm.sessions import resolve_write_root, unusable_write_root
 
     fmt = get_format(ctx)
-    result = resolve_write_root(Path(cwd) if cwd else Path.cwd())
+    # Safety net: an unhandled exception would exit 1 with a traceback, which a
+    # hook reads as "nothing to fence". Any surprise is "marker unusable" (3).
+    try:
+        result = resolve_write_root(Path(cwd) if cwd else Path.cwd())
+    except Exception as exc:
+        result = unusable_write_root(exc)
     if fmt == OutputFormat.JSON:
         print(json.dumps(result, indent=2))
     elif result["ok"]:
