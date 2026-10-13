@@ -549,6 +549,9 @@ clawpm lease heartbeat --task <id>
 clawpm lease release --task <id>
 clawpm lease sweep [--dry-run]
 
+# Pre-merge head attestation (read-only; prints the merge line, never runs it)
+clawpm pr verify <N> [--expect-head <full-sha>] [--repo owner/name] [--remote fork]
+
 # Tournament selection
 clawpm judge tournament \
     --rubric-file rubric.md \
