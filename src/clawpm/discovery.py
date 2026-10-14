@@ -675,7 +675,7 @@ def _read_project_id_from_settings(settings_file: Path) -> str | None:
     # TOML parse failed - try regex extraction of the id field only.
     # This handles the common case where only repo_path has backslashes.
     try:
-        text = settings_file.read_text(encoding="utf-8", errors="replace")
+        text = settings_file.read_text(encoding="utf-8-sig", errors="replace")
         match = re.search(r'^id\s*=\s*"([^"]+)"', text, re.MULTILINE)
         if match:
             return match.group(1)

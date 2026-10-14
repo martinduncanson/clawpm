@@ -186,7 +186,7 @@ def active_dispatch_dirs(
     # Map abs-target-dir -> latest action for THIS (task_id, project_id)
     latest: dict[str, str] = {}
     try:
-        for line in path.read_text(encoding="utf-8", errors="strict").splitlines():
+        for line in path.read_text(encoding="utf-8-sig", errors="strict").splitlines():
             line = line.strip()
             if not line:
                 continue

@@ -173,7 +173,7 @@ def read_entries(
 
     entries: list[WorkLogEntry] = []
 
-    with open(worklog_path, encoding="utf-8") as f:
+    with open(worklog_path, encoding="utf-8-sig") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -221,7 +221,7 @@ def get_logged_commit_hashes(
         return set()
 
     hashes: set[str] = set()
-    with open(worklog_path, encoding="utf-8") as f:
+    with open(worklog_path, encoding="utf-8-sig") as f:
         for line in f:
             line = line.strip()
             if not line:

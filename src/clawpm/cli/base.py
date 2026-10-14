@@ -181,7 +181,7 @@ def _read_patterns_file(path: str, option_name: str, fmt) -> list[str]:
             fmt=fmt,
         )
         sys.exit(1)
-    lines = p.read_text(encoding="utf-8").splitlines()
+    lines = p.read_text(encoding="utf-8-sig").splitlines()
     return [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
 
 

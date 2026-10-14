@@ -571,7 +571,7 @@ def _load_ledger(portfolio_root: Path) -> tuple[dict[str, SessionRecord], bool]:
         # feature, likely to run in parallel with other dispatches) could
         # transiently disable session resolution for every OTHER already-
         # registered worktree, not just the one racing this read.
-        raw = retry_transient(lambda: path.read_text(encoding="utf-8", errors="replace"))
+        raw = retry_transient(lambda: path.read_text(encoding="utf-8-sig", errors="replace"))
     except OSError as exc:
         # error, not warning (Codex P1, PR #55): this is the fail-open path
         # that most directly recreates CLAWP-098's original corruption —
