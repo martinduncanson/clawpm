@@ -553,6 +553,8 @@ clawpm lease sweep [--dry-run]
 clawpm sessions write-root [--cwd <dir>]  # JSON {ok, root, task_id, project_id}; exit 0 found, 1 not in a dispatched worktree (ok=false, reason no_dispatch_marker), 3 marker unusable, any unexpected resolve error, or a resolved root that cannot be written to a closed pipe (ok=false, reason marker_unusable)
 # Pre-merge head attestation (read-only; prints the merge line, never runs it)
 clawpm pr verify <N> [--expect-head <full-sha>] [--repo owner/name] [--remote fork]
+# Post-merge landing from the MAIN checkout: verify PR merged + on remote base, ff, mark done, commit only the task paths
+clawpm tasks land <id> --pr <N> [--push] [--remove-worktree] [--repo owner/name] [--remote fork]  # exit 1 = refused, nothing changed; exit 2 = failed after the ff began
 
 # Tournament selection
 clawpm judge tournament \

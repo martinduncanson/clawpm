@@ -804,6 +804,61 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_ids: tuple[str,
     _render_state_results(results, new_state, project_id, fmt, batch=batch)
 
 
+@tasks.command("land")
+@click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
+@click.argument("task_id")
+@click.option("--pr", "pr_number", type=int, required=True, help="The merged pull request that delivered this task")
+@click.option("--push", "push", is_flag=True, help="Push the landing commit and verify the remote head equals local HEAD")
+@click.option("--remove-worktree", "remove_worktree", is_flag=True, help="Remove the task's worktree afterwards (plain `git worktree remove`; never forced)")
+@click.option("--repo", "repo", default=None, help="owner/name (default: derived from --remote)")
+@click.option("--remote", "remote", default="fork", show_default=True, help="Git remote holding the base branch")
+@click.pass_context
+def tasks_land(ctx: click.Context, project_id: str | None, task_id: str, pr_number: int, push: bool, remove_worktree: bool, repo: str | None, remote: str) -> None:
+    """Book a merged PR from the main checkout (CLAWP-147-002).
+
+    Verifies the PR is MERGED and its merge commit is on <remote>/<base>,
+    fast-forwards the checked-out base branch, marks the task done and commits
+    ONLY the task's own paths (no attribution trailer). Never merges, never
+    forces, never deletes a branch.
+
+    Refuses with nothing changed (exit 1) when: the PR is not merged or its
+    merge commit is not on the remote base; any tracked path outside the task's
+    own files is modified (the path is named); the command runs inside a linked
+    (dispatched) worktree or on the wrong branch; or the fast-forward is not
+    clean. Exit 2 means a step failed AFTER the fast-forward began; the error
+    says what was done and nothing is undone. ``git fetch`` is the only thing a
+    refusal can have touched (remote-tracking refs).
+    """
+    from clawpm.land import LandError, land_task
+
+    fmt = get_format(ctx)
+    config = require_portfolio(ctx)
+    project_id, _ = require_project(ctx, project_id)
+    task_id = expand_task_id(task_id, project_id)
+    try:
+        result = land_task(
+            config, project_id, task_id, pr_number,
+            push=push, remove_worktree=remove_worktree, repo=repo, remote=remote,
+        )
+    except LandError as exc:
+        output_error(exc.code, exc.message, {**exc.details, "changed": exc.changed}, fmt=fmt)
+        sys.exit(2 if exc.changed else 1)
+
+    if fmt == OutputFormat.JSON:
+        output_json(result)
+    else:
+        click.echo(f"Landed {task_id} (PR #{pr_number}, {result['repo']}): commit {result['commit']['sha']}")
+        click.echo(f"  fast-forward {result['fast_forward']['from']} -> {result['fast_forward']['to']}")
+        for path in result["commit"]["files"]:
+            click.echo(f"  committed {path}")
+        if result["pushed"]:
+            click.echo(f"  pushed {result['pushed']['remote']}/{result['branch']} = {result['pushed']['head']}")
+        if result["worktree_removed"]:
+            click.echo(f"  removed worktree {result['worktree_removed']}")
+        for path in result["uncommitted_other"]:
+            click.echo(f"  left uncommitted (not a task path): {path}", err=True)
+
+
 @tasks.command("decompose")
 @click.option("--project", "-p", "project_id", help="Project ID (auto-detected if not specified)")
 @click.argument("parent_id")
