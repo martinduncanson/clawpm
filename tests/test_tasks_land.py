@@ -290,9 +290,13 @@ def real_repo(isolated_portfolio, tmp_path, monkeypatch):
     return isolated_portfolio, repo, bare, task, merge, pr
 
 
+def _fetch():
+    _REAL_RUN(["git", "fetch", "--no-recurse-submodules", "fork"], cwd=str(Path.cwd()), check=True, capture_output=True)
+
+
 def _land(task, pr, *extra, lie_after_push=None, timeout_on=None, on_merge=None, rewrite_merge=None, env=None, after_push=None, prefetch=True):
     if prefetch:  # `tasks land` never fetches: the operator runs `git fetch <remote>` first
-        _REAL_RUN(["git", "fetch", "--no-recurse-submodules", "fork"], cwd=str(Path.cwd()), check=True, capture_output=True)
+        _fetch()
     fake = RealGit(pr, lie_after_push, timeout_on, on_merge, rewrite_merge, after_push)
     with patch("subprocess.run", fake), patch.dict("os.environ", env or {}):
         res = _invoke(task.id, "--pr", "7", "-p", "test", "--repo", REPO, *extra)
@@ -355,8 +359,9 @@ def test_edit_to_the_tasks_own_file_refuses_before_any_mutation(real_repo):
     port, repo, bare, task, merge, pr = real_repo
     tf = port.tasks_dir / f"{task.id}.md"
     tf.write_text(tf.read_text(encoding="utf-8") + "\nA note.\n", encoding="utf-8", newline="")
+    _fetch()
     before = _refs(repo)
-    res, _ = _land(task, pr)
+    res, _ = _land(task, pr, prefetch=False)
     assert res.exit_code == 1 and "task_file_dirty" in res.output and '"changed": false' in res.output, res.output
     assert _refs(repo) == before
     assert "A note." in tf.read_text(encoding="utf-8")
@@ -493,8 +498,9 @@ def test_inherited_autostash_cannot_turn_a_refusal_into_a_mutation(real_repo, tm
     tf = port.tasks_dir / f"{task.id}.md"
     tf.write_text(tf.read_text(encoding="utf-8") + "\nlocal edit\n", encoding="utf-8", newline="")
     _g(repo, "config", "merge.autoStash", "true")
+    _fetch()
     before = _refs(repo)
-    res, _ = _land(task, _with_merge(pr, new))
+    res, _ = _land(task, _with_merge(pr, new), prefetch=False)
     assert res.exit_code == 1 and "task_file_dirty" in res.output, res.output
     assert _refs(repo) == before
     assert "local edit" in tf.read_text(encoding="utf-8")
@@ -504,8 +510,9 @@ def test_inherited_autostash_cannot_turn_a_refusal_into_a_mutation(real_repo, tm
 def test_pr_that_renames_the_task_file_refuses_before_the_ff(real_repo, tmp_path):
     port, repo, bare, task, merge, pr = real_repo
     new = _advance(tmp_path, edit=lambda other: _g(other, "mv", f".project/tasks/{task.id}.md", f".project/tasks/{task.id}.progress.md"))
+    _fetch()
     before = _refs(repo)
-    res, _ = _land(task, _with_merge(pr, new))
+    res, _ = _land(task, _with_merge(pr, new), prefetch=False)
     assert res.exit_code == 1 and "task_missing_at_tip" in res.output and '"changed": false' in res.output, res.output
     assert _refs(repo) == before
 
@@ -986,7 +993,7 @@ def test_extra_remote_tag_refspec_cannot_move_a_local_tag(real_repo):
     assert res.exit_code == 1 and "remote_not_fetched" in res.output, res.output
     assert _refs(repo) == before
     # even with the tracking ref current (operator fetched the branch only), the landing leaves the tag alone
-    _g(repo, "update-ref", "refs/remotes/fork/main", merge)
+    _g(repo, "fetch", "--no-tags", "fork", "+refs/heads/main:refs/remotes/fork/main")
     tag = _g(repo, "rev-parse", "v1")
     res, _ = _land(task, pr, prefetch=False)
     assert res.exit_code == 0, res.output
