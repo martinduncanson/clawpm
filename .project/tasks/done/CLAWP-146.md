@@ -3,7 +3,7 @@ baseline_ref: 4bdaf22
 created: '2026-10-11'
 id: CLAWP-146
 priority: 6
-updated: '2026-10-11'
+updated: '2026-10-14'
 ---
 # BOM class: inbox and lease readers skip a BOM-prefixed first record (and settings TOML rejects BOM)
 
