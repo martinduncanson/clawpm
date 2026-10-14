@@ -215,7 +215,8 @@ def quick_next(ctx: click.Context, project_id: str | None, batch_mode: bool, fro
     if frontier_root is not None:
         if batch_mode:
             raise click.UsageError("--frontier cannot be combined with --batch.")
-        project_id, _ = require_project(ctx, project_id)
+        # Read-only query: never auto-init a .project/ from an untracked repo.
+        project_id, _ = require_project(ctx, project_id, auto_init=False)
         render_frontier(config, project_id, frontier_root, fmt)
         return
 

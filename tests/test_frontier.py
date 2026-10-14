@@ -124,3 +124,53 @@ def test_unknown_root_errors(isolated_portfolio):
         main, ["--project", iso.project_id, "next", "--frontier", "NOPE-999"]
     )
     assert res.exit_code == 1
+
+
+def test_tasks_list_frontier_refuses_conflicting_filters(isolated_portfolio):
+    iso = isolated_portfolio
+    root = add_task(iso.config, iso.project_id, title="Root",
+                    predictions=Predictions(success_criteria=["c"]))
+    cases = [
+        (["--state", "done"], "--state"),
+        (["--tag", "x"], "--tag"),
+        (["--all-tags"], "--all-tags"),
+        (["--priority", "<=3"], "--priority"),
+        (["--text", "foo"], "--text"),
+        (["--regex"], "--regex"),
+        (["--complexity", "s"], "--complexity"),
+        (["--parent", "X-1"], "--parent"),
+        (["--linked", "X-1"], "--linked"),
+        (["--limit", "0"], "--limit"),
+        (["--flat"], "--flat"),
+        (["--include-archived"], "--include-archived"),
+    ]
+    for extra, name in cases:
+        res = CliRunner().invoke(
+            main,
+            ["--format", "json", "--project", iso.project_id, "tasks", "list",
+             "--frontier", root.id, *extra],
+        )
+        assert res.exit_code != 0, (extra, res.output)
+        assert name in res.output, (extra, res.output)
+        assert '"frontier"' not in res.output
+
+    # several at once are all named in one message
+    res = CliRunner().invoke(
+        main,
+        ["--project", iso.project_id, "tasks", "list", "--frontier", root.id,
+         "--state", "done", "--limit", "1"],
+    )
+    assert res.exit_code != 0
+    assert "--state" in res.output and "--limit" in res.output
+
+
+def test_frontier_commands_do_not_auto_init_untracked_repo(isolated_portfolio, monkeypatch):
+    iso = isolated_portfolio
+    repo = iso.root / "projects" / "untracked-repo"
+    (repo / ".git").mkdir(parents=True)
+    monkeypatch.chdir(repo)
+    for argv in (["next", "--frontier", "X-1"], ["tasks", "list", "--frontier", "X-1"]):
+        res = CliRunner().invoke(main, argv)
+        assert res.exit_code != 0, res.output
+        assert "Auto-initialized" not in res.output
+        assert not (repo / ".project").exists(), argv

@@ -62,7 +62,7 @@ def tasks(ctx: click.Context) -> None:
 )
 @click.option(
     "--frontier", "frontier_root", default=None,
-    help="Show the actionable frontier under this root task (CLAWP-111-004): ready, blocked (waiting_on) and claimed (lease holder). Single project; other filters are ignored.",
+    help="Show the actionable frontier under this root task (CLAWP-111-004): ready, blocked (waiting_on) and claimed (lease holder). Single project; combining with other filters (--state, --tag, --limit, ...) is refused.",
 )
 @click.pass_context
 def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, flat: bool, tags: tuple[str, ...], all_tags: bool, text: str | None, use_regex: bool, priority: str | None, complexities: tuple[str, ...], parent: str | None, linked: str | None, limit: int | None, all_projects: bool, include_archived: bool, frontier_root: str | None = None) -> None:
@@ -76,7 +76,28 @@ def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, fl
     if frontier_root is not None:
         if all_projects:
             raise click.UsageError("--frontier cannot be combined with --all-projects.")
-        project_id, _ = require_project(ctx, project_id)
+        conflicting = [
+            flag for flag, is_set in (
+                ("--state", state is not None),
+                ("--flat", flat),
+                ("--tag", bool(tags)),
+                ("--all-tags", all_tags),
+                ("--text", text is not None),
+                ("--regex", use_regex),
+                ("--priority", priority is not None),
+                ("--complexity", bool(complexities)),
+                ("--parent", parent is not None),
+                ("--linked", linked is not None),
+                ("--limit", limit is not None),
+                ("--include-archived", include_archived),
+            ) if is_set
+        ]
+        if conflicting:
+            raise click.UsageError(
+                "--frontier cannot be combined with " + ", ".join(conflicting) + "."
+            )
+        # Read-only query: never auto-init a .project/ from an untracked repo.
+        project_id, _ = require_project(ctx, project_id, auto_init=False)
         render_frontier(config, project_id, frontier_root, fmt)
         return
 
