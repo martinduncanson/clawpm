@@ -1151,3 +1151,79 @@ def test_tip_that_adds_the_child_already_done_still_lands(real_repo, tmp_path):
     res, _ = _land(task, _with_merge(pr, new))
     assert res.exit_code == 0, res.output
     assert (port.tasks_dir / "done" / f"{tid}.md").exists()
+
+
+# --------------------------------------------------------------------------
+# r12 (CLAWP-147-002): ORIG_HEAD is restored on a failed ff; one validator
+# --------------------------------------------------------------------------
+
+
+def _orig_head(repo):
+    p = repo / ".git" / "ORIG_HEAD"
+    return p.read_bytes() if p.exists() else None
+
+
+def _failed_ff_untouched(real_repo_ctx, pre_set: bool):
+    port, repo, bare, task, merge, pr = real_repo_ctx
+    (repo / "feature.txt").write_text("local collision\n", encoding="utf-8")  # untracked; the PR adds the same path
+    _fetch()
+    if pre_set:  # a sha that is NOT HEAD, so a git-written ORIG_HEAD would differ from it
+        _g(repo, "update-ref", "ORIG_HEAD", merge)
+    _g(repo, "update-index", "--refresh")
+    snap, refs, orig = _snapshot(repo), _refs(repo), _orig_head(repo)
+    assert (orig is not None) == pre_set
+    tags = _g(repo, "tag", "-l")
+    res, _ = _land(task, pr, prefetch=False)
+    assert res.exit_code == 1 and "ff_failed" in res.output and '"changed": false' in res.output, res.output
+    assert _snapshot(repo) == snap and _refs(repo) == refs and _g(repo, "tag", "-l") == tags
+    assert _orig_head(repo) == orig
+
+
+def test_failed_ff_leaves_orig_head_absent_when_it_was_absent(real_repo):
+    _failed_ff_untouched(real_repo, pre_set=False)
+
+
+def test_failed_ff_restores_a_pre_set_orig_head(real_repo):
+    _failed_ff_untouched(real_repo, pre_set=True)
+
+
+def test_precheck_and_transition_share_the_one_validator(real_repo):
+    port, repo, bare, task, merge, pr = real_repo
+    (port.tasks_dir / f"{task.id}-C1.md").write_bytes(
+        f"---\nid: {task.id}-C1\nparent: {task.id}\ncreated: '2026-10-14'\npriority: 5\n---\n# child\n".encode("utf-8")
+    )
+    import clawpm.tasks as tasks_mod
+    real = tasks_mod.validate_done_transition
+    seen: list[str | None] = []
+
+    def spy(*a, **kw):
+        out = real(*a, **kw)
+        seen.append(out.code if out else None)
+        return out
+
+    with patch("clawpm.tasks.validate_done_transition", spy):
+        _fetch()
+        res, _ = _land(task, pr, prefetch=False)
+        assert res.exit_code == 1 and "subtasks_incomplete" in res.output
+        from clawpm.services.tasks import transition
+        out = transition(port.config, project_id="test", task_id=task.id, new_state="done")
+    assert out["ok"] is False
+    assert len(seen) == 2 and seen[0] == seen[1] == "subtasks_incomplete", seen
+
+
+def test_transition_accepts_a_done_dir_that_is_a_symlink_to_a_directory(isolated_portfolio, tmp_path):
+    from clawpm.services.tasks import transition
+
+    task = add_task(isolated_portfolio.config, "test", "Symlinked done dir")
+    real_done = tmp_path / "elsewhere"
+    real_done.mkdir()
+    done = isolated_portfolio.tasks_dir / "done"
+    if done.is_dir() and not done.is_symlink():
+        done.rmdir()
+    try:
+        done.symlink_to(real_done, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks need privileges here")
+    out = transition(isolated_portfolio.config, project_id="test", task_id=task.id, new_state="done")
+    assert out["ok"] is True, out
+    assert (real_done / f"{task.id}.md").exists()

@@ -1912,13 +1912,25 @@ def validate_done_transition(
     return None
 
 
-def _lstat_kind(path: Path) -> str:
-    """absent | dir | other, by lstat (a symlink, even to a directory, is ``other``)."""
+def _lstat_kind(path: Path, *, follow_dir_symlink: bool = False) -> str:
+    """absent | dir | other, by lstat (a symlink is ``other``).
+
+    ``follow_dir_symlink`` counts a symlink whose target is a directory as a
+    directory (what ``mkdir(exist_ok=True)`` always accepted); a dangling
+    symlink or one to a file stays ``other``.
+    """
     try:
         st = os.lstat(path)
     except (FileNotFoundError, NotADirectoryError):
         return "absent"
-    return "dir" if stat.S_ISDIR(st.st_mode) else "other"
+    if stat.S_ISDIR(st.st_mode):
+        return "dir"
+    if follow_dir_symlink and stat.S_ISLNK(st.st_mode):
+        try:
+            return "dir" if stat.S_ISDIR(os.stat(path).st_mode) else "other"
+        except OSError:
+            return "other"
+    return "other"
 
 
 def gather_done_destination(
@@ -1936,7 +1948,7 @@ def gather_done_destination(
     done_dir = tasks_dir / "done"
     leaf = done_dir / (task.id if is_directory_task else f"{task.id}.md")
     current = task.file_path.parent if is_directory_task else task.file_path
-    done_kind = _lstat_kind(done_dir)
+    done_kind = _lstat_kind(done_dir, follow_dir_symlink=True)
     return DestinationFacts(
         done_dir=done_kind,
         leaf=_lstat_kind(leaf) if done_kind == "dir" else "absent",

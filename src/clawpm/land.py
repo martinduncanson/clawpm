@@ -12,8 +12,10 @@ the local ``<remote>/<base>`` ref must already equal the remote's tip. The task
 file must also be clean and byte-identical at HEAD and at that tip, so
 eligibility is judged on one agreed version. After the fast-forward starts, a
 failure raises a :class:`LandError` with ``changed=True`` and says what was and
-was not done. There is no recovery step of any kind: no reset, no force, no
-branch delete. ``--remove-worktree`` uses plain ``git worktree remove`` (git
+was not done. There is no recovery step of any kind (no reset, no force, no
+branch delete) with ONE exception: a failed fast-forward restores ``ORIG_HEAD``
+(git writes it before it can refuse) to its exact prior bytes, or deletes it if
+it was absent, so a refused landing leaves no trace in the git directory. ``--remove-worktree`` uses plain ``git worktree remove`` (git
 itself refuses a dirty one).
 
 Every ref read uses the verified tip SHA, never the ``<remote>/<base>`` name (a
@@ -157,17 +159,50 @@ def _status_entries(cwd: Path, *, untracked: str, changed: bool = False) -> list
     return [(e[:2], e[3:]) for e in raw.split("\0") if len(e) > 3]  # "XY path"
 
 
-def _checkout_state(cwd: Path, *, changed: bool = False) -> tuple[str, str, str]:
-    """HEAD, the logical index (stat-independent) and the status including untracked files.
+_GIT_DIR_STATE_FILES = ("ORIG_HEAD", "MERGE_HEAD", "MERGE_MODE", "MERGE_MSG", "SQUASH_MSG")
+
+
+def _git_dir_state(cwd: Path, *, changed: bool = False) -> tuple[tuple[str, bytes | None], ...]:
+    """Bytes of the merge bookkeeping files in the --git-dir (``None`` when absent) plus every ref."""
+    git_dir = Path(_out(["rev-parse", "--absolute-git-dir"], cwd, changed=changed))
+    files: list[tuple[str, bytes | None]] = []
+    for name in _GIT_DIR_STATE_FILES:
+        try:
+            files.append((name, (git_dir / name).read_bytes()))
+        except FileNotFoundError:
+            files.append((name, None))
+        except OSError as exc:
+            raise LandError("git_failed", f"could not read {git_dir / name}: {exc}", changed=changed)
+    refs = _git(["for-each-ref", "--format=%(refname) %(objectname)"], cwd, changed=changed).stdout or ""
+    return (*files, ("refs", refs.encode("utf-8", "replace")))
+
+
+def _restore_orig_head(cwd: Path, before: tuple[tuple[str, bytes | None], ...]) -> None:
+    """Put ORIG_HEAD back exactly as it was (failed ff only); best effort, the caller re-compares."""
+    wanted = dict(before).get("ORIG_HEAD")
+    try:
+        path = Path(_out(["rev-parse", "--absolute-git-dir"], cwd, changed=True)) / "ORIG_HEAD"
+        if wanted is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_bytes(wanted)
+    except (OSError, LandError):
+        pass  # the comparison that follows reports changed=True
+
+
+def _checkout_state(cwd: Path, *, changed: bool = False) -> tuple:
+    """HEAD, the logical index, the status including untracked files, and the git-dir bookkeeping.
 
     A failed merge can leave the index or working files changed while HEAD has
     not moved (git updates them before the ref), so "nothing changed" is
-    decided by comparing this tuple before and after, never HEAD alone.
+    decided by comparing this tuple before and after, never HEAD alone. The
+    last element covers ORIG_HEAD / MERGE_* / SQUASH_MSG and every ref.
     """
     return (
         _out(["rev-parse", "HEAD"], cwd, changed=changed),
         _git(["ls-files", "--stage", "-z"], cwd, changed=changed).stdout or "",
         _git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames", "--ignore-submodules=none"], cwd, changed=changed).stdout or "",
+        _git_dir_state(cwd, changed=changed),
     )
 
 
@@ -577,6 +612,7 @@ def land_task(
         # A failed merge can have updated the index or files before the ref, so
         # compare the whole checkout state, not HEAD alone; if it cannot be read, assume changed.
         try:
+            _restore_orig_head(toplevel, state_before[3])  # git writes it before refusing
             changed = _checkout_state(toplevel) != state_before
             after = _out(["rev-parse", "HEAD"], toplevel)
         except LandError:
