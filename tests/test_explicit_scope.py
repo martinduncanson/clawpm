@@ -305,3 +305,41 @@ class TestIsTaskStoreCanonicalScope:
         monkeypatch.chdir(fx["elsewhere"])
         assert is_task_store_canonical(cfg, "test")
         assert not is_task_store_canonical(cfg, "test", scope=Scope.bound(fx["wt"]))
+
+
+class TestRound2Findings:
+    """CLAWP-136 Codex r1: RuntimeError from resolve() and pinned stores."""
+
+    def test_resolve_runtimeerror_logs_and_falls_back(self, fx, monkeypatch, caplog):
+        from clawpm.sessions import resolve_path_or_none
+
+        real_resolve = Path.resolve
+
+        def loop(self, *a, **kw):
+            # Python 3.11 raises RuntimeError("Symlink loop ...") here.
+            if self.name == "symlink-loop":
+                raise RuntimeError("Symlink loop from 'symlink-loop'")
+            return real_resolve(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "resolve", loop)
+        with caplog.at_level("ERROR"):
+            assert resolve_path_or_none(fx["elsewhere"] / "symlink-loop") is None
+            scope = resolve_scope(
+                fx["config"], "test", fx["elsewhere"] / "symlink-loop"
+            )
+        assert scope == Scope.canonical()
+        assert any("Symlink loop" in r.getMessage() for r in caplog.records)
+
+    def test_pinned_store_canonicality(self, fx, monkeypatch):
+        from clawpm.discovery import is_task_store_canonical
+
+        cfg = fx["config"]
+        assert not is_task_store_canonical(
+            cfg, "test", scope=Scope.pinned(fx["wt_meta"])
+        )
+        assert is_task_store_canonical(
+            cfg, "test", scope=Scope.pinned(fx["canon"])
+        )
+        assert is_task_store_canonical(cfg, "test")
+        monkeypatch.chdir(fx["wt"])
+        assert not is_task_store_canonical(cfg, "test")

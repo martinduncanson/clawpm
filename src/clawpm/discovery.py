@@ -373,7 +373,18 @@ def is_task_store_canonical(
     CLAWP-136: an explicit *scope* answers for that scope rather than the
     ambient one; ``scope=None`` is the ambient behaviour above.
     """
+    if scope is not None and scope.pinned_project_dir is not None:
+        # An explicitly pinned store is canonical only if it IS the project's
+        # canonical store (Codex r1 P2, PR #110); unknown project => not.
+        project = get_project(config, project_id)
+        if not (project and project.project_dir):
+            return False
+        return _same_dir(scope.pinned_project_dir, project.project_dir / ".project")
     return _session_scoped_project_dir(config, project_id, scope=scope) is None
+
+
+def _same_dir(a: Path, b: Path) -> bool:
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
 
 
 def get_repo_path(
