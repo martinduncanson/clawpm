@@ -232,7 +232,8 @@ def resolve_path_or_none(
     """
     try:
         return Path(path).resolve()
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
+        # RuntimeError: Python 3.11 raises it (not OSError) for a symlink loop.
         logger.error("Failed to resolve cwd %s: %s. %s", path, exc, fallback)
         return None
 
@@ -946,7 +947,14 @@ def _resolve_write_root(cwd: Path) -> dict:
     # Lazy: dispatch imports this module at load time.
     from .dispatch import inspect_dispatch_marker, settings_path
 
-    resolved = resolve_path_or_none(cwd)
+    # Not resolve_path_or_none: that also swallows RuntimeError (symlink
+    # loop), which here must stay loud ("unexpected RuntimeError" via the
+    # caller's catch-all) so a hook never reads it as "no fence".
+    try:
+        resolved: Optional[Path] = Path(cwd).resolve()
+    except OSError as exc:
+        logger.error("Failed to resolve cwd %s: %s.", cwd, exc)
+        resolved = None
     if resolved is None:
         return {
             "ok": False,

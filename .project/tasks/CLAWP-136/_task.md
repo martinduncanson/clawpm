@@ -1,5 +1,7 @@
 ---
 baseline_ref: 34facb4
+children:
+- CLAWP-136-001
 created: '2026-10-06'
 id: CLAWP-136
 predictions:
@@ -9,7 +11,7 @@ predictions:
   duration_min: 120
   filled_by: agent
 priority: 5
-updated: '2026-10-06'
+updated: '2026-10-14'
 ---
 # CLAWP-122 follow-ups: guard dispatch --target-dir resolve; migrate hand-scoped sites to explicit Scope
 
