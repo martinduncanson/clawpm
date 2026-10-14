@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 import subprocess
 import tempfile
 from pathlib import Path
@@ -182,34 +183,22 @@ def _worktree_blocker(wt: Path) -> tuple[str, str] | None:
     return None
 
 
-def _check_task_eligible(task, status: dict, task_id: str) -> None:
-    """Refuse a task that ``transition()`` would refuse (done, a decision, open children)."""
-    if task.state == TaskState.DONE:
-        raise LandError("task_already_done", f"{task_id} is already done; nothing to land")
-    if task.kind == "decision":
-        raise LandError(
-            "decision_needs_resolution",
-            f"{task_id} is a decision task; close it with `tasks state {task_id} done --resolution ...`",
-        )
-    if status["incomplete"] or status["missing"]:
-        raise LandError(
-            "subtasks_incomplete",
-            f"{task_id} has incomplete subtasks",
-            {"incomplete": [c["id"] for c in status["incomplete"]], "missing": list(status["missing"])},
-        )
+def _task_at_tip(config, project_id: str, task_id: str, toplevel: Path, tasks_dir: Path, tip: str, target: str) -> None:
+    """Refuse now if the task cannot be marked done on the post-fast-forward tree.
 
-
-def _task_at_tip(config, project_id: str, task_id: str, toplevel: Path, tasks_dir: Path, tip: str, target: str) -> bool:
-    """Refuse now if the task, as it exists at the verified tip, is not landable.
-
-    The fast-forward replaces the task files, so eligibility (open children,
-    decision kind) and the task's shape read from the current checkout can be
-    stale in either direction. The tip's task directory is extracted to a temp
-    dir and read through a pinned Scope, with no mutation of the checkout.
-    Returns True when the task is decomposed (``<ID>/_task.md``) at the tip.
+    The fast-forward replaces the task files, so eligibility read from the
+    current checkout can be stale in either direction. The post-ff task tree is
+    simulated in a temp dir: the tip's blobs plus the local task files the ff
+    leaves in place (untracked or ignored ones, which can hold an open child).
+    The task and its rollup are read from that tree through a pinned Scope, then
+    judged by the SAME validator ``transition()`` uses, together with the
+    ``done/`` destination as it will be after the ff. Nothing in the checkout
+    is mutated.
     """
     from clawpm.sessions import Scope
-    from clawpm.tasks import get_task, parent_rollup_status
+    from clawpm.tasks import (
+        DestinationFacts, get_task, parent_rollup_status, validate_done_transition,
+    )
 
     try:
         tasks_rel = _rel(tasks_dir, toplevel)
@@ -219,13 +208,50 @@ def _task_at_tip(config, project_id: str, task_id: str, toplevel: Path, tasks_di
     # export-ignore / export-subst attributes (from the tip or info/attributes).
     listing = _git(["ls-tree", "-r", "-z", "--full-tree", tip, "--", tasks_rel], toplevel, binary=True).stdout
     entries = []
+    tip_paths: set[str] = set()
     for rec in listing.split(b"\0"):
         meta, _, name = rec.partition(b"\t")
         parts = meta.split()
-        if len(parts) == 3 and parts[1] == b"blob" and parts[0] != b"120000":  # symlinks are not task files
-            entries.append((parts[2], name.decode("utf-8", "replace")))
+        if len(parts) != 3:
+            continue
+        name_s = name.decode("utf-8", "replace")
+        tip_paths.add(name_s)
+        if parts[1] == b"blob" and parts[0] != b"120000":  # symlinks are not task files
+            entries.append((parts[2], name_s))
     if not entries:
         raise LandError("task_missing_at_tip", f"{tasks_rel} does not exist in {target}; cannot validate {task_id} there")
+    tracked = {
+        p for p in (_git(["ls-files", "-z", "--", tasks_rel], toplevel).stdout or "").split("\0") if p
+    }
+
+    def tracked_at_head(rel: str) -> bool:
+        return rel in tracked or any(p.startswith(rel + "/") for p in tracked)
+
+    def unverifiable(why: str) -> LandError:
+        return LandError(
+            "task_tree_unverifiable",
+            f"cannot simulate the task tree after the fast-forward ({why}); landing {task_id} refused",
+            {"reason": why},
+        )
+
+    def kind_at_tip(rel: str) -> str:
+        """absent | dir | other for ``rel`` once the ff has been applied."""
+        out = _git(["ls-tree", "-z", "--full-tree", tip, "--", rel], toplevel, binary=True).stdout
+        for rec in out.split(b"\0"):
+            meta, _, name = rec.partition(b"\t")
+            parts = meta.split()
+            if len(parts) == 3 and name.decode("utf-8", "replace") == rel:
+                return "dir" if parts[1] == b"tree" else "other"
+        if tracked_at_head(rel):  # removed by the ff
+            return "absent"
+        try:
+            st = os.lstat(toplevel / rel)
+        except (FileNotFoundError, NotADirectoryError):
+            return "absent"
+        except OSError as exc:
+            raise unverifiable(f"{rel}: {exc}")
+        return "dir" if stat.S_ISDIR(st.st_mode) else "other"
+
     blobs = _git(["cat-file", "--batch"], toplevel, stdin=b"".join(oid + b"\n" for oid, _ in entries)).stdout
     with tempfile.TemporaryDirectory(prefix="clawpm-land-") as tmp:
         root = Path(tmp).resolve()
@@ -242,12 +268,63 @@ def _task_at_tip(config, project_id: str, task_id: str, toplevel: Path, tasks_di
                 continue
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(data)
+
+        # Local task files that survive the ff: not in the tip (which wins) and
+        # not tracked at HEAD (those vanish with it). The task's own done/
+        # destination is judged below as a destination fact, not as a task file.
+        own_leaf = f"done/{task_id}"
+
+        def is_destination(rel_in_tasks: str) -> bool:
+            return rel_in_tasks in (own_leaf, f"{own_leaf}.md") or rel_in_tasks.startswith(own_leaf + "/")
+
+        def fail_walk(exc: OSError) -> None:
+            raise exc
+
+        try:
+            for dirpath, dirnames, filenames in os.walk(tasks_dir, followlinks=False, onerror=fail_walk):
+                here = Path(dirpath)
+                for d in dirnames:
+                    rel_d = (here / d).relative_to(tasks_dir).as_posix()
+                    if os.path.islink(here / d) and not is_destination(rel_d):
+                        raise unverifiable(f"{(Path(tasks_rel) / rel_d).as_posix()} is a symlinked directory")
+                for fn in filenames:
+                    if not fn.endswith(".md"):
+                        continue
+                    rel_f = (here / fn).relative_to(tasks_dir).as_posix()
+                    full_rel = (Path(tasks_rel) / rel_f).as_posix()
+                    if full_rel in tip_paths or tracked_at_head(full_rel) or is_destination(rel_f):
+                        continue
+                    out_file = (root / full_rel).resolve()
+                    if root not in out_file.parents:
+                        continue
+                    out_file.parent.mkdir(parents=True, exist_ok=True)
+                    out_file.write_bytes((here / fn).read_bytes())
+        except OSError as exc:
+            raise unverifiable(str(exc))
+
         scope = Scope(pinned_project_dir=(root / tasks_rel).parent)
         tip_task = get_task(config, project_id, task_id, scope=scope)
         if tip_task is None:
             raise LandError("task_missing_at_tip", f"{task_id} does not exist in {target}; the PR removed or renamed it")
-        _check_task_eligible(tip_task, parent_rollup_status(config, project_id, tip_task, scope=scope), task_id)
-        return tip_task.file_path is not None and tip_task.file_path.name == "_task.md"
+        if tip_task.state == TaskState.DONE:
+            raise LandError("task_already_done", f"{task_id} is already done; nothing to land")
+        decomposed = tip_task.file_path is not None and tip_task.file_path.name == "_task.md"
+        done_rel = f"{tasks_rel}/done"
+        leaf_rel = f"{done_rel}/{task_id if decomposed else task_id + '.md'}"
+        done_kind = kind_at_tip(done_rel)
+        facts = DestinationFacts(
+            done_dir=done_kind,
+            leaf=kind_at_tip(leaf_rel) if done_kind != "other" else "absent",
+            leaf_is_current=False,
+            done_path=done_rel,
+            leaf_path=leaf_rel,
+        )
+        refusal = validate_done_transition(
+            task_id, tip_task.kind, None, False,
+            parent_rollup_status(config, project_id, tip_task, scope=scope), facts,
+        )
+        if refusal is not None:
+            raise LandError(refusal.code, refusal.message, refusal.details)
 
 
 def _check_task_file_agreed(toplevel: Path, rel: str, head: str, tip: str, target: str, task_id: str) -> None:
@@ -469,28 +546,11 @@ def land_task(
     #     so transition() can never judge a different file than the one checked.
     _check_task_file_agreed(toplevel, _rel(task.file_path, toplevel), before, tip, target, task_id)
 
-    # 5b. The task as it will exist at the verified tip (the ff replaces its files):
-    #     eligibility, then the done/ destination for THAT shape. Anything already
-    #     there, tracked at the tip or sitting in the checkout, would make the
-    #     post-ff move refuse, so refuse now instead.
+    # 5b. The task and its done/ destination as they will exist after the ff,
+    #     judged by the validator transition() itself uses. Anything that would
+    #     make the post-ff move refuse is refused here, before any mutation.
     if tasks_dir is not None:
-        decomposed = _task_at_tip(config, project_id, task_id, toplevel, tasks_dir, tip, target)
-        try:
-            done_rel = _rel(tasks_dir / "done" / (task_id if decomposed else f"{task_id}.md"), toplevel)
-        except ValueError:
-            done_rel = None
-        if done_rel and (toplevel / done_rel).exists():
-            raise LandError(
-                "done_destination_exists",
-                f"{done_rel} already exists in the checkout; move it aside before landing {task_id}",
-                {"path": done_rel},
-            )
-        if done_rel and (_git(["ls-tree", "--name-only", tip, "--", done_rel], toplevel).stdout or "").strip():
-            raise LandError(
-                "done_destination_exists",
-                f"{done_rel} already exists in {target}; resolve it before landing {task_id}",
-                {"path": done_rel},
-            )
+        _task_at_tip(config, project_id, task_id, toplevel, tasks_dir, tip, target)
 
     # 6. Optional worktree removal: refuse up front when it cannot succeed.
     wt_path: Path | None = None

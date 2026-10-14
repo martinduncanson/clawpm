@@ -1090,3 +1090,64 @@ def test_parent_whose_children_are_completed_at_the_tip_lands_without_a_manual_p
     res, _ = _land(task, _with_merge(pr, new))  # the local checkout still shows an open child
     assert res.exit_code == 0, res.output
     assert (port.tasks_dir / "done" / f"{tid}.md").exists()
+
+
+# --------------------------------------------------------------------------
+# r11 (CLAWP-147-002): the pre-check simulates the post-ff tree and shares
+# transition()'s validator
+# --------------------------------------------------------------------------
+
+
+def _refuses_untouched(real_repo_ctx, pr, code):
+    port, repo, bare, task, merge, _ = real_repo_ctx
+    _fetch()  # the operator's fetch is not part of the landing; snapshot after it
+    _g(repo, "update-index", "--refresh")
+    snap, refs = _snapshot(repo), _refs(repo)
+    res, _ = _land(task, pr, prefetch=False)
+    assert res.exit_code == 1 and code in res.output and '"changed": false' in res.output, res.output
+    assert _snapshot(repo) == snap and _refs(repo) == refs
+
+
+def test_untracked_open_child_in_the_checkout_refuses_before_the_ff(real_repo):
+    port, repo, bare, task, merge, pr = real_repo
+    (port.tasks_dir / f"{task.id}-C1.md").write_bytes(
+        f"---\nid: {task.id}-C1\nparent: {task.id}\ncreated: '2026-10-14'\npriority: 5\n---\n# child\n".encode("utf-8")
+    )
+    _refuses_untouched(real_repo, pr, "subtasks_incomplete")
+
+
+def test_untracked_regular_file_at_done_refuses_before_the_ff(real_repo):
+    port, repo, bare, task, merge, pr = real_repo
+    done = port.tasks_dir / "done"
+    if done.is_dir():
+        done.rmdir()  # empty, so nothing tracked is lost
+    done.write_text("not a directory\n", encoding="utf-8")
+    _refuses_untouched(real_repo, pr, "done_destination_not_directory")
+
+
+def test_dangling_symlink_at_the_done_leaf_refuses_before_the_ff(real_repo):
+    port, repo, bare, task, merge, pr = real_repo
+    done = port.tasks_dir / "done"
+    done.mkdir(exist_ok=True)
+    try:
+        (done / f"{task.id}.md").symlink_to(repo / "no-such-target.md")
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks need privileges here")
+    _refuses_untouched(real_repo, pr, "done_destination_exists")
+
+
+def test_tip_that_adds_the_child_already_done_still_lands(real_repo, tmp_path):
+    port, repo, bare, task, merge, pr = real_repo
+    tid = task.id
+
+    def edit(other):
+        d = other / ".project" / "tasks" / "done"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{tid}-C1.md").write_bytes(
+            f"---\nid: {tid}-C1\nparent: {tid}\ncreated: '2026-10-14'\npriority: 5\n---\n# child\n".encode("utf-8")
+        )
+
+    new = _advance(tmp_path, edit=edit)
+    res, _ = _land(task, _with_merge(pr, new))
+    assert res.exit_code == 0, res.output
+    assert (port.tasks_dir / "done" / f"{tid}.md").exists()
