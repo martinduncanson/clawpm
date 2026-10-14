@@ -26,6 +26,7 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 
 ### Changed
 
+- `skills/clawpm/SKILL.md` split into a ~13k-char core (always-on rules, quick start, routing table) plus eight on-demand files under `skills/clawpm/references/`; content moved verbatim apart from a few reworded lines, pointers to the reference files and a `--predicted-by` attribution note, with no behaviour change other than load order (token-audit cut 1).
 - MCP server tech-debt (#86, CLAWP-106): `tasks_state` gains `meta_reflect`/`process_lesson` (CLI parity); the `context` tool returns `project` as the plain id string with the metadata dict moved to `project_info` (BREAKING for consumers reading `context["project"]["id"]`); `ToolSpec.min_tier` is a `Literal` validated at construction; README no longer claims `--tools standard` widens the set; `build_agent_context` imports hoisted and docstring/module claims corrected.
 - SKILL.md doc cleanup: document `-f/--format` as the only output control (no `--json`), the `uv tool install`/`pipx` shim-only install, `doctor -p/--project`, the post-batch `tasks list` check, and the CLAWP-109 Windows glob fix state (#82, CLAWP-110).
 
