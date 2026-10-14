@@ -24,7 +24,7 @@ This core holds the always-on rules and the everyday commands. Everything else l
 | `references/multi-session.md` | Two sessions on one project, task-ID collisions, `.clawpm-tasks.lock`. |
 | `references/troubleshooting.md` | A clawpm command failed or dropped an argument, `ModuleNotFoundError`, Windows glob/`--scope` problems, `add_failed`. |
 
-The rules below stay inline on purpose: an agent that never opens a reference file must still obey them. The review and merge rules (no `/gemini review`, wait for Codex via `wait-for-codex.py`, never skip PRE-REVIEW for auth or data-storage changes) live only in `references/messaging-and-integrations.md`; read it before any commit, push, PR or merge.
+The rules below stay inline on purpose: an agent that never opens a reference file must still obey them. The review and merge rules (no `/gemini review`, wait for Codex via `wait-for-codex.py`, never skip PRE-REVIEW for auth, serialization, data-storage or silently-failing-invariant changes) live only in `references/messaging-and-integrations.md`; read it before any commit, push, PR or merge.
 
 ## When to use clawpm — defacto default
 
@@ -129,7 +129,7 @@ For high-stakes or complex tasks, also include the Phase 1.5 fields (`--success-
 **Reference class > intuition.** Before predicting, look at 1-3 prior similar tasks. Pass
 them via `--reference-task`. Empty `reference_tasks` = "I used the inside view only".
 
-Attribution: `--predicted-by` exists on `clawpm tasks add`, not on the `clawpm add` shortcut. Without it, predictions are recorded as `operator`. After the operator confirms or edits your proposal, pass `--predicted-by operator-edited`. Pass `agent` only for predictions the operator has not reviewed.
+Attribution: `--predicted-by` exists on `clawpm tasks add`, not on the `clawpm add` shortcut. Without it, the CLI records predictions as `operator`; the MCP `tasks_add` tool records `agent`. After the operator confirms or edits your proposal, pass `--predicted-by operator-edited`. Pass `agent` only for predictions the operator has not reviewed.
 
 ## Tips
 
@@ -149,4 +149,4 @@ Attribution: `--predicted-by` exists on `clawpm tasks add`, not on the `clawpm a
 - **Apply phase rubric:** "every decision with `status:approved` applied with an audit entry; **zero** writes lacking an approved decision ID."
 - The outcome ("tie-out / books balance") is the rubric **only** for the final close task, dispatched *after* the human sign-off exists.
 
-**Never `--worktree`-dispatch a task that mutates a single shared store.** Worktree isolation is built for parallel *code* work with disjoint file scopes (see the Scope-Aware Dispatch section in `references/dispatch-and-scope.md`). A task that appends to one shared ledger — a decisions store, `work_log.jsonl`, leases, any append-only state, **including clawpm's own JSONL stores** — must dispatch **in-place against the main repo dir**, or the ledger forks per worktree branch and records diverge or are lost. Worktree dispatch is for code; in-place dispatch is for state. `clawpm agent dispatch` is not covered by the CLAWP-098 worktree-mutator fix (it mints no session pointer): read `references/dispatch-and-scope.md` before running ID-based mutators inside its worktree.
+**Never `--worktree`-dispatch a task that mutates a single shared store.** Worktree isolation is built for parallel *code* work with disjoint file scopes (see the Scope-Aware Dispatch section in `references/dispatch-and-scope.md`). A task that appends to one shared ledger — a decisions store, `work_log.jsonl`, leases, any append-only state, **including clawpm's own JSONL stores** — must dispatch **in-place against the main repo dir**, or the ledger forks per worktree branch and records diverge or are lost. Worktree dispatch is for code; in-place dispatch is for state. `clawpm agent dispatch` is a separate path from the CLAWP-098 worktree-mutator fix: since CLAWP-115 it registers a session for its worktree only when the worktree carries its own `.project/`, and none otherwise. Read `references/dispatch-and-scope.md` before running ID-based mutators inside its worktree.
