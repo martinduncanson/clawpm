@@ -200,7 +200,8 @@ Hierarchical multi-level trees are expressed in one document via `parent_ref` �
 
 Every task carries predictions (duration, complexity, confidence, approach, pre-mortem, reference tasks). When done, actuals are computed from the work log. A structured reflection event is written to `~/clawpm/reflections/<task-id>.jsonl`.
 
-- `clawpm reflect summarize` — actual/predicted duration ratios bucketed by complexity / confidence / agent_profile.
+- `clawpm reflect summarize` — actual/predicted duration ratios bucketed by complexity / confidence / agent_profile. Also emits the spec 2.3 `calibration` block (Brier, calibration curve, overconfidence, log-MAE, bias, closure, miss categories); `--include-decisions` scores decision-kind tasks in that block (excluded by default).
+- `clawpm reflect scorecard [--project P] [--include-decisions] [--json]` — five-line calibration scorecard: closure, bias factor, Brier + n, overconfidence headline, top miss category / metareflection due; `--json` returns the calibration block.
 - `clawpm reflect suggest` — deflates a gut estimate by the learned median ratio (falls back to global ratio when a bucket has fewer than `--min-bucket` samples). Deterministic; no model call.
 - `clawpm reflect history-import` — back-fills the corpus by scanning historical session transcripts for task-ID mentions.
 - `clawpm reflect void` — marks a reflection event void (event-source discipline; appends a void marker, never deletes the original).
@@ -627,6 +628,9 @@ clawpm done CLAWP-042 \
 
 # Query the calibration corpus
 clawpm reflect summarize
+clawpm reflect summarize --include-decisions
+clawpm reflect scorecard
+clawpm reflect scorecard --json
 clawpm reflect suggest --complexity m --predicted-duration 2h
 clawpm reflect suggest CLAWP-042
 clawpm reflect history-import --source <dir>
