@@ -14,6 +14,7 @@ from clawpm.models import MISS_CATEGORIES, PortfolioConfig, Predictions, Project
 from clawpm.output import OutputFormat, output_error, output_json, output_success, output_task_detail, output_tasks_list
 from clawpm.discovery import (
     discover_projects, get_project, get_scoped_project_settings, is_task_store_canonical,
+    resolve_scope,
 )
 from clawpm.tasks import add_subtask, add_task, archive_done_tasks, change_task_state, distinct_tags, edit_fog, edit_task, get_task, list_tasks, split_task
 from clawpm.worklog import add_entry, filter_files_changed, read_entries
@@ -60,14 +61,46 @@ def tasks(ctx: click.Context) -> None:
     help="Fold archived done tasks (done/archive/) back into the listing (CLAWP-085). "
          "Only affects 'done' and 'all' scans.",
 )
+@click.option(
+    "--frontier", "frontier_root", default=None,
+    help="Show the actionable frontier under this root task (CLAWP-111-004): ready, blocked (waiting_on) and claimed (lease holder). Single project; combining with other filters (--state, --tag, --limit, ...) is refused.",
+)
 @click.pass_context
-def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, flat: bool, tags: tuple[str, ...], all_tags: bool, text: str | None, use_regex: bool, priority: str | None, complexities: tuple[str, ...], parent: str | None, linked: str | None, limit: int | None, all_projects: bool, include_archived: bool) -> None:
+def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, flat: bool, tags: tuple[str, ...], all_tags: bool, text: str | None, use_regex: bool, priority: str | None, complexities: tuple[str, ...], parent: str | None, linked: str | None, limit: int | None, all_projects: bool, include_archived: bool, frontier_root: str | None = None) -> None:
     """List tasks for a project (default: open+progress+blocked, use -s all for everything).
 
     ``--all-projects`` (CLAWP-084) spans every ACTIVE project instead of one.
     """
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
+
+    if frontier_root is not None:
+        if all_projects:
+            raise click.UsageError("--frontier cannot be combined with --all-projects.")
+        conflicting = [
+            flag for flag, is_set in (
+                ("--state", state is not None),
+                ("--flat", flat),
+                ("--tag", bool(tags)),
+                ("--all-tags", all_tags),
+                ("--text", text is not None),
+                ("--regex", use_regex),
+                ("--priority", priority is not None),
+                ("--complexity", bool(complexities)),
+                ("--parent", parent is not None),
+                ("--linked", linked is not None),
+                ("--limit", limit is not None),
+                ("--include-archived", include_archived),
+            ) if is_set
+        ]
+        if conflicting:
+            raise click.UsageError(
+                "--frontier cannot be combined with " + ", ".join(conflicting) + "."
+            )
+        # Read-only query: never auto-init a .project/ from an untracked repo.
+        project_id, _ = require_project(ctx, project_id, auto_init=False)
+        render_frontier(config, project_id, frontier_root, fmt)
+        return
 
     if all_projects:
         # CLAWP-084 — portfolio-wide view. --project scopes to a single project,
@@ -107,6 +140,43 @@ def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, fl
     # parent/child hierarchy is per-project and the merged task_map could
     # otherwise conflate identical ids from different projects.
     output_tasks_list(found_tasks, fmt=fmt, flat=flat, show_project=all_projects)
+
+
+def render_frontier(config: PortfolioConfig, project_id: str, root: str, fmt: OutputFormat) -> None:
+    """Shared body of ``next --frontier`` and ``tasks list --frontier`` (CLAWP-111-004)."""
+    from clawpm.tasks import frontier as _frontier
+
+    root_id = expand_task_id(root, project_id)
+    if get_task(config, project_id, root_id) is None:
+        output_error("task_not_found", f"Root task '{root_id}' not found in project '{project_id}'", fmt=fmt)
+        sys.exit(1)
+    result = _frontier(config, project_id, root_id) or {"frontier": [], "blocked": [], "claimed": []}
+    clear = not (result["frontier"] or result["blocked"] or result["claimed"])
+    if fmt == OutputFormat.JSON:
+        output_json({"root": root_id, **result, "message": "Map is clear: no open tasks under this root." if clear else None})
+        return
+    if clear:
+        click.echo(f"Map is clear: no open tasks under {root_id}.")
+        return
+    if result["frontier"]:
+        click.echo("Frontier (ready now):")
+        for t in result["frontier"]:
+            click.echo(f"  {t['title']} [{t['id']}]")
+    if result["blocked"]:
+        click.echo("Blocked:")
+        for t in result["blocked"]:
+            waiting = ", ".join(result_title_ref(config, project_id, w) for w in t["waiting_on"])
+            click.echo(f"  {t['title']} [{t['id']}] waiting on {waiting}")
+    if result["claimed"]:
+        click.echo("Claimed:")
+        for t in result["claimed"]:
+            click.echo(f"  {t['title']} [{t['id']}] held by {t['lease_holder'] or 'unknown holder'}")
+
+
+def result_title_ref(config: PortfolioConfig, project_id: str, task_id: str) -> str:
+    """``Title [ID]`` for a dependency id; ``[ID]`` alone only if it cannot be resolved."""
+    dep = get_task(config, project_id, task_id)
+    return f"{dep.title} [{task_id}]" if dep else f"[{task_id}]"
 
 
 def _collect_project_tasks(
@@ -1560,18 +1630,15 @@ def tasks_dispatch(
     # not found" / mutate a divergent copy. `resolve_scope_from` makes every
     # session lookup below key on the target. (`--worktree` is unchanged: see
     # the source-repo comment in the body.)
-    if target_dir is not None and not worktree:
-        from clawpm.sessions import resolve_scope_from
-
-        _scope = resolve_scope_from(Path(target_dir).resolve())
-    else:
-        _scope = nullcontext()
-    with _scope:
-        _tasks_dispatch_impl(
-            ctx, project_id, task_id, target_dir, worktree, no_session_context,
-            force, confirm_close, refute_votes, lease_ttl, fallback_policy,
-            confirm_stale, max_iterations,
-        )
+    #
+    # CLAWP-136: the scope is an explicit value resolved once in the impl
+    # (`discovery.resolve_scope`, which logs and falls back to canonical when
+    # the target cannot be resolved) and threaded to each scoped lookup.
+    _tasks_dispatch_impl(
+        ctx, project_id, task_id, target_dir, worktree, no_session_context,
+        force, confirm_close, refute_votes, lease_ttl, fallback_policy,
+        confirm_stale, max_iterations,
+    )
 
 
 def _tasks_dispatch_impl(
@@ -1600,6 +1667,14 @@ def _tasks_dispatch_impl(
     config = require_portfolio(ctx)
     project_id, _source = require_project(ctx, project_id)
     task_id = expand_task_id(task_id, project_id)
+
+    # Bind once. `None` (no --target-dir, or --worktree) keeps ambient
+    # resolution exactly as before.
+    scope = (
+        resolve_scope(config, project_id, target_dir=Path(target_dir))
+        if target_dir is not None and not worktree
+        else None
+    )
 
     # CLAWP-039: opportunistic lease sweep — one of the two no-daemon expiry
     # detectors (the other is `clawpm doctor`). A holder that died is reaped
@@ -1632,7 +1707,7 @@ def _tasks_dispatch_impl(
         swept = []
         sweep_error = f"{type(exc).__name__}: {exc}"
 
-    task = get_task(config, project_id, task_id)
+    task = get_task(config, project_id, task_id, scope=scope)
     if not task:
         output_error("task_not_found", f"No task with id '{task_id}'", fmt=fmt)
         sys.exit(1)
@@ -1672,7 +1747,7 @@ def _tasks_dispatch_impl(
             )
         else:
             from clawpm.discovery import get_repo_path as _get_repo_path_for_drift
-            _repo_for_drift = _get_repo_path_for_drift(config, project_id)
+            _repo_for_drift = _get_repo_path_for_drift(config, project_id, scope=scope)
         _drift_result = detect_scope_drift(
             repo_path=_repo_for_drift,
             scope=getattr(task, "scope", []),
@@ -1722,7 +1797,9 @@ def _tasks_dispatch_impl(
     # dispatch's live hooks untorn-down. Refuse up front rather than plumb
     # scope through the lease registry and every sweep call site — the
     # operator can dispatch without --lease-ttl for a worktree-scoped task.
-    if lease_ttl is not None and not is_task_store_canonical(config, project_id):
+    if lease_ttl is not None and not is_task_store_canonical(
+        config, project_id, scope=scope
+    ):
         output_error(
             "lease_unsupported_scope",
             f"Task {task_id!r} resolves from a registered worktree's own "

@@ -258,3 +258,88 @@ class TestLogAddExemplar:
         assert r.exit_code == 0, r.output
         assert seen_git_cwd and _same(seen_git_cwd[0], fx["wt"])
         assert stamps == [True]
+
+
+class TestDispatchTargetDirResolveGuard:
+    """CLAWP-136: ``tasks dispatch --target-dir`` must not crash when the
+    target cannot be resolved (same class as PR #75 Codex r1 P2 #2)."""
+
+    def test_unresolvable_target_dir_logs_and_does_not_crash(
+        self, fx, monkeypatch, caplog
+    ):
+        task = add_task(fx["config"], "test", "dispatch me")
+        bad = fx["elsewhere"] / "unavailable-volume"
+        real_resolve = Path.resolve
+        failed = []
+
+        def flaky(self, *a, **kw):
+            # Fail only the scope resolve (the first); later sites are not
+            # the guard under test.
+            if self.name == "unavailable-volume" and not failed:
+                failed.append(1)
+                raise OSError("simulated unavailable volume")
+            return real_resolve(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "resolve", flaky)
+        with caplog.at_level("ERROR"):
+            result = CliRunner().invoke(
+                main,
+                ["--project", "test", "tasks", "dispatch", task.id,
+                 "--target-dir", str(bad)],
+            )
+        assert not isinstance(result.exception, OSError), result.output
+        assert result.exit_code == 0, result.output
+        assert any(
+            "simulated unavailable volume" in r.getMessage() for r in caplog.records
+        )
+
+
+class TestIsTaskStoreCanonicalScope:
+    def test_scope_overrides_ambient(self, fx, monkeypatch):
+        from clawpm.discovery import is_task_store_canonical
+
+        cfg = fx["config"]
+        monkeypatch.chdir(fx["wt"])
+        assert not is_task_store_canonical(cfg, "test")
+        assert is_task_store_canonical(cfg, "test", scope=Scope.canonical())
+        monkeypatch.chdir(fx["elsewhere"])
+        assert is_task_store_canonical(cfg, "test")
+        assert not is_task_store_canonical(cfg, "test", scope=Scope.bound(fx["wt"]))
+
+
+class TestRound2Findings:
+    """CLAWP-136 Codex r1: RuntimeError from resolve() and pinned stores."""
+
+    def test_resolve_runtimeerror_logs_and_falls_back(self, fx, monkeypatch, caplog):
+        from clawpm.sessions import resolve_path_or_none
+
+        real_resolve = Path.resolve
+
+        def loop(self, *a, **kw):
+            # Python 3.11 raises RuntimeError("Symlink loop ...") here.
+            if self.name == "symlink-loop":
+                raise RuntimeError("Symlink loop from 'symlink-loop'")
+            return real_resolve(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "resolve", loop)
+        with caplog.at_level("ERROR"):
+            assert resolve_path_or_none(fx["elsewhere"] / "symlink-loop") is None
+            scope = resolve_scope(
+                fx["config"], "test", fx["elsewhere"] / "symlink-loop"
+            )
+        assert scope == Scope.canonical()
+        assert any("Symlink loop" in r.getMessage() for r in caplog.records)
+
+    def test_pinned_store_canonicality(self, fx, monkeypatch):
+        from clawpm.discovery import is_task_store_canonical
+
+        cfg = fx["config"]
+        assert not is_task_store_canonical(
+            cfg, "test", scope=Scope.pinned(fx["wt_meta"])
+        )
+        assert is_task_store_canonical(
+            cfg, "test", scope=Scope.pinned(fx["canon"])
+        )
+        assert is_task_store_canonical(cfg, "test")
+        monkeypatch.chdir(fx["wt"])
+        assert not is_task_store_canonical(cfg, "test")

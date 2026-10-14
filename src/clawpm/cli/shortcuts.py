@@ -12,7 +12,7 @@ from clawpm.discovery import discover_projects, get_project
 from clawpm.tasks import get_next_task, get_task, list_tasks
 from clawpm.worklog import add_entry
 from clawpm.context import expand_task_id
-from clawpm.cli.tasks import _render_state_results, tasks_add, tasks_state
+from clawpm.cli.tasks import _render_state_results, render_frontier, tasks_add, tasks_state
 from clawpm.services.tasks import transition_isolated
 from clawpm.cli.projects import projects_next
 from clawpm.cli.base import main, get_format, require_portfolio, require_project
@@ -202,11 +202,23 @@ def quick_unblock(ctx: click.Context, project_id: str | None, task_ids: tuple[st
     "--batch", "batch_mode", is_flag=True, default=False,
     help="Return the next parallel batch (tasks sharing the lowest open parallel_group) instead of a single task (CLAWP-021).",
 )
+@click.option(
+    "--frontier", "frontier_root", default=None,
+    help="Show the actionable frontier under this root task (CLAWP-111-004): ready, blocked (waiting_on) and claimed (lease holder).",
+)
 @click.pass_context
-def quick_next(ctx: click.Context, project_id: str | None, batch_mode: bool) -> None:
-    """Get the next task to work on, or the next parallel batch with --batch."""
+def quick_next(ctx: click.Context, project_id: str | None, batch_mode: bool, frontier_root: str | None = None) -> None:
+    """Get the next task to work on, the next parallel batch with --batch, or a root's frontier with --frontier."""
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
+
+    if frontier_root is not None:
+        if batch_mode:
+            raise click.UsageError("--frontier cannot be combined with --batch.")
+        # Read-only query: never auto-init a .project/ from an untracked repo.
+        project_id, _ = require_project(ctx, project_id, auto_init=False)
+        render_frontier(config, project_id, frontier_root, fmt)
+        return
 
     if batch_mode:
         # Batch mode requires a single project — we don't aggregate batches

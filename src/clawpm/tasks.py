@@ -587,23 +587,96 @@ def get_next_task(config: PortfolioConfig, project_id: str) -> Task | None:
         if task.state not in (TaskState.OPEN, TaskState.PROGRESS):
             continue
 
-        # Check if all dependencies are satisfied. A dependency missing from the
-        # cheap filename set may still be an archived DONE task (CLAWP-085:
-        # done/archive is pruned from _done_task_ids). Probe only those
-        # stragglers — usually zero — with lightweight path existence checks
-        # against the archive silo (no YAML parse; anything under done/archive is
-        # DONE by location), and treat a hit as satisfied.
-        if task.depends:
-            unresolved = [d for d in task.depends if d not in done_ids]
-            if unresolved and not all(
-                any(p.exists() for p in _archive_candidate_paths(tasks_dir, d))
-                for d in unresolved
-            ):
-                continue
+        if _unmet_dependencies(tasks_dir, task, done_ids):
+            continue
 
         return task
 
     return None
+
+
+def _unmet_dependencies(tasks_dir: Path, task: Task, done_ids: set[str]) -> list[str]:
+    """Dependencies of ``task`` that are not DONE (empty list = satisfied).
+
+    A dependency missing from the cheap filename set may still be an archived
+    DONE task (CLAWP-085: done/archive is pruned from _done_task_ids). Probe
+    only those stragglers — usually zero — with lightweight path existence
+    checks against the archive silo (no YAML parse; anything under
+    done/archive is DONE by location), and treat a hit as satisfied.
+    """
+    return [
+        d for d in task.depends
+        if d not in done_ids
+        and not any(p.exists() for p in _archive_candidate_paths(tasks_dir, d))
+    ]
+
+
+def frontier(config: PortfolioConfig, project_id: str, root_id: str) -> dict | None:
+    """The actionable frontier under ``root_id`` (CLAWP-111-004).
+
+    Considers the leaf OPEN descendants of the root at any depth (a task with
+    open descendants of its own is a map node, not work). Each is exactly one of:
+
+    - ``claimed``  — holds an active, unexpired lease (``lease_holder`` is the
+      lease's holder id, or null for a holder-less lease); also covers a
+      PROGRESS leaf under the root that holds such a lease;
+    - ``blocked``  — has dependencies that are not DONE (``waiting_on``);
+    - ``frontier`` — ready to start.
+
+    Each list is ordered by priority then id. An expired lease does not claim:
+    this uses ``Lease.is_expired``, the same rule the sweep applies. Returns
+    ``None`` when the project has no tasks dir. One lease-registry replay and
+    one scan of the open tree: no per-task file reads.
+    """
+    from datetime import datetime, timezone
+
+    from .leases import active_leases
+
+    tasks_dir = get_tasks_dir(config, project_id)
+    if not tasks_dir:
+        return None
+
+    candidates: list[Task] = []
+    _scan_task_files(tasks_dir, candidates, None)
+    by_parent: dict[str, list[Task]] = {}
+    for t in candidates:
+        if t.parent:
+            by_parent.setdefault(t.parent, []).append(t)
+
+    descendants: list[Task] = []
+    seen = {root_id}
+    stack = [root_id]
+    while stack:
+        for child in by_parent.get(stack.pop(), []):
+            if child.id in seen:
+                continue
+            seen.add(child.id)
+            descendants.append(child)
+            stack.append(child.id)
+
+    now = datetime.now(timezone.utc)
+    held = {
+        l.task_id: l for l in active_leases(config.portfolio_root)
+        if l.project_id == project_id and not l.is_expired(now)
+    }
+    done_ids = _done_task_ids(tasks_dir)
+
+    out: dict[str, list] = {"frontier": [], "blocked": [], "claimed": []}
+    for t in sorted(descendants, key=lambda t: (t.priority, t.id)):
+        if t.state not in (TaskState.OPEN, TaskState.PROGRESS) or t.id in by_parent:
+            continue
+        lease = held.get(t.id)
+        if lease is not None:
+            out["claimed"].append({"id": t.id, "title": t.title, "lease_holder": lease.holder_id})
+            continue
+        if t.state is not TaskState.OPEN:
+            continue
+        waiting = _unmet_dependencies(tasks_dir, t, done_ids)
+        if waiting:
+            out["blocked"].append({"id": t.id, "title": t.title, "waiting_on": waiting})
+        else:
+            out["frontier"].append({"id": t.id, "title": t.title, "priority": t.priority})
+    return out
 
 
 # Match the top-level `updated:` key however it's spaced (`updated: x`,
