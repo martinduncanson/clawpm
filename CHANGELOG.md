@@ -30,6 +30,7 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 
 ### Fixed
 
+- `tasks dispatch --target-dir` no longer crashes when the target cannot be resolved: it binds one explicit `Scope` through `discovery.resolve_scope` (logged fallback to canonical) and threads it to the task, repo and lease-store lookups instead of an ambient `resolve_scope_from`; `is_task_store_canonical` gains `scope=`. Remaining hand-scoped sites stay on ambient resolution; `resolve_path_or_none` also falls back on `RuntimeError` (symlink loop, Python 3.11) and a pinned scope reports canonical only for the project's own store (#110, CLAWP-136).
 - BOM class beyond task frontmatter: inbox, lease, work_log, id-reservation, dispatch, session, reflection, history and issues JSONL readers now decode with `utf-8-sig`, so a BOM no longer makes the first record vanish; portfolio/project settings TOML tolerates a BOM; scope-file, `--body-file`, `--stdin` body and `emit-tree` stdin reads drop it; `doctor` reads work_log.jsonl with `utf-8-sig` (a BOM first record no longer makes a task look stale); `edit_fog` on a frontmatter-less file no longer fuses the closing fence to the heading (`---# Real task`) (#107, CLAWP-146).
 
 - Task files that start with a UTF-8 BOM are no longer read as frontmatter-less: the frontmatter parsers ignore the BOM, and the `updated` and `state` line writers keep it (#101, CLAWP-144).

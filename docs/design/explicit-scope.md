@@ -78,11 +78,12 @@ Still on ambient resolution plus a hand-placed contextvar:
   `suppress_session_resolution()`.
 - `cli/project.py` (`doctor --apply`): `suppress_session_resolution()` around
   the lease sweep.
-- `cli/tasks.py` (`tasks dispatch --target-dir`): `resolve_scope_from(target)`.
-  Maps to `resolve_scope(config, pid, target_dir=target)`. The `lease_ttl`
-  guard uses `is_task_store_canonical`, which has no `scope=` yet.
+- `cli/tasks.py` (`tasks dispatch --target-dir`): MIGRATED (CLAWP-136). Binds
+  `resolve_scope(config, pid, target_dir=target)` once and threads it to
+  `get_task`, `get_repo_path` and `is_task_store_canonical` (which gained
+  `scope=`). An unresolvable target logs and falls back to canonical.
 
-Most blocked on one thing: the task-state mutators in `tasks.py` (`add_task`,
+The other four are still blocked on one thing: the task-state mutators in `tasks.py` (`add_task`,
 `change_task_state`, `list_tasks`, and others) still call `get_tasks_dir`
 without a scope. Thread `scope=` through them before converting the sites above.
 `is_task_store_canonical` should gain the same keyword.
