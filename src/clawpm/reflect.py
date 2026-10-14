@@ -14,7 +14,7 @@ import json
 import os
 import re
 import statistics
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1179,6 +1179,163 @@ def _iter_done_events(portfolio_root: Path, project_id: str | None = None):
             yield rec
 
 
+def _parse_ts(value: Any) -> datetime | None:
+    """Parse an ISO-8601 timestamp (``Z`` ok) to an aware datetime, else None."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _actuals_from_dict(data: dict[str, Any]) -> Actuals:
+    complexity = None
+    if c := data.get("complexity"):
+        try:
+            complexity = TaskComplexity(c)
+        except ValueError:
+            pass
+    return Actuals(
+        duration_min=data.get("duration_min"),
+        complexity=complexity,
+        files_changed=data.get("files_changed"),
+        files_touched=data.get("files_touched") or [],
+        iterations=data.get("iterations"),
+        active_min=data.get("active_min"),
+    )
+
+
+def load_calibration_rows(
+    portfolio_root: Path,
+    project_id: str | None = None,
+    include_decisions: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Build the rows + closure ledger that ``calibration.compute_calibration`` scores.
+
+    CLAWP-112-004. Same per-(file, project) keying and void semantics as
+    ``_iter_done_events`` (an unscoped void drops the file, a scoped void drops
+    that project). Per project the latest ``task_done`` is the outcome.
+
+    Scored snapshot (spec 2.5): the REGISTERED prediction, plus any revision
+    stamped at or before the first start (``occurred_at - actuals.duration_min``);
+    with no duration the latest revision is used. A done event with no
+    ``prediction_id`` is legacy and scores its own embedded predictions. The
+    ``held`` outcome is recomputed from that snapshot via ``resolve_axes``.
+
+    Ledger: ``registered`` counts distinct prediction ids (registered events
+    plus any id a done event carries), ``resolved`` the non-voided done events
+    with an id, ``voided`` the ids of voided tasks, ``legacy_resolved`` done
+    events with no id (counted apart, not in the closure rate).
+    """
+    rows: list[dict[str, Any]] = []
+    ledger = {"registered": 0, "resolved": 0, "voided": 0, "legacy_resolved": 0}
+    ref_dir = _reflections_dir(portfolio_root)
+    if not ref_dir.exists():
+        return rows, ledger
+    for ref_file in sorted(ref_dir.glob("*.jsonl")):
+        try:
+            text = ref_file.read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            continue
+        states: dict[str | None, dict[str, Any]] = {}
+        voided_projects: set[str | None] = set()
+        unscoped_void = False
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            evt = rec.get("event")
+            proj = rec.get("project_id")
+            if evt == "void":
+                if proj is None:
+                    unscoped_void = True
+                else:
+                    voided_projects.add(proj)
+                continue
+            if project_id is not None and proj != project_id:
+                continue
+            st = states.setdefault(proj, {"registered": {}, "revisions": {}, "done": None})
+            pid = rec.get("prediction_id")
+            snap = rec.get("predictions")
+            if evt == "prediction_registered":
+                if pid and isinstance(snap, dict):
+                    st["registered"].setdefault(pid, snap)
+            elif evt == "prediction_revised":
+                if pid and isinstance(snap, dict):
+                    st["revisions"].setdefault(pid, []).append(
+                        (_parse_ts(rec.get("revised_at")), snap)
+                    )
+            elif evt == "task_done":
+                st["done"] = rec
+        for proj, st in states.items():
+            done = st["done"]
+            done_pid = done.get("prediction_id") if done else None
+            ids = set(st["registered"]) | ({done_pid} if done_pid else set())
+            ledger["registered"] += len(ids)
+            if unscoped_void or proj in voided_projects:
+                ledger["voided"] += len(ids)
+                continue
+            if done is None:
+                continue
+            if done_pid:
+                ledger["resolved"] += 1
+            else:
+                ledger["legacy_resolved"] += 1
+            rows.append(
+                _calibration_row(done, st, ref_file.stem, proj, include_decisions)
+            )
+    return rows, ledger
+
+
+def _calibration_row(
+    done: dict[str, Any],
+    state: dict[str, Any],
+    file_stem: str,
+    project: str | None,
+    include_decisions: bool,
+) -> dict[str, Any]:
+    pid = done.get("prediction_id")
+    actuals = _actuals_from_dict(done.get("actuals") or {})
+    occurred = _parse_ts(done.get("occurred_at"))
+    preds = Predictions.from_dict(done.get("predictions") or {})
+    if pid and pid in state["registered"]:
+        snap = state["registered"][pid]
+        first_start = None
+        if occurred is not None and actuals.duration_min is not None:
+            first_start = occurred - timedelta(minutes=actuals.duration_min)
+        for ts, rev in state["revisions"].get(pid, []):
+            if first_start is None or (ts is not None and ts <= first_start):
+                snap = rev
+        preds = Predictions.from_dict(snap)
+    deltas = _compute_deltas(preds, actuals)
+    axes = resolve_axes(
+        preds, actuals, deltas, kind=None if include_decisions else done.get("kind")
+    )
+    ratio = None
+    if axes["duration"] != "unresolvable":
+        actual_val, _src = _actual_duration_and_source(actuals.to_dict())
+        ratio = actual_val / preds.duration_min
+    return {
+        "project_id": project or "",
+        "task_id": done.get("task_id") or file_stem,
+        "occurred_at": occurred,
+        "confidence": preds.confidence,
+        "held": axes["held"],
+        "duration_ratio": ratio,
+        "complexity": preds.complexity.value if preds.complexity else None,
+        "miss_category": done.get("miss_category"),
+        "legacy": not pid,
+    }
+
+
 def _actual_duration_and_source(actuals: dict) -> tuple["int | float | None", "str | None"]:
     """Pick the actual-duration value to score against, and say which it was.
 
@@ -1260,6 +1417,9 @@ def _interpret_ratio(median_ratio: float | None) -> str:
 def summarize_calibration(
     portfolio_root: Path,
     project_id: str | None = None,
+    include_decisions: bool = False,
+    now: datetime | None = None,
+    with_calibration: bool = True,
 ) -> dict:
     """Aggregate predicted-vs-actual duration ratios across the corpus.
 
@@ -1267,6 +1427,11 @@ def summarize_calibration(
     Rows whose duration ratio can't be computed (missing/zero predicted or
     actual) are counted as ``dirty_flagged`` and excluded from the stats so
     they don't poison the ratio. ``project_id=None`` aggregates all projects.
+
+    CLAWP-112-004: the result also carries ``calibration`` (spec 2.3), scored
+    from the registered prediction snapshots. ``include_decisions`` scores
+    ``kind: decision`` tasks on the duration axis too (excluded by default).
+    ``with_calibration=False`` skips that second corpus read.
     """
     done = list(_iter_done_events(portfolio_root, project_id))
     usable: list[float] = []
@@ -1305,7 +1470,7 @@ def summarize_calibration(
         duration_source = "wallclock"
     else:
         duration_source = None
-    return {
+    result = {
         "project_id": project_id or "ALL",
         "total_done": len(done),
         "with_usable_duration": len(usable),
@@ -1324,6 +1489,12 @@ def summarize_calibration(
         },
         "interpretation": _interpret_ratio(overall["median_ratio"]),
     }
+    if with_calibration:
+        from .calibration import compute_calibration
+
+        rows, ledger = load_calibration_rows(portfolio_root, project_id, include_decisions)
+        result["calibration"] = compute_calibration(rows, ledger, now=now)
+    return result
 
 
 def suggest_duration(
@@ -1343,7 +1514,7 @@ def suggest_duration(
     model call. ``calibrated_duration_min`` is only returned when a predicted
     duration is supplied and a ratio exists.
     """
-    summary = summarize_calibration(portfolio_root, project_id)
+    summary = summarize_calibration(portfolio_root, project_id, with_calibration=False)
 
     chosen = summary["overall"]
     chosen_key = "global"
