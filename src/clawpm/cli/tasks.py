@@ -833,7 +833,7 @@ def tasks_land(ctx: click.Context, project_id: str | None, task_id: str, pr_numb
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
-    project_id, _ = require_project(ctx, project_id)
+    project_id, _ = require_project(ctx, project_id, auto_init=False)  # a refusal must write nothing
     task_id = expand_task_id(task_id, project_id)
     try:
         result = land_task(

@@ -14,7 +14,9 @@ There is no recovery step of any kind: no reset, no force, no branch delete.
 ``--remove-worktree`` uses plain ``git worktree remove`` (git itself refuses a
 dirty one).
 
-The merge itself stays with the operator; this module never merges.
+Every ref read after the fetch uses the verified tip SHA, never the
+``<remote>/<base>`` name (a tag or local branch of that name would win the
+lookup). The merge itself stays with the operator; this module never merges.
 """
 
 from __future__ import annotations
@@ -24,11 +26,13 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from clawpm.codex_check import _extract_github_owner_repo
 from clawpm.models import TaskState
-from clawpm.pr_verify import PrVerifyError, _FULL_SHA, _gh_json, _remote_head, _resolve_repo
+from clawpm.pr_verify import PrVerifyError, _FULL_SHA, _gh_json, _remote_head, _resolve_repo, _run
 
 _TIMEOUT = 60
 _NO_ATTRIBUTION = re.compile(r"co-authored-by|generated with|claude", re.I)
+_LAND_BRANCH = "main"
 
 
 class LandError(Exception):
@@ -42,8 +46,25 @@ class LandError(Exception):
         self.changed = changed
 
 
-def _git(args: list[str], cwd: Path, *, ok_codes: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess:
-    """Run git in ``cwd``; raise LandError unless the exit code is in ``ok_codes``."""
+def _label(args: list[str]) -> str:
+    """The subcommand and its first args, without git's leading global options."""
+    i = 0
+    while i < len(args):
+        if args[i] == "-c":
+            i += 2
+        elif args[i].startswith("--no-optional-locks"):
+            i += 1
+        else:
+            break
+    return " ".join(args[i:i + 3])
+
+
+def _git(args: list[str], cwd: Path, *, ok_codes: tuple[int, ...] = (0,), changed: bool = False) -> subprocess.CompletedProcess:
+    """Run git in ``cwd``; raise LandError unless the exit code is in ``ok_codes``.
+
+    ``changed`` is True for every call made after the first mutation, so a
+    failure there can never be reported as "nothing changed".
+    """
     try:
         proc = subprocess.run(
             ["git", *args],
@@ -55,27 +76,41 @@ def _git(args: list[str], cwd: Path, *, ok_codes: tuple[int, ...] = (0,)) -> sub
             timeout=_TIMEOUT,
         )
     except FileNotFoundError:
-        raise LandError("git_missing", "`git` is not installed or not on PATH")
+        raise LandError("git_missing", "`git` is not installed or not on PATH", changed=changed)
     except subprocess.TimeoutExpired:
-        raise LandError("git_timeout", f"`git {' '.join(args[:3])}` timed out after {_TIMEOUT}s")
+        raise LandError("git_timeout", f"`git {_label(args)}` timed out after {_TIMEOUT}s", changed=changed)
     except OSError as exc:
-        raise LandError("git_failed", f"could not run git: {exc}")
+        raise LandError("git_failed", f"could not run git: {exc}", changed=changed)
     if proc.returncode not in ok_codes:
         raise LandError(
             "git_failed",
-            f"`git {' '.join(args[:3])}` exited {proc.returncode}",
+            f"`git {_label(args)}` exited {proc.returncode}",
             {"stderr": (proc.stderr or "").strip()},
+            changed=changed,
         )
     return proc
 
 
-def _out(args: list[str], cwd: Path) -> str:
-    return (_git(args, cwd).stdout or "").strip()
+def _out(args: list[str], cwd: Path, *, changed: bool = False) -> str:
+    return (_git(args, cwd, changed=changed).stdout or "").strip()
 
 
-def _dirty_tracked_paths(cwd: Path) -> list[str]:
-    """Tracked paths with staged or unstaged changes (untracked files are ignored)."""
-    raw = _git(["status", "--porcelain=v1", "-z", "--untracked-files=no", "--no-renames"], cwd).stdout or ""
+def _dirty_tracked_paths(cwd: Path, *, changed: bool = False) -> list[str]:
+    """Tracked paths with staged or unstaged changes (untracked files are ignored).
+
+    ``--no-optional-locks`` keeps status from refreshing (rewriting) the index,
+    so a refusal leaves its bytes alone. Submodule ignore settings are
+    overridden so a hidden submodule edit cannot pass the clean-checkout gate.
+    """
+    raw = _git(
+        [
+            "--no-optional-locks", "-c", "diff.ignoreSubmodules=none",
+            "status", "--porcelain=v1", "-z", "--untracked-files=no", "--no-renames",
+            "--ignore-submodules=none",
+        ],
+        cwd,
+        changed=changed,
+    ).stdout or ""
     paths = []
     for entry in raw.split("\0"):
         if len(entry) > 3:  # "XY path"
@@ -112,21 +147,28 @@ def _linked_worktrees(cwd: Path) -> list[dict[str, str]]:
     return blocks
 
 
-def _find_task_worktree(cwd: Path, toplevel: Path, task_id: str) -> Path | None:
-    found = []
+def _find_task_worktree(cwd: Path, toplevel: Path, task_id: str) -> dict[str, str] | None:
+    """The linked worktree checked out on ``clawpm/<task_id>`` (matched by branch, never by directory name)."""
+    found: list[dict[str, str]] = []
     for blk in _linked_worktrees(cwd):
         wt = blk.get("worktree")
         if not wt or Path(wt).resolve() == toplevel:
             continue
-        if blk.get("branch") == f"refs/heads/clawpm/{task_id}" or Path(wt).name == task_id:
-            found.append(Path(wt))
+        if blk.get("branch") == f"refs/heads/clawpm/{task_id}":
+            found.append(blk)
     if len(found) > 1:
         raise LandError(
             "worktree_ambiguous",
             f"more than one worktree matches {task_id}; remove it by hand",
-            {"worktrees": [str(p) for p in found]},
+            {"worktrees": [b["worktree"] for b in found]},
         )
     return found[0] if found else None
+
+
+def _remote_slug(remote: str) -> str | None:
+    """owner/name of the remote's effective URL, or None when it is not a github.com URL."""
+    parsed = _extract_github_owner_repo(_run(["git", "remote", "get-url", remote]).strip())
+    return f"{parsed[0]}/{parsed[1]}" if parsed else None
 
 
 def land_task(
@@ -142,11 +184,11 @@ def land_task(
     cwd: Path | None = None,
 ) -> dict[str, Any]:
     """Run the landing transaction; return a result dict or raise :class:`LandError`."""
-    from clawpm.tasks import get_task, parent_rollup_status
+    from clawpm.tasks import get_task, get_tasks_dir, parent_rollup_status
 
     cwd = Path(cwd) if cwd else Path.cwd()
 
-    # 1. Where are we? Must be the main checkout, on the PR's base branch.
+    # 1. Where are we? Must be the main checkout, on `main`.
     toplevel = Path(_out(["rev-parse", "--show-toplevel"], cwd)).resolve()
     git_dir, common_dir = (_out(["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"], cwd).splitlines() + ["", ""])[:2]
     if Path(git_dir).resolve() != Path(common_dir).resolve():
@@ -159,6 +201,13 @@ def land_task(
     branch = _git(["symbolic-ref", "--short", "-q", "HEAD"], toplevel, ok_codes=(0, 1)).stdout.strip()
     if not branch:
         raise LandError("detached_head", "the main checkout is on a detached HEAD; check out the base branch first")
+    if branch != _LAND_BRANCH:
+        raise LandError(
+            "wrong_branch",
+            f"the checkout is on '{branch}'; `tasks land` only lands onto '{_LAND_BRANCH}'",
+            {"branch": branch, "required": _LAND_BRANCH},
+        )
+    before = _out(["rev-parse", "HEAD"], toplevel)
 
     # 2. The task: must exist, be open work, and live inside this checkout.
     task = get_task(config, project_id, task_id)
@@ -187,6 +236,23 @@ def land_task(
             f"task files at {old_entry} are not inside the checkout {toplevel}",
         )
 
+    # 2b. Where the task will land (done/). Anything already there, tracked or
+    #     not, would make the post-ff move refuse, so refuse now instead.
+    tasks_dir = get_tasks_dir(config, project_id)
+    done_rel: str | None = None
+    if tasks_dir is not None:
+        done_name = task_id if task.file_path.name == "_task.md" else f"{task_id}.md"
+        try:
+            done_rel = _rel(tasks_dir / "done" / done_name, toplevel)
+        except ValueError:
+            done_rel = None
+    if done_rel and (toplevel / done_rel).exists():
+        raise LandError(
+            "done_destination_exists",
+            f"{done_rel} already exists in the checkout; move it aside before landing {task_id}",
+            {"path": done_rel},
+        )
+
     # 3. Dirty tracked paths outside the task's own files (the stray-edit case).
     stray = [p for p in _dirty_tracked_paths(toplevel) if not _is_own(p, [old_rel])]
     if stray:
@@ -196,8 +262,17 @@ def land_task(
             {"paths": stray},
         )
 
-    # 4. The PR: MERGED, onto this branch, with a full merge commit sha.
+    # 4. The PR: MERGED, onto this branch, with a full merge commit sha, in the remote's own repo.
     try:
+        if repo:
+            actual = _remote_slug(remote)
+            if actual is None or actual.lower() != repo.lower():
+                raise LandError(
+                    "repo_remote_mismatch",
+                    f"--repo {repo} does not match remote '{remote}' ({actual or 'not a github.com URL'}); "
+                    "refusing to attest a PR from a different repository",
+                    {"repo": repo, "remote_repo": actual},
+                )
         repo_slug = _resolve_repo(repo, remote)
         pr = _gh_json([
             "pr", "view", str(pr_number), "--repo", repo_slug,
@@ -219,9 +294,10 @@ def land_task(
 
     # 5. Refs: fetch (moves remote-tracking refs only), then prove the tracking
     #    ref is current, the merge commit is in it and our branch can fast-forward.
+    #    From here on only the verified `tip` sha is used, never the ref name.
     _git(["fetch", remote], toplevel)
     target = f"{remote}/{base}"
-    tip = _out(["rev-parse", "--verify", f"refs/remotes/{target}"], toplevel)
+    tip = _out(["rev-parse", "--verify", f"refs/remotes/{target}^{{commit}}"], toplevel)
     try:
         remote_tip = _remote_head(remote, base)
     except PrVerifyError as exc:
@@ -234,71 +310,97 @@ def land_task(
         )
     if _git(["cat-file", "-e", f"{merge_sha}^{{commit}}"], toplevel, ok_codes=(0, 1)).returncode != 0:
         raise LandError("merge_commit_not_fetched", f"merge commit {merge_sha} is not in the local repository after fetch")
-    if _git(["merge-base", "--is-ancestor", merge_sha, target], toplevel, ok_codes=(0, 1)).returncode != 0:
+    if _git(["merge-base", "--is-ancestor", merge_sha, tip], toplevel, ok_codes=(0, 1)).returncode != 0:
         raise LandError(
             "merge_commit_not_in_base",
-            f"merge commit {merge_sha} is not an ancestor of {target}",
+            f"merge commit {merge_sha} is not an ancestor of {target} ({tip})",
             {"merge_commit": merge_sha, "target": target},
         )
-    if _git(["merge-base", "--is-ancestor", "HEAD", target], toplevel, ok_codes=(0, 1)).returncode != 0:
+    if _git(["merge-base", "--is-ancestor", before, tip], toplevel, ok_codes=(0, 1)).returncode != 0:
         raise LandError(
             "not_fast_forward",
             f"{branch} has commits that are not in {target}; refusing a non-fast-forward",
-            {"head": _out(["rev-parse", "HEAD"], toplevel), "target": target},
+            {"head": before, "target": target},
+        )
+    if done_rel and (_git(["ls-tree", "--name-only", tip, "--", done_rel], toplevel).stdout or "").strip():
+        raise LandError(
+            "done_destination_exists",
+            f"{done_rel} already exists in {target}; resolve it before landing {task_id}",
+            {"path": done_rel},
         )
 
     # 6. Optional worktree removal: refuse up front when it cannot succeed.
     wt_path: Path | None = None
     if remove_worktree:
-        wt_path = _find_task_worktree(toplevel, toplevel, task_id)
-        if wt_path is not None and (_git(["status", "--porcelain"], wt_path).stdout or "").strip():
-            raise LandError("worktree_dirty", f"worktree {wt_path} has uncommitted or untracked files; not removing it", {"worktree": str(wt_path)})
+        blk = _find_task_worktree(toplevel, toplevel, task_id)
+        if blk is not None:
+            wt_path = Path(blk["worktree"])
+            if "locked" in blk:
+                raise LandError("worktree_locked", f"worktree {wt_path} is locked; unlock it first or drop --remove-worktree", {"worktree": str(wt_path)})
+            wt_status = _git(["--no-optional-locks", "status", "--porcelain"], wt_path).stdout or ""
+            if wt_status.strip():
+                raise LandError("worktree_dirty", f"worktree {wt_path} has uncommitted or untracked files; not removing it", {"worktree": str(wt_path)})
 
-    # ---- first mutation ----
-    before = _out(["rev-parse", "HEAD"], toplevel)
+    # ---- first mutation: every failure from here on is changed=True ----
     try:
-        _git(["merge", "--ff-only", target], toplevel)
+        # No autostash: a configured merge.autoStash must not turn a refusal into a stash + pop.
+        _git(["-c", "merge.autoStash=false", "merge", "--ff-only", "--no-autostash", tip], toplevel)
     except LandError as exc:
         # git refuses a ff that would overwrite local changes before touching anything.
-        after = _out(["rev-parse", "HEAD"], toplevel)
+        after = _out(["rev-parse", "HEAD"], toplevel, changed=True)
         raise LandError(
             "ff_failed", exc.message, {**exc.details, "head": after}, changed=(after != before)
         )
-    ff_head = _out(["rev-parse", "HEAD"], toplevel)
+    ff_head = _out(["rev-parse", "HEAD"], toplevel, changed=True)
 
     from clawpm.services.tasks import transition
 
     done_note = f"Landed via PR #{pr_number}"
-    res = transition(config, project_id=project_id, task_id=task_id, new_state="done", note=done_note)
+    try:
+        # The PR may have renamed the task file, so re-resolve it after the ff.
+        landed = get_task(config, project_id, task_id)
+        ff_rel = _rel(_task_entry(landed.file_path), toplevel) if landed and landed.file_path else None
+        res = transition(config, project_id=project_id, task_id=task_id, new_state="done", note=done_note)
+        moved = get_task(config, project_id, task_id) if res.get("ok") else None
+        new_rel = _rel(_task_entry(moved.file_path), toplevel) if moved and moved.file_path else None
+    except LandError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - past the ff, anything unexpected must still say changed
+        raise LandError(
+            "state_change_failed",
+            f"{task_id} was not marked done after the fast-forward: {exc}",
+            {"fast_forwarded_to": ff_head},
+            changed=True,
+        )
     if not res.get("ok"):
         raise LandError(
             "state_change_failed",
             f"{task_id} was not marked done: {res.get('error')}: {res.get('message')}",
             {"fast_forwarded_to": ff_head, "state_error": res.get("error")},
-            changed=ff_head != before,
+            changed=True,
         )
-    moved = get_task(config, project_id, task_id)
-    new_rel = _rel(_task_entry(moved.file_path), toplevel) if moved and moved.file_path else None
-    own = [p for p in (old_rel, new_rel) if p]
+    own = list(dict.fromkeys(p for p in (old_rel, ff_rel, new_rel) if p))
 
-    # Stage and commit ONLY the task's own paths.
-    specs = [
-        p for p in own
-        if (toplevel / p).exists() or (_git(["ls-files", "--", p], toplevel).stdout or "").strip()
-    ]
-    msg = f"chore: mark {task_id} done (PR #{pr_number} merged)"
+    # Stage and commit ONLY the task's own paths. A pathspec is kept when it
+    # exists or is still tracked (a pending deletion); one the ff already
+    # removed from the index and tree is skipped.
     try:
-        _git(["add", "-A", "--", *specs], toplevel)
-        _git(["commit", "-m", msg, "--", *specs], toplevel)
+        specs = [
+            p for p in own
+            if (toplevel / p).exists() or (_git(["ls-files", "--", p], toplevel, changed=True).stdout or "").strip()
+        ]
+        msg = f"chore: mark {task_id} done (PR #{pr_number} merged)"
+        _git(["add", "-A", "--", *specs], toplevel, changed=True)
+        _git(["commit", "-m", msg, "--", *specs], toplevel, changed=True)
     except LandError as exc:
         raise LandError(
             "commit_failed", exc.message,
-            {**exc.details, "fast_forwarded_to": ff_head, "task_paths": specs}, changed=True,
+            {**exc.details, "fast_forwarded_to": ff_head}, changed=True,
         )
-    head = _out(["rev-parse", "HEAD"], toplevel)
-    count = int(_out(["rev-list", "--count", f"{ff_head}..HEAD"], toplevel) or 0)
-    files = [f for f in (_git(["diff-tree", "--no-commit-id", "--name-only", "-r", "--no-renames", "-z", "HEAD"], toplevel).stdout or "").split("\0") if f]
-    body = _out(["log", "-1", "--format=%B"], toplevel)
+    head = _out(["rev-parse", "HEAD"], toplevel, changed=True)
+    count = int(_out(["rev-list", "--count", f"{ff_head}..HEAD"], toplevel, changed=True) or 0)
+    files = [f for f in (_git(["diff-tree", "--no-commit-id", "--name-only", "-r", "--no-renames", "-z", "HEAD"], toplevel, changed=True).stdout or "").split("\0") if f]
+    body = _out(["log", "-1", "--format=%B"], toplevel, changed=True)
     if count != 1 or not all(_is_own(f, own) for f in files) or _NO_ATTRIBUTION.search(body):
         raise LandError(
             "commit_unexpected",
@@ -319,7 +421,7 @@ def land_task(
         "commit": {"sha": head, "message": msg, "files": files},
         "pushed": None,
         "worktree_removed": None,
-        "uncommitted_other": [p for p in _dirty_tracked_paths(toplevel) if not _is_own(p, own)],
+        "uncommitted_other": [p for p in _dirty_tracked_paths(toplevel, changed=True) if not _is_own(p, own)],
         "warnings": list((res.get("data") or {}).get("warnings") or []),
     }
 
