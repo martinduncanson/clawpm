@@ -24,8 +24,9 @@ def reflect() -> None:
 
 @reflect.command("summarize")
 @click.option("--project", "-p", "project_id", default=None, help="Project ID")
+@click.option("--include-decisions", "include_decisions", is_flag=True, default=False, help="Score kind:decision tasks on the duration axis too (excluded by default).")
 @click.pass_context
-def reflect_summarize(ctx: click.Context, project_id: str | None) -> None:
+def reflect_summarize(ctx: click.Context, project_id: str | None, include_decisions: bool) -> None:
     """Summarize predicted-vs-actual duration calibration across done tasks (CLAWP-040).
 
     Aggregates the reflection corpus into duration ratios (actual/predicted)
@@ -45,7 +46,9 @@ def reflect_summarize(ctx: click.Context, project_id: str | None) -> None:
     # By here `project_id` is the resolved scope: subcommand > global, with
     # None meaning aggregate ALL. The call below passes the resolved value,
     # NOT a raw default.
-    summary = summarize_calibration(config.portfolio_root, project_id)
+    summary = summarize_calibration(
+        config.portfolio_root, project_id, include_decisions=include_decisions
+    )
     output_success(
         f"Calibration summary ({summary['project_id']}): "
         f"{summary['with_usable_duration']}/{summary['total_done']} done tasks "
@@ -53,6 +56,37 @@ def reflect_summarize(ctx: click.Context, project_id: str | None) -> None:
         data=summary,
         fmt=fmt,
     )
+
+
+@reflect.command("scorecard")
+@click.option("--project", "-p", "project_id", default=None, help="Project ID")
+@click.option("--include-decisions", "include_decisions", is_flag=True, default=False, help="Score kind:decision tasks on the duration axis too (excluded by default).")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit the calibration block as JSON instead of five text lines.")
+@click.pass_context
+def reflect_scorecard(
+    ctx: click.Context, project_id: str | None, include_decisions: bool, as_json: bool
+) -> None:
+    """Five-line calibration scorecard (CLAWP-112-004).
+
+    Closure, bias factor, Brier + n, overconfidence headline, top miss category
+    and metareflection due. Prints five text lines whatever the global
+    --format; --json returns the full calibration block (spec 2.3). Omit
+    --project to span all projects.
+    """
+    from clawpm.calibration import render_scorecard
+    from clawpm.reflect import summarize_calibration
+
+    config = require_portfolio(ctx)
+    if project_id is None:
+        project_id = ctx.obj.get("global_project")
+    block = summarize_calibration(
+        config.portfolio_root, project_id, include_decisions=include_decisions
+    )["calibration"]
+    if as_json:
+        click.echo(json.dumps(block, indent=2))
+        return
+    for line in render_scorecard(block):
+        click.echo(line)
 
 
 @reflect.command("suggest")
