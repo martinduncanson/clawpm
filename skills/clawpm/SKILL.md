@@ -11,7 +11,7 @@ Multi-project task management. All commands emit JSON by default, so JSON needs 
 
 ## Reference files — load on demand
 
-This core holds the always-on rules and the everyday commands. Everything else lives in `references/` next to this SKILL.md (`skills/clawpm/references/` in a source checkout; if this file was copied elsewhere, read them from the clawpm repo). Read the file when its trigger fires; do not guess flags from memory.
+This core holds the always-on rules and the everyday commands. Everything else lives in `references/` next to this SKILL.md (`skills/clawpm/references/` in a source checkout). If this file was copied to a runtime clone root by `sync-runtime-clones.sh`, the references are at `<clone-root>/skills/clawpm/references/`. Read the file when its trigger fires; do not guess flags from memory.
 
 | File | Load when |
 |---|---|
@@ -20,7 +20,7 @@ This core holds the always-on rules and the everyday commands. Everything else l
 | `references/setup-and-projects.md` | First install, `clawpm setup`, `project init`, project auto-detection, subtasks, `clawpm context`. |
 | `references/command-reference.md` | You need a flag or subcommand not in Quick Start: any `tasks`, `log`, `research`, `issues`, `lease`, `mission`, `doctor` command. |
 | `references/predictions-and-reflection.md` | Filling `--predict-*` / `--success-criteria` flags, completing with reflection notes, `reflect summarize`, `reflect suggest`, `reflect void`. |
-| `references/messaging-and-integrations.md` | `clawpm inbox` messaging between agents, or review/commit/PR workflow integration points. |
+| `references/messaging-and-integrations.md` | `clawpm inbox` messaging between agents, or before any commit, push, PR or merge (review/PR workflow integration points). |
 | `references/multi-session.md` | Two sessions on one project, task-ID collisions, `.clawpm-tasks.lock`. |
 | `references/troubleshooting.md` | A clawpm command failed or dropped an argument, `ModuleNotFoundError`, Windows glob/`--scope` problems, `add_failed`. |
 
@@ -122,13 +122,22 @@ for any task with a non-trivial outcome ("if I do X, then Y will improve"). Add
 predictions defeat the reflection layer's purpose — they produce structurally-empty
 events that yield no calibration signal.
 
+**Always fill in `--process-lesson` on done events — it's the rung that lets you climb.**
+**Reference class > intuition.** Before predicting, look at 1-3 prior similar tasks. Pass
+them via `--reference-task`. Empty `reference_tasks` = "I used the inside view only".
+
+Pass `--predicted-by agent` when an agent files the predictions. The default is "operator"
+whenever predictions are present, so agent guesses would otherwise be recorded as
+operator-authored (use `operator-edited` once the operator has reviewed them).
+
 ## Tips
 
 - **Flag order**: `clawpm [global flags] <command> [command flags]` — e.g. `clawpm -f text tasks list -s open`
 - **JSON output**: All commands emit JSON by default; use `-f text` for human-readable
 - **One command per call**: Don't chain clawpm commands with `&&` — run each separately. Don't paste `;`-separated batches either.
 - **Verify batches**: after any batch of `tasks add`, run `clawpm tasks list` to confirm every task landed. On installs that predate the Windows glob fix (below), an add with a mangled argument could exit 0 and drop the task silently. The check is cheap and still worth running.
-
+- **Portfolio root**: Default `~/clawpm`
+- **Work log**: Append-only at `<portfolio>/work_log.jsonl`
 - **Windows glob expansion (fixed by CLAWP-109, PR #77)**: in installs that predate that fix, Click expanded every argv entry on Windows (glob, `~`, `$VAR`, `%VAR%`), so `--scope "src/**"` arrived as file paths: a usage error when several files matched, a silently rewritten scope (`src\a.py`) when one did. Newer installs pass arguments verbatim. On 0.2.0 or older, pass patterns with `--scope-file` / `--predict-scope-file`, use a wildcard-free prefix, and keep literal double-star out of free text (`--actual`, `--context`, `--summary`; write "double-star" in prose). Those installs also silently dropped any argument containing a double-star sequence, with exit 0, so verify with `clawpm tasks list` after a batch. Options that name a filesystem path (`--target-dir`, `--body-file`, `--scope-file`, `--in-repo`, ...) still expand `~` and environment variables. Quote wildcard patterns: an unquoted one can be globbed by a POSIX shell on any OS (including Git Bash on Windows) or by PowerShell on Linux/macOS before clawpm runs. PowerShell and cmd on Windows pass arguments through verbatim.
 
 ## Dispatch discipline — rubric scoping & worktree safety
@@ -139,4 +148,4 @@ events that yield no calibration signal.
 - **Apply phase rubric:** "every decision with `status:approved` applied with an audit entry; **zero** writes lacking an approved decision ID."
 - The outcome ("tie-out / books balance") is the rubric **only** for the final close task, dispatched *after* the human sign-off exists.
 
-**Never `--worktree`-dispatch a task that mutates a single shared store.** Worktree isolation is built for parallel *code* work with disjoint file scopes (see Scope-Aware Dispatch below). A task that appends to one shared ledger — a decisions store, `work_log.jsonl`, leases, any append-only state, **including clawpm's own JSONL stores** — must dispatch **in-place against the main repo dir**, or the ledger forks per worktree branch and records diverge or are lost. Worktree dispatch is for code; in-place dispatch is for state.
+**Never `--worktree`-dispatch a task that mutates a single shared store.** Worktree isolation is built for parallel *code* work with disjoint file scopes (see the Scope-Aware Dispatch section in `references/dispatch-and-scope.md`). A task that appends to one shared ledger — a decisions store, `work_log.jsonl`, leases, any append-only state, **including clawpm's own JSONL stores** — must dispatch **in-place against the main repo dir**, or the ledger forks per worktree branch and records diverge or are lost. Worktree dispatch is for code; in-place dispatch is for state.

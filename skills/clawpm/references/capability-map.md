@@ -12,7 +12,7 @@ clawpm is meant to be *agentic*: the acting agent should reach for the right pri
 | One task is really several independent sub-pieces | `tasks decompose <id>` | Splits into child subtasks under the parent; each gets its own rubric. |
 | Several queued tasks can run in parallel | set `--parallel-group N`, then `clawpm next --batch` | Returns the next dispatchable group; `tasks add` siblings sharing a group run together. |
 | About to spawn a parallel agent on shared files | `clawpm conflicts --scope ...` (or `--task <id>`) | Pre-flight file-claim check; empty `conflicts` array = safe to dispatch. |
-| Subagent doing >5min file work toward a verifiable goal | **see "Two dispatch modes" below** | The mode depends on *how* the subagent runs (separate process vs in-harness). |
+| Subagent doing >5min file work toward a verifiable goal | **see "Two dispatch modes" in `SKILL.md`** | The mode depends on *how* the subagent runs (separate process vs in-harness). |
 | Verify a subagent's deliverable against its rubric | `subagent-judge` skill | Independent criterion-by-criterion grade; catches "said done, missed criterion N". |
 | Render a task's rubric for a grader / outcome payload | `tasks emit-rubric <id>` | Markdown rubric, or `--rubric-format outcome-payload` for the Anthropic Outcomes shape. |
 | Long/crash-prone dispatch that must survive a dead holder | `lease grant/heartbeat` (+ `tasks dispatch --lease-ttl`) | TTL + heartbeat; expiry → fallback policy (requeue/route/escalate). No daemon. |

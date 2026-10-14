@@ -193,6 +193,3 @@ Doctor always exits 0; `--strict` exits 1 if any warning is present.
 | progress | `tasks/CLAWP-042.progress.md` | In progress |
 | done | `tasks/done/CLAWP-042.md` | Completed |
 | blocked | `tasks/blocked/CLAWP-042.md` | Waiting |
-
-- **Portfolio root**: Default `~/clawpm`
-- **Work log**: Append-only at `<portfolio>/work_log.jsonl`

@@ -39,7 +39,7 @@ writing an append-only JSONL event to `~/clawpm/reflections/<task-id>.jsonl`.
 > only" — that's signal too. Phase 2 will surface reference candidates automatically;
 > for now do it manually.
 
-
+**Claude's mandate (full text in `SKILL.md`): when Claude adds a task on the operator's behalf, ALWAYS include predictions.**
 
 The operator has specifically requested this: Claude's time estimates are
 systematically biased (often 10-100× over actual). Capturing predictions creates
