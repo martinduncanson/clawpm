@@ -238,7 +238,7 @@ class RealGit:
             return _cp(json.dumps(self.pr))
         if self.timeout_on and _norm(args)[:2] == ["git", self.timeout_on]:
             raise subprocess.TimeoutExpired(args, 1)
-        if args[:2] == ["git", "push"]:
+        if _norm(args)[:2] == ["git", "push"]:
             self.pushed = True
         if self.lie_after_push and self.pushed and args[:2] == ["git", "ls-remote"]:
             return _cp(f"{self.lie_after_push}\trefs/heads/main\n")
@@ -311,7 +311,7 @@ def test_push_verifies_remote_head_equals_local(real_repo):
     head = _g(repo, "rev-parse", "HEAD")
     assert _g(bare, "rev-parse", "refs/heads/main") == head
     assert _payload(res)["pushed"]["head"] == head
-    assert not any("--force" in c or "-f" in c for c in fake.calls if c[:2] == ["git", "push"])
+    assert not any("--force" in c or "-f" in c for c in fake.calls if _norm(c)[:2] == ["git", "push"])
 
 
 def test_push_verification_mismatch_is_loud(real_repo):

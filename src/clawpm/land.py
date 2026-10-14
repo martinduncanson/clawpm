@@ -21,18 +21,50 @@ lookup). The merge itself stays with the operator; this module never merges.
 
 from __future__ import annotations
 
+import io
+import os
 import re
 import subprocess
+import tarfile
+import tempfile
 from pathlib import Path
 from typing import Any
 
 from clawpm.codex_check import _extract_github_owner_repo
 from clawpm.models import TaskState
-from clawpm.pr_verify import PrVerifyError, _FULL_SHA, _gh_json, _remote_head, _resolve_repo, _run
+from clawpm.pr_verify import PrVerifyError, _FULL_SHA, _gh_json, _remote_head, _resolve_repo
 
 _TIMEOUT = 60
 _NO_ATTRIBUTION = re.compile(r"co-authored-by|generated with|claude", re.I)
 _LAND_BRANCH = "main"
+
+# Every git call runs with these pinned, so user/repo config cannot change what
+# a command does (CLAWP-147-002 rounds 2-4: autostash, squash mergeoptions,
+# hidden untracked files, ignored submodules, a pruning fetch). Command-line
+# `-c` outranks every config file.
+_GIT_PINS = (
+    "merge.autoStash=false",
+    "merge.ff=only",
+    f"branch.{_LAND_BRANCH}.mergeoptions=",
+    "status.showUntrackedFiles=all",
+    "diff.ignoreSubmodules=none",
+    "core.fsmonitor=false",
+    "submodule.recurse=false",
+    "fetch.recurseSubmodules=false",
+    "fetch.prune=false",
+    "fetch.pruneTags=false",
+    "push.recurseSubmodules=no",
+    "push.followTags=false",
+    "gc.auto=0",
+    "maintenance.auto=false",
+)
+# Location and config overrides inherited from a parent git process or the shell.
+_GIT_ENV_STRIPPED = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+    "GIT_NAMESPACE", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS",
+)
+# transition() result keys ending in `_errors` that only degrade the audit trail.
+_SOFT_TRANSITION_ERRORS = ("reflection_errors", "files_changed_errors", "parent_ready_errors")
 
 
 class LandError(Exception):
@@ -48,32 +80,41 @@ class LandError(Exception):
 
 def _label(args: list[str]) -> str:
     """The subcommand and its first args, without git's leading global options."""
-    i = 0
-    while i < len(args):
-        if args[i] == "-c":
-            i += 2
-        elif args[i].startswith("--no-optional-locks"):
-            i += 1
-        else:
-            break
-    return " ".join(args[i:i + 3])
+    return " ".join(args[:3])
 
 
-def _git(args: list[str], cwd: Path, *, ok_codes: tuple[int, ...] = (0,), changed: bool = False) -> subprocess.CompletedProcess:
-    """Run git in ``cwd``; raise LandError unless the exit code is in ``ok_codes``.
+def _git_env(*, mutates: bool) -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_ENV_STRIPPED}
+    env["GIT_TERMINAL_PROMPT"] = "0"  # a credential prompt must fail, not hang
+    env["GIT_ADVICE"] = "0"
+    env["GIT_MERGE_AUTOEDIT"] = "no"
+    if not mutates:
+        env["GIT_OPTIONAL_LOCKS"] = "0"  # a read must not rewrite the index
+    return env
 
-    ``changed`` is True for every call made after the first mutation, so a
-    failure there can never be reported as "nothing changed".
+
+def _git(
+    args: list[str], cwd: Path, *, ok_codes: tuple[int, ...] = (0,), changed: bool = False,
+    mutates: bool = False, binary: bool = False,
+) -> subprocess.CompletedProcess:
+    """The ONE place land.py runs git: config pinned, location env stripped.
+
+    Raise LandError unless the exit code is in ``ok_codes``. ``changed`` is
+    True for every call made after the first mutation, so a failure there can
+    never be reported as "nothing changed". ``mutates`` marks the calls that
+    write (fetch, merge, add, commit, push, worktree remove); every other call
+    runs with optional locks off. ``binary`` returns bytes on stdout.
     """
+    pins = [x for pin in _GIT_PINS for x in ("-c", pin)]
+    text_kw: dict[str, Any] = {} if binary else {"text": True, "encoding": "utf-8", "errors": "replace"}
     try:
         proc = subprocess.run(
-            ["git", *args],
+            ["git", *pins, *args],
             cwd=str(cwd),
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=_TIMEOUT,
+            env=_git_env(mutates=mutates),
+            **text_kw,
         )
     except FileNotFoundError:
         raise LandError("git_missing", "`git` is not installed or not on PATH", changed=changed)
@@ -85,7 +126,7 @@ def _git(args: list[str], cwd: Path, *, ok_codes: tuple[int, ...] = (0,), change
         raise LandError(
             "git_failed",
             f"`git {_label(args)}` exited {proc.returncode}",
-            {"stderr": (proc.stderr or "").strip()},
+            {"stderr": (proc.stderr.decode("utf-8", "replace") if isinstance(proc.stderr, bytes) else (proc.stderr or "")).strip()},
             changed=changed,
         )
     return proc
@@ -98,24 +139,97 @@ def _out(args: list[str], cwd: Path, *, changed: bool = False) -> str:
 def _dirty_tracked_paths(cwd: Path, *, changed: bool = False) -> list[str]:
     """Tracked paths with staged or unstaged changes (untracked files are ignored).
 
-    ``--no-optional-locks`` keeps status from refreshing (rewriting) the index,
-    so a refusal leaves its bytes alone. Submodule ignore settings are
-    overridden so a hidden submodule edit cannot pass the clean-checkout gate.
+    A read-only call (optional locks off), so a refusal leaves the index bytes
+    alone; submodule ignore settings are pinned off so a hidden submodule edit
+    cannot pass the clean-checkout gate.
     """
+    return [p for _, p in _status_entries(cwd, untracked="no", changed=changed)]
+
+
+def _status_entries(cwd: Path, *, untracked: str, changed: bool = False) -> list[tuple[str, str]]:
+    """``(XY, path)`` per ``git status`` entry; ``untracked`` is ``no`` or ``all``."""
     raw = _git(
-        [
-            "--no-optional-locks", "-c", "diff.ignoreSubmodules=none",
-            "status", "--porcelain=v1", "-z", "--untracked-files=no", "--no-renames",
-            "--ignore-submodules=none",
-        ],
+        ["status", "--porcelain=v1", "-z", f"--untracked-files={untracked}", "--no-renames", "--ignore-submodules=none"],
         cwd,
         changed=changed,
     ).stdout or ""
-    paths = []
-    for entry in raw.split("\0"):
-        if len(entry) > 3:  # "XY path"
-            paths.append(entry[3:])
-    return paths
+    return [(e[:2], e[3:]) for e in raw.split("\0") if len(e) > 3]  # "XY path"
+
+
+def _checkout_state(cwd: Path, *, changed: bool = False) -> tuple[str, str, str]:
+    """HEAD, the logical index (stat-independent) and the status including untracked files.
+
+    A failed merge can leave the index or working files changed while HEAD has
+    not moved (git updates them before the ref), so "nothing changed" is
+    decided by comparing this tuple before and after, never HEAD alone.
+    """
+    return (
+        _out(["rev-parse", "HEAD"], cwd, changed=changed),
+        _git(["ls-files", "--stage", "-z"], cwd, changed=changed).stdout or "",
+        _git(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames", "--ignore-submodules=none"], cwd, changed=changed).stdout or "",
+    )
+
+
+def _worktree_blocker(wt: Path) -> tuple[str, str] | None:
+    """``(code, message)`` when a plain ``git worktree remove`` of ``wt`` would refuse or lose work."""
+    if _status_entries(wt, untracked="all"):
+        return "worktree_dirty", f"worktree {wt} has uncommitted or untracked files; not removing it"
+    for entry in (_git(["ls-files", "--stage", "-z"], wt).stdout or "").split("\0"):
+        meta, _, sub = entry.partition("\t")
+        if meta.startswith("160000"):  # a gitlink; git refuses to remove a worktree whose submodule is populated
+            if (wt / sub / ".git").exists():
+                return "worktree_has_submodules", f"worktree {wt} has a populated submodule ({sub}); git will not remove it"
+    return None
+
+
+def _check_task_eligible(task, status: dict, task_id: str) -> None:
+    """Refuse a task that ``transition()`` would refuse (done, a decision, open children)."""
+    if task.state == TaskState.DONE:
+        raise LandError("task_already_done", f"{task_id} is already done; nothing to land")
+    if task.kind == "decision":
+        raise LandError(
+            "decision_needs_resolution",
+            f"{task_id} is a decision task; close it with `tasks state {task_id} done --resolution ...`",
+        )
+    if status["incomplete"] or status["missing"]:
+        raise LandError(
+            "subtasks_incomplete",
+            f"{task_id} has incomplete subtasks",
+            {"incomplete": [c["id"] for c in status["incomplete"]], "missing": list(status["missing"])},
+        )
+
+
+def _task_at_tip(config, project_id: str, task_id: str, toplevel: Path, tasks_dir: Path, tip: str, target: str) -> None:
+    """Refuse now if the task, as it exists at the verified tip, is not landable.
+
+    The fast-forward replaces the task files, so eligibility read from the
+    current checkout can be stale. The tip's task directory is extracted to a
+    temp dir and read through a pinned Scope, with no mutation of the checkout.
+    """
+    from clawpm.sessions import Scope
+    from clawpm.tasks import get_task, parent_rollup_status
+
+    try:
+        tasks_rel = _rel(tasks_dir, toplevel)
+    except ValueError:
+        raise LandError("task_outside_checkout", f"tasks dir {tasks_dir} is not inside the checkout {toplevel}")
+    proc = _git(["archive", "--format=tar", tip, "--", tasks_rel], toplevel, ok_codes=(0, 128), binary=True)
+    if proc.returncode != 0:
+        raise LandError("task_missing_at_tip", f"{tasks_rel} does not exist in {target}; cannot validate {task_id} there")
+    with tempfile.TemporaryDirectory(prefix="clawpm-land-") as tmp:
+        root = Path(tmp).resolve()
+        with tarfile.open(fileobj=io.BytesIO(proc.stdout), mode="r:") as tar:
+            for m in tar.getmembers():
+                dest = (root / m.name).resolve()
+                if not m.isfile() or root not in dest.parents:
+                    continue
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(tar.extractfile(m).read())
+        scope = Scope(pinned_project_dir=(root / tasks_rel).parent)
+        tip_task = get_task(config, project_id, task_id, scope=scope)
+        if tip_task is None:
+            raise LandError("task_missing_at_tip", f"{task_id} does not exist in {target}; the PR removed or renamed it")
+        _check_task_eligible(tip_task, parent_rollup_status(config, project_id, tip_task, scope=scope), task_id)
 
 
 def _is_own(path: str, own: list[str]) -> bool:
@@ -167,7 +281,7 @@ def _find_task_worktree(cwd: Path, toplevel: Path, task_id: str) -> dict[str, st
 
 def _remote_slug(remote: str) -> str | None:
     """owner/name of the remote's effective URL, or None when it is not a github.com URL."""
-    parsed = _extract_github_owner_repo(_run(["git", "remote", "get-url", remote]).strip())
+    parsed = _extract_github_owner_repo(_out(["remote", "get-url", remote], Path.cwd()))
     return f"{parsed[0]}/{parsed[1]}" if parsed else None
 
 
@@ -213,20 +327,7 @@ def land_task(
     task = get_task(config, project_id, task_id)
     if task is None or task.file_path is None:
         raise LandError("task_not_found", f"No task with id '{task_id}' in project '{project_id}'")
-    if task.state == TaskState.DONE:
-        raise LandError("task_already_done", f"{task_id} is already done; nothing to land")
-    if task.kind == "decision":
-        raise LandError(
-            "decision_needs_resolution",
-            f"{task_id} is a decision task; close it with `tasks state {task_id} done --resolution ...`",
-        )
-    status = parent_rollup_status(config, project_id, task)
-    if status["incomplete"] or status["missing"]:
-        raise LandError(
-            "subtasks_incomplete",
-            f"{task_id} has incomplete subtasks",
-            {"incomplete": [c["id"] for c in status["incomplete"]], "missing": list(status["missing"])},
-        )
+    _check_task_eligible(task, parent_rollup_status(config, project_id, task), task_id)
     old_entry = _task_entry(task.file_path)
     try:
         old_rel = _rel(old_entry, toplevel)
@@ -295,7 +396,7 @@ def land_task(
     # 5. Refs: fetch (moves remote-tracking refs only), then prove the tracking
     #    ref is current, the merge commit is in it and our branch can fast-forward.
     #    From here on only the verified `tip` sha is used, never the ref name.
-    _git(["fetch", remote], toplevel)
+    _git(["fetch", remote], toplevel, mutates=True)
     target = f"{remote}/{base}"
     tip = _out(["rev-parse", "--verify", f"refs/remotes/{target}^{{commit}}"], toplevel)
     try:
@@ -329,6 +430,10 @@ def land_task(
             {"path": done_rel},
         )
 
+    # 5b. The task as it will exist at the verified tip (the ff replaces its files).
+    if tasks_dir is not None:
+        _task_at_tip(config, project_id, task_id, toplevel, tasks_dir, tip, target)
+
     # 6. Optional worktree removal: refuse up front when it cannot succeed.
     wt_path: Path | None = None
     if remove_worktree:
@@ -337,21 +442,36 @@ def land_task(
             wt_path = Path(blk["worktree"])
             if "locked" in blk:
                 raise LandError("worktree_locked", f"worktree {wt_path} is locked; unlock it first or drop --remove-worktree", {"worktree": str(wt_path)})
-            wt_status = _git(["--no-optional-locks", "status", "--porcelain"], wt_path).stdout or ""
-            if wt_status.strip():
-                raise LandError("worktree_dirty", f"worktree {wt_path} has uncommitted or untracked files; not removing it", {"worktree": str(wt_path)})
+            blocker = _worktree_blocker(wt_path)
+            if blocker:
+                raise LandError(blocker[0], blocker[1], {"worktree": str(wt_path)})
+
+    # 7. Snapshot the checkout; HEAD must still be what every check above ran against.
+    state_before = _checkout_state(toplevel)
+    if state_before[0] != before:
+        raise LandError("head_moved", f"HEAD moved from {before} to {state_before[0]} during the checks; run again", {"head": state_before[0]})
 
     # ---- first mutation: every failure from here on is changed=True ----
     try:
-        # No autostash: a configured merge.autoStash must not turn a refusal into a stash + pop.
-        _git(["-c", "merge.autoStash=false", "merge", "--ff-only", "--no-autostash", tip], toplevel)
+        # Pinned off (see _GIT_PINS) and repeated on the command line: no autostash, no squash, ff only.
+        _git(["merge", "--ff-only", "--no-squash", "--no-autostash", tip], toplevel, mutates=True)
     except LandError as exc:
-        # git refuses a ff that would overwrite local changes before touching anything.
-        after = _out(["rev-parse", "HEAD"], toplevel, changed=True)
-        raise LandError(
-            "ff_failed", exc.message, {**exc.details, "head": after}, changed=(after != before)
-        )
+        # A failed merge can have updated the index or files before the ref, so
+        # compare the whole checkout state, not HEAD alone; if it cannot be read, assume changed.
+        try:
+            changed = _checkout_state(toplevel) != state_before
+            after = _out(["rev-parse", "HEAD"], toplevel)
+        except LandError:
+            changed, after = True, None
+        raise LandError("ff_failed", exc.message, {**exc.details, "head": after}, changed=changed)
     ff_head = _out(["rev-parse", "HEAD"], toplevel, changed=True)
+    if ff_head != tip:
+        raise LandError(
+            "ff_not_applied",
+            f"git merge --ff-only exited 0 but HEAD is {ff_head}, not the verified tip {tip}; nothing was marked done",
+            {"head": ff_head, "tip": tip},
+            changed=_checkout_state(toplevel, changed=True) != state_before,
+        )
 
     from clawpm.services.tasks import transition
 
@@ -390,8 +510,8 @@ def land_task(
             if (toplevel / p).exists() or (_git(["ls-files", "--", p], toplevel, changed=True).stdout or "").strip()
         ]
         msg = f"chore: mark {task_id} done (PR #{pr_number} merged)"
-        _git(["add", "-A", "--", *specs], toplevel, changed=True)
-        _git(["commit", "-m", msg, "--", *specs], toplevel, changed=True)
+        _git(["add", "-A", "--", *specs], toplevel, changed=True, mutates=True)
+        _git(["commit", "-m", msg, "--", *specs], toplevel, changed=True, mutates=True)
     except LandError as exc:
         raise LandError(
             "commit_failed", exc.message,
@@ -399,13 +519,14 @@ def land_task(
         )
     head = _out(["rev-parse", "HEAD"], toplevel, changed=True)
     count = int(_out(["rev-list", "--count", f"{ff_head}..HEAD"], toplevel, changed=True) or 0)
+    parent = _git(["rev-parse", "--verify", "-q", "HEAD^"], toplevel, ok_codes=(0, 1), changed=True).stdout.strip()
     files = [f for f in (_git(["diff-tree", "--no-commit-id", "--name-only", "-r", "--no-renames", "-z", "HEAD"], toplevel, changed=True).stdout or "").split("\0") if f]
     body = _out(["log", "-1", "--format=%B"], toplevel, changed=True)
-    if count != 1 or not all(_is_own(f, own) for f in files) or _NO_ATTRIBUTION.search(body):
+    if count != 1 or parent != ff_head or not all(_is_own(f, own) for f in files) or _NO_ATTRIBUTION.search(body):
         raise LandError(
             "commit_unexpected",
             "the landing commit is not exactly one task-only commit without attribution; inspect it, nothing was undone",
-            {"commits": count, "files": files, "head": head},
+            {"commits": count, "parent": parent, "files": files, "head": head},
             changed=True,
         )
 
@@ -424,10 +545,25 @@ def land_task(
         "uncommitted_other": [p for p in _dirty_tracked_paths(toplevel, changed=True) if not _is_own(p, own)],
         "warnings": list((res.get("data") or {}).get("warnings") or []),
     }
+    # transition() reports secondary failures (a dependent left blocked, a log
+    # not written) in `*_errors` keys while still returning ok=True. Surface
+    # them: audit-only ones as warnings, the rest make the landing not ok.
+    tdata = res.get("data") or {}
+    errors: list[dict[str, Any]] = []
+    for key in sorted(k for k in tdata if k.endswith("_errors") and tdata[k]):
+        for item in tdata[key] if isinstance(tdata[key], list) else [tdata[key]]:
+            if key in _SOFT_TRANSITION_ERRORS:
+                result["warnings"].append(f"{key}: {item}")
+            else:
+                errors.append({"source": key, "detail": item})
+    if errors:
+        result["ok"] = False
+        result["landed"] = True
+        result["errors"] = errors
 
     if push:
         try:
-            _git(["push", remote, f"HEAD:refs/heads/{base}"], toplevel)
+            _git(["push", "--no-follow-tags", "--no-recurse-submodules", remote, f"HEAD:refs/heads/{base}"], toplevel, mutates=True)
         except LandError as exc:
             raise LandError("push_failed", exc.message, {**exc.details, "local_head": head, "result": result}, changed=True)
         try:
@@ -445,7 +581,10 @@ def land_task(
 
     if remove_worktree and wt_path is not None:
         try:
-            _git(["worktree", "remove", str(wt_path)], toplevel)
+            blocker = _worktree_blocker(wt_path)  # re-check: work may have appeared since the precheck
+            if blocker:
+                raise LandError(blocker[0], blocker[1], {"worktree": str(wt_path)}, changed=True)
+            _git(["worktree", "remove", str(wt_path)], toplevel, mutates=True)
         except LandError as exc:
             raise LandError("worktree_remove_failed", exc.message, {**exc.details, "result": result}, changed=True)
         result["worktree_removed"] = str(wt_path)

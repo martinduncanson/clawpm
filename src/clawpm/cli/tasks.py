@@ -857,6 +857,12 @@ def tasks_land(ctx: click.Context, project_id: str | None, task_id: str, pr_numb
             click.echo(f"  removed worktree {result['worktree_removed']}")
         for path in result["uncommitted_other"]:
             click.echo(f"  left uncommitted (not a task path): {path}", err=True)
+        for warning in result["warnings"]:
+            click.echo(f"  warning: {warning}", err=True)
+        for err in result.get("errors", []):
+            click.echo(f"  ERROR {err['source']}: {err['detail']}", err=True)
+    if not result["ok"]:
+        sys.exit(2)  # landed and committed, but a secondary step failed (see "errors")
 
 
 @tasks.command("decompose")
