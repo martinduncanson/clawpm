@@ -230,3 +230,62 @@ def test_edit_fog_on_bom_frontmatterless_file_keeps_heading(isolated_portfolio):
     assert raw.count(BOM) == 1 and raw.startswith(BOM)
     assert b"---# " not in raw
     assert get_task(pf.config, pf.project_id, "FOG-002").title == "Real task"
+
+
+# ------------------------------------------- round 2: second-audit readers
+
+
+def test_doctor_work_log_first_record_survives_bom(isolated_portfolio):
+    """cli/project.py doctor: a BOM-prefixed FIRST work_log record used to be
+    dropped by the skip-malformed arm, so a task whose newest touch was that
+    record was reported stale."""
+    from datetime import datetime, timedelta, timezone
+
+    pf = isolated_portfolio
+    old = (datetime.now(timezone.utc) - timedelta(days=30)).date().isoformat()
+    prog = pf.tasks_dir / "test-001.progress.md"
+    prog.write_text(
+        f"---\nid: test-001\nupdated: {old}\n---\n# Prog\n", encoding="utf-8"
+    )
+    log = pf.root / "work_log.jsonl"
+    fresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    log.write_text(
+        json.dumps({"task": "test-001", "ts": fresh, "action": "progress"}) + "\n",
+        encoding="utf-8",
+    )
+    _add_bom(log)
+
+    result = CliRunner().invoke(main, ["doctor"])
+    assert result.exit_code == 0, result.output
+    stale_ids = [s["task_id"] for s in json.loads(result.output).get("stale_tasks", [])]
+    assert "test-001" not in stale_ids
+
+
+def test_tasks_add_stdin_body_tolerates_bom(isolated_portfolio):
+    from clawpm.tasks import get_task
+
+    pf = isolated_portfolio
+    result = CliRunner().invoke(
+        main,
+        ["--project", "test", "tasks", "add", "--title", "T", "--stdin"],
+        input="\ufeff## Plan\n\nbody\n",
+    )
+    assert result.exit_code == 0, result.output
+    task_id = json.loads(result.output)["data"]["id"]
+    text = get_task(pf.config, "test", task_id).file_path.read_bytes()
+    assert BOM not in text
+
+
+def test_emit_tree_stdin_tolerates_bom(isolated_portfolio):
+    result = CliRunner().invoke(
+        main,
+        ["--project", "test", "tasks", "emit-tree", "--dry-run"],
+        input="\ufeff" + json.dumps({
+            "schema_version": 1,
+            "root": {"title": "R"},
+            "leaves": [{"ref": "L1", "parent_ref": None, "title": "A",
+                        "leaf_key": "k1"}],
+        }),
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["status"] == "ok"

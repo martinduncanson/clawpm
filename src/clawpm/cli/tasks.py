@@ -18,6 +18,7 @@ from clawpm.discovery import (
 from clawpm.tasks import add_subtask, add_task, archive_done_tasks, change_task_state, distinct_tags, edit_fog, edit_task, get_task, list_tasks, split_task
 from clawpm.worklog import add_entry, filter_files_changed, read_entries
 from clawpm.context import expand_task_id
+from clawpm.frontmatter import strip_bom
 from clawpm.cli.base import main, _mutation_errors, get_format, require_portfolio, require_project, _read_patterns_file, _FALLBACK_POLICIES, ExpandedPath
 from clawpm.services.tasks import transition_isolated
 from clawpm.sessions import stat_exists as _stat_exists
@@ -1062,7 +1063,7 @@ def tasks_add(
     elif body_file:
         task_body = Path(body_file).read_text(encoding="utf-8-sig")
     elif read_stdin:
-        task_body = sys.stdin.read()
+        task_body = strip_bom(sys.stdin.read())
     elif description:
         task_body = description
 
@@ -2594,7 +2595,7 @@ def tasks_emit_tree(
 
     # Read JSON from stdin
     try:
-        raw_text = click.get_text_stream("stdin").read()
+        raw_text = strip_bom(click.get_text_stream("stdin").read())
     except Exception as exc:
         output_error("stdin_read_error", f"Failed to read stdin: {exc}", fmt=fmt)
         sys.exit(1)

@@ -446,7 +446,7 @@ def _project_doctor_impl(
             # Read work_log entries for this task to find more recent touch
             work_log_path = config.portfolio_root / "work_log.jsonl"
             if work_log_path.exists():
-                for line in work_log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                for line in work_log_path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
                     line = line.strip()
                     if not line:
                         continue
