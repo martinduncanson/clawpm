@@ -21,18 +21,16 @@ lookup). The merge itself stays with the operator; this module never merges.
 
 from __future__ import annotations
 
-import io
 import os
 import re
 import subprocess
-import tarfile
 import tempfile
 from pathlib import Path
 from typing import Any
 
 from clawpm.codex_check import _extract_github_owner_repo
 from clawpm.models import TaskState
-from clawpm.pr_verify import PrVerifyError, _FULL_SHA, _gh_json, _remote_head, _resolve_repo
+from clawpm.pr_verify import PrVerifyError, _FULL_SHA, _gh_json
 
 _TIMEOUT = 60
 _NO_ATTRIBUTION = re.compile(r"co-authored-by|generated with|claude", re.I)
@@ -95,7 +93,7 @@ def _git_env(*, mutates: bool) -> dict[str, str]:
 
 def _git(
     args: list[str], cwd: Path, *, ok_codes: tuple[int, ...] = (0,), changed: bool = False,
-    mutates: bool = False, binary: bool = False,
+    mutates: bool = False, binary: bool = False, stdin: bytes | None = None,
 ) -> subprocess.CompletedProcess:
     """The ONE place land.py runs git: config pinned, location env stripped.
 
@@ -103,9 +101,11 @@ def _git(
     True for every call made after the first mutation, so a failure there can
     never be reported as "nothing changed". ``mutates`` marks the calls that
     write (fetch, merge, add, commit, push, worktree remove); every other call
-    runs with optional locks off. ``binary`` returns bytes on stdout.
+    runs with optional locks off. ``binary`` returns bytes on stdout; ``stdin``
+    (bytes) implies it.
     """
     pins = [x for pin in _GIT_PINS for x in ("-c", pin)]
+    binary = binary or stdin is not None
     text_kw: dict[str, Any] = {} if binary else {"text": True, "encoding": "utf-8", "errors": "replace"}
     try:
         proc = subprocess.run(
@@ -114,6 +114,7 @@ def _git(
             capture_output=True,
             timeout=_TIMEOUT,
             env=_git_env(mutates=mutates),
+            **({"input": stdin} if stdin is not None else {}),
             **text_kw,
         )
     except FileNotFoundError:
@@ -213,18 +214,33 @@ def _task_at_tip(config, project_id: str, task_id: str, toplevel: Path, tasks_di
         tasks_rel = _rel(tasks_dir, toplevel)
     except ValueError:
         raise LandError("task_outside_checkout", f"tasks dir {tasks_dir} is not inside the checkout {toplevel}")
-    proc = _git(["archive", "--format=tar", tip, "--", tasks_rel], toplevel, ok_codes=(0, 128), binary=True)
-    if proc.returncode != 0:
+    # Blobs are read straight from the tree object: `git archive` would apply
+    # export-ignore / export-subst attributes (from the tip or info/attributes).
+    listing = _git(["ls-tree", "-r", "-z", "--full-tree", tip, "--", tasks_rel], toplevel, binary=True).stdout
+    entries = []
+    for rec in listing.split(b"\0"):
+        meta, _, name = rec.partition(b"\t")
+        parts = meta.split()
+        if len(parts) == 3 and parts[1] == b"blob" and parts[0] != b"120000":  # symlinks are not task files
+            entries.append((parts[2], name.decode("utf-8", "replace")))
+    if not entries:
         raise LandError("task_missing_at_tip", f"{tasks_rel} does not exist in {target}; cannot validate {task_id} there")
+    blobs = _git(["cat-file", "--batch"], toplevel, stdin=b"".join(oid + b"\n" for oid, _ in entries)).stdout
     with tempfile.TemporaryDirectory(prefix="clawpm-land-") as tmp:
         root = Path(tmp).resolve()
-        with tarfile.open(fileobj=io.BytesIO(proc.stdout), mode="r:") as tar:
-            for m in tar.getmembers():
-                dest = (root / m.name).resolve()
-                if not m.isfile() or root not in dest.parents:
-                    continue
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(tar.extractfile(m).read())
+        pos = 0
+        for oid, name in entries:
+            nl = blobs.index(b"\n", pos)
+            header = blobs[pos:nl].split()
+            if len(header) != 3 or header[1] != b"blob":
+                raise LandError("git_failed", f"git cat-file --batch gave {blobs[pos:nl]!r} for {oid.decode()}")
+            size = int(header[2])
+            data, pos = blobs[nl + 1:nl + 1 + size], nl + 1 + size + 1
+            dest = (root / name).resolve()
+            if root not in dest.parents:
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
         scope = Scope(pinned_project_dir=(root / tasks_rel).parent)
         tip_task = get_task(config, project_id, task_id, scope=scope)
         if tip_task is None:
@@ -283,6 +299,20 @@ def _remote_slug(remote: str) -> str | None:
     """owner/name of the remote's effective URL, or None when it is not a github.com URL."""
     parsed = _extract_github_owner_repo(_out(["remote", "get-url", remote], Path.cwd()))
     return f"{parsed[0]}/{parsed[1]}" if parsed else None
+
+
+def _remote_branch_tip(remote: str, branch: str, cwd: Path, *, changed: bool = False) -> str:
+    """The sha of ``refs/heads/<branch>`` on ``remote``, through the pinned runner (pr_verify's own is unpinned)."""
+    out = _out(["ls-remote", remote, f"refs/heads/{branch}"], cwd, changed=changed)
+    for line in out.splitlines():
+        sha, _, ref = line.partition("\t")
+        if ref.strip() == f"refs/heads/{branch}" and _FULL_SHA.match(sha.strip()):
+            return sha.strip()
+    raise LandError(
+        "remote_branch_missing",
+        f"branch '{branch}' not found on remote '{remote}' (deleted, or the PR head is in another repo)",
+        changed=changed,
+    )
 
 
 def land_task(
@@ -374,7 +404,9 @@ def land_task(
                     "refusing to attest a PR from a different repository",
                     {"repo": repo, "remote_repo": actual},
                 )
-        repo_slug = _resolve_repo(repo, remote)
+        repo_slug = repo or _remote_slug(remote)
+        if not repo_slug:
+            raise LandError("repo_unresolved", f"cannot derive owner/repo from remote '{remote}'; pass --repo")
         pr = _gh_json([
             "pr", "view", str(pr_number), "--repo", repo_slug,
             "--json", "state,mergeCommit,baseRefName,headRefName,url",
@@ -399,10 +431,7 @@ def land_task(
     _git(["fetch", remote], toplevel, mutates=True)
     target = f"{remote}/{base}"
     tip = _out(["rev-parse", "--verify", f"refs/remotes/{target}^{{commit}}"], toplevel)
-    try:
-        remote_tip = _remote_head(remote, base)
-    except PrVerifyError as exc:
-        raise LandError(exc.code, exc.message, exc.details)
+    remote_tip = _remote_branch_tip(remote, base, toplevel)
     if tip != remote_tip:
         raise LandError(
             "tracking_ref_stale",
@@ -567,8 +596,8 @@ def land_task(
         except LandError as exc:
             raise LandError("push_failed", exc.message, {**exc.details, "local_head": head, "result": result}, changed=True)
         try:
-            remote_after = _remote_head(remote, base)
-        except PrVerifyError as exc:
+            remote_after = _remote_branch_tip(remote, base, toplevel, changed=True)
+        except LandError as exc:
             raise LandError(exc.code, exc.message, {**exc.details, "result": result}, changed=True)
         if remote_after != head:
             raise LandError(

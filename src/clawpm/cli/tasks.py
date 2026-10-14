@@ -827,7 +827,10 @@ def tasks_land(ctx: click.Context, project_id: str | None, task_id: str, pr_numb
     own files is modified (the path is named); the command runs inside a linked
     (dispatched) worktree or on the wrong branch; or the fast-forward is not
     clean. Exit 2 means a step failed AFTER the fast-forward began; the error
-    says what was done and nothing is undone. ``git fetch`` is the only thing a
+    says what was done and nothing is undone. Exit 2 is also used when the
+    landing committed but a secondary step failed (a dependent left blocked, a
+    log not written): the result then has ``ok: false``, ``landed: true`` and an
+    ``errors`` list. ``git fetch`` is the only thing a
     refusal can have touched (remote-tracking refs).
     """
     from clawpm.land import LandError, land_task

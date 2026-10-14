@@ -225,22 +225,36 @@ def _g(cwd, *args):
 class RealGit:
     """Pass git through to the real binary; answer gh from canned data."""
 
-    def __init__(self, pr, lie_after_push: str | None = None, timeout_on: str | None = None):
+    def __init__(self, pr, lie_after_push: str | None = None, timeout_on: str | None = None, on_merge=None, rewrite_merge=None, after_push=None):
         self.pr = pr
+        self.after_push = after_push
         self.timeout_on = timeout_on
+        self.on_merge = on_merge  # called just before git merge runs; may mutate the checkout, may raise
+        self.rewrite_merge = rewrite_merge  # replaces the merge argv (simulates inherited config changing git's behaviour)
         self.calls: list[list[str]] = []
+        self.envs: list[dict | None] = []
         self.lie_after_push = lie_after_push
         self.pushed = False
 
     def __call__(self, args, **kw):
         self.calls.append(list(args))
+        self.envs.append(kw.get("env"))
         if args[0] == "gh":
             return _cp(json.dumps(self.pr))
         if self.timeout_on and _norm(args)[:2] == ["git", self.timeout_on]:
             raise subprocess.TimeoutExpired(args, 1)
+        if _norm(args)[:2] == ["git", "merge"]:
+            if self.on_merge:
+                self.on_merge()
+            if self.rewrite_merge:
+                args = self.rewrite_merge(args)
         if _norm(args)[:2] == ["git", "push"]:
             self.pushed = True
-        if self.lie_after_push and self.pushed and args[:2] == ["git", "ls-remote"]:
+            proc = _REAL_RUN(args, **kw)
+            if self.after_push:
+                self.after_push()
+            return proc
+        if self.lie_after_push and self.pushed and _norm(args)[:2] == ["git", "ls-remote"]:
             return _cp(f"{self.lie_after_push}\trefs/heads/main\n")
         return _REAL_RUN(args, **kw)
 
@@ -276,9 +290,9 @@ def real_repo(isolated_portfolio, tmp_path, monkeypatch):
     return isolated_portfolio, repo, bare, task, merge, pr
 
 
-def _land(task, pr, *extra, lie_after_push=None, timeout_on=None):
-    fake = RealGit(pr, lie_after_push, timeout_on)
-    with patch("subprocess.run", fake):
+def _land(task, pr, *extra, lie_after_push=None, timeout_on=None, on_merge=None, rewrite_merge=None, env=None, after_push=None):
+    fake = RealGit(pr, lie_after_push, timeout_on, on_merge, rewrite_merge, after_push)
+    with patch("subprocess.run", fake), patch.dict("os.environ", env or {}):
         res = _invoke(task.id, "--pr", "7", "-p", "test", "--repo", REPO, *extra)
     return res, fake
 
@@ -626,7 +640,74 @@ def _s_stat_touch_then_open(ctx):
     return {**ctx["pr"], "state": "OPEN", "mergeCommit": None}, [], "pr_not_merged"
 
 
-@pytest.mark.parametrize("scenario", [_s_open_pr, _s_stray, _s_local_commit, _s_wrong_branch, _s_done_dest, _s_dirty_worktree, _s_locked_worktree, _s_stat_touch_then_open])
+def _tip_edit_make_decision(task_id):
+    def edit(other):
+        p = other / ".project" / "tasks" / f"{task_id}.md"
+        p.write_bytes(p.read_text(encoding="utf-8").replace("---\n", "---\nkind: decision\n", 1).encode("utf-8"))
+    return edit
+
+
+def _tip_edit_add_child(task_id):
+    def edit(other):
+        (other / ".project" / "tasks" / f"{task_id}-C1.md").write_bytes(
+            f"---\nid: {task_id}-C1\nparent: {task_id}\ncreated: '2026-10-14'\npriority: 5\n---\n# child\n".encode("utf-8")
+        )
+    return edit
+
+
+def _s_hidden_untracked_worktree(ctx):
+    wt = ctx["tmp"] / "wts" / ctx["task"].id
+    _g(ctx["repo"], "worktree", "add", str(wt), "-b", f"clawpm/{ctx['task'].id}", "main")
+    (wt / "scratch.txt").write_text("wip\n", encoding="utf-8")
+    _g(ctx["repo"], "config", "status.showUntrackedFiles", "no")  # plain `git worktree remove` would not see the file
+    return ctx["pr"], ["--remove-worktree"], "worktree_dirty"
+
+
+def _s_submodule_worktree(ctx):
+    wt = ctx["tmp"] / "wts" / ctx["task"].id
+    _g(ctx["repo"], "worktree", "add", str(wt), "-b", f"clawpm/{ctx['task'].id}", "main")
+    _add_populated_submodule(ctx["tmp"], wt)
+    return ctx["pr"], ["--remove-worktree"], "worktree_has_submodules"
+
+
+def _s_decision_at_tip(ctx):
+    new = _advance(ctx["tmp"], edit=_tip_edit_make_decision(ctx["task"].id))
+    return _with_merge(ctx["pr"], new), [], "decision_needs_resolution"
+
+
+def _s_child_at_tip(ctx):
+    new = _advance(ctx["tmp"], edit=_tip_edit_add_child(ctx["task"].id))
+    return _with_merge(ctx["pr"], new), [], "subtasks_incomplete"
+
+
+def _s_removed_at_tip(ctx):
+    tid = ctx["task"].id
+    new = _advance(ctx["tmp"], edit=lambda other: _g(other, "rm", f".project/tasks/{tid}.md"))
+    return _with_merge(ctx["pr"], new), [], "task_missing_at_tip"
+
+
+def _add_populated_submodule(tmp_path, wt):
+    subsrc = tmp_path / "subsrc"
+    subsrc.mkdir()
+    nohooks = tmp_path / "nohooks"
+    _g(subsrc, "init", "-b", "main")
+    for k, v in (("user.name", "t"), ("user.email", "t@example.com"), ("commit.gpgsign", "false"), ("core.hooksPath", str(nohooks))):
+        _g(subsrc, "config", k, v)
+    (subsrc / "f.txt").write_text("1\n", encoding="utf-8")
+    _g(subsrc, "add", "-A")
+    _g(subsrc, "commit", "-m", "sub")
+    _g(wt, "-c", "protocol.file.allow=always", "submodule", "add", str(subsrc), "sub")
+    _g(wt, "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", "-c", f"core.hooksPath={nohooks}", "commit", "-m", "add submodule")
+
+
+_SCENARIOS = [
+    _s_open_pr, _s_stray, _s_local_commit, _s_wrong_branch, _s_done_dest, _s_dirty_worktree, _s_locked_worktree,
+    _s_stat_touch_then_open, _s_hidden_untracked_worktree, _s_submodule_worktree, _s_decision_at_tip, _s_child_at_tip,
+    _s_removed_at_tip,
+]
+
+
+@pytest.mark.parametrize("scenario", _SCENARIOS)
 def test_every_refusal_leaves_head_index_and_tree_byte_identical(real_repo, tmp_path, scenario):
     port, repo, bare, task, merge, pr = real_repo
     _g(repo, "update-index", "--refresh")
@@ -635,3 +716,231 @@ def test_every_refusal_leaves_head_index_and_tree_byte_identical(real_repo, tmp_
     res, _ = _land(task, pr2, *extra)
     assert res.exit_code == 1 and code in res.output, res.output
     assert _snapshot(repo) == snap
+
+
+# --------------------------------------------------------------------------
+# Round 5 (Codex r2): behaviour inherited from config / hidden state
+# --------------------------------------------------------------------------
+
+HOSTILE_CONFIG = (
+    ("branch.main.mergeoptions", "--squash"),
+    ("status.showUntrackedFiles", "no"),
+    ("merge.autoStash", "true"),
+    ("merge.ff", "false"),
+    ("diff.ignoreSubmodules", "all"),
+    ("fetch.prune", "true"),
+    ("fetch.pruneTags", "true"),
+    ("push.followTags", "true"),
+    ("submodule.recurse", "true"),
+)
+_PINS = [
+    "merge.autoStash=false", "merge.ff=only", "branch.main.mergeoptions=", "status.showUntrackedFiles=all",
+    "diff.ignoreSubmodules=none", "core.fsmonitor=false", "submodule.recurse=false", "fetch.recurseSubmodules=false",
+    "fetch.prune=false", "fetch.pruneTags=false", "push.recurseSubmodules=no", "push.followTags=false",
+    "gc.auto=0", "maintenance.auto=false",
+]
+_PIN_ARGV = [x for p in _PINS for x in ("-c", p)]
+
+
+def _hostile(repo):
+    for k, v in HOSTILE_CONFIG:
+        _g(repo, "config", k, v)
+
+
+def test_inherited_squash_mergeoptions_still_fast_forwards(real_repo):  # (a)
+    port, repo, bare, task, merge, pr = real_repo
+    _g(repo, "config", "branch.main.mergeoptions", "--squash")
+    res, _ = _land(task, pr)
+    assert res.exit_code == 0, res.output
+    assert _payload(res)["fast_forward"]["to"] == merge
+    assert _g(repo, "rev-parse", "HEAD^") == merge
+    assert (port.tasks_dir / "done" / f"{task.id}.md").exists()
+
+
+def test_merge_that_exits_0_without_moving_head_marks_nothing_done(real_repo):  # (a) postcondition
+    port, repo, bare, task, merge, pr = real_repo
+    before = _g(repo, "rev-parse", "HEAD")
+    res, _ = _land(task, pr, rewrite_merge=lambda a: a[: a.index("merge") + 1] + ["--squash", a[-1]])
+    assert res.exit_code == 2 and "ff_not_applied" in res.output, res.output
+    assert '"changed": true' in res.output  # the squash staged the PR's files
+    assert _g(repo, "rev-parse", "HEAD") == before
+    assert (port.tasks_dir / f"{task.id}.md").exists() and not (port.tasks_dir / "done" / f"{task.id}.md").exists()
+
+
+def test_untracked_worktree_files_hidden_by_config_block_removal(real_repo, tmp_path):  # (b)
+    port, repo, bare, task, merge, pr = real_repo
+    wt = tmp_path / "wts" / task.id
+    _g(repo, "worktree", "add", str(wt), "-b", f"clawpm/{task.id}", "main")
+    (wt / "scratch.txt").write_text("wip\n", encoding="utf-8")
+    _g(repo, "config", "status.showUntrackedFiles", "no")
+    before = _g(repo, "rev-parse", "HEAD")
+    res, _ = _land(task, pr, "--remove-worktree")
+    assert res.exit_code == 1 and "worktree_dirty" in res.output, res.output
+    assert _g(repo, "rev-parse", "HEAD") == before
+    assert (wt / "scratch.txt").read_text(encoding="utf-8") == "wip\n"
+
+
+def test_work_that_appears_in_the_worktree_after_the_precheck_is_not_deleted(real_repo, tmp_path):  # (b) recheck before removal
+    port, repo, bare, task, merge, pr = real_repo
+    wt = tmp_path / "wts" / task.id
+    _g(repo, "worktree", "add", str(wt), "-b", f"clawpm/{task.id}", "main")
+    _g(repo, "config", "status.showUntrackedFiles", "no")
+    res, _ = _land(task, pr, "--push", "--remove-worktree", after_push=lambda: (wt / "late.txt").write_text("late\n", encoding="utf-8"))
+    assert res.exit_code == 2 and "worktree_remove_failed" in res.output, res.output
+    assert (wt / "late.txt").read_text(encoding="utf-8") == "late\n"
+
+
+def test_failed_merge_that_touched_the_index_but_not_head_is_reported_changed(real_repo):  # (c)
+    port, repo, bare, task, merge, pr = real_repo
+    before = _g(repo, "rev-parse", "HEAD")
+
+    def half_merge():
+        (repo / "half.txt").write_text("half\n", encoding="utf-8")
+        _g(repo, "add", "half.txt")
+        raise subprocess.TimeoutExpired("git merge", 1)
+
+    res, _ = _land(task, pr, on_merge=half_merge)
+    assert res.exit_code == 2 and "ff_failed" in res.output, res.output
+    assert '"changed": true' in res.output
+    assert _g(repo, "rev-parse", "HEAD") == before  # HEAD alone would have said "nothing changed"
+
+
+def test_failed_merge_that_changed_nothing_is_still_a_clean_refusal(real_repo):  # (c) no false positive
+    port, repo, bare, task, merge, pr = real_repo
+
+    def nothing():
+        raise subprocess.TimeoutExpired("git merge", 1)
+
+    res, _ = _land(task, pr, on_merge=nothing)
+    assert res.exit_code == 1 and "ff_failed" in res.output and '"changed": false' in res.output, res.output
+
+
+def test_task_that_becomes_a_decision_at_the_tip_refuses_before_the_ff(real_repo, tmp_path):  # (d)
+    port, repo, bare, task, merge, pr = real_repo
+    new = _advance(tmp_path, edit=_tip_edit_make_decision(task.id))
+    before = _g(repo, "rev-parse", "HEAD")
+    res, _ = _land(task, _with_merge(pr, new))
+    assert res.exit_code == 1 and "decision_needs_resolution" in res.output, res.output
+    assert _g(repo, "rev-parse", "HEAD") == before
+
+
+def test_tip_validation_is_not_fooled_by_export_ignore_attributes(real_repo, tmp_path):  # (d) git archive would honour these
+    port, repo, bare, task, merge, pr = real_repo
+    (repo / ".git" / "info" / "attributes").write_text("* export-ignore\n", encoding="utf-8")
+    new = _advance(tmp_path, edit=_tip_edit_make_decision(task.id))
+    res, _ = _land(task, _with_merge(pr, new))
+    assert res.exit_code == 1 and "decision_needs_resolution" in res.output, res.output
+
+
+def test_a_landable_task_at_the_tip_passes_the_tip_validation(real_repo, tmp_path):  # (d) positive path through the extraction
+    port, repo, bare, task, merge, pr = real_repo
+
+    def edit(other):
+        p = other / ".project" / "tasks" / f"{task.id}.md"
+        p.write_bytes(p.read_bytes() + b"\nremote note\n")
+
+    new = _advance(tmp_path, edit=edit)
+    res, _ = _land(task, _with_merge(pr, new))
+    assert res.exit_code == 0, res.output
+    assert "remote note" in (port.tasks_dir / "done" / f"{task.id}.md").read_text(encoding="utf-8")
+
+
+def test_populated_submodule_in_the_worktree_refuses_before_the_ff(real_repo, tmp_path):  # (e)
+    port, repo, bare, task, merge, pr = real_repo
+    wt = tmp_path / "wts" / task.id
+    _g(repo, "worktree", "add", str(wt), "-b", f"clawpm/{task.id}", "main")
+    _add_populated_submodule(tmp_path, wt)
+    before = _g(repo, "rev-parse", "HEAD")
+    res, _ = _land(task, pr, "--remove-worktree")
+    assert res.exit_code == 1 and "worktree_has_submodules" in res.output, res.output
+    assert _g(repo, "rev-parse", "HEAD") == before and wt.exists()
+
+
+def _with_transition_errors(monkeypatch, **errors):
+    import clawpm.services.tasks as svc
+
+    real = svc.transition
+
+    def wrapped(*a, **kw):
+        res = real(*a, **kw)
+        res.setdefault("data", {}).update(errors)
+        return res
+
+    monkeypatch.setattr(svc, "transition", wrapped)
+
+
+def test_a_failed_dependency_cascade_makes_the_landing_not_ok(real_repo, monkeypatch):  # (f)
+    port, repo, bare, task, merge, pr = real_repo
+    _with_transition_errors(monkeypatch, cascade_errors=[{"error_class": "OSError", "message": "dependent stayed blocked"}])
+    res, _ = _land(task, pr)
+    assert res.exit_code == 2, res.output
+    out = _payload(res)
+    assert out["ok"] is False and out["landed"] is True
+    assert out["errors"] == [{"source": "cascade_errors", "detail": {"error_class": "OSError", "message": "dependent stayed blocked"}}]
+    assert _g(repo, "rev-parse", "HEAD^") == merge  # the commit exists, nothing undone
+
+
+def test_audit_only_transition_errors_stay_warnings(real_repo, monkeypatch):  # (f)
+    port, repo, bare, task, merge, pr = real_repo
+    _with_transition_errors(monkeypatch, reflection_errors=[{"error_class": "X", "message": "no reflection"}])
+    res, _ = _land(task, pr)
+    assert res.exit_code == 0, res.output
+    out = _payload(res)
+    assert out["ok"] is True and "errors" not in out
+    assert any(w.startswith("reflection_errors:") for w in out["warnings"])
+
+
+def test_hostile_inherited_config_and_env_cannot_change_a_successful_landing(real_repo, tmp_path):
+    port, repo, bare, task, merge, pr = real_repo
+    _hostile(repo)
+    _g(repo, "update-ref", "refs/remotes/fork/stale", "HEAD")  # fetch.prune=true would delete this
+    wt = tmp_path / "wts" / task.id
+    _g(repo, "worktree", "add", str(wt), "-b", f"clawpm/{task.id}", "main")
+    env = {
+        "GIT_DIR": str(tmp_path / "nowhere" / ".git"),
+        "GIT_WORK_TREE": str(tmp_path / "nowhere"),
+        "GIT_INDEX_FILE": str(tmp_path / "nowhere.index"),
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "branch.main.mergeoptions",
+        "GIT_CONFIG_VALUE_0": "--squash",
+        "GIT_CONFIG_PARAMETERS": "'merge.ff'='false'",
+    }
+    res, fake = _land(task, pr, "--push", "--remove-worktree", env=env)
+    assert res.exit_code == 0, res.output
+    out = _payload(res)
+    head = _g(repo, "rev-parse", "HEAD")
+    assert out["ok"] and out["fast_forward"]["to"] == merge and _g(repo, "rev-parse", "HEAD^") == merge
+    assert _g(bare, "rev-parse", "refs/heads/main") == head
+    assert not wt.exists()
+    assert _g(repo, "rev-parse", "--verify", "-q", "refs/remotes/fork/stale")  # not pruned
+    assert _g(repo, "stash", "list") == ""
+
+
+def test_every_git_call_land_makes_is_pinned_and_env_stripped(real_repo, tmp_path):
+    port, repo, bare, task, merge, pr = real_repo
+    wt = tmp_path / "wts" / task.id
+    _g(repo, "worktree", "add", str(wt), "-b", f"clawpm/{task.id}", "main")
+    env = {"GIT_DIR": str(repo / ".git"), "GIT_WORK_TREE": str(repo), "GIT_INDEX_FILE": str(repo / ".git" / "index"), "GIT_CONFIG_COUNT": "0"}
+    res, fake = _land(task, pr, "--push", "--remove-worktree", env=env)
+    assert res.exit_code == 0, res.output
+    git_calls = [(a, e) for a, e in zip(fake.calls, fake.envs) if a[0] == "git"]
+    pinned = [(a, e) for a, e in git_calls if a[1:1 + len(_PIN_ARGV)] == _PIN_ARGV]
+    unpinned = [a for a, e in git_calls if a[1:1 + len(_PIN_ARGV)] != _PIN_ARGV]
+    # the only git processes outside land.py's runner are transition()'s own files_changed enrichment
+    assert {a[1] for a in unpinned} <= {"diff", "rev-parse", "log"}, unpinned
+    subs = {a[1 + len(_PIN_ARGV)] for a, _ in pinned}
+    assert {"merge", "fetch", "commit", "push", "ls-remote", "worktree", "status", "ls-tree", "cat-file"} <= subs, subs
+    for _, e in pinned:
+        assert e is not None
+        assert not {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"} & set(e)
+        assert e["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_land_py_has_exactly_one_process_spawn_site():
+    import re
+
+    import clawpm.land as land
+
+    src = Path(land.__file__).read_text(encoding="utf-8")
+    assert len(re.findall(r"subprocess\.(run|Popen|call|check_output|check_call)\(", src)) == 1
+    assert "os.system" not in src and "_remote_head" not in src and "_resolve_repo" not in src
