@@ -72,6 +72,9 @@ def _clean_row(row: Any) -> tuple[dict[str, Any] | None, bool]:
     miss = row.get("miss_category")
     if miss is not None and not isinstance(miss, str):
         bad, miss = True, None
+    profile = row.get("agent_profile")
+    if profile is not None and not isinstance(profile, str):
+        bad, profile = True, None
     project = row.get("project_id")
     if not isinstance(project, str):
         bad = bad or project is not None
@@ -87,6 +90,7 @@ def _clean_row(row: Any) -> tuple[dict[str, Any] | None, bool]:
         "held": held,
         "duration_ratio": ratio,
         "complexity": complexity,
+        "agent_profile": profile,
         "miss_category": miss,
         "legacy": bool(row.get("legacy")),
     }, bad
@@ -173,6 +177,24 @@ def _bias(ratios: list[float]) -> dict[str, Any]:
         direction = "calibrated"
     return {"n": n, "insufficient_data": False, "factor": _r4(factor),
             "direction": direction}
+
+
+def _bias_by_bucket(dur_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Spec 2.3 per-bucket bias: ``_bias`` applied to each slice, same gate."""
+    dims = {
+        "by_complexity": lambda r: r["complexity"] or "unknown",
+        "by_confidence": lambda r: (
+            "unset" if r.get("confidence") is None else str(r["confidence"])),
+        "by_agent_profile": lambda r: r.get("agent_profile") or "unspecified",
+        "by_project": lambda r: r["project_id"] or "unknown",
+    }
+    out: dict[str, Any] = {}
+    for name, key_of in dims.items():
+        groups: dict[str, list[float]] = {}
+        for row in dur_rows:
+            groups.setdefault(key_of(row), []).append(row["duration_ratio"])
+        out[name] = {k: _bias(groups[k]) for k in sorted(groups)}
+    return out
 
 
 def _bucket_bias(dur_rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -340,7 +362,7 @@ def compute_calibration(
         "calibration_curve": curve,
         "overconfidence_ratio": _overconfidence(curve, len(scored)),
         "mae_log": mae,
-        "bias": _bias(ratios),
+        "bias": {**_bias(ratios), **_bias_by_bucket(dur_rows)},
         "bucket_bias_factor": _serialise_bucket_bias(bucket_bias),
         "duration_debiased": _debiased(dur_rows, bucket_bias),
         "learning_velocity": _learning_velocity(scored, now),

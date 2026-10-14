@@ -602,3 +602,64 @@ class TestRound5Findings:
         dq = summarize_calibration(tmp_path, None)["calibration"]["data_quality"]
         assert dq["unknown_events"] == 1
         assert dq["malformed_lines"] == 1
+
+
+class TestPerBucketBias:
+    """Spec 2.3 `bias`: per-bucket exp(median(ln r)), same gate as global."""
+
+    def _bias(self, rows):
+        return compute_calibration(rows, LEDGER, now=NOW)["bias"]
+
+    def test_median_of_logs_not_arithmetic_median(self):
+        # Equal groups at 0.25 and 1: exp(median ln r) = exp(-0.693) = 0.5,
+        # an arithmetic median of the ratios would say 0.625.
+        rows = [_row(3, "correct", 0.25) for _ in range(10)]
+        rows += [_row(3, "correct", 1.0) for _ in range(10)]
+        b = self._bias(rows)
+        assert b["by_complexity"]["m"]["n"] == 20
+        assert b["by_complexity"]["m"]["factor"] == pytest.approx(0.5, abs=1e-4)
+        assert b["by_complexity"]["m"]["direction"] == "inflated"
+
+    def test_small_bucket_is_insufficient_with_null_values(self):
+        rows = [_row(3, "correct", 0.5, complexity="m") for _ in range(20)]
+        rows += [_row(3, "correct", 2.0, complexity="l") for _ in range(5)]
+        by = self._bias(rows)["by_complexity"]
+        assert by["l"] == {"n": 5, "insufficient_data": True,
+                           "factor": None, "direction": None}
+        assert by["m"]["insufficient_data"] is False
+
+    def test_confidence_unset_and_agent_profile_buckets(self):
+        rows = []
+        for _ in range(20):
+            r = _row(None, "correct", 0.5)
+            r["agent_profile"] = "coder"
+            rows.append(r)
+        for _ in range(3):
+            rows.append(_row(4, "correct", 2.0))
+        b = self._bias(rows)
+        assert b["by_confidence"]["unset"]["n"] == 20
+        assert b["by_confidence"]["unset"]["factor"] == pytest.approx(0.5, abs=1e-4)
+        assert b["by_confidence"]["4"]["insufficient_data"] is True
+        assert b["by_agent_profile"]["coder"]["n"] == 20
+        assert b["by_agent_profile"]["unspecified"]["n"] == 3
+
+    def test_project_bucket_under_portfolio_scope(self):
+        rows = [_row(3, "correct", 0.5, project="pa") for _ in range(20)]
+        rows += [_row(3, "correct", 2.0, project="pb") for _ in range(20)]
+        b = self._bias(rows)
+        assert b["by_project"]["pa"]["factor"] == pytest.approx(0.5, abs=1e-4)
+        assert b["by_project"]["pa"]["direction"] == "inflated"
+        assert b["by_project"]["pb"]["factor"] == pytest.approx(2.0, abs=1e-4)
+        assert b["by_project"]["pb"]["direction"] == "optimistic"
+        assert b["n"] == 40
+
+    def test_global_bias_fields_unchanged(self):
+        b = self._bias(_golden_rows())
+        assert b["n"] == 40 and b["factor"] == pytest.approx(0.5, abs=1e-4)
+
+    def test_agent_profile_flows_from_done_event(self, tmp_path):
+        for i in range(20):
+            _done(tmp_path, f"AP-{i}", actual=50, conf=3)
+        by = summarize_calibration(tmp_path, "proj")["calibration"]["bias"]
+        assert "by_agent_profile" in by
+        assert "unspecified" in by["by_agent_profile"]

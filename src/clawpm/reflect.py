@@ -1358,6 +1358,7 @@ def _calibration_row(
         "held": axes["held"],
         "duration_ratio": ratio,
         "complexity": preds.complexity.value if preds.complexity else None,
+        "agent_profile": done.get("agent_profile"),
         "miss_category": done.get("miss_category"),
         "legacy": not pid,
     }
