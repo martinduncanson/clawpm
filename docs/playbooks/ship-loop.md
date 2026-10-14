@@ -17,6 +17,18 @@ Brief a worker for ONE round: "implement, push, open the PR, report, stop". Neve
 - On a finding, a failure or a stall, the orchestrator dispatches a FRESH worker from the report. It does not continue the old one: its context is bloated and its framing is stale.
 - A stalled worker usually stalled after finishing the edit. Inspect its worktree before discarding anything.
 
+Brief for a failed-round redispatch (self-contained; no patch or test code):
+
+```
+Objective:       <the task, one sentence>
+Bad pattern:     <what the last worker did wrong or repeated>
+Known evidence:  <findings, failing test names, exact sha, PR number>
+Next step:       <the one thing to do this round>
+Recovery signal: <the observable result that shows the round worked>
+```
+
+Restart only when the worker is not converging (repeats a mistake after steering, reintroduces a fixed defect, ignores findings). A round count alone is not a reason.
+
 ## 2. Worktree per worker
 
 Each worker gets its own worktree off `fork/main`:
@@ -43,7 +55,7 @@ git ls-remote fork refs/heads/clawpm/<ID>
 
 The two shas must match, in full. A mismatch means the push failed or lagged; reviewing then reviews stale code. A worker report that quotes an abbreviated sha, or no sha, is not verified.
 
-Planned: `clawpm pr verify` (CLAWP-147-001) will perform this check in one command. Until it ships, do it by hand.
+`clawpm pr verify <PR> --expect-head <sha>` (CLAWP-147-001) performs this check in one command and prints the exact merge line. The manual check above is the fallback.
 
 ## 5. Codex gate
 
@@ -59,6 +71,8 @@ Use a per-session `-Brief` and `-Out` path. The shared temp-dir `rev-brief.md` i
 ### Stop rule
 
 - A round with only P3 findings: merge. Log them; do not start another round.
+- Sort every finding as required behaviour, discretionary refinement or cosmetic preference. Only required behaviour blocks the merge. Log the rest.
+- Ask the reviewer for every defect in one pass, then a completeness check: "if the worker fixed exactly these defects and changed nothing else, would you accept?" If not, the list is incomplete. This targets findings that drip in one per round.
 - A recurring bug class across rounds: stop fixing instances. Audit the whole class with an exhaustive search and fix it at the source, in one worker round.
 - Findings per round not falling: attribute them by source. One feature generating findings every round belongs in its own PR.
 - A fix must not turn a loud failure into a silent fall-through. Check this before accepting it.
