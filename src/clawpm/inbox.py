@@ -128,7 +128,7 @@ def _read_events_once(path: Path) -> list[dict]:
     if not path.exists():
         return []
     events: list[dict] = []
-    with open(path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8-sig") as f:
         for line in f:
             line = line.strip()
             if not line:

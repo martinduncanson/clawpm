@@ -31,6 +31,8 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 
 ### Fixed
 
+- BOM class beyond task frontmatter: inbox, lease, work_log, id-reservation, dispatch, session, reflection, history and issues JSONL readers now decode with `utf-8-sig`, so a BOM no longer makes the first record vanish; portfolio/project settings TOML tolerates a BOM; scope-file, `--body-file`, `--stdin` body and `emit-tree` stdin reads drop it; `doctor` reads work_log.jsonl with `utf-8-sig` (a BOM first record no longer makes a task look stale); `edit_fog` on a frontmatter-less file no longer fuses the closing fence to the heading (`---# Real task`) (#107, CLAWP-146).
+
 - Task files that start with a UTF-8 BOM are no longer read as frontmatter-less: the frontmatter parsers ignore the BOM, and the `updated` and `state` line writers keep it (#101, CLAWP-144).
 - The CLAWP-142 inbox stress test now forces a reader/writer overlap on every append (event barrier while the writer holds the byte-0 lock) instead of relying on scheduling, so the read-retry path is always exercised (#100, CLAWP-145).
 - State-change, archive and split moves are now single atomic renames and never leave two copies of a task: a failed or cross-device rename raises with the source untouched, and an existing destination is refused instead of nested or overwritten (#98, CLAWP-143).

@@ -95,7 +95,7 @@ def get_context_project() -> str | None:
         return None
     
     try:
-        content = CONTEXT_FILE.read_text(encoding="utf-8").strip()
+        content = CONTEXT_FILE.read_text(encoding="utf-8-sig").strip()
         if content:
             return content
     except (OSError, UnicodeDecodeError) as exc:
@@ -387,7 +387,7 @@ def build_agent_context(config, project_id: str, source: str = "explicit", log_l
         if issues_file.exists():
             try:
                 open_issues = []
-                with open(issues_file, encoding="utf-8", errors="replace") as f:
+                with open(issues_file, encoding="utf-8-sig", errors="replace") as f:
                     for line in f:
                         line = line.strip()
                         if line:

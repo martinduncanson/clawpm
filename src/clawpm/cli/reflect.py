@@ -253,7 +253,7 @@ def reflect_void(
             return
 
         # Read existing events to check whether void already applied
-        lines = [l for l in ref_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+        lines = [l for l in ref_file.read_text(encoding="utf-8-sig").splitlines() if l.strip()]
         existing_records = []
         for line in lines:
             try:
@@ -313,7 +313,7 @@ def reflect_void(
             return
         for ref_file in sorted(ref_dir.glob("*.jsonl")):
             derived_tid = ref_file.stem
-            lines = [l for l in ref_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+            lines = [l for l in ref_file.read_text(encoding="utf-8-sig").splitlines() if l.strip()]
             has_empty_actuals = False
             for line in lines:
                 try:

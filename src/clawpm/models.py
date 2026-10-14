@@ -19,6 +19,16 @@ else:
 from .frontmatter import FrontmatterError, split_frontmatter, strip_bom
 
 
+def _load_toml(path: Path) -> dict[str, Any]:
+    """Parse a TOML file, tolerating a leading UTF-8 BOM (CLAWP-146).
+
+    ``tomllib`` rejects the BOM that Windows editors prepend, which made an
+    otherwise-valid portfolio.toml / settings.toml unloadable.
+    """
+    raw = path.read_bytes().removeprefix(b"\xef\xbb\xbf")
+    return tomllib.loads(raw.decode("utf-8"))
+
+
 class ProjectStatus(str, Enum):
     ACTIVE = "active"
     PAUSED = "paused"
@@ -166,8 +176,7 @@ class PortfolioConfig:
     @classmethod
     def load(cls, path: Path) -> PortfolioConfig:
         """Load portfolio config from TOML file."""
-        with open(path, "rb") as f:
-            data = tomllib.load(f)
+        data = _load_toml(path)
 
         portfolio_root = Path(data.get("portfolio_root", path.parent)).expanduser()
         project_roots = [
@@ -212,8 +221,7 @@ class ProjectSettings:
     @classmethod
     def load(cls, path: Path) -> ProjectSettings:
         """Load project settings from TOML file."""
-        with open(path, "rb") as f:
-            data = tomllib.load(f)
+        data = _load_toml(path)
 
         repo_path = None
         if rp := data.get("repo_path"):

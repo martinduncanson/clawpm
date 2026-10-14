@@ -350,7 +350,7 @@ def latest_prediction_snapshot(
     if not ref_file.exists():
         return None
     latest: dict[str, Any] | None = None
-    for line in ref_file.read_text(encoding="utf-8").splitlines():
+    for line in ref_file.read_text(encoding="utf-8-sig").splitlines():
         if not line.strip():
             continue
         try:
@@ -563,7 +563,7 @@ def find_reference_tasks(
     candidates: list[dict] = []
     for ref_file in ref_dir.glob("*.jsonl"):
         try:
-            text = ref_file.read_text(encoding="utf-8", errors="replace")
+            text = ref_file.read_text(encoding="utf-8-sig", errors="replace")
         except OSError:
             continue
         # Codex round-1 P2 fix: voided events MUST be excluded from
@@ -807,7 +807,7 @@ def count_iterations_for_task(
     if not ref_file.exists():
         return 0
     count = 0
-    for line in ref_file.read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in ref_file.read_text(encoding="utf-8-sig", errors="replace").splitlines():
         line = line.strip()
         if not line:
             continue
@@ -870,7 +870,7 @@ def detect_thrashing(
 
     # Collect iteration events for this project, in order.
     events: list[dict] = []
-    for line in ref_file.read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in ref_file.read_text(encoding="utf-8-sig", errors="replace").splitlines():
         line = line.strip()
         if not line:
             continue
@@ -1143,7 +1143,7 @@ def _iter_done_events(portfolio_root: Path, project_id: str | None = None):
         return
     for ref_file in ref_dir.glob("*.jsonl"):
         try:
-            text = ref_file.read_text(encoding="utf-8", errors="replace")
+            text = ref_file.read_text(encoding="utf-8-sig", errors="replace")
         except OSError:
             continue
         per_project: dict[str | None, dict] = {}  # latest done per project_id

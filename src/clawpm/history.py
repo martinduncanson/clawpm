@@ -115,7 +115,7 @@ def extract_task_mentions(
     """
     mentions: list[TaskMention] = []
     try:
-        with open(log_path, encoding="utf-8", errors="replace") as f:
+        with open(log_path, encoding="utf-8-sig", errors="replace") as f:
             for line_no, line in enumerate(f, start=1):
                 line = line.strip()
                 if not line:

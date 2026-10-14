@@ -73,7 +73,7 @@ def reserved_high_water(
     nothing reserved under that key)."""
     path = _ledger_path(portfolio_root)
     try:
-        raw = retry_transient(lambda: path.read_text(encoding="utf-8", errors="replace"))
+        raw = retry_transient(lambda: path.read_text(encoding="utf-8-sig", errors="replace"))
     except FileNotFoundError:
         return None
     except OSError as exc:
