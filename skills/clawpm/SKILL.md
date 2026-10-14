@@ -129,7 +129,7 @@ For high-stakes or complex tasks, also include the Phase 1.5 fields (`--success-
 **Reference class > intuition.** Before predicting, look at 1-3 prior similar tasks. Pass
 them via `--reference-task`. Empty `reference_tasks` = "I used the inside view only".
 
-Attribution: `--predicted-by` exists on `clawpm tasks add`, not on the `clawpm add` shortcut. Without it, the CLI records predictions as `operator`; the MCP `tasks_add` tool records `agent`. After the operator confirms or edits your proposal, pass `--predicted-by operator-edited`. Pass `agent` only for predictions the operator has not reviewed.
+Attribution: `--predicted-by` exists on `clawpm tasks add`, not on the `clawpm add` shortcut. Without it, `clawpm tasks add` records predictions as `operator` when prediction flags are set; `tasks decompose`, `agent dispatch`, `inbox materialize` and the MCP `tasks_add` tool record `agent`. After the operator confirms or edits your proposal, pass `--predicted-by operator-edited`. Pass `agent` only for predictions the operator has not reviewed.
 
 ## Tips
 
@@ -148,5 +148,7 @@ Attribution: `--predicted-by` exists on `clawpm tasks add`, not on the `clawpm a
 - **Compute phase rubric:** "divergence report for period X emitted; all candidates queued in `<ledger>`; **zero** state writes performed." The zero-writes criterion is itself gradeable from the audit log — a *prohibition* criterion, not just an achievement one.
 - **Apply phase rubric:** "every decision with `status:approved` applied with an audit entry; **zero** writes lacking an approved decision ID."
 - The outcome ("tie-out / books balance") is the rubric **only** for the final close task, dispatched *after* the human sign-off exists.
+
+**Before dispatching parallel agents, run `clawpm conflicts --scope <glob>` (or `--task <id>`).** A non-empty `conflicts` array means an in-flight task claims overlapping files: serialise the tasks or decompose them to disjoint scopes. Detail: `references/dispatch-and-scope.md`.
 
 **Never `--worktree`-dispatch a task that mutates a single shared store.** Worktree isolation is built for parallel *code* work with disjoint file scopes (see the Scope-Aware Dispatch section in `references/dispatch-and-scope.md`). A task that appends to one shared ledger — a decisions store, `work_log.jsonl`, leases, any append-only state, **including clawpm's own JSONL stores** — must dispatch **in-place against the main repo dir**, or the ledger forks per worktree branch and records diverge or are lost. Worktree dispatch is for code; in-place dispatch is for state. `clawpm agent dispatch` is a separate path from the CLAWP-098 worktree-mutator fix: since CLAWP-115 it registers a session for its worktree only when the worktree carries its own `.project/`, and none otherwise. Read `references/dispatch-and-scope.md` before running ID-based mutators inside its worktree.
