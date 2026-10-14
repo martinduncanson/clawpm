@@ -73,7 +73,7 @@ def reflect_scorecard(
     --format; --json returns the full calibration block (spec 2.3). Omit
     --project to span all projects.
     """
-    from clawpm.calibration import render_data_quality, render_scorecard
+    from clawpm.calibration import render_scorecard
     from clawpm.reflect import summarize_calibration
 
     config = require_portfolio(ctx)
@@ -85,7 +85,7 @@ def reflect_scorecard(
     if as_json:
         click.echo(json.dumps(block, indent=2))
         return
-    for line in render_scorecard(block) + render_data_quality(block):
+    for line in render_scorecard(block):
         click.echo(line)
 
 

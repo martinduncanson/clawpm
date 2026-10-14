@@ -1269,11 +1269,13 @@ def load_calibration_rows(
                 ledger["non_object"] += 1
                 continue
             evt = rec.get("event")
+            proj = rec.get("project_id")
+            pid = rec.get("prediction_id")
+            if project_id is not None and isinstance(proj, str) and proj != project_id:
+                continue  # another project's record: out of scope, never counted
             if not isinstance(evt, str) or evt not in _KNOWN_EVENTS:
                 ledger["unknown_events"] += 1
                 continue
-            proj = rec.get("project_id")
-            pid = rec.get("prediction_id")
             if not (proj is None or isinstance(proj, str)) or not (
                 pid is None or isinstance(pid, str)
             ):

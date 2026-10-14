@@ -555,8 +555,8 @@ class TestRound4Findings:
         r = CliRunner().invoke(main, ["reflect", "scorecard", "-p", "test"])
         assert r.exit_code == 0, r.output
         lines = [ln for ln in r.output.splitlines() if ln.strip()]
-        assert len(lines) == 6
-        assert "malformed" in lines[5]
+        assert len(lines) == 5
+        assert "malformed" in lines[2]
 
     def test_summarize_does_not_create_reflections_dir(self, tmp_path):
         assert not (tmp_path / "reflections").exists()
@@ -574,3 +574,31 @@ class TestRound4Findings:
         assert r.exit_code == 0, r.output
         assert not ref.exists()
         assert sorted(p.name for p in root.iterdir()) == before
+
+
+class TestRound5Findings:
+    """Codex gate r2 P2s 1-3 on PR #111."""
+
+    def test_inclusive_band_survives_exp_log_rounding(self):
+        # Factor is mathematically 0.1; exp(log(0.1)) lands a hair under and
+        # would push 0.05 / factor below 0.5. All 21 ratios qualify.
+        rows = [_row(3, "correct", 0.1) for _ in range(20)]
+        rows.append(_row(3, "incorrect", 0.05))
+        c = compute_calibration(rows, LEDGER, now=NOW)
+        assert c["duration_debiased"]["hit_rate"] == pytest.approx(1.0, abs=1e-9)
+
+    def test_other_projects_events_not_counted_in_scope(self, tmp_path):
+        ref = tmp_path / "reflections"
+        ref.mkdir()
+        with (ref / "B-1.jsonl").open("w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"event": "mystery", "project_id": "projB"}) + "\n")
+            fh.write(json.dumps({"event": "task_done", "project_id": "projB",
+                                 "prediction_id": []}) + "\n")
+        dq = summarize_calibration(tmp_path, "projA")["calibration"]["data_quality"]
+        assert dq["unknown_events"] == 0
+        assert dq["malformed_lines"] == 0
+        assert dq["non_object"] == 0
+        # Unscoped request still sees them.
+        dq = summarize_calibration(tmp_path, None)["calibration"]["data_quality"]
+        assert dq["unknown_events"] == 1
+        assert dq["malformed_lines"] == 1

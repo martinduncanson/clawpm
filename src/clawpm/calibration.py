@@ -201,6 +201,14 @@ def _serialise_bucket_bias(bucket_bias: dict[str, Any]) -> dict[str, Any]:
     return {k: {**v, "factor": _r4(v["factor"])} for k, v in bucket_bias.items()}
 
 
+_BAND_LOG_TOL = 1e-9
+
+
+def _in_band(ratio: float, factor: float = 1.0) -> bool:
+    """Inclusive 0.5..2.0 band test in log space, tolerant of exp/log float error."""
+    return abs(math.log(ratio) - math.log(factor)) <= math.log(2.0) + _BAND_LOG_TOL
+
+
 def _debiased(dur_rows: list[dict[str, Any]], bucket_bias: dict[str, Any]) -> dict[str, Any]:
     n = len(dur_rows)
     if _gate(n):
@@ -208,11 +216,11 @@ def _debiased(dur_rows: list[dict[str, Any]], bucket_bias: dict[str, Any]) -> di
     raw_hits = debiased_hits = 0
     for row in dur_rows:
         r = row["duration_ratio"]
-        raw_hits += 0.5 <= r <= 2.0
+        raw_hits += _in_band(r)
         factor = (bucket_bias.get(row["complexity"] or "unknown") or bucket_bias["global"])["factor"]
         if factor is None or not factor > 0:
             factor = 1.0  # no usable factor: score the raw ratio, never divide by zero
-        debiased_hits += 0.5 <= r / factor <= 2.0
+        debiased_hits += _in_band(r, factor)
     return {"n": n, "insufficient_data": False,
             "hit_rate": _r4(debiased_hits / n), "raw_hit_rate": _r4(raw_hits / n)}
 
@@ -349,7 +357,10 @@ def compute_calibration(
 
 
 def render_data_quality(block: dict[str, Any]) -> list[str]:
-    """One line when any record was skipped or rejected, else none."""
+    """One clause when any record was skipped or rejected, else none.
+
+    ``render_scorecard`` folds it into the Brier line: the scorecard is exactly
+    five lines."""
     dq = block.get("data_quality") or {}
     parts = [f"{dq[k]} {label}" for k, label in (
         ("malformed_lines", "malformed lines"),
@@ -384,6 +395,7 @@ def render_scorecard(block: dict[str, Any]) -> list[str]:
         line3 = f"brier: insufficient data (n={br['n']}, need {MIN_N})"
     else:
         line3 = f"brier: {br['value']:.4f} (n={br['n']})"
+    line3 += "".join("; " + part for part in render_data_quality(block))
 
     oc = block["overconfidence_ratio"]
     if oc["headline"] is None:
