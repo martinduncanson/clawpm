@@ -82,4 +82,4 @@ depends: []
 Description of what needs doing.
 ```
 
-Modern tasks (post Phase 1) also carry predictions (duration, scope, hypothesis, confidence, success criteria, pre-mortem) — see `<repo>/skills/clawpm/SKILL.md` for the full `clawpm tasks add` invocation.
+Modern tasks (post Phase 1) also carry predictions (duration, scope, hypothesis, confidence, success criteria, pre-mortem) — see `<repo>/skills/clawpm/references/predictions-and-reflection.md` for the full `clawpm tasks add` invocation.
