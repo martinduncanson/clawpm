@@ -373,6 +373,7 @@ clawpm projects list --filter active   # Filter by status
 clawpm tasks                        # List open + in-progress + blocked
 clawpm tasks list [-s all]          # Filter by state (open/progress/done/blocked/rejected/all)
 clawpm tasks list -s rejected       # View the won't-do / rejected ledger
+clawpm tasks list --frontier <root> # Frontier under a root map: ready / blocked (waiting_on) / claimed (lease holder); same as `clawpm next --frontier <root>`
 clawpm tasks show <id>              # Full task details (predictions, scope, contract, backlinks, body)
 clawpm tasks add -t "Title" [-b "body"] [--parent <id>] [--scope "glob/**"] [--tag <tag>]
 clawpm tasks edit <id> [--title/--priority/--complexity/--body/--scope/--tag/--clear-tags]
