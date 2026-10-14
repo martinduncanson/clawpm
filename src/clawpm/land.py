@@ -7,16 +7,18 @@ commit ONLY the task's own paths (no attribution trailer).
 
 Everything that can refuse runs before the first mutation, so a refusal
 (:class:`LandError` with ``changed=False``) leaves the checkout exactly as it
-was. The one exception to "nothing changed" is ``git fetch``, which only moves
-remote-tracking refs. After the fast-forward starts, a failure raises a
-:class:`LandError` with ``changed=True`` and says what was and was not done.
-There is no recovery step of any kind: no reset, no force, no branch delete.
-``--remove-worktree`` uses plain ``git worktree remove`` (git itself refuses a
-dirty one).
+was. Landing never fetches: the operator runs ``git fetch <remote>`` first, and
+the local ``<remote>/<base>`` ref must already equal the remote's tip. The task
+file must also be clean and byte-identical at HEAD and at that tip, so
+eligibility is judged on one agreed version. After the fast-forward starts, a
+failure raises a :class:`LandError` with ``changed=True`` and says what was and
+was not done. There is no recovery step of any kind: no reset, no force, no
+branch delete. ``--remove-worktree`` uses plain ``git worktree remove`` (git
+itself refuses a dirty one).
 
-Every ref read after the fetch uses the verified tip SHA, never the
-``<remote>/<base>`` name (a tag or local branch of that name would win the
-lookup). The merge itself stays with the operator; this module never merges.
+Every ref read uses the verified tip SHA, never the ``<remote>/<base>`` name (a
+tag or local branch of that name would win the lookup). The merge itself stays
+with the operator; this module never merges.
 """
 
 from __future__ import annotations
@@ -38,7 +40,7 @@ _LAND_BRANCH = "main"
 
 # Every git call runs with these pinned, so user/repo config cannot change what
 # a command does (CLAWP-147-002 rounds 2-4: autostash, squash mergeoptions,
-# hidden untracked files, ignored submodules, a pruning fetch). Command-line
+# hidden untracked files, ignored submodules). Command-line
 # `-c` outranks every config file.
 _GIT_PINS = (
     "merge.autoStash=false",
@@ -48,9 +50,6 @@ _GIT_PINS = (
     "diff.ignoreSubmodules=none",
     "core.fsmonitor=false",
     "submodule.recurse=false",
-    "fetch.recurseSubmodules=false",
-    "fetch.prune=false",
-    "fetch.pruneTags=false",
     "push.recurseSubmodules=no",
     "push.followTags=false",
     "gc.auto=0",
@@ -94,18 +93,17 @@ def _git_env(*, mutates: bool) -> dict[str, str]:
 def _git(
     args: list[str], cwd: Path, *, ok_codes: tuple[int, ...] = (0,), changed: bool = False,
     mutates: bool = False, binary: bool = False, stdin: bytes | None = None,
-    extra_pins: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess:
     """The ONE place land.py runs git: config pinned, location env stripped.
 
     Raise LandError unless the exit code is in ``ok_codes``. ``changed`` is
     True for every call made after the first mutation, so a failure there can
     never be reported as "nothing changed". ``mutates`` marks the calls that
-    write (fetch, merge, add, commit, push, worktree remove); every other call
-    runs with optional locks off. ``binary`` returns bytes on stdout; ``stdin``
-    (bytes) implies it. ``extra_pins`` are per-call ``-c`` pins (the remote-named ones).
+    write (merge, add, commit, push, worktree remove); every other call runs
+    with optional locks off. ``binary`` returns bytes on stdout; ``stdin``
+    (bytes) implies it.
     """
-    pins = [x for pin in (*_GIT_PINS, *extra_pins) for x in ("-c", pin)]
+    pins = [x for pin in _GIT_PINS for x in ("-c", pin)]
     binary = binary or stdin is not None
     text_kw: dict[str, Any] = {} if binary else {"text": True, "encoding": "utf-8", "errors": "replace"}
     try:
@@ -252,6 +250,28 @@ def _task_at_tip(config, project_id: str, task_id: str, toplevel: Path, tasks_di
         return tip_task.file_path is not None and tip_task.file_path.name == "_task.md"
 
 
+def _check_task_file_agreed(toplevel: Path, rel: str, head: str, tip: str, target: str, task_id: str) -> None:
+    """Refuse unless ``rel`` has no local modification and its blob is the same at HEAD and the tip."""
+    if rel in {p for _, p in _status_entries(toplevel, untracked="no")}:
+        raise LandError(
+            "task_file_dirty",
+            f"{rel} has local modifications (staged or unstaged); commit or discard them before landing {task_id}",
+            {"path": rel},
+        )
+    head_blob = _git(["rev-parse", "--verify", "-q", f"{head}:{rel}"], toplevel, ok_codes=(0, 1)).stdout.strip()
+    if not head_blob:
+        raise LandError("task_file_not_committed", f"{rel} is not tracked at HEAD; commit it before landing {task_id}", {"path": rel})
+    tip_blob = _git(["rev-parse", "--verify", "-q", f"{tip}:{rel}"], toplevel, ok_codes=(0, 1)).stdout.strip()
+    if not tip_blob:
+        raise LandError("task_missing_at_tip", f"{rel} does not exist in {target}; the PR removed or renamed {task_id}", {"path": rel})
+    if tip_blob != head_blob:
+        raise LandError(
+            "task_file_differs_at_tip",
+            f"{rel} differs between HEAD and {target}; fast-forward or reconcile it first, then land {task_id}",
+            {"path": rel, "head_blob": head_blob, "tip_blob": tip_blob},
+        )
+
+
 def _is_own(path: str, own: list[str]) -> bool:
     return any(path == o or path.startswith(o + "/") for o in own)
 
@@ -334,7 +354,7 @@ def land_task(
     """Run the landing transaction; return a result dict or raise :class:`LandError`."""
     from clawpm.tasks import get_task, get_tasks_dir
 
-    cwd =Path(cwd) if cwd else Path.cwd()
+    cwd = Path(cwd) if cwd else Path.cwd()
 
     # 1. Where are we? Must be the main checkout, on `main`.
     toplevel = Path(_out(["rev-parse", "--show-toplevel"], cwd)).resolve()
@@ -417,26 +437,20 @@ def land_task(
     if branch != base:
         raise LandError("wrong_branch", f"PR #{pr_number} merged into '{base}' but the checkout is on '{branch}'", {"base": base, "branch": branch})
 
-    # 5. Refs: fetch (moves remote-tracking refs only), then prove the tracking
+    # 5. Refs: no fetch (the operator ran `git fetch <remote>`). Prove the tracking
     #    ref is current, the merge commit is in it and our branch can fast-forward.
     #    From here on only the verified `tip` sha is used, never the ref name.
-    # `remote.<name>.prune*` outranks `fetch.prune*`, so the remote-level keys are
-    # pinned too, and the flags are repeated: a fetch must never delete a local ref.
-    _git(
-        ["fetch", "--no-prune", "--no-prune-tags", "--no-tags", remote], toplevel, mutates=True,
-        extra_pins=(f"remote.{remote}.prune=false", f"remote.{remote}.pruneTags=false"),
-    )
     target = f"{remote}/{base}"
     tip = _out(["rev-parse", "--verify", f"refs/remotes/{target}^{{commit}}"], toplevel)
     remote_tip = _remote_branch_tip(remote, base, toplevel)
     if tip != remote_tip:
         raise LandError(
-            "tracking_ref_stale",
-            f"{target} is {tip} locally but {remote_tip} on the remote after fetch (frozen fetch refspec?)",
+            "remote_not_fetched",
+            f"{target} is {tip} locally but {remote_tip} on the remote; run `git fetch {remote}` first (landing never fetches)",
             {"local": tip, "remote": remote_tip},
         )
     if _git(["cat-file", "-e", f"{merge_sha}^{{commit}}"], toplevel, ok_codes=(0, 1)).returncode != 0:
-        raise LandError("merge_commit_not_fetched", f"merge commit {merge_sha} is not in the local repository after fetch")
+        raise LandError("merge_commit_not_fetched", f"merge commit {merge_sha} is not in the local repository; run `git fetch {remote}` first")
     if _git(["merge-base", "--is-ancestor", merge_sha, tip], toplevel, ok_codes=(0, 1)).returncode != 0:
         raise LandError(
             "merge_commit_not_in_base",
@@ -449,6 +463,11 @@ def land_task(
             f"{branch} has commits that are not in {target}; refusing a non-fast-forward",
             {"head": before, "target": target},
         )
+
+    # 5a. One agreed task file: clean against HEAD and byte-identical at the tip.
+    #     Local edits that the ff would keep (or conflict with) are refused here,
+    #     so transition() can never judge a different file than the one checked.
+    _check_task_file_agreed(toplevel, _rel(task.file_path, toplevel), before, tip, target, task_id)
 
     # 5b. The task as it will exist at the verified tip (the ff replaces its files):
     #     eligibility, then the done/ destination for THAT shape. Anything already

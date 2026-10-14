@@ -147,6 +147,7 @@ def _assert_refused(res, env, task_file, code):
     assert res.exit_code == 1, res.output
     assert code in res.output
     assert env.mutating() == []
+    assert not any(_norm(c)[1:2] == ["fetch"] for c in env.calls)  # land never fetches
     assert task_file.exists()
 
 
@@ -165,7 +166,9 @@ def test_merge_commit_not_ancestor_of_remote_base_refuses(land_env):
 def test_stale_tracking_ref_refuses(land_env):
     _, task, task_file, make = land_env
     env = make(tip=HEAD, remote_tip=TIP)
-    _assert_refused(_run(env, task), env, task_file, "tracking_ref_stale")
+    res = _run(env, task)
+    _assert_refused(res, env, task_file, "remote_not_fetched")
+    assert "git fetch fork" in res.output
 
 
 def test_dirty_unrelated_tracked_path_refuses_and_names_it(land_env):
@@ -287,7 +290,9 @@ def real_repo(isolated_portfolio, tmp_path, monkeypatch):
     return isolated_portfolio, repo, bare, task, merge, pr
 
 
-def _land(task, pr, *extra, lie_after_push=None, timeout_on=None, on_merge=None, rewrite_merge=None, env=None, after_push=None):
+def _land(task, pr, *extra, lie_after_push=None, timeout_on=None, on_merge=None, rewrite_merge=None, env=None, after_push=None, prefetch=True):
+    if prefetch:  # `tasks land` never fetches: the operator runs `git fetch <remote>` first
+        _REAL_RUN(["git", "fetch", "--no-recurse-submodules", "fork"], cwd=str(Path.cwd()), check=True, capture_output=True)
     fake = RealGit(pr, lie_after_push, timeout_on, on_merge, rewrite_merge, after_push)
     with patch("subprocess.run", fake), patch.dict("os.environ", env or {}):
         res = _invoke(task.id, "--pr", "7", "-p", "test", "--repo", REPO, *extra)
@@ -346,12 +351,15 @@ def test_stray_dirty_file_refuses_in_a_real_repo(real_repo):
     assert "# stray edit" in stray.read_text(encoding="utf-8")
 
 
-def test_edit_to_the_tasks_own_file_does_not_block(real_repo):
+def test_edit_to_the_tasks_own_file_refuses_before_any_mutation(real_repo):
     port, repo, bare, task, merge, pr = real_repo
     tf = port.tasks_dir / f"{task.id}.md"
     tf.write_text(tf.read_text(encoding="utf-8") + "\nA note.\n", encoding="utf-8", newline="")
+    before = _refs(repo)
     res, _ = _land(task, pr)
-    assert res.exit_code == 0, res.output
+    assert res.exit_code == 1 and "task_file_dirty" in res.output and '"changed": false' in res.output, res.output
+    assert _refs(repo) == before
+    assert "A note." in tf.read_text(encoding="utf-8")
 
 
 def test_local_commits_not_on_remote_refuse_non_fast_forward(real_repo):
@@ -443,6 +451,11 @@ def test_tasks_land_never_auto_inits_a_project(land_env):
     assert seen.get("auto_init") is False
 
 
+def _refs(repo):
+    """HEAD plus every ref (branches, tags, remote-tracking): byte-identical across a refusal."""
+    return _g(repo, "rev-parse", "HEAD"), _g(repo, "for-each-ref", "--format=%(refname) %(objectname)")
+
+
 def _advance(tmp_path, name="adv.txt", body="more\n", edit=None):
     """Land one more commit on the bare remote from the `other` clone; return its sha."""
     other = tmp_path / "other"
@@ -480,26 +493,21 @@ def test_inherited_autostash_cannot_turn_a_refusal_into_a_mutation(real_repo, tm
     tf = port.tasks_dir / f"{task.id}.md"
     tf.write_text(tf.read_text(encoding="utf-8") + "\nlocal edit\n", encoding="utf-8", newline="")
     _g(repo, "config", "merge.autoStash", "true")
-    before = _g(repo, "rev-parse", "HEAD")
+    before = _refs(repo)
     res, _ = _land(task, _with_merge(pr, new))
-    assert res.exit_code == 1, res.output
-    assert "ff_failed" in res.output
-    assert _g(repo, "rev-parse", "HEAD") == before
+    assert res.exit_code == 1 and "task_file_dirty" in res.output, res.output
+    assert _refs(repo) == before
     assert "local edit" in tf.read_text(encoding="utf-8")
     assert _g(repo, "stash", "list") == ""
 
 
-def test_pr_that_renames_the_task_file_leaves_no_duplicate_in_a_fresh_checkout(real_repo, tmp_path):
+def test_pr_that_renames_the_task_file_refuses_before_the_ff(real_repo, tmp_path):
     port, repo, bare, task, merge, pr = real_repo
     new = _advance(tmp_path, edit=lambda other: _g(other, "mv", f".project/tasks/{task.id}.md", f".project/tasks/{task.id}.progress.md"))
+    before = _refs(repo)
     res, _ = _land(task, _with_merge(pr, new))
-    assert res.exit_code == 0, res.output
-    tracked = _g(repo, "ls-tree", "-r", "--name-only", "HEAD").splitlines()
-    assert f".project/tasks/done/{task.id}.md" in tracked
-    assert f".project/tasks/{task.id}.progress.md" not in tracked
-    assert f".project/tasks/{task.id}.md" not in tracked
-    assert _g(repo, "status", "--porcelain", "--untracked-files=no") == ""
-    assert _g(repo, "rev-list", "--count", f"{new}..HEAD") == "1"
+    assert res.exit_code == 1 and "task_missing_at_tip" in res.output and '"changed": false' in res.output, res.output
+    assert _refs(repo) == before
 
 
 def test_untracked_done_destination_refuses_before_the_fast_forward(real_repo):
@@ -678,7 +686,7 @@ def _s_submodule_worktree(ctx):
 
 def _s_decision_at_tip(ctx):
     new = _advance(ctx["tmp"], edit=_tip_edit_make_decision(ctx["task"].id))
-    return _with_merge(ctx["pr"], new), [], "decision_needs_resolution"
+    return _with_merge(ctx["pr"], new), [], "task_file_differs_at_tip"
 
 
 def _s_child_at_tip(ctx):
@@ -741,8 +749,8 @@ HOSTILE_CONFIG = (
 )
 _PINS = [
     "merge.autoStash=false", "merge.ff=only", "branch.main.mergeoptions=", "status.showUntrackedFiles=all",
-    "diff.ignoreSubmodules=none", "core.fsmonitor=false", "submodule.recurse=false", "fetch.recurseSubmodules=false",
-    "fetch.prune=false", "fetch.pruneTags=false", "push.recurseSubmodules=no", "push.followTags=false",
+    "diff.ignoreSubmodules=none", "core.fsmonitor=false", "submodule.recurse=false",
+    "push.recurseSubmodules=no", "push.followTags=false",
     "gc.auto=0", "maintenance.auto=false",
 ]
 _PIN_ARGV = [x for p in _PINS for x in ("-c", p)]
@@ -826,29 +834,16 @@ def test_task_that_becomes_a_decision_at_the_tip_refuses_before_the_ff(real_repo
     new = _advance(tmp_path, edit=_tip_edit_make_decision(task.id))
     before = _g(repo, "rev-parse", "HEAD")
     res, _ = _land(task, _with_merge(pr, new))
-    assert res.exit_code == 1 and "decision_needs_resolution" in res.output, res.output
+    assert res.exit_code == 1 and "task_file_differs_at_tip" in res.output, res.output
     assert _g(repo, "rev-parse", "HEAD") == before
 
 
 def test_tip_validation_is_not_fooled_by_export_ignore_attributes(real_repo, tmp_path):  # (d) git archive would honour these
     port, repo, bare, task, merge, pr = real_repo
     (repo / ".git" / "info" / "attributes").write_text("* export-ignore\n", encoding="utf-8")
-    new = _advance(tmp_path, edit=_tip_edit_make_decision(task.id))
+    new = _advance(tmp_path, edit=_tip_edit_add_child(task.id))
     res, _ = _land(task, _with_merge(pr, new))
-    assert res.exit_code == 1 and "decision_needs_resolution" in res.output, res.output
-
-
-def test_a_landable_task_at_the_tip_passes_the_tip_validation(real_repo, tmp_path):  # (d) positive path through the extraction
-    port, repo, bare, task, merge, pr = real_repo
-
-    def edit(other):
-        p = other / ".project" / "tasks" / f"{task.id}.md"
-        p.write_bytes(p.read_bytes() + b"\nremote note\n")
-
-    new = _advance(tmp_path, edit=edit)
-    res, _ = _land(task, _with_merge(pr, new))
-    assert res.exit_code == 0, res.output
-    assert "remote note" in (port.tasks_dir / "done" / f"{task.id}.md").read_text(encoding="utf-8")
+    assert res.exit_code == 1 and "subtasks_incomplete" in res.output, res.output
 
 
 def test_populated_submodule_in_the_worktree_refuses_before_the_ff(real_repo, tmp_path):  # (e)
@@ -898,6 +893,7 @@ def test_audit_only_transition_errors_stay_warnings(real_repo, monkeypatch):  # 
 
 def test_hostile_inherited_config_and_env_cannot_change_a_successful_landing(real_repo, tmp_path):
     port, repo, bare, task, merge, pr = real_repo
+    _g(repo, "fetch", "fork")  # the operator's own fetch, before the hostile config is in play
     _hostile(repo)
     _g(repo, "update-ref", "refs/remotes/fork/stale", "HEAD")  # fetch.prune=true would delete this
     wt = tmp_path / "wts" / task.id
@@ -911,7 +907,7 @@ def test_hostile_inherited_config_and_env_cannot_change_a_successful_landing(rea
         "GIT_CONFIG_VALUE_0": "--squash",
         "GIT_CONFIG_PARAMETERS": "'merge.ff'='false'",
     }
-    res, fake = _land(task, pr, "--push", "--remove-worktree", env=env)
+    res, fake = _land(task, pr, "--push", "--remove-worktree", env=env, prefetch=False)
     assert res.exit_code == 0, res.output
     out = _payload(res)
     head = _g(repo, "rev-parse", "HEAD")
@@ -934,14 +930,9 @@ def test_every_git_call_land_makes_is_pinned_and_env_stripped(real_repo, tmp_pat
     unpinned = [a for a, e in git_calls if a[1:1 + len(_PIN_ARGV)] != _PIN_ARGV]
     # the only git processes outside land.py's runner are transition()'s own files_changed enrichment
     assert {a[1] for a in unpinned} <= {"diff", "rev-parse", "log"}, unpinned
-    def _sub(a):  # skip the per-call `-c remote.<name>.*` pins that follow the fixed ones
-        i = 1 + len(_PIN_ARGV)
-        while a[i] == "-c":
-            i += 2
-        return a[i]
-
-    subs = {_sub(a) for a, _ in pinned}
-    assert {"merge", "fetch", "commit", "push", "ls-remote", "worktree", "status", "ls-tree", "cat-file"} <= subs, subs
+    subs = {a[1 + len(_PIN_ARGV)] for a, _ in pinned}
+    assert {"merge", "commit", "push", "ls-remote", "worktree", "status", "ls-tree", "cat-file"} <= subs, subs
+    assert "fetch" not in subs and not any("fetch" in a for a in unpinned)  # land never fetches
     for _, e in pinned:
         assert e is not None
         assert not {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"} & set(e)
@@ -963,18 +954,72 @@ def test_land_py_has_exactly_one_process_spawn_site():
 # --------------------------------------------------------------------------
 
 
-def test_remote_level_prune_config_cannot_delete_a_local_only_tag_before_a_refusal(real_repo):
+def _git_calls(fake):
+    return [_norm(c)[1:] for c in fake.calls if c[0] == "git"]
+
+
+def test_land_never_runs_fetch_and_refuses_when_the_tracking_ref_is_stale(real_repo):
     port, repo, bare, task, merge, pr = real_repo
-    _g(repo, "tag", "local-only-tag")
-    _g(repo, "config", "remote.fork.prune", "true")  # outranks fetch.prune=false in git's config precedence
-    _g(repo, "config", "remote.fork.pruneTags", "true")
-    (repo / "local.txt").write_text("x\n", encoding="utf-8")
-    _g(repo, "add", "local.txt")
-    _g(repo, "commit", "-m", "local only")
-    local = _g(repo, "rev-parse", "HEAD")
-    res, _ = _land(task, _with_merge(pr, local))  # refuses AFTER the fetch: that commit is not in the remote base
-    assert res.exit_code == 1 and "merge_commit_not_in_base" in res.output and '"changed": false' in res.output, res.output
-    assert "local-only-tag" in _g(repo, "tag", "--list").split()
+    before = _refs(repo)
+    res, fake = _land(task, pr, prefetch=False)  # remote has the merge, fork/main does not yet
+    assert res.exit_code == 1 and "remote_not_fetched" in res.output and "git fetch fork" in res.output, res.output
+    assert '"changed": false' in res.output
+    assert _refs(repo) == before
+    assert not any(c[0] == "fetch" for c in _git_calls(fake))
+
+
+def test_land_with_a_prefetched_tracking_ref_succeeds_without_running_fetch(real_repo):
+    port, repo, bare, task, merge, pr = real_repo
+    _g(repo, "fetch", "fork")
+    res, fake = _land(task, pr, prefetch=False)
+    assert res.exit_code == 0, res.output
+    assert not any(c[0] == "fetch" for c in _git_calls(fake))
+
+
+def test_extra_remote_tag_refspec_cannot_move_a_local_tag(real_repo):
+    port, repo, bare, task, merge, pr = real_repo
+    _g(repo, "tag", "v1")  # local v1 -> HEAD
+    _g(bare, "tag", "v1", merge)  # the remote's v1 differs
+    _g(repo, "config", "--add", "remote.fork.fetch", "+refs/tags/*:refs/tags/*")
+    before = _refs(repo)
+    res, _ = _land(task, pr, prefetch=False)
+    assert res.exit_code == 1 and "remote_not_fetched" in res.output, res.output
+    assert _refs(repo) == before
+    # even with the tracking ref current (operator fetched the branch only), the landing leaves the tag alone
+    _g(repo, "update-ref", "refs/remotes/fork/main", merge)
+    tag = _g(repo, "rev-parse", "v1")
+    res, _ = _land(task, pr, prefetch=False)
+    assert res.exit_code == 0, res.output
+    assert _g(repo, "rev-parse", "v1") == tag
+
+
+@pytest.mark.parametrize("staged", [False, True])
+def test_local_task_kind_edit_refuses_before_any_mutation(real_repo, staged):
+    port, repo, bare, task, merge, pr = real_repo
+    tf = port.tasks_dir / f"{task.id}.md"
+    tf.write_bytes(tf.read_text(encoding="utf-8").replace("---\n", "---\nkind: decision\n", 1).encode("utf-8"))
+    if staged:
+        _g(repo, "add", str(tf))
+    _g(repo, "fetch", "fork")
+    before, content = _refs(repo), tf.read_bytes()
+    res, _ = _land(task, pr, prefetch=False)
+    assert res.exit_code == 1 and "task_file_dirty" in res.output and '"changed": false' in res.output, res.output
+    assert _refs(repo) == before and tf.read_bytes() == content
+
+
+def test_task_file_that_differs_between_head_and_tip_refuses(real_repo, tmp_path):
+    port, repo, bare, task, merge, pr = real_repo
+
+    def edit(other):
+        p = other / ".project" / "tasks" / f"{task.id}.md"
+        p.write_bytes(p.read_bytes() + b"\nremote note\n")
+
+    new = _advance(tmp_path, edit=edit)
+    _g(repo, "fetch", "fork")
+    before = _refs(repo)
+    res, _ = _land(task, _with_merge(pr, new), prefetch=False)
+    assert res.exit_code == 1 and "task_file_differs_at_tip" in res.output and '"changed": false' in res.output, res.output
+    assert _refs(repo) == before
 
 
 def _tip_edit_convert_to_dir(task_id):
@@ -985,12 +1030,12 @@ def _tip_edit_convert_to_dir(task_id):
 
 
 def _s_shape_change_dest_exists(ctx):
-    """The PR turns <ID>.md into <ID>/_task.md, so the move target is done/<ID>/, not done/<ID>.md."""
+    """The PR turns <ID>.md into <ID>/_task.md: the file at the local path is gone at the tip, so land refuses."""
     done_dir = ctx["port"].tasks_dir / "done" / ctx["task"].id
     done_dir.mkdir(parents=True)
     (done_dir / "stale.md").write_text("stale\n", encoding="utf-8")
     new = _advance(ctx["tmp"], edit=_tip_edit_convert_to_dir(ctx["task"].id))
-    return _with_merge(ctx["pr"], new), [], "done_destination_exists"
+    return _with_merge(ctx["pr"], new), [], "task_missing_at_tip"
 
 
 def _s_shape_change_dest_in_tip(ctx):
@@ -1003,7 +1048,7 @@ def _s_shape_change_dest_in_tip(ctx):
         _tip_edit_convert_to_dir(tid)(other)
 
     new = _advance(ctx["tmp"], edit=edit)
-    return _with_merge(ctx["pr"], new), [], "done_destination_exists"
+    return _with_merge(ctx["pr"], new), [], "task_missing_at_tip"
 
 
 @pytest.mark.parametrize("scenario", [_s_shape_change_dest_exists, _s_shape_change_dest_in_tip])
