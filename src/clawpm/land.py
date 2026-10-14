@@ -94,6 +94,7 @@ def _git_env(*, mutates: bool) -> dict[str, str]:
 def _git(
     args: list[str], cwd: Path, *, ok_codes: tuple[int, ...] = (0,), changed: bool = False,
     mutates: bool = False, binary: bool = False, stdin: bytes | None = None,
+    extra_pins: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess:
     """The ONE place land.py runs git: config pinned, location env stripped.
 
@@ -102,9 +103,9 @@ def _git(
     never be reported as "nothing changed". ``mutates`` marks the calls that
     write (fetch, merge, add, commit, push, worktree remove); every other call
     runs with optional locks off. ``binary`` returns bytes on stdout; ``stdin``
-    (bytes) implies it.
+    (bytes) implies it. ``extra_pins`` are per-call ``-c`` pins (the remote-named ones).
     """
-    pins = [x for pin in _GIT_PINS for x in ("-c", pin)]
+    pins = [x for pin in (*_GIT_PINS, *extra_pins) for x in ("-c", pin)]
     binary = binary or stdin is not None
     text_kw: dict[str, Any] = {} if binary else {"text": True, "encoding": "utf-8", "errors": "replace"}
     try:
@@ -200,12 +201,14 @@ def _check_task_eligible(task, status: dict, task_id: str) -> None:
         )
 
 
-def _task_at_tip(config, project_id: str, task_id: str, toplevel: Path, tasks_dir: Path, tip: str, target: str) -> None:
+def _task_at_tip(config, project_id: str, task_id: str, toplevel: Path, tasks_dir: Path, tip: str, target: str) -> bool:
     """Refuse now if the task, as it exists at the verified tip, is not landable.
 
-    The fast-forward replaces the task files, so eligibility read from the
-    current checkout can be stale. The tip's task directory is extracted to a
-    temp dir and read through a pinned Scope, with no mutation of the checkout.
+    The fast-forward replaces the task files, so eligibility (open children,
+    decision kind) and the task's shape read from the current checkout can be
+    stale in either direction. The tip's task directory is extracted to a temp
+    dir and read through a pinned Scope, with no mutation of the checkout.
+    Returns True when the task is decomposed (``<ID>/_task.md``) at the tip.
     """
     from clawpm.sessions import Scope
     from clawpm.tasks import get_task, parent_rollup_status
@@ -246,6 +249,7 @@ def _task_at_tip(config, project_id: str, task_id: str, toplevel: Path, tasks_di
         if tip_task is None:
             raise LandError("task_missing_at_tip", f"{task_id} does not exist in {target}; the PR removed or renamed it")
         _check_task_eligible(tip_task, parent_rollup_status(config, project_id, tip_task, scope=scope), task_id)
+        return tip_task.file_path is not None and tip_task.file_path.name == "_task.md"
 
 
 def _is_own(path: str, own: list[str]) -> bool:
@@ -328,9 +332,9 @@ def land_task(
     cwd: Path | None = None,
 ) -> dict[str, Any]:
     """Run the landing transaction; return a result dict or raise :class:`LandError`."""
-    from clawpm.tasks import get_task, get_tasks_dir, parent_rollup_status
+    from clawpm.tasks import get_task, get_tasks_dir
 
-    cwd = Path(cwd) if cwd else Path.cwd()
+    cwd =Path(cwd) if cwd else Path.cwd()
 
     # 1. Where are we? Must be the main checkout, on `main`.
     toplevel = Path(_out(["rev-parse", "--show-toplevel"], cwd)).resolve()
@@ -357,7 +361,10 @@ def land_task(
     task = get_task(config, project_id, task_id)
     if task is None or task.file_path is None:
         raise LandError("task_not_found", f"No task with id '{task_id}' in project '{project_id}'")
-    _check_task_eligible(task, parent_rollup_status(config, project_id, task), task_id)
+    # Eligibility (open children, decision kind) is judged at the verified tip in
+    # step 5b: the fast-forward replaces these files, so the local view can be stale.
+    if task.state == TaskState.DONE:
+        raise LandError("task_already_done", f"{task_id} is already done; nothing to land")
     old_entry = _task_entry(task.file_path)
     try:
         old_rel = _rel(old_entry, toplevel)
@@ -367,22 +374,7 @@ def land_task(
             f"task files at {old_entry} are not inside the checkout {toplevel}",
         )
 
-    # 2b. Where the task will land (done/). Anything already there, tracked or
-    #     not, would make the post-ff move refuse, so refuse now instead.
     tasks_dir = get_tasks_dir(config, project_id)
-    done_rel: str | None = None
-    if tasks_dir is not None:
-        done_name = task_id if task.file_path.name == "_task.md" else f"{task_id}.md"
-        try:
-            done_rel = _rel(tasks_dir / "done" / done_name, toplevel)
-        except ValueError:
-            done_rel = None
-    if done_rel and (toplevel / done_rel).exists():
-        raise LandError(
-            "done_destination_exists",
-            f"{done_rel} already exists in the checkout; move it aside before landing {task_id}",
-            {"path": done_rel},
-        )
 
     # 3. Dirty tracked paths outside the task's own files (the stray-edit case).
     stray = [p for p in _dirty_tracked_paths(toplevel) if not _is_own(p, [old_rel])]
@@ -428,7 +420,12 @@ def land_task(
     # 5. Refs: fetch (moves remote-tracking refs only), then prove the tracking
     #    ref is current, the merge commit is in it and our branch can fast-forward.
     #    From here on only the verified `tip` sha is used, never the ref name.
-    _git(["fetch", remote], toplevel, mutates=True)
+    # `remote.<name>.prune*` outranks `fetch.prune*`, so the remote-level keys are
+    # pinned too, and the flags are repeated: a fetch must never delete a local ref.
+    _git(
+        ["fetch", "--no-prune", "--no-prune-tags", "--no-tags", remote], toplevel, mutates=True,
+        extra_pins=(f"remote.{remote}.prune=false", f"remote.{remote}.pruneTags=false"),
+    )
     target = f"{remote}/{base}"
     tip = _out(["rev-parse", "--verify", f"refs/remotes/{target}^{{commit}}"], toplevel)
     remote_tip = _remote_branch_tip(remote, base, toplevel)
@@ -452,16 +449,29 @@ def land_task(
             f"{branch} has commits that are not in {target}; refusing a non-fast-forward",
             {"head": before, "target": target},
         )
-    if done_rel and (_git(["ls-tree", "--name-only", tip, "--", done_rel], toplevel).stdout or "").strip():
-        raise LandError(
-            "done_destination_exists",
-            f"{done_rel} already exists in {target}; resolve it before landing {task_id}",
-            {"path": done_rel},
-        )
 
-    # 5b. The task as it will exist at the verified tip (the ff replaces its files).
+    # 5b. The task as it will exist at the verified tip (the ff replaces its files):
+    #     eligibility, then the done/ destination for THAT shape. Anything already
+    #     there, tracked at the tip or sitting in the checkout, would make the
+    #     post-ff move refuse, so refuse now instead.
     if tasks_dir is not None:
-        _task_at_tip(config, project_id, task_id, toplevel, tasks_dir, tip, target)
+        decomposed = _task_at_tip(config, project_id, task_id, toplevel, tasks_dir, tip, target)
+        try:
+            done_rel = _rel(tasks_dir / "done" / (task_id if decomposed else f"{task_id}.md"), toplevel)
+        except ValueError:
+            done_rel = None
+        if done_rel and (toplevel / done_rel).exists():
+            raise LandError(
+                "done_destination_exists",
+                f"{done_rel} already exists in the checkout; move it aside before landing {task_id}",
+                {"path": done_rel},
+            )
+        if done_rel and (_git(["ls-tree", "--name-only", tip, "--", done_rel], toplevel).stdout or "").strip():
+            raise LandError(
+                "done_destination_exists",
+                f"{done_rel} already exists in {target}; resolve it before landing {task_id}",
+                {"path": done_rel},
+            )
 
     # 6. Optional worktree removal: refuse up front when it cannot succeed.
     wt_path: Path | None = None

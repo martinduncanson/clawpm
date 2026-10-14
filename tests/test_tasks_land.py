@@ -75,7 +75,6 @@ class FakeEnv:
         self.calls: list[list[str]] = []
         self.gh_error: Exception | None = None
         self.remote_url = "git@github.com:acme/widgets.git"
-        self.tip_has_dest = ""
         self.__dict__.update(over)
 
     def mutating(self):
@@ -97,8 +96,6 @@ class FakeEnv:
         sub = a[1]
         if a[1:3] == ["remote", "get-url"]:
             return _cp(self.remote_url + "\n")
-        if sub == "ls-tree":
-            return _cp(self.tip_has_dest)
         if a[1:3] == ["rev-parse", "--show-toplevel"]:
             return _cp(str(self.toplevel) + "\n")
         if "--git-common-dir" in a:
@@ -414,10 +411,19 @@ def test_repo_with_an_unparseable_remote_url_fails_closed(land_env):
     _assert_refused(_run(env, task), env, task_file, "repo_remote_mismatch")
 
 
-def test_done_destination_present_in_the_target_tip_refuses(land_env):
-    _, task, task_file, make = land_env
-    env = make(tip_has_dest="present\n")
-    _assert_refused(_run(env, task), env, task_file, "done_destination_exists")
+def test_done_destination_present_in_the_target_tip_refuses(real_repo, tmp_path):
+    port, repo, bare, task, merge, pr = real_repo
+
+    def edit(other):
+        done = other / ".project" / "tasks" / "done"
+        done.mkdir(exist_ok=True)
+        (done / f"{task.id}.md").write_text("stale\n", encoding="utf-8")
+
+    new = _advance(tmp_path, edit=edit)
+    before = _g(repo, "rev-parse", "HEAD")
+    res, _ = _land(task, _with_merge(pr, new))
+    assert res.exit_code == 1 and "done_destination_exists" in res.output and '"changed": false' in res.output, res.output
+    assert _g(repo, "rev-parse", "HEAD") == before
 
 
 def test_tasks_land_never_auto_inits_a_project(land_env):
@@ -928,7 +934,13 @@ def test_every_git_call_land_makes_is_pinned_and_env_stripped(real_repo, tmp_pat
     unpinned = [a for a, e in git_calls if a[1:1 + len(_PIN_ARGV)] != _PIN_ARGV]
     # the only git processes outside land.py's runner are transition()'s own files_changed enrichment
     assert {a[1] for a in unpinned} <= {"diff", "rev-parse", "log"}, unpinned
-    subs = {a[1 + len(_PIN_ARGV)] for a, _ in pinned}
+    def _sub(a):  # skip the per-call `-c remote.<name>.*` pins that follow the fixed ones
+        i = 1 + len(_PIN_ARGV)
+        while a[i] == "-c":
+            i += 2
+        return a[i]
+
+    subs = {_sub(a) for a, _ in pinned}
     assert {"merge", "fetch", "commit", "push", "ls-remote", "worktree", "status", "ls-tree", "cat-file"} <= subs, subs
     for _, e in pinned:
         assert e is not None
@@ -944,3 +956,85 @@ def test_land_py_has_exactly_one_process_spawn_site():
     src = Path(land.__file__).read_text(encoding="utf-8")
     assert len(re.findall(r"subprocess\.(run|Popen|call|check_output|check_call)\(", src)) == 1
     assert "os.system" not in src and "_remote_head" not in src and "_resolve_repo" not in src
+
+
+# --------------------------------------------------------------------------
+# Round 7 (Codex r3): remote-level prune config, tip-shaped destination, tip-state eligibility
+# --------------------------------------------------------------------------
+
+
+def test_remote_level_prune_config_cannot_delete_a_local_only_tag_before_a_refusal(real_repo):
+    port, repo, bare, task, merge, pr = real_repo
+    _g(repo, "tag", "local-only-tag")
+    _g(repo, "config", "remote.fork.prune", "true")  # outranks fetch.prune=false in git's config precedence
+    _g(repo, "config", "remote.fork.pruneTags", "true")
+    (repo / "local.txt").write_text("x\n", encoding="utf-8")
+    _g(repo, "add", "local.txt")
+    _g(repo, "commit", "-m", "local only")
+    local = _g(repo, "rev-parse", "HEAD")
+    res, _ = _land(task, _with_merge(pr, local))  # refuses AFTER the fetch: that commit is not in the remote base
+    assert res.exit_code == 1 and "merge_commit_not_in_base" in res.output and '"changed": false' in res.output, res.output
+    assert "local-only-tag" in _g(repo, "tag", "--list").split()
+
+
+def _tip_edit_convert_to_dir(task_id):
+    def edit(other):
+        (other / ".project" / "tasks" / task_id).mkdir()
+        _g(other, "mv", f".project/tasks/{task_id}.md", f".project/tasks/{task_id}/_task.md")
+    return edit
+
+
+def _s_shape_change_dest_exists(ctx):
+    """The PR turns <ID>.md into <ID>/_task.md, so the move target is done/<ID>/, not done/<ID>.md."""
+    done_dir = ctx["port"].tasks_dir / "done" / ctx["task"].id
+    done_dir.mkdir(parents=True)
+    (done_dir / "stale.md").write_text("stale\n", encoding="utf-8")
+    new = _advance(ctx["tmp"], edit=_tip_edit_convert_to_dir(ctx["task"].id))
+    return _with_merge(ctx["pr"], new), [], "done_destination_exists"
+
+
+def _s_shape_change_dest_in_tip(ctx):
+    tid = ctx["task"].id
+
+    def edit(other):
+        d = other / ".project" / "tasks" / "done" / tid
+        d.mkdir(parents=True)
+        (d / "stale.md").write_text("stale\n", encoding="utf-8")
+        _tip_edit_convert_to_dir(tid)(other)
+
+    new = _advance(ctx["tmp"], edit=edit)
+    return _with_merge(ctx["pr"], new), [], "done_destination_exists"
+
+
+@pytest.mark.parametrize("scenario", [_s_shape_change_dest_exists, _s_shape_change_dest_in_tip])
+def test_shape_changing_pr_refusals_leave_head_index_and_tree_byte_identical(real_repo, tmp_path, scenario):
+    port, repo, bare, task, merge, pr = real_repo
+    _g(repo, "update-index", "--refresh")
+    pr2, extra, code = scenario({"port": port, "repo": repo, "task": task, "pr": pr, "tmp": tmp_path})
+    snap = _snapshot(repo)
+    res, _ = _land(task, pr2, *extra)
+    assert res.exit_code == 1 and code in res.output and '"changed": false' in res.output, res.output
+    assert _snapshot(repo) == snap
+
+
+def test_parent_whose_children_are_completed_at_the_tip_lands_without_a_manual_pull(real_repo, tmp_path):
+    port, repo, bare, task, merge, pr = real_repo
+    tid = task.id
+    other = tmp_path / "other"
+    _g(other, "pull", "--ff-only", "origin", "main")
+    tasks = other / ".project" / "tasks"
+    tasks.mkdir(parents=True, exist_ok=True)
+    (tasks / f"{tid}-C1.md").write_bytes(f"---\nid: {tid}-C1\nparent: {tid}\ncreated: '2026-10-14'\npriority: 5\n---\n# child\n".encode("utf-8"))
+    _g(other, "add", "-A")
+    _g(other, "commit", "-m", "add child")
+    _g(other, "push", "origin", "main")
+    _g(repo, "pull", "--ff-only", "fork", "main")  # the local checkout has the open child and the PR commit
+
+    def edit(other):
+        (other / ".project" / "tasks" / "done").mkdir(exist_ok=True)
+        _g(other, "mv", f".project/tasks/{tid}-C1.md", f".project/tasks/done/{tid}-C1.md")
+
+    new = _advance(tmp_path, edit=edit)
+    res, _ = _land(task, _with_merge(pr, new))  # the local checkout still shows an open child
+    assert res.exit_code == 0, res.output
+    assert (port.tasks_dir / "done" / f"{tid}.md").exists()
