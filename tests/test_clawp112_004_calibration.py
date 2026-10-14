@@ -488,3 +488,89 @@ class TestRenderScorecard:
         lines = render_scorecard(compute_calibration(rows, LEDGER, now=NOW))
         assert "missed_variable" in lines[4]
         assert math.isfinite(len(lines))
+
+
+class TestRound4Findings:
+    """Codex gate r1 P2s 1-4 on PR #111."""
+
+    def test_debias_keeps_full_precision(self):
+        # 20 ratios of 1/30 and one of 2/30: the median factor is exactly
+        # 1/30, so every debiased ratio is 1.0 (x20) or 2.0 -> hit rate 1.0.
+        # A factor rounded to 4 dp pushes 2.0 to 2.0002 and a hit to a miss.
+        rows = [_row(3, "correct", 1 / 30) for _ in range(20)]
+        rows.append(_row(3, "correct", 2 / 30))
+        c = compute_calibration(rows, LEDGER, now=NOW)
+        assert c["duration_debiased"]["hit_rate"] == pytest.approx(1.0, abs=1e-9)
+
+    def test_tiny_factor_does_not_divide_by_zero(self):
+        rows = [_row(3, "correct", 1e-5) for _ in range(20)]
+        c = compute_calibration(rows, LEDGER, now=NOW)
+        assert c["duration_debiased"]["n"] == 20
+        assert c["duration_debiased"]["hit_rate"] == pytest.approx(1.0, abs=1e-9)
+
+    def test_malformed_confidence_rejected_and_counted(self):
+        rows = [_row(3, "correct", 1.0) for _ in range(20)]
+        rows.append(_row([], "correct", 1.0))
+        rows.append(_row({"a": 1}, "incorrect", 1.0))
+        rows.append(_row(True, "correct", 1.0))
+        c = compute_calibration(rows, LEDGER, now=NOW)
+        assert c["brier"]["n"] == 20
+        assert c["brier"]["n_unscored"] == 3
+
+    def test_malformed_ratio_and_held_rejected_and_counted(self):
+        rows = [_row(3, "correct", 1.0) for _ in range(20)]
+        rows.append(_row(3, "correct", "fast"))
+        rows.append(_row(3, ["x"], 1.0))
+        c = compute_calibration(rows, LEDGER, now=NOW)
+        assert c["mae_log"]["n"] == 21  # the str ratio is rejected, the list-held row keeps its ratio
+        assert c["data_quality"]["rejected_rows"] == 2
+
+    def test_loader_counts_bad_lines_and_survives_bad_confidence(self, tmp_path):
+        for i in range(3):
+            _done(tmp_path, f"Q-{i}", actual=100)
+        ref = tmp_path / "reflections" / "Q-0.jsonl"
+        bad_done = {"event": "task_done", "task_id": "Q-9", "project_id": "proj",
+                    "predictions": {"duration_min": 100, "confidence": []},
+                    "actuals": {"duration_min": 100, "active_min": 100}}
+        with ref.open("a", encoding="utf-8") as fh:
+            fh.write("{not json\n")
+            fh.write("[1, 2]\n")
+            fh.write(json.dumps({"event": "mystery", "project_id": "proj"}) + "\n")
+            fh.write(json.dumps(bad_done) + "\n")
+        c = summarize_calibration(tmp_path, "proj")["calibration"]
+        dq = c["data_quality"]
+        assert dq["malformed_lines"] == 1
+        assert dq["non_object"] == 1
+        assert dq["unknown_events"] == 1
+
+    def test_scorecard_shows_data_quality_line_only_when_nonzero(
+        self, temp_portfolio_with_repo
+    ):
+        root = temp_portfolio_with_repo["config"].portfolio_root
+        _done(root, "DQ-1", project="test")
+        r = CliRunner().invoke(main, ["reflect", "scorecard", "-p", "test"])
+        assert len([ln for ln in r.output.splitlines() if ln.strip()]) == 5
+        with (root / "reflections" / "DQ-1.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write("{broken\n")
+        r = CliRunner().invoke(main, ["reflect", "scorecard", "-p", "test"])
+        assert r.exit_code == 0, r.output
+        lines = [ln for ln in r.output.splitlines() if ln.strip()]
+        assert len(lines) == 6
+        assert "malformed" in lines[5]
+
+    def test_summarize_does_not_create_reflections_dir(self, tmp_path):
+        assert not (tmp_path / "reflections").exists()
+        summarize_calibration(tmp_path, None)
+        assert not (tmp_path / "reflections").exists()
+
+    def test_scorecard_does_not_create_reflections_dir(self, temp_portfolio_with_repo):
+        root = temp_portfolio_with_repo["config"].portfolio_root
+        ref = root / "reflections"
+        if ref.exists():
+            import shutil
+            shutil.rmtree(ref)
+        before = sorted(p.name for p in root.iterdir())
+        r = CliRunner().invoke(main, ["reflect", "scorecard", "-p", "test"])
+        assert r.exit_code == 0, r.output
+        assert not ref.exists()
+        assert sorted(p.name for p in root.iterdir()) == before

@@ -35,10 +35,61 @@ VELOCITY_MIN_WINDOWS = 3
 P_BY_CONFIDENCE = {1: 0.55, 2: 0.65, 3: 0.75, 4: 0.85, 5: 0.95}
 
 _RESOLVED = ("correct", "incorrect")
+_HELD_VALUES = ("correct", "incorrect", "unresolvable")
 
 
 def _r4(value: float | None) -> float | None:
     return None if value is None else round(value, 4)
+
+
+def _is_number(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _clean_row(row: Any) -> tuple[dict[str, Any] | None, bool]:
+    """Return ``(row, malformed)``. A malformed field is nulled, never raised on.
+
+    The corpus is operator-writable JSONL, so any field can hold any JSON
+    type. Fields are rejected one by one and the caller counts the rows.
+    """
+    if not isinstance(row, dict):
+        return None, True
+    bad = False
+    conf = row.get("confidence")
+    if conf is not None and not (
+        isinstance(conf, int) and not isinstance(conf, bool) and conf in P_BY_CONFIDENCE
+    ):
+        bad, conf = True, None
+    held = row.get("held")
+    if held is not None and not (isinstance(held, str) and held in _HELD_VALUES):
+        bad, held = True, None
+    ratio = row.get("duration_ratio")
+    if ratio is not None and not (_is_number(ratio) and ratio > 0):
+        bad, ratio = True, None
+    complexity = row.get("complexity")
+    if complexity is not None and not isinstance(complexity, str):
+        bad, complexity = True, None
+    miss = row.get("miss_category")
+    if miss is not None and not isinstance(miss, str):
+        bad, miss = True, None
+    project = row.get("project_id")
+    if not isinstance(project, str):
+        bad = bad or project is not None
+        project = ""
+    at = row.get("occurred_at")
+    if at is not None and not isinstance(at, datetime):
+        bad, at = True, None
+    return {
+        "project_id": project,
+        "task_id": row.get("task_id"),
+        "occurred_at": at,
+        "confidence": conf,
+        "held": held,
+        "duration_ratio": ratio,
+        "complexity": complexity,
+        "miss_category": miss,
+        "legacy": bool(row.get("legacy")),
+    }, bad
 
 
 def _gate(n: int) -> bool:
@@ -125,11 +176,13 @@ def _bias(ratios: list[float]) -> dict[str, Any]:
 
 
 def _bucket_bias(dur_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Per-complexity factors at FULL precision; ``_serialise_bucket_bias``
+    rounds them for output only, so debiasing never sees a rounded factor."""
     all_ratios = [r["duration_ratio"] for r in dur_rows]
     global_n = len(all_ratios)
     global_factor = None if _gate(global_n) else _median_factor(all_ratios)
     out: dict[str, Any] = {
-        "global": {"factor": _r4(global_factor), "n": global_n, "source": "global"}
+        "global": {"factor": global_factor, "n": global_n, "source": "global"}
     }
     buckets: dict[str, list[float]] = {}
     for row in dur_rows:
@@ -137,11 +190,15 @@ def _bucket_bias(dur_rows: list[dict[str, Any]]) -> dict[str, Any]:
     for key in sorted(buckets):
         ratios = buckets[key]
         if not _gate(len(ratios)):
-            out[key] = {"factor": _r4(_median_factor(ratios)), "n": len(ratios),
+            out[key] = {"factor": _median_factor(ratios), "n": len(ratios),
                         "source": f"complexity={key}"}
         else:
-            out[key] = {"factor": _r4(global_factor), "n": global_n, "source": "global"}
+            out[key] = {"factor": global_factor, "n": global_n, "source": "global"}
     return out
+
+
+def _serialise_bucket_bias(bucket_bias: dict[str, Any]) -> dict[str, Any]:
+    return {k: {**v, "factor": _r4(v["factor"])} for k, v in bucket_bias.items()}
 
 
 def _debiased(dur_rows: list[dict[str, Any]], bucket_bias: dict[str, Any]) -> dict[str, Any]:
@@ -153,6 +210,8 @@ def _debiased(dur_rows: list[dict[str, Any]], bucket_bias: dict[str, Any]) -> di
         r = row["duration_ratio"]
         raw_hits += 0.5 <= r <= 2.0
         factor = (bucket_bias.get(row["complexity"] or "unknown") or bucket_bias["global"])["factor"]
+        if factor is None or not factor > 0:
+            factor = 1.0  # no usable factor: score the raw ratio, never divide by zero
         debiased_hits += 0.5 <= r / factor <= 2.0
     return {"n": n, "insufficient_data": False,
             "hit_rate": _r4(debiased_hits / n), "raw_hit_rate": _r4(raw_hits / n)}
@@ -238,6 +297,14 @@ def compute_calibration(
 ) -> dict[str, Any]:
     """Build the spec 2.3 ``calibration`` block from rows and the closure ledger."""
     now = now or datetime.now(timezone.utc)
+    cleaned: list[dict[str, Any]] = []
+    rejected_rows = 0
+    for raw in rows:
+        row, bad = _clean_row(raw)
+        rejected_rows += bad
+        if row is not None:
+            cleaned.append(row)
+    rows = cleaned
     resolved = [r for r in rows if r.get("held") in _RESOLVED]
     scored = [r for r in resolved if r.get("confidence") in P_BY_CONFIDENCE]
     n_unscored = len(resolved) - len(scored)
@@ -266,13 +333,33 @@ def compute_calibration(
         "overconfidence_ratio": _overconfidence(curve, len(scored)),
         "mae_log": mae,
         "bias": _bias(ratios),
-        "bucket_bias_factor": bucket_bias,
+        "bucket_bias_factor": _serialise_bucket_bias(bucket_bias),
         "duration_debiased": _debiased(dur_rows, bucket_bias),
         "learning_velocity": _learning_velocity(scored, now),
         "miss_category_distribution": {"n": len(missed), "counts": dist},
         "metareflection_due": _metareflection(missed, now),
         "closure": _closure(ledger),
+        "data_quality": {
+            "malformed_lines": int(ledger.get("malformed_lines", 0)),
+            "non_object": int(ledger.get("non_object", 0)),
+            "unknown_events": int(ledger.get("unknown_events", 0)),
+            "rejected_rows": rejected_rows,
+        },
     }
+
+
+def render_data_quality(block: dict[str, Any]) -> list[str]:
+    """One line when any record was skipped or rejected, else none."""
+    dq = block.get("data_quality") or {}
+    parts = [f"{dq[k]} {label}" for k, label in (
+        ("malformed_lines", "malformed lines"),
+        ("non_object", "non-object records"),
+        ("unknown_events", "unknown events"),
+        ("rejected_rows", "rejected rows"),
+    ) if dq.get(k)]
+    if not parts:
+        return []
+    return ["data quality: skipped " + ", ".join(parts)]
 
 
 def render_scorecard(block: dict[str, Any]) -> list[str]:

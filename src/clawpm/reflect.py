@@ -83,6 +83,11 @@ def _reflections_dir(portfolio_root: Path) -> Path:
     return d
 
 
+def _reflections_dir_ro(portfolio_root: Path) -> Path:
+    """Path of the reflections dir WITHOUT creating it (read commands)."""
+    return portfolio_root / "reflections"
+
+
 def _compute_active_min(task_entries: list[WorkLogEntry]) -> int | None:
     """Sum capped gaps between consecutive work_log entries for one task.
 
@@ -531,7 +536,7 @@ def find_reference_tasks(
     time without any subprocess or network. Phase 2 can swap in something
     smarter; the API surface stays the same.
     """
-    ref_dir = _reflections_dir(portfolio_root)
+    ref_dir = _reflections_dir_ro(portfolio_root)
     if not ref_dir.exists():
         return []
 
@@ -1138,7 +1143,7 @@ def _iter_done_events(portfolio_root: Path, project_id: str | None = None):
     within the file. When the caller passes ``project_id``, only that
     project's records are considered.
     """
-    ref_dir = _reflections_dir(portfolio_root)
+    ref_dir = _reflections_dir_ro(portfolio_root)
     if not ref_dir.exists():
         return
     for ref_file in ref_dir.glob("*.jsonl"):
@@ -1156,6 +1161,8 @@ def _iter_done_events(portfolio_root: Path, project_id: str | None = None):
             try:
                 rec = json.loads(line)
             except json.JSONDecodeError:
+                continue
+            if not isinstance(rec, dict):
                 continue
             evt = rec.get("event")
             if evt == "void":
@@ -1207,6 +1214,12 @@ def _actuals_from_dict(data: dict[str, Any]) -> Actuals:
     )
 
 
+_KNOWN_EVENTS = (
+    "task_done", "task_blocked", "void", "prediction_registered",
+    "prediction_revised", "iteration_event",
+)
+
+
 def load_calibration_rows(
     portfolio_root: Path,
     project_id: str | None = None,
@@ -1230,8 +1243,9 @@ def load_calibration_rows(
     events with no id (counted apart, not in the closure rate).
     """
     rows: list[dict[str, Any]] = []
-    ledger = {"registered": 0, "resolved": 0, "voided": 0, "legacy_resolved": 0}
-    ref_dir = _reflections_dir(portfolio_root)
+    ledger = {"registered": 0, "resolved": 0, "voided": 0, "legacy_resolved": 0,
+              "malformed_lines": 0, "non_object": 0, "unknown_events": 0}
+    ref_dir = _reflections_dir_ro(portfolio_root)
     if not ref_dir.exists():
         return rows, ledger
     for ref_file in sorted(ref_dir.glob("*.jsonl")):
@@ -1249,11 +1263,23 @@ def load_calibration_rows(
             try:
                 rec = json.loads(line)
             except json.JSONDecodeError:
+                ledger["malformed_lines"] += 1
                 continue
             if not isinstance(rec, dict):
+                ledger["non_object"] += 1
                 continue
             evt = rec.get("event")
+            if not isinstance(evt, str) or evt not in _KNOWN_EVENTS:
+                ledger["unknown_events"] += 1
+                continue
             proj = rec.get("project_id")
+            pid = rec.get("prediction_id")
+            if not (proj is None or isinstance(proj, str)) or not (
+                pid is None or isinstance(pid, str)
+            ):
+                # An unhashable or non-string id cannot key a ledger entry.
+                ledger["malformed_lines"] += 1
+                continue
             if evt == "void":
                 if proj is None:
                     unscoped_void = True
@@ -1263,7 +1289,6 @@ def load_calibration_rows(
             if project_id is not None and proj != project_id:
                 continue
             st = states.setdefault(proj, {"registered": {}, "revisions": {}, "done": None})
-            pid = rec.get("prediction_id")
             snap = rec.get("predictions")
             if evt == "prediction_registered":
                 if pid and isinstance(snap, dict):
