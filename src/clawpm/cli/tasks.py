@@ -14,6 +14,7 @@ from clawpm.models import MISS_CATEGORIES, PortfolioConfig, Predictions, Project
 from clawpm.output import OutputFormat, output_error, output_json, output_success, output_task_detail, output_tasks_list
 from clawpm.discovery import (
     discover_projects, get_project, get_scoped_project_settings, is_task_store_canonical,
+    resolve_scope,
 )
 from clawpm.tasks import add_subtask, add_task, archive_done_tasks, change_task_state, distinct_tags, edit_fog, edit_task, get_task, list_tasks, split_task
 from clawpm.worklog import add_entry, filter_files_changed, read_entries
@@ -1496,18 +1497,15 @@ def tasks_dispatch(
     # not found" / mutate a divergent copy. `resolve_scope_from` makes every
     # session lookup below key on the target. (`--worktree` is unchanged: see
     # the source-repo comment in the body.)
-    if target_dir is not None and not worktree:
-        from clawpm.sessions import resolve_scope_from
-
-        _scope = resolve_scope_from(Path(target_dir).resolve())
-    else:
-        _scope = nullcontext()
-    with _scope:
-        _tasks_dispatch_impl(
-            ctx, project_id, task_id, target_dir, worktree, no_session_context,
-            force, confirm_close, refute_votes, lease_ttl, fallback_policy,
-            confirm_stale, max_iterations,
-        )
+    #
+    # CLAWP-136: the scope is an explicit value resolved once in the impl
+    # (`discovery.resolve_scope`, which logs and falls back to canonical when
+    # the target cannot be resolved) and threaded to each scoped lookup.
+    _tasks_dispatch_impl(
+        ctx, project_id, task_id, target_dir, worktree, no_session_context,
+        force, confirm_close, refute_votes, lease_ttl, fallback_policy,
+        confirm_stale, max_iterations,
+    )
 
 
 def _tasks_dispatch_impl(
@@ -1536,6 +1534,14 @@ def _tasks_dispatch_impl(
     config = require_portfolio(ctx)
     project_id, _source = require_project(ctx, project_id)
     task_id = expand_task_id(task_id, project_id)
+
+    # Bind once. `None` (no --target-dir, or --worktree) keeps ambient
+    # resolution exactly as before.
+    scope = (
+        resolve_scope(config, project_id, target_dir=Path(target_dir))
+        if target_dir is not None and not worktree
+        else None
+    )
 
     # CLAWP-039: opportunistic lease sweep — one of the two no-daemon expiry
     # detectors (the other is `clawpm doctor`). A holder that died is reaped
@@ -1568,7 +1574,7 @@ def _tasks_dispatch_impl(
         swept = []
         sweep_error = f"{type(exc).__name__}: {exc}"
 
-    task = get_task(config, project_id, task_id)
+    task = get_task(config, project_id, task_id, scope=scope)
     if not task:
         output_error("task_not_found", f"No task with id '{task_id}'", fmt=fmt)
         sys.exit(1)
@@ -1608,7 +1614,7 @@ def _tasks_dispatch_impl(
             )
         else:
             from clawpm.discovery import get_repo_path as _get_repo_path_for_drift
-            _repo_for_drift = _get_repo_path_for_drift(config, project_id)
+            _repo_for_drift = _get_repo_path_for_drift(config, project_id, scope=scope)
         _drift_result = detect_scope_drift(
             repo_path=_repo_for_drift,
             scope=getattr(task, "scope", []),
@@ -1658,7 +1664,9 @@ def _tasks_dispatch_impl(
     # dispatch's live hooks untorn-down. Refuse up front rather than plumb
     # scope through the lease registry and every sweep call site — the
     # operator can dispatch without --lease-ttl for a worktree-scoped task.
-    if lease_ttl is not None and not is_task_store_canonical(config, project_id):
+    if lease_ttl is not None and not is_task_store_canonical(
+        config, project_id, scope=scope
+    ):
         output_error(
             "lease_unsupported_scope",
             f"Task {task_id!r} resolves from a registered worktree's own "

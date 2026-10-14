@@ -347,7 +347,9 @@ def get_project_dir(
     return None
 
 
-def is_task_store_canonical(config: PortfolioConfig, project_id: str) -> bool:
+def is_task_store_canonical(
+    config: PortfolioConfig, project_id: str, *, scope: Scope | None = None
+) -> bool:
     """Whether ``get_project_dir`` would resolve *project_id* to the
     CANONICAL checkout for the currently active scope (ambient cwd, or a
     :func:`sessions.resolve_scope_from` override) rather than to a
@@ -367,8 +369,11 @@ def is_task_store_canonical(config: PortfolioConfig, project_id: str) -> bool:
     ``True`` for every ordinary single-checkout invocation (the overwhelming
     majority) — this is a no-op there, mirroring ``get_project_dir``'s own
     contract.
+
+    CLAWP-136: an explicit *scope* answers for that scope rather than the
+    ambient one; ``scope=None`` is the ambient behaviour above.
     """
-    return _session_scoped_project_dir(config, project_id) is None
+    return _session_scoped_project_dir(config, project_id, scope=scope) is None
 
 
 def get_repo_path(
