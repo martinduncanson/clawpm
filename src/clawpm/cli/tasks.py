@@ -61,14 +61,46 @@ def tasks(ctx: click.Context) -> None:
     help="Fold archived done tasks (done/archive/) back into the listing (CLAWP-085). "
          "Only affects 'done' and 'all' scans.",
 )
+@click.option(
+    "--frontier", "frontier_root", default=None,
+    help="Show the actionable frontier under this root task (CLAWP-111-004): ready, blocked (waiting_on) and claimed (lease holder). Single project; combining with other filters (--state, --tag, --limit, ...) is refused.",
+)
 @click.pass_context
-def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, flat: bool, tags: tuple[str, ...], all_tags: bool, text: str | None, use_regex: bool, priority: str | None, complexities: tuple[str, ...], parent: str | None, linked: str | None, limit: int | None, all_projects: bool, include_archived: bool) -> None:
+def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, flat: bool, tags: tuple[str, ...], all_tags: bool, text: str | None, use_regex: bool, priority: str | None, complexities: tuple[str, ...], parent: str | None, linked: str | None, limit: int | None, all_projects: bool, include_archived: bool, frontier_root: str | None = None) -> None:
     """List tasks for a project (default: open+progress+blocked, use -s all for everything).
 
     ``--all-projects`` (CLAWP-084) spans every ACTIVE project instead of one.
     """
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
+
+    if frontier_root is not None:
+        if all_projects:
+            raise click.UsageError("--frontier cannot be combined with --all-projects.")
+        conflicting = [
+            flag for flag, is_set in (
+                ("--state", state is not None),
+                ("--flat", flat),
+                ("--tag", bool(tags)),
+                ("--all-tags", all_tags),
+                ("--text", text is not None),
+                ("--regex", use_regex),
+                ("--priority", priority is not None),
+                ("--complexity", bool(complexities)),
+                ("--parent", parent is not None),
+                ("--linked", linked is not None),
+                ("--limit", limit is not None),
+                ("--include-archived", include_archived),
+            ) if is_set
+        ]
+        if conflicting:
+            raise click.UsageError(
+                "--frontier cannot be combined with " + ", ".join(conflicting) + "."
+            )
+        # Read-only query: never auto-init a .project/ from an untracked repo.
+        project_id, _ = require_project(ctx, project_id, auto_init=False)
+        render_frontier(config, project_id, frontier_root, fmt)
+        return
 
     if all_projects:
         # CLAWP-084 — portfolio-wide view. --project scopes to a single project,
@@ -108,6 +140,43 @@ def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, fl
     # parent/child hierarchy is per-project and the merged task_map could
     # otherwise conflate identical ids from different projects.
     output_tasks_list(found_tasks, fmt=fmt, flat=flat, show_project=all_projects)
+
+
+def render_frontier(config: PortfolioConfig, project_id: str, root: str, fmt: OutputFormat) -> None:
+    """Shared body of ``next --frontier`` and ``tasks list --frontier`` (CLAWP-111-004)."""
+    from clawpm.tasks import frontier as _frontier
+
+    root_id = expand_task_id(root, project_id)
+    if get_task(config, project_id, root_id) is None:
+        output_error("task_not_found", f"Root task '{root_id}' not found in project '{project_id}'", fmt=fmt)
+        sys.exit(1)
+    result = _frontier(config, project_id, root_id) or {"frontier": [], "blocked": [], "claimed": []}
+    clear = not (result["frontier"] or result["blocked"] or result["claimed"])
+    if fmt == OutputFormat.JSON:
+        output_json({"root": root_id, **result, "message": "Map is clear: no open tasks under this root." if clear else None})
+        return
+    if clear:
+        click.echo(f"Map is clear: no open tasks under {root_id}.")
+        return
+    if result["frontier"]:
+        click.echo("Frontier (ready now):")
+        for t in result["frontier"]:
+            click.echo(f"  {t['title']} [{t['id']}]")
+    if result["blocked"]:
+        click.echo("Blocked:")
+        for t in result["blocked"]:
+            waiting = ", ".join(result_title_ref(config, project_id, w) for w in t["waiting_on"])
+            click.echo(f"  {t['title']} [{t['id']}] waiting on {waiting}")
+    if result["claimed"]:
+        click.echo("Claimed:")
+        for t in result["claimed"]:
+            click.echo(f"  {t['title']} [{t['id']}] held by {t['lease_holder'] or 'unknown holder'}")
+
+
+def result_title_ref(config: PortfolioConfig, project_id: str, task_id: str) -> str:
+    """``Title [ID]`` for a dependency id; ``[ID]`` alone only if it cannot be resolved."""
+    dep = get_task(config, project_id, task_id)
+    return f"{dep.title} [{task_id}]" if dep else f"[{task_id}]"
 
 
 def _collect_project_tasks(
