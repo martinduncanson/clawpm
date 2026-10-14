@@ -24,7 +24,7 @@ This core holds the always-on rules and the everyday commands. Everything else l
 | `references/multi-session.md` | Two sessions on one project, task-ID collisions, `.clawpm-tasks.lock`. |
 | `references/troubleshooting.md` | A clawpm command failed or dropped an argument, `ModuleNotFoundError`, Windows glob/`--scope` problems, `add_failed`. |
 
-The rules below stay inline on purpose: they are prohibitions, and an agent that never opens a reference file must still obey them.
+The rules below stay inline on purpose: an agent that never opens a reference file must still obey them. The review and merge rules (no `/gemini review`, wait for Codex via `wait-for-codex.py`, never skip PRE-REVIEW for auth or data-storage changes) live only in `references/messaging-and-integrations.md`; read it before any commit, push, PR or merge.
 
 ## When to use clawpm — defacto default
 
@@ -122,13 +122,14 @@ for any task with a non-trivial outcome ("if I do X, then Y will improve"). Add
 predictions defeat the reflection layer's purpose — they produce structurally-empty
 events that yield no calibration signal.
 
+For high-stakes or complex tasks, also include the Phase 1.5 fields (`--success-criteria`, `--predict-approach`, `--confidence`, `--reference-task`, `--pre-mortem`, `--unknowns`). Flag list, completion flags and reflection rules: `references/predictions-and-reflection.md`.
+
 **Always fill in `--process-lesson` on done events — it's the rung that lets you climb.**
+
 **Reference class > intuition.** Before predicting, look at 1-3 prior similar tasks. Pass
 them via `--reference-task`. Empty `reference_tasks` = "I used the inside view only".
 
-Pass `--predicted-by agent` when an agent files the predictions. The default is "operator"
-whenever predictions are present, so agent guesses would otherwise be recorded as
-operator-authored (use `operator-edited` once the operator has reviewed them).
+Attribution: `--predicted-by` exists on `clawpm tasks add`, not on the `clawpm add` shortcut. Without it, predictions are recorded as `operator`. After the operator confirms or edits your proposal, pass `--predicted-by operator-edited`. Pass `agent` only for predictions the operator has not reviewed.
 
 ## Tips
 
@@ -148,4 +149,4 @@ operator-authored (use `operator-edited` once the operator has reviewed them).
 - **Apply phase rubric:** "every decision with `status:approved` applied with an audit entry; **zero** writes lacking an approved decision ID."
 - The outcome ("tie-out / books balance") is the rubric **only** for the final close task, dispatched *after* the human sign-off exists.
 
-**Never `--worktree`-dispatch a task that mutates a single shared store.** Worktree isolation is built for parallel *code* work with disjoint file scopes (see the Scope-Aware Dispatch section in `references/dispatch-and-scope.md`). A task that appends to one shared ledger — a decisions store, `work_log.jsonl`, leases, any append-only state, **including clawpm's own JSONL stores** — must dispatch **in-place against the main repo dir**, or the ledger forks per worktree branch and records diverge or are lost. Worktree dispatch is for code; in-place dispatch is for state.
+**Never `--worktree`-dispatch a task that mutates a single shared store.** Worktree isolation is built for parallel *code* work with disjoint file scopes (see the Scope-Aware Dispatch section in `references/dispatch-and-scope.md`). A task that appends to one shared ledger — a decisions store, `work_log.jsonl`, leases, any append-only state, **including clawpm's own JSONL stores** — must dispatch **in-place against the main repo dir**, or the ledger forks per worktree branch and records diverge or are lost. Worktree dispatch is for code; in-place dispatch is for state. `clawpm agent dispatch` is not covered by the CLAWP-098 worktree-mutator fix (it mints no session pointer): read `references/dispatch-and-scope.md` before running ID-based mutators inside its worktree.
