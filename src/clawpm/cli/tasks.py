@@ -255,7 +255,7 @@ def tasks_show(ctx: click.Context, project_id: str | None, task_id: str) -> None
     reflections_voided = False
     ref_file = config.portfolio_root / "reflections" / f"{task_id}.jsonl"
     if ref_file.exists():
-        for _line in ref_file.read_text(encoding="utf-8").splitlines():
+        for _line in ref_file.read_text(encoding="utf-8-sig").splitlines():
             _line = _line.strip()
             if not _line:
                 continue
@@ -1060,7 +1060,7 @@ def tasks_add(
     if body:
         task_body = body
     elif body_file:
-        task_body = Path(body_file).read_text(encoding="utf-8")
+        task_body = Path(body_file).read_text(encoding="utf-8-sig")
     elif read_stdin:
         task_body = sys.stdin.read()
     elif description:

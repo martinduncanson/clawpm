@@ -3492,7 +3492,10 @@ def edit_fog(
             frontmatter, content = split_frontmatter(text, where=str(task.file_path))
         except FrontmatterError as exc:
             if exc.reason == "absent":
-                frontmatter, content = {}, strip_bom(text)
+                # `content` is spliced straight after the closing fence below, so it
+                # must carry its own separator or the fence fuses with the first
+                # line (`---# Real task`) and hides the title (CLAWP-146).
+                frontmatter, content = {}, "\n\n" + strip_bom(text)
             elif exc.reason == "unterminated":
                 raise ValueError(
                     f"Task {task_id} has an unterminated frontmatter fence; "

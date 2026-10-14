@@ -145,7 +145,7 @@ def gather_signals(
         ref_file = config.portfolio_root / "reflections" / f"{t.id}.jsonl"
         if ref_file.exists():
             try:
-                lines = ref_file.read_text(encoding="utf-8").splitlines()
+                lines = ref_file.read_text(encoding="utf-8-sig").splitlines()
                 project_scoped: list[dict[str, Any]] = []
                 for ln in lines:
                     ln = ln.strip()

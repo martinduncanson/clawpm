@@ -258,7 +258,7 @@ def _replay(portfolio_root: Path) -> dict[tuple[str, str], Lease]:
         return {}
     leases: dict[tuple[str, str], Lease] = {}
     try:
-        raw = path.read_text(encoding="utf-8", errors="strict")
+        raw = path.read_text(encoding="utf-8-sig", errors="strict")
     except (OSError, UnicodeDecodeError):
         return {}
     for line in raw.splitlines():
