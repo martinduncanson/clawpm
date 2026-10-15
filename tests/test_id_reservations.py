@@ -296,3 +296,200 @@ class TestCaseFoldedKeys:
         tt.use("wt-b")
         nxt = add_subtask(tt.config, tt.project_id, parent.id, "next child")
         assert _ordinal(nxt.id) == _ordinal(explicit) + 1
+
+
+# ---------------------------------------------------------------------------
+# CLAWP-148: ids that exist only on the primary remote's main
+# ---------------------------------------------------------------------------
+
+
+def _run_git(cwd: Path, *args: str) -> str:
+    import subprocess
+
+    proc = subprocess.run(
+        ["git", "-c", "user.email=t@example.test", "-c", "user.name=t",
+         "-c", "commit.gpgsign=false", *args],
+        cwd=str(cwd), capture_output=True, text=True, check=True,
+    )
+    return proc.stdout
+
+
+class _Remote:
+    """The project dir as a git checkout with a bare ``fork`` remote."""
+
+    def __init__(self, pf, remote_name: str = "fork"):
+        self.pf = pf
+        self.repo = pf.project_dir
+        self.bare = pf.root.parent / "remote.git"
+        self.remote_name = remote_name
+        _run_git(pf.root.parent, "init", "--bare", "-b", "main", str(self.bare))
+        _run_git(self.repo, "init", "-b", "main")
+        (self.repo / "README.md").write_text("seed\n", encoding="utf-8")
+        _run_git(self.repo, "add", "README.md")
+        _run_git(self.repo, "commit", "-m", "seed")
+        _run_git(self.repo, "remote", "add", remote_name, str(self.bare))
+        _run_git(self.repo, "push", remote_name, "main")
+
+    def publish(self, *rel_paths: str) -> None:
+        """Commit task files (given relative to ``.project/tasks``) to the
+        remote's main from a second clone, then update OUR tracking ref."""
+        other = self.pf.root.parent / "other-clone"
+        if not other.exists():
+            _run_git(self.pf.root.parent, "clone", str(self.bare), str(other))
+        for rel in rel_paths:
+            f = other / ".project" / "tasks" / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("---\nid: x\n---\n", encoding="utf-8")
+            _run_git(other, "add", "-f", str(f.relative_to(other)))
+        _run_git(other, "commit", "-m", "remote tasks")
+        _run_git(other, "push", "origin", "main")
+        _run_git(self.repo, "fetch", self.remote_name)
+
+
+@pytest.fixture
+def remote(isolated_portfolio):
+    return _Remote(isolated_portfolio)
+
+
+def _seed_prefix(pf) -> tuple[str, int]:
+    seed = add_task(pf.config, pf.project_id, "seed")
+    return seed.id.rsplit("-", 1)[0], _ordinal(seed.id)
+
+
+class TestRemoteMainIds:
+    def test_id_only_on_remote_main_is_skipped(self, remote):
+        pf = remote.pf
+        prefix, n = _seed_prefix(pf)
+        remote.publish(f"{prefix}-{n + 9:03d}.md")
+        warnings: list[str] = []
+        t = add_task(pf.config, pf.project_id, "next", mint_warnings=warnings)
+        assert _ordinal(t.id) == n + 10
+        assert warnings == []
+
+    def test_done_dir_and_nested_ids_count(self, remote):
+        pf = remote.pf
+        prefix, n = _seed_prefix(pf)
+        remote.publish(
+            f"done/{prefix}-{n + 4:03d}.md",
+            f"{prefix}-{n + 20:03d}/{prefix}-{n + 20:03d}-006.md",
+        )
+        t = add_task(pf.config, pf.project_id, "next")
+        assert _ordinal(t.id) == n + 21
+
+    def test_lower_remote_ids_change_nothing(self, remote):
+        pf = remote.pf
+        prefix, n = _seed_prefix(pf)
+        remote.publish(f"{prefix}-000.md")
+        warnings: list[str] = []
+        t = add_task(pf.config, pf.project_id, "next", mint_warnings=warnings)
+        assert _ordinal(t.id) == n + 1
+        assert warnings == []
+
+    def test_subtask_ordinal_skips_remote_child(self, remote):
+        pf = remote.pf
+        prefix, n = _seed_prefix(pf)
+        parent_id = f"{prefix}-{n:03d}"
+        remote.publish(f"{parent_id}/{parent_id}-004.md")
+        child = add_subtask(pf.config, pf.project_id, parent_id, "child")
+        assert child.id == f"{parent_id}-005"
+
+    def test_lowercase_remote_only_id_is_skipped(self, remote):
+        pf = remote.pf
+        prefix, n = _seed_prefix(pf)
+        remote.publish(f"{prefix.lower()}-{n + 7:03d}.md")
+        t = add_task(pf.config, pf.project_id, "next")
+        assert _ordinal(t.id) == n + 8
+
+    def test_uppercase_remote_only_id_is_still_skipped(self, remote):
+        pf = remote.pf
+        prefix, n = _seed_prefix(pf)
+        remote.publish(f"{prefix.upper()}-{n + 7:03d}.md")
+        t = add_task(pf.config, pf.project_id, "next")
+        assert _ordinal(t.id) == n + 8
+
+    def test_mixed_case_nested_remote_id_is_skipped(self, remote):
+        pf = remote.pf
+        prefix, n = _seed_prefix(pf)
+        mixed = prefix.capitalize()
+        remote.publish(f"{mixed}-{n + 12:03d}/{mixed}-{n + 12:03d}-002.md")
+        t = add_task(pf.config, pf.project_id, "next")
+        assert _ordinal(t.id) == n + 13
+
+    def test_mixed_case_remote_child_is_skipped(self, remote):
+        pf = remote.pf
+        prefix, n = _seed_prefix(pf)
+        parent_id = f"{prefix}-{n:03d}"
+        remote.publish(f"{parent_id}/{parent_id.capitalize()}-004.md")
+        child = add_subtask(pf.config, pf.project_id, parent_id, "child")
+        assert child.id == f"{parent_id}-005"
+
+    def test_extensionless_remote_file_reserves_nothing(self, remote):
+        pf = remote.pf
+        prefix, n = _seed_prefix(pf)
+        remote.publish(f"{prefix}-{n + 99:03d}")
+        t = add_task(pf.config, pf.project_id, "next")
+        assert _ordinal(t.id) == n + 1
+
+    def test_remote_md_file_and_directory_still_reserve(self, remote):
+        pf = remote.pf
+        prefix, n = _seed_prefix(pf)
+        remote.publish(
+            f"{prefix}-{n + 5:03d}.md",
+            f"{prefix}-{n + 9:03d}/_task.md",
+            f"{prefix}-{n + 99:03d}",
+        )
+        t = add_task(pf.config, pf.project_id, "next")
+        assert _ordinal(t.id) == n + 10
+
+    def test_no_remote_warns_and_still_adds(self, isolated_portfolio):
+        pf = isolated_portfolio
+        _run_git(pf.project_dir, "init", "-b", "main")
+        warnings: list[str] = []
+        t = add_task(pf.config, pf.project_id, "x", mint_warnings=warnings)
+        assert t is not None and _ordinal(t.id) == 0
+        assert len(warnings) == 1 and "remote" in warnings[0].lower()
+
+    def test_remote_main_ref_missing_warns(self, remote):
+        pf = remote.pf
+        _run_git(remote.repo, "update-ref", "-d", "refs/remotes/fork/main")
+        warnings: list[str] = []
+        t = add_task(pf.config, pf.project_id, "x", mint_warnings=warnings)
+        assert t is not None
+        assert len(warnings) == 1 and "fork/main" in warnings[0]
+
+    def test_ls_tree_failure_warns_and_still_adds(self, remote, monkeypatch):
+        from clawpm import land
+
+        real = land._git
+
+        def flaky(args, cwd, **kw):
+            if args and args[0] == "ls-tree":
+                raise land.LandError("git_failed", "`git ls-tree` exited 128")
+            return real(args, cwd, **kw)
+
+        monkeypatch.setattr(land, "_git", flaky)
+        warnings: list[str] = []
+        t = add_task(remote.pf.config, remote.pf.project_id, "x", mint_warnings=warnings)
+        assert t is not None
+        assert len(warnings) == 1 and "ls-tree" in warnings[0]
+
+    def test_unreadable_ledger_warns_in_mint_warnings(self, remote):
+        pf = remote.pf
+        (pf.root / LEDGER_NAME).mkdir()  # reading a directory raises OSError
+        warnings: list[str] = []
+        t = add_task(pf.config, pf.project_id, "x", mint_warnings=warnings)
+        assert t is not None and _ordinal(t.id) == 0
+        assert len(warnings) == 1 and "ledger" in warnings[0].lower()
+
+    def test_cli_json_carries_warnings_and_exit_zero(self, isolated_portfolio):
+        import json
+
+        from click.testing import CliRunner
+
+        from clawpm.cli import main
+
+        pf = isolated_portfolio  # not a git checkout: no remote to read
+        r = CliRunner().invoke(main, ["-p", pf.project_id, "tasks", "add", "-t", "x"])
+        assert r.exit_code == 0, r.output
+        data = json.loads(r.output)["data"]
+        assert any("remote" in w.lower() for w in data["warnings"])

@@ -65,12 +65,16 @@ def split_task_id(task_id: str) -> tuple[str, int] | None:
 
 
 def reserved_high_water(
-    portfolio_root: Path, key: str, project_id: str | None = None
+    portfolio_root: Path,
+    key: str,
+    project_id: str | None = None,
+    warnings: list[str] | None = None,
 ) -> int | None:
     """Highest ordinal ever reserved for ``key`` (by ``project_id``, when given:
     two projects may deliberately share an explicit prefix and must not
     inflate each other), or ``None`` (no ledger, or
-    nothing reserved under that key)."""
+    nothing reserved under that key). ``warnings`` (CLAWP-148) also receives a
+    line for a degraded read, so a caller can surface it on its own output."""
     path = _ledger_path(portfolio_root)
     try:
         raw = retry_transient(lambda: path.read_text(encoding="utf-8-sig", errors="replace"))
@@ -83,6 +87,11 @@ def reserved_high_water(
             "until this clears.",
             path, type(exc).__name__, exc,
         )
+        if warnings is not None:
+            warnings.append(
+                f"id reservation ledger {path} is unreadable ({type(exc).__name__}: "
+                f"{exc}); ids reserved by other worktrees are invisible to this mint"
+            )
         return None
 
     want = normalize_key(key)

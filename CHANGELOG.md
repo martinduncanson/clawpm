@@ -8,6 +8,7 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 
 ### Added
 
+- `tasks add` / `add_subtask` skip task ids already present on the primary remote `main` (read from the local `fork/main`, else `origin/main`, with no fetch), so a stale local ledger cannot re-mint a landed id; fail-open with a loud warning (`data.warnings` in JSON, stderr in text) when no remote ref is readable (#119, CLAWP-148).
 - Calibration layer documented in the skill's predictions-and-reflection reference: `--miss-category` (six values, noise is valid), `--actual-complexity`, `--resolution`, `reflect scorecard`, the closure alarm and the metareflection nudge, linked to `docs/design/calibration-metrics-spec.md` (#120, CLAWP-112-006)
 - "Working the map" section in the clawpm skill (frontier, claim, resolve, close, graduate fog; one decision leaf per session; refer by name; humans answer human leaves) and plugin commands `/clawpm:plan`, `/clawpm:chart`, `/clawpm:next` listed in the marketplace manifest (#116, CLAWP-111-006)
 - clawpm-planner chart mode (decision maps as a rule with trigger and no-fog exit), recon fan-out via `feature-dev:code-explorer`, specify interview discipline, l/xl approach lenses, WHEN/THEN criterion phrasing and the default stop-list; examples updated (#112, CLAWP-111-005)
