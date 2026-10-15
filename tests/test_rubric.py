@@ -227,6 +227,15 @@ class TestRubricRendering:
         # Piebald evaluator doctrine line present
         assert "evidence, not proof" in md
 
+    def test_grading_instructions_state_freshness_rule(self, temp_portfolio):
+        """CLAWP-149: a signal counts only if produced after the last edit."""
+        config = temp_portfolio["config"]
+        task = add_task(config, "test", title="Fresh task")
+        task = get_task(config, "test", task.id)
+        md = render_rubric_markdown(task)
+        assert "AFTER the last relevant edit" in md
+        assert "hygiene, not behavioural evidence" in md
+
     def test_renders_structured_criterion(self, temp_portfolio):
         config = temp_portfolio["config"]
         task = add_task(
