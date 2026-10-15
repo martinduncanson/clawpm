@@ -82,6 +82,34 @@ class TestWindowBoundary:
         assert c["window_30d"] == {"registered": 0, "resolved": 0, "voided": 0, "rate": None}
         assert c["alarm"] is not None  # all-time 0.30
 
+    @staticmethod
+    def _fallback(resolved, voided, open_):
+        reg = resolved + voided + open_
+        ledger = {"registered": reg, "resolved": resolved, "voided": voided,
+                  "legacy_resolved": 0, "registered_30d": 0, "resolved_30d": 0,
+                  "voided_30d": 0}
+        return compute_calibration([], ledger, now=NOW)["closure"]
+
+    def test_fallback_mostly_voided_closed_history_does_not_alarm(self):
+        # 9 voided + 1 resolved, nothing open: every live prediction closed.
+        c = self._fallback(resolved=1, voided=9, open_=0)
+        assert c["rate"] == 0.1  # legacy void-inclusive rate unchanged
+        assert c["open_predictions"] == 0
+        assert c["alarm"] is None
+
+    def test_fallback_judges_live_predictions_only_no_alarm(self):
+        # 10 registered - 4 voided = 6 live; 5 / 6 = 0.833 (all-time rate 0.5)
+        c = self._fallback(resolved=5, voided=4, open_=1)
+        assert c["rate"] == 0.5
+        assert c["alarm"] is None
+
+    def test_fallback_low_live_closure_still_alarms(self):
+        # 2 resolved / (2 + 3 open) = 0.4 -> alarm on the all-time basis.
+        c = self._fallback(resolved=2, voided=5, open_=3)
+        assert c["alarm"] is not None
+        assert c["alarm_basis"] == "all_time"
+        assert "0.40" in c["alarm"]
+
     def test_empty_ledger_has_window_key_and_no_alarm(self):
         c = compute_calibration([], {}, now=NOW)["closure"]
         assert c["window_30d"]["rate"] is None
