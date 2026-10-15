@@ -83,7 +83,11 @@ Still on ambient resolution plus a hand-placed contextvar:
   `get_task`, `get_repo_path` and `is_task_store_canonical` (which gained
   `scope=`). An unresolvable target logs and falls back to canonical.
 
-The other four are still blocked on one thing: the task-state mutators in `tasks.py` (`add_task`,
-`change_task_state`, `list_tasks`, and others) still call `get_tasks_dir`
-without a scope. Thread `scope=` through them before converting the sites above.
-`is_task_store_canonical` should gain the same keyword.
+The other four were blocked on the task-state mutators. CLAWP-136-001 round 1
+threaded `scope=` through them: `list_tasks`, `distinct_tags`, `get_next_task`,
+`select_next_batch`, `frontier`, `archive_done_tasks`, `cascade_unblock_dependents`,
+`parent_ready_signal`, `find_task_by_source_request`, `edit_fog`, `split_task`.
+Where the function already used `scope` for the task's file globs (`add_task`,
+`add_task_with_status`, `edit_task`, `add_subtask`) the keyword is
+`store_scope=`. A given scope never falls back to cwd discovery.
+Round 2 migrates the four call sites above.
