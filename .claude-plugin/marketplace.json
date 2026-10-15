@@ -15,12 +15,13 @@
       "source": "./",
       "strict": false,
       "commands": [
-        "./commands/clawpm-plan.md",
-        "./commands/clawpm-chart.md",
-        "./commands/clawpm-next.md"
+        "./commands/plan.md",
+        "./commands/chart.md",
+        "./commands/next.md"
       ],
       "skills": [
-        "./skills/clawpm"
+        "./skills/clawpm",
+        "./skills/clawpm-planner"
       ]
     }
   ]
