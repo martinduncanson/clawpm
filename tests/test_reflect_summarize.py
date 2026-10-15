@@ -292,3 +292,46 @@ class TestSuggestUsesPredictedComplexity:
         assert out["data"]["fell_back_to_global"] is False
         # 600 * 0.1 = 60
         assert out["data"]["calibrated_duration_min"] == 60
+
+
+class TestGeometricMedian:
+    """CLAWP-150: legacy median_ratio slices and suggest use spec 2.3
+    exp(median(ln r)) (the calibration module's single formula)."""
+
+    def _even_corpus(self, tmp_path):
+        # 3 tasks at ratio 0.25 and 3 at ratio 1.0, all complexity m.
+        for i in range(3):
+            _done(tmp_path, f"Q-{i}", 400, 100, complexity="m", confidence=3,
+                  profile="p")
+        for i in range(3):
+            _done(tmp_path, f"U-{i}", 100, 100, complexity="m", confidence=3,
+                  profile="p")
+
+    def test_even_n_summarize_slices_use_geometric_midpoint(self, tmp_path):
+        self._even_corpus(tmp_path)
+        s = summarize_calibration(tmp_path, project_id="test", with_calibration=False)
+        assert s["overall"]["median_ratio"] == 0.5  # arithmetic would be 0.625
+        assert s["by_complexity"]["m"]["median_ratio"] == 0.5
+        assert s["by_confidence"]["3"]["median_ratio"] == 0.5
+        assert s["by_agent_profile"]["p"]["median_ratio"] == 0.5
+
+    def test_even_n_suggest_uses_geometric_midpoint(self, tmp_path):
+        self._even_corpus(tmp_path)
+        res = suggest_duration(tmp_path, complexity="m", predicted_min=100,
+                               project_id="test", min_bucket=5)
+        assert res["bucket"] == "complexity=m"
+        assert res["median_ratio"] == 0.5
+        assert res["calibrated_duration_min"] == 50
+
+    def test_odd_n_unchanged(self, tmp_path):
+        # Middle element of an odd sample is the same under both medians.
+        for i, act in enumerate((25, 100, 300)):
+            _done(tmp_path, f"O-{i}", 100, act, complexity="m")
+        s = summarize_calibration(tmp_path, project_id="test", with_calibration=False)
+        assert s["overall"]["median_ratio"] == 1.0
+        assert s["by_complexity"]["m"]["median_ratio"] == 1.0
+        assert s["overall"]["mean_ratio"] == round((0.25 + 1 + 3) / 3, 4)
+
+    def test_single_formula_shared_with_calibration(self):
+        from clawpm import calibration, reflect
+        assert reflect._median_factor is calibration._median_factor

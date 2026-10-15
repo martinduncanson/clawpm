@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .calibration import _median_factor
 from .models import Actuals, Predictions, TaskComplexity, WorkLogAction, WorkLogEntry
 
 
@@ -1412,7 +1413,8 @@ def _bucket_stats(ratios: list[float]) -> dict:
         return {"n": 0, "median_ratio": None, "mean_ratio": None}
     return {
         "n": len(ratios),
-        "median_ratio": round(statistics.median(ratios), 4),
+        # Spec 2.3 bias: exp(median(ln r)), one formula shared with calibration.
+        "median_ratio": round(_median_factor(ratios), 4),
         "mean_ratio": round(statistics.fmean(ratios), 4),
     }
 

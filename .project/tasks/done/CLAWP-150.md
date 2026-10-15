@@ -22,7 +22,10 @@ predictions:
   - WHEN a bucket has equal groups at ratios 0.25 and 1 THEN summarize median_ratio
     and reflect suggest report 0.5 not 0.625
 priority: 6
-updated: '2026-10-14'
+resolution: 'Legacy median_ratio slices and reflect suggest use the geometric median
+  via calibration._median_factor (PR #115)'
+resolved_at: '2026-10-15'
+updated: '2026-10-15'
 ---
 # Migrate legacy median_ratio slices and reflect suggest to exp(median(ln r)) (spec 2.3 bias)
 
