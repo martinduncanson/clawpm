@@ -24,7 +24,7 @@
       "title": "Decide: validate rows before or during the save",
       "success_criteria": [
         {
-          "criterion": "A resolution is recorded naming the chosen validation point and the rejected alternative",
+          "criterion": "WHEN the decision closes THEN a resolution names the chosen validation point and the rejected alternative",
           "gradeable_signal": "task resolution field is non-empty when the task closes",
           "comparator": "eq:non-empty"
         }
@@ -47,7 +47,7 @@
       "title": "Decide: maximum accepted file size",
       "success_criteria": [
         {
-          "criterion": "A resolution is recorded with the numeric limit and its reason",
+          "criterion": "WHEN the decision closes THEN a resolution records the numeric limit and its reason",
           "gradeable_signal": "task resolution field is non-empty when the task closes",
           "comparator": "eq:non-empty"
         }
@@ -63,7 +63,7 @@
       "depends_refs": ["D1"],
       "success_criteria": [
         {
-          "criterion": "A file with 2 bad rows out of 10 yields 8 valid rows and 2 reported errors",
+          "criterion": "WHEN a file has 2 bad rows out of 10 THEN 8 valid rows are returned and 2 errors are reported",
           "gradeable_signal": "unit test over a fixture CSV",
           "comparator": "eq:8 valid, 2 errors"
         }
@@ -86,7 +86,7 @@
       "depends_refs": ["D2", "B1"],
       "success_criteria": [
         {
-          "criterion": "A file over the D2 limit is rejected with 413 and nothing is saved",
+          "criterion": "WHEN a file over the D2 limit is uploaded THEN the endpoint returns 413 and nothing is saved",
           "gradeable_signal": "API test posting an oversized file",
           "comparator": "eq:413"
         }

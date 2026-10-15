@@ -64,7 +64,7 @@ stop_conditions: ["If the notes PUT endpoint is not idempotent, STOP and report 
 baseline_ref: ts:2026-06-12T...
 predictions:
   success_criteria:
-  - {criterion: "Edits persist after a 2s idle ...", gradeable_signal: "...", comparator: "eq:1 draft row"}
+  - {criterion: "WHEN a user stops typing for 2s THEN the edit is saved ...", gradeable_signal: "...", comparator: "eq:1 draft row"}
 ```
 
 PRD research entry written + linked: `.project/research/2026-06-12_prd-prd-draft-autosave-for-the-note-editor.md`.
