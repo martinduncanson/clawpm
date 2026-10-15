@@ -24,7 +24,7 @@
       "title": "Sourced pricing dataset for the 5 competitors",
       "success_criteria": [
         {
-          "criterion": "Every competitor's published tiers captured with a primary-source citation",
+          "criterion": "WHEN a competitor publishes pricing tiers THEN every tier is captured with a primary-source citation",
           "gradeable_signal": "dataset has >=5 competitors, each row carries a source URL + access date",
           "comparator": "gte:5 competitors, 100% cited"
         }
@@ -51,7 +51,7 @@
       "title": "Normalised like-for-like comparison matrix",
       "success_criteria": [
         {
-          "criterion": "All prices normalised to USD per seat per month at a stated FX date",
+          "criterion": "WHEN a price is entered in the matrix THEN it is stated in USD per seat per month at a stated FX date",
           "gradeable_signal": "matrix has one common unit; every cell traces to a K1 dataset row",
           "comparator": "eq:100% cells sourced"
         }
@@ -78,7 +78,7 @@
       "title": "Synthesis and one-page recommendation",
       "success_criteria": [
         {
-          "criterion": "Recommendation names one concrete positioning move with its expected trade-off",
+          "criterion": "WHEN the brief is read THEN its recommendation names one concrete positioning move with its expected trade-off",
           "gradeable_signal": "exec summary states a single move + the trade-off, each claim citing K2 cells",
           "comparator": "eq:1 named move"
         }
