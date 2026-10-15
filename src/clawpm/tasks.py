@@ -139,6 +139,8 @@ def list_tasks(
     project_id: str,
     state_filter: TaskState | None = None,
     include_archived: bool = False,
+    *,
+    scope: Scope | None = None,
 ) -> list[Task]:
     """List all tasks for a project.
 
@@ -148,7 +150,7 @@ def list_tasks(
     are DONE tasks, so they only appear where DONE tasks would (no filter, or
     ``state_filter=DONE``).
     """
-    tasks_dir = get_tasks_dir(config, project_id)
+    tasks_dir = get_tasks_dir(config, project_id, **_scope_kw(scope))
     if not tasks_dir:
         return []
 
@@ -183,6 +185,8 @@ def distinct_tags(
     config: PortfolioConfig,
     project_id: str,
     include_done: bool = True,
+    *,
+    scope: Scope | None = None,
 ) -> list[tuple[str, int]]:
     """Return distinct workstream tags with task counts (CLAWP-069).
 
@@ -196,8 +200,10 @@ def distinct_tags(
     """
     # list_tasks(state_filter=None) excludes the rejected/ silo by design, so
     # union an explicit rejected scan to make the tag universe complete.
-    tasks = list_tasks(config, project_id, state_filter=None)
-    tasks = tasks + list_tasks(config, project_id, state_filter=TaskState.REJECTED)
+    tasks = list_tasks(config, project_id, state_filter=None, **_scope_kw(scope))
+    tasks = tasks + list_tasks(
+        config, project_id, state_filter=TaskState.REJECTED, **_scope_kw(scope)
+    )
     _terminal = {TaskState.DONE, TaskState.REJECTED}
     counts: dict[str, int] = {}
     for task in tasks:
@@ -433,7 +439,7 @@ def get_task(
 
 
 def select_next_batch(
-    config: PortfolioConfig, project_id: str,
+    config: PortfolioConfig, project_id: str, *, scope: Scope | None = None,
 ) -> tuple[int | None, list[Task], list[dict]]:
     """Return the next dispatchable parallel batch for a project (CLAWP-021).
 
@@ -458,7 +464,7 @@ def select_next_batch(
     # Local import to avoid circular: cli.py imports from tasks.py.
     from .cli import _globs_overlap
 
-    tasks = list_tasks(config, project_id)
+    tasks = list_tasks(config, project_id, **_scope_kw(scope))
     by_id = {t.id: t for t in tasks}
 
     # Group tasks by parallel_group; ignore tasks without the field.
@@ -553,9 +559,11 @@ def _done_task_ids(tasks_dir: Path) -> set[str]:
     return ids
 
 
-def get_next_task(config: PortfolioConfig, project_id: str) -> Task | None:
+def get_next_task(
+    config: PortfolioConfig, project_id: str, *, scope: Scope | None = None
+) -> Task | None:
     """Get the next task to work on (highest priority open task with satisfied dependencies)."""
-    tasks_dir = get_tasks_dir(config, project_id)
+    tasks_dir = get_tasks_dir(config, project_id, **_scope_kw(scope))
     if not tasks_dir:
         return None
 
@@ -613,7 +621,9 @@ def _unmet_dependencies(tasks_dir: Path, task: Task, done_ids: set[str]) -> list
     ]
 
 
-def frontier(config: PortfolioConfig, project_id: str, root_id: str) -> dict | None:
+def frontier(
+    config: PortfolioConfig, project_id: str, root_id: str, *, scope: Scope | None = None
+) -> dict | None:
     """The actionable frontier under ``root_id`` (CLAWP-111-004).
 
     Considers the leaf OPEN descendants of the root at any depth (a task with
@@ -634,7 +644,7 @@ def frontier(config: PortfolioConfig, project_id: str, root_id: str) -> dict | N
 
     from .leases import active_leases
 
-    tasks_dir = get_tasks_dir(config, project_id)
+    tasks_dir = get_tasks_dir(config, project_id, **_scope_kw(scope))
     if not tasks_dir:
         return None
 
@@ -1491,6 +1501,7 @@ def archive_done_tasks(
     *,
     older_than_days: float,
     dry_run: bool = False,
+    scope: Scope | None = None,
 ) -> list[dict]:
     """Move stale DONE tasks out of the hot path into ``done/archive/``.
 
@@ -1525,7 +1536,7 @@ def archive_done_tasks(
         (Grok review). Records are appended AFTER the move commits, so the list
         never claims a move that didn't happen.
     """
-    tasks_dir = get_tasks_dir(config, project_id)
+    tasks_dir = get_tasks_dir(config, project_id, **_scope_kw(scope))
     if not tasks_dir:
         return []
     done_dir = tasks_dir / "done"
@@ -1627,6 +1638,8 @@ def cascade_unblock_dependents(
     config: PortfolioConfig,
     project_id: str,
     completed_task_id: str,
+    *,
+    scope: Scope | None = None,
 ) -> list[dict]:
     """Auto-promote blocked tasks whose deps are now all done.
 
@@ -1648,9 +1661,9 @@ def cascade_unblock_dependents(
     future iteration makes the cascade recursive, reintroduce a visited
     set.
     """
-    all_tasks = list_tasks(config, project_id)
+    all_tasks = list_tasks(config, project_id, **_scope_kw(scope))
     by_id = {t.id: t for t in all_tasks}
-    tasks_dir = get_tasks_dir(config, project_id)
+    tasks_dir = get_tasks_dir(config, project_id, **_scope_kw(scope))
 
     transitions: list[dict] = []
 
@@ -1691,7 +1704,7 @@ def cascade_unblock_dependents(
         # otherwise overwrite the edit or recreate the old path.
         with file_lock(tasks_dir / ".clawpm-tasks.lock"):
             moved = change_task_state(
-                config, project_id, task.id, TaskState.OPEN
+                config, project_id, task.id, TaskState.OPEN, **_scope_kw(scope)
             )
             if moved is None:
                 continue
@@ -1962,6 +1975,8 @@ def parent_ready_signal(
     config: PortfolioConfig,
     project_id: str,
     child_task_id: str,
+    *,
+    scope: Scope | None = None,
 ) -> dict | None:
     """After a child hits DONE, report if its parent is now fully rolled up.
 
@@ -1972,13 +1987,13 @@ def parent_ready_signal(
     still gate it); the caller surfaces this as an advisory so the operator
     knows the parent is now closeable.
     """
-    child = get_task(config, project_id, child_task_id)
+    child = get_task(config, project_id, child_task_id, **_scope_kw(scope))
     if child is None or not child.parent:
         return None
-    parent = get_task(config, project_id, child.parent)
+    parent = get_task(config, project_id, child.parent, **_scope_kw(scope))
     if parent is None or parent.state == TaskState.DONE:
         return None
-    status = parent_rollup_status(config, project_id, parent)
+    status = parent_rollup_status(config, project_id, parent, **_scope_kw(scope))
     if status["ready"]:
         return {
             "parent_id": parent.id,
@@ -2216,7 +2231,9 @@ def _remote_main_task_stems(tasks_dir: Path, warnings: list[str] | None) -> set[
     return stems
 
 
-def _ledger_project_id(config: PortfolioConfig, project_id: str, settings=None) -> str:
+def _ledger_project_id(
+    config: PortfolioConfig, project_id: str, settings=None, *, scope: Scope | None = None
+) -> str:
     """The id the project's own settings declare, for reservation-ledger keys.
 
     CLAWP-092 (Codex r1): ``--project clawpm`` and ``--project CLAWPM`` resolve
@@ -2227,7 +2244,7 @@ def _ledger_project_id(config: PortfolioConfig, project_id: str, settings=None) 
     from .discovery import get_scoped_project_settings
 
     if settings is None:
-        settings = get_scoped_project_settings(config, project_id)
+        settings = get_scoped_project_settings(config, project_id, **_scope_kw(scope))
     return getattr(settings, "id", None) or project_id
 
 
@@ -3139,8 +3156,12 @@ def add_task(
     source_request: str | None = None,
     kind: str | None = None,
     mint_warnings: list[str] | None = None,
+    store_scope: Scope | None = None,
 ) -> Task | None:
     """Add a new task to a project (see :func:`add_task_with_status`).
+
+    ``store_scope`` (CLAWP-136-001) pins the task store / repo / settings
+    resolution; it is named so because ``scope`` here is the task's file globs.
 
     With ``source_request`` set, an existing task carrying the same key is
     returned instead of creating a second one.
@@ -3152,7 +3173,7 @@ def add_task(
         parallel_group=parallel_group, agent_profile=agent_profile,
         out_of_scope=out_of_scope, stop_conditions=stop_conditions,
         delegability=delegability, source_request=source_request, kind=kind,
-        mint_warnings=mint_warnings,
+        mint_warnings=mint_warnings, store_scope=store_scope,
     )[0]
 
 
@@ -3176,6 +3197,7 @@ def add_task_with_status(
     source_request: str | None = None,
     kind: str | None = None,
     mint_warnings: list[str] | None = None,
+    store_scope: Scope | None = None,
 ) -> tuple[Task | None, bool]:
     """Add a new task to a project; return ``(task, created)``.
 
@@ -3191,14 +3213,15 @@ def add_task_with_status(
     (no remote, remote ref missing, ``ls-tree`` failure, unreadable ledger) are
     appended to it so the caller can surface them; the add still succeeds.
     """
-    tasks_dir = get_tasks_dir(config, project_id)
+    tasks_dir = get_tasks_dir(config, project_id, **_scope_kw(store_scope))
     if not tasks_dir:
         # Registry lookup succeeded but tasks/ doesn't exist yet - or registry
         # lookup failed entirely.  Try registry first, then CWD-walk fallback.
-        project_dot_dir = get_project_dir(config, project_id)
-        if not project_dot_dir:
+        project_dot_dir = get_project_dir(config, project_id, **_scope_kw(store_scope))
+        if not project_dot_dir and store_scope is None:
             # Registry failed (e.g. malformed settings.toml).  Fall back to CWD
             # walk so operators don't get a silent failure when inside the repo.
+            # An explicit scope never falls back to ambient discovery.
             project_dot_dir = find_project_dir_fallback(config, project_id)
         if not project_dot_dir:
             return None, False
@@ -3218,7 +3241,7 @@ def add_task_with_status(
     # commits the baseline is simply wrong, and every later scope-drift
     # decision inherits the error. Git metadata has to come from whichever
     # checkout the task store was redirected to.
-    _repo_path = _get_repo_path_for_baseline(config, project_id)
+    _repo_path = _get_repo_path_for_baseline(config, project_id, **_scope_kw(store_scope))
     _baseline_ref = resolve_baseline_ref(_repo_path)
 
     # Session-scoped settings, resolved for EVERY create — explicit `--id`
@@ -3233,8 +3256,10 @@ def add_task_with_status(
     # with emit-tree and add_subtask, which also mint IDs into a store.
     from .discovery import get_scoped_project_settings
 
-    _settings = get_scoped_project_settings(config, project_id)
-    _ledger_pid = _ledger_project_id(config, project_id, _settings)
+    _settings = get_scoped_project_settings(config, project_id, **_scope_kw(store_scope))
+    _ledger_pid = _ledger_project_id(
+        config, project_id, _settings, **_scope_kw(store_scope)
+    )
 
     # CLAWP-051 — per-project file lock serialises ID allocation (scan→write)
     # and explicit-ID creates so two concurrent sessions in the same project
@@ -3478,7 +3503,8 @@ def add_task_with_status(
 
 
 def find_task_by_source_request(
-    config: PortfolioConfig, project_id: str, source_request: str
+    config: PortfolioConfig, project_id: str, source_request: str,
+    *, scope: Scope | None = None,
 ) -> Task | None:
     """Return the task whose frontmatter ``source_request`` equals the key, in any state.
 
@@ -3486,7 +3512,7 @@ def find_task_by_source_request(
     the project's tasks dir (open, progress, done, blocked, rejected); a cheap
     substring pre-check avoids parsing files that cannot match.
     """
-    tasks_dir = get_tasks_dir(config, project_id)
+    tasks_dir = get_tasks_dir(config, project_id, **_scope_kw(scope))
     if not tasks_dir or not tasks_dir.exists():
         return None
     return _scan_source_request(tasks_dir, source_request)
@@ -3545,9 +3571,14 @@ def edit_task(
     stop_conditions: list[str] | None = None,
     delegability: str | None = None,
     kind: str | None = None,
+    store_scope: Scope | None = None,
 ) -> Task | None:
-    """Edit task metadata (frontmatter) and optionally title/body."""
-    tasks_dir = get_tasks_dir(config, project_id)
+    """Edit task metadata (frontmatter) and optionally title/body.
+
+    ``store_scope`` (CLAWP-136-001) pins the task store; named so because
+    ``scope`` here is the task's file globs.
+    """
+    tasks_dir = get_tasks_dir(config, project_id, **_scope_kw(store_scope))
     if not tasks_dir:
         return None
 
@@ -3556,7 +3587,7 @@ def edit_task(
     # to serialise against concurrent state moves / splits (was previously an
     # unlocked, non-retried in-place rewrite). file_lock is reentrant per-thread.
     with file_lock(tasks_dir / ".clawpm-tasks.lock"):
-        task = get_task(config, project_id, task_id)
+        task = get_task(config, project_id, task_id, **_scope_kw(store_scope))
         if not task or not task.file_path:
             return None
 
@@ -3776,6 +3807,8 @@ def edit_fog(
     task_id: str,
     add: str | None = None,
     drop: str | None = None,
+    *,
+    scope: Scope | None = None,
 ) -> Task | None:
     """Add/remove an entry in a task's fog list (``not_yet_specified``), CLAWP-111-002.
 
@@ -3788,12 +3821,12 @@ def edit_fog(
     matching here, unlike ``--graduates``, since this is a direct
     administrative edit rather than free-text disambiguation.
     """
-    tasks_dir = get_tasks_dir(config, project_id)
+    tasks_dir = get_tasks_dir(config, project_id, **_scope_kw(scope))
     if not tasks_dir:
         return None
 
     with file_lock(tasks_dir / ".clawpm-tasks.lock"):
-        task = get_task(config, project_id, task_id)
+        task = get_task(config, project_id, task_id, **_scope_kw(scope))
         if not task or not task.file_path:
             return None
 
@@ -3878,13 +3911,15 @@ def split_task(
     config: PortfolioConfig,
     project_id: str,
     task_id: str,
+    *,
+    scope: Scope | None = None,
 ) -> Task | None:
     """Convert a regular task file into a parent directory structure.
     
     Converts TASK-ID.md → TASK-ID/_task.md
     Works from any state directory (tasks/, done/, blocked/).
     """
-    tasks_dir = get_tasks_dir(config, project_id)
+    tasks_dir = get_tasks_dir(config, project_id, **_scope_kw(scope))
     if not tasks_dir:
         return None
 
@@ -3893,7 +3928,7 @@ def split_task(
     # called directly (CLI / emit_tree — acquires for real) or from inside
     # add_subtask's critical section (nested re-acquire on the same path).
     with file_lock(tasks_dir / ".clawpm-tasks.lock"):
-        task = get_task(config, project_id, task_id)
+        task = get_task(config, project_id, task_id, **_scope_kw(scope))
         if not task or not task.file_path:
             return None
 
@@ -4217,8 +4252,12 @@ def add_subtask(
     graduates: str | None = None,
     kind: str | None = None,
     mint_warnings: list[str] | None = None,
+    store_scope: Scope | None = None,
 ) -> Task | None:
     """Add a subtask to a parent task.
+
+    ``store_scope`` (CLAWP-136-001) pins the task store; named so because
+    ``scope`` here is the task's file globs.
 
     Auto-splits parent if not already a directory.
     Generates sequential subtask ID (PARENT-001, PARENT-002, etc.).
@@ -4230,7 +4269,7 @@ def add_subtask(
     matches, raises :class:`FogMatchError` BEFORE any mutation — no child, no
     parent split, no parent write.
     """
-    tasks_dir = get_tasks_dir(config, project_id)
+    tasks_dir = get_tasks_dir(config, project_id, **_scope_kw(store_scope))
     if not tasks_dir:
         return None
 
@@ -4241,7 +4280,8 @@ def add_subtask(
     from .discovery import get_scoped_project_settings
 
     _ledger_pid = _ledger_project_id(
-        config, project_id, get_scoped_project_settings(config, project_id)
+        config, project_id,
+        get_scoped_project_settings(config, project_id, **_scope_kw(store_scope)), **_scope_kw(store_scope),
     )
 
     # CLAWP-051 Finding 6 — wrap the ENTIRE parent-resolution + allocate-and-create
@@ -4265,7 +4305,7 @@ def add_subtask(
     # thread, and nothing calls add_subtask while holding a project lock.
     with portfolio_prefix_lock(config.portfolio_root), file_lock(_lock_path):
         # Resolve the parent as a directory INSIDE the lock (read + optional split).
-        parent = get_task(config, project_id, parent_id)
+        parent = get_task(config, project_id, parent_id, **_scope_kw(store_scope))
         if not parent:
             return None
         # CLAWP-085: an archived parent is frozen DONE history. Decomposing into
@@ -4291,7 +4331,7 @@ def add_subtask(
             matched_fog = _match_fog_entry(parent.not_yet_specified, graduates)
 
         if parent.file_path and parent.file_path.name != "_task.md":
-            parent = split_task(config, project_id, parent_id)
+            parent = split_task(config, project_id, parent_id, **_scope_kw(store_scope))
             if not parent:
                 return None
         parent_dir = parent.file_path.parent if parent.file_path else None
