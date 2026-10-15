@@ -2204,11 +2204,15 @@ def _remote_main_task_stems(tasks_dir: Path, warnings: list[str] | None) -> set[
     for path in listing.split("\0"):
         if not path.startswith(rel_prefix):
             continue
-        for part in path[len(rel_prefix):].split("/"):
-            if part.lower().endswith(".md"):
-                part = part[:-3]
-            if part:
-                stems.add(part)
+        parts = path[len(rel_prefix):].split("/")
+        # Directory components always count (split parents); the final
+        # component is a file and counts only as a ``.md`` task file, as in
+        # the local scan.
+        last = parts.pop()
+        if last.lower().endswith(".md"):
+            parts.append(last[:-3])
+        # Upper-cased: ids are case-insensitive (``normalize_key``).
+        stems.update(p.upper() for p in parts if p)
     return stems
 
 
@@ -2248,7 +2252,7 @@ def _next_root_ordinal(
     )
     # CLAWP-148: ids present only on the primary remote's main. A subtask id
     # (``CLAWP-111-006``) implies its root ordinal, so nesting is allowed.
-    pat = _task_id_regex(prefix, subtasks=True)
+    pat = _task_id_regex(prefix.upper(), subtasks=True)
     remote_max = max(
         (int(m.group(1)) for s in _remote_main_task_stems(tasks_dir, warnings)
          if (m := pat.match(s))),
@@ -4182,7 +4186,9 @@ def _existing_child_ordinals(
         if reserved is not None:
             nums.add(reserved)
         # CLAWP-148: children already on the primary remote's main.
-        child_pat = re.compile(rf"^{re.escape(parent_id)}-{{1,2}}(\d+)(?:\.progress)?$")
+        child_pat = re.compile(
+            rf"^{re.escape(parent_id.upper())}-{{1,2}}(\d+)(?:(?i:\.progress))?$"
+        )
         for stem in _remote_main_task_stems(tasks_dir, warnings):
             m = child_pat.match(stem)
             if m:

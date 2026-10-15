@@ -393,6 +393,54 @@ class TestRemoteMainIds:
         child = add_subtask(pf.config, pf.project_id, parent_id, "child")
         assert child.id == f"{parent_id}-005"
 
+    def test_lowercase_remote_only_id_is_skipped(self, remote):
+        pf = remote.pf
+        prefix, n = _seed_prefix(pf)
+        remote.publish(f"{prefix.lower()}-{n + 7:03d}.md")
+        t = add_task(pf.config, pf.project_id, "next")
+        assert _ordinal(t.id) == n + 8
+
+    def test_uppercase_remote_only_id_is_still_skipped(self, remote):
+        pf = remote.pf
+        prefix, n = _seed_prefix(pf)
+        remote.publish(f"{prefix.upper()}-{n + 7:03d}.md")
+        t = add_task(pf.config, pf.project_id, "next")
+        assert _ordinal(t.id) == n + 8
+
+    def test_mixed_case_nested_remote_id_is_skipped(self, remote):
+        pf = remote.pf
+        prefix, n = _seed_prefix(pf)
+        mixed = prefix.capitalize()
+        remote.publish(f"{mixed}-{n + 12:03d}/{mixed}-{n + 12:03d}-002.md")
+        t = add_task(pf.config, pf.project_id, "next")
+        assert _ordinal(t.id) == n + 13
+
+    def test_mixed_case_remote_child_is_skipped(self, remote):
+        pf = remote.pf
+        prefix, n = _seed_prefix(pf)
+        parent_id = f"{prefix}-{n:03d}"
+        remote.publish(f"{parent_id}/{parent_id.capitalize()}-004.md")
+        child = add_subtask(pf.config, pf.project_id, parent_id, "child")
+        assert child.id == f"{parent_id}-005"
+
+    def test_extensionless_remote_file_reserves_nothing(self, remote):
+        pf = remote.pf
+        prefix, n = _seed_prefix(pf)
+        remote.publish(f"{prefix}-{n + 99:03d}")
+        t = add_task(pf.config, pf.project_id, "next")
+        assert _ordinal(t.id) == n + 1
+
+    def test_remote_md_file_and_directory_still_reserve(self, remote):
+        pf = remote.pf
+        prefix, n = _seed_prefix(pf)
+        remote.publish(
+            f"{prefix}-{n + 5:03d}.md",
+            f"{prefix}-{n + 9:03d}/_task.md",
+            f"{prefix}-{n + 99:03d}",
+        )
+        t = add_task(pf.config, pf.project_id, "next")
+        assert _ordinal(t.id) == n + 10
+
     def test_no_remote_warns_and_still_adds(self, isolated_portfolio):
         pf = isolated_portfolio
         _run_git(pf.project_dir, "init", "-b", "main")
