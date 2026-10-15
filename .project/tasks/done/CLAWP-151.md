@@ -22,7 +22,7 @@ predictions:
   - WHEN pr verify --task ID is run for a merged PR THEN the task record carries the
     verification and a refusal leaves task files byte-identical
 priority: 6
-updated: '2026-10-14'
+updated: '2026-10-15'
 ---
 # tasks land: pr verify --task ID (deferred follow-up of CLAWP-147-002)
 
