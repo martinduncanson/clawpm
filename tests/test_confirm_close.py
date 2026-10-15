@@ -268,6 +268,12 @@ class TestPromptDistinct:
         assert "EVIDENCE" in a
         assert "REPRODUCTION" in b
 
+    def test_evidence_lens_states_freshness_rule(self):
+        """CLAWP-149: same freshness rule as rubric grading instructions."""
+        a = build_refutation_prompt(RUBRIC, HAS_EVIDENCE, "r", lens="evidence")
+        assert "AFTER the last relevant edit" in a
+        assert "hygiene, not behavioural evidence" in a
+
 
 # ---------------------------------------------------------------------------
 # CLAWP-043: the refuter is BLIND to the base judge's reason by default — the

@@ -9,6 +9,7 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 ### Added
 
 - `tasks add` / `add_subtask` skip task ids already present on the primary remote `main` (read from the local `fork/main`, else `origin/main`, with no fetch), so a stale local ledger cannot re-mint a landed id; fail-open with a loud warning (`data.warnings` in JSON, stderr in text) when no remote ref is readable (#119, CLAWP-148).
+- Calibration layer documented in the skill's predictions-and-reflection reference: `--miss-category` (six values, noise is valid), `--actual-complexity`, `--resolution`, `reflect scorecard`, the closure alarm and the metareflection nudge, linked to `docs/design/calibration-metrics-spec.md` (#120, CLAWP-112-006)
 - "Working the map" section in the clawpm skill (frontier, claim, resolve, close, graduate fog; one decision leaf per session; refer by name; humans answer human leaves) and plugin commands `/clawpm:plan`, `/clawpm:chart`, `/clawpm:next` listed in the marketplace manifest (#116, CLAWP-111-006)
 - clawpm-planner chart mode (decision maps as a rule with trigger and no-fog exit), recon fan-out via `feature-dev:code-explorer`, specify interview discipline, l/xl approach lenses, WHEN/THEN criterion phrasing and the default stop-list; examples updated (#112, CLAWP-111-005)
 
@@ -33,6 +34,7 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 
 ### Changed
 
+- Rubric grading instructions and the refuter EVIDENCE lens now state a freshness rule: a gradeable signal counts only if produced after the last relevant edit, and lint/build/type checks are hygiene, not behavioural evidence (#118, CLAWP-149).
 - `reflect summarize` `median_ratio` slices (overall, by_complexity, by_confidence, by_agent_profile) and the `reflect suggest` deflator now use the spec 2.3 geometric median `exp(median(ln r))` through `calibration._median_factor`, so an even-n sample at ratios 0.25 and 1 reports 0.5 instead of 0.625; odd-n results are unchanged (#115, CLAWP-150).
 - `skills/clawpm/SKILL.md` split into a ~13k-char core (always-on rules, quick start, routing table) plus eight on-demand files under `skills/clawpm/references/`; content moved verbatim apart from a few reworded lines, pointers to the reference files and a `--predicted-by` attribution note, with no behaviour change other than load order (token-audit cut 1).
 - MCP server tech-debt (#86, CLAWP-106): `tasks_state` gains `meta_reflect`/`process_lesson` (CLI parity); the `context` tool returns `project` as the plain id string with the metadata dict moved to `project_info` (BREAKING for consumers reading `context["project"]["id"]`); `ToolSpec.min_tier` is a `Literal` validated at construction; README no longer claims `--tools standard` widens the set; `build_agent_context` imports hoisted and docstring/module claims corrected.
