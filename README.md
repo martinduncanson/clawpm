@@ -341,6 +341,8 @@ clawpm reflect summarize    # update the calibration corpus
 | `clawpm done 42` | `clawpm tasks state 42 done` | Mark done (auto-logs files changed) |
 | `clawpm block 42 --note "reason"` | `clawpm tasks state 42 blocked` | Mark blocked |
 | `clawpm unblock 42 [--start]` | `clawpm tasks state 42 open` | Clear a blocker (`--start` → progress) |
+| `clawpm block 42 --question "..." --option A --option B [--recommend A]` | `clawpm tasks state 42 blocked` + decision record | Block on a human decision |
+| `clawpm unblock 42 --answer "A"` | `clawpm tasks state 42 open` + answer record | Record the answer and clear the blocker |
 | `clawpm next` | `clawpm projects next` | Next task across all projects |
 | `clawpm status` | — | Project overview |
 | `clawpm context` | — | Full agent context (spec, tasks, log, git, issues) |
@@ -423,6 +425,7 @@ Write `[[CLAWP-042]]` in any task / research / mission body to link it. `clawpm 
 
 ```bash
 clawpm tasks list --all-projects                  # every ACTIVE project in one list, each row carries project_id
+clawpm tasks list --needs-human --all-projects  # tasks blocked on an unanswered human question (JSON rows: id, project, title, question, options, recommendation, blocked_since)
 clawpm tasks list --all-projects --tag concurrency # composes with every filter above, per-project
 ```
 

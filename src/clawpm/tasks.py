@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import stat
+import tempfile
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -1470,6 +1471,242 @@ def change_task_state(
         #     a scanner can hit the freshly-moved file transiently even though
         #     the move under the lock already committed (CLAWP-051).
         return retry_transient(Task.from_file, new_path)
+
+
+def normalize_human_options(options) -> list[dict[str, str]]:
+    """Validate an options list for a human decision (CLAWP-154).
+
+    Accepts strings or ``{label, detail?}`` mappings; returns
+    ``[{"label": ..., "detail"?: ...}]``. Labels are stripped, non-empty and
+    unique (case-sensitive) so ``recommendation`` and an answer can name one
+    unambiguously. Raises ``ValueError`` otherwise.
+    """
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in options or []:
+        if isinstance(item, str):
+            label, detail = item, None
+        elif isinstance(item, dict):
+            label, detail = item.get("label"), item.get("detail")
+        else:
+            raise ValueError(f"Invalid option {item!r}: expected a label or {{label, detail}}.")
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError(f"Invalid option {item!r}: label must be a non-empty string.")
+        label = label.strip()
+        if label in seen:
+            raise ValueError(f"Duplicate option label {label!r}.")
+        seen.add(label)
+        opt = {"label": label}
+        if isinstance(detail, str) and detail.strip():
+            opt["detail"] = detail.strip()
+        out.append(opt)
+    return out
+
+
+def is_awaiting_human(task: Task) -> bool:
+    """True when ``task`` is blocked on a human decision nobody has answered."""
+    return (
+        task.state == TaskState.BLOCKED
+        and task.blocked_on == "human"
+        and bool(task.question)
+        and not task.answer
+    )
+
+
+_HUMAN_DECISION_KEYS = ("blocked_on", "question", "options", "recommendation", "answer")
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write ``data`` to ``path`` through a UNIQUE temp file in the same dir.
+
+    A fixed ``<id>.tmp`` name lets two writers of one file replace or delete
+    each other's temp; ``mkstemp`` gives each write its own. The temp is
+    removed on every failure path; the final swap is an atomic replace.
+    """
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        mode = None
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        if mode is not None:
+            try:
+                os.chmod(tmp_name, mode)
+            except OSError:
+                pass
+        retry_transient(os.replace, tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _rewrite_decision_frontmatter(file_path: Path, updates: dict) -> None:
+    """Surgical frontmatter rewrite for the human-decision keys (CLAWP-154).
+
+    Only the keys named in ``updates`` (value, or ``REMOVE``) plus ``updated``
+    are touched: comments, key order, quoting, the BOM and CRLF line endings of
+    everything else are preserved byte for byte. Frontmatter that cannot be
+    spliced safely raises ``ValueError`` BEFORE anything is written.
+    """
+    from .frontmatter_splice import splice_keys
+    from .pr_record import PrRecordError
+
+    with guard_fs_tamper(f"Task file '{file_path}'"):
+        text = file_path.read_bytes().decode("utf-8")
+    try:
+        new_text = splice_keys(text, {**updates, "updated": today_utc_iso()})
+    except PrRecordError as exc:
+        raise ValueError(f"Cannot update decision record in '{file_path}': {exc}")
+    _atomic_write_bytes(file_path, new_text.encode("utf-8"))
+
+
+def record_human_question(
+    config: PortfolioConfig,
+    project_id: str,
+    task_id: str,
+    question: str,
+    options=None,
+    recommendation: str | None = None,
+    *,
+    scope: Scope | None = None,
+) -> Task | None:
+    """Record the decision a blocked task waits on a human for (CLAWP-154).
+
+    Call AFTER the task is blocked (the existing block transition owns the
+    move). Writes ``blocked_on: human``, ``question``, ``options`` and
+    ``recommendation`` and clears any earlier ``answer``. Raises ``ValueError``
+    for a blank question, bad options, a recommendation that is not an option
+    label, or a task that is not blocked. Returns ``None`` if the task is
+    absent. ``scope`` is honoured exactly (no ambient fallback).
+    """
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("A non-empty question is required.")
+    opts = normalize_human_options(options)
+    rec = recommendation.strip() if isinstance(recommendation, str) else None
+    if rec and rec not in {o["label"] for o in opts}:
+        raise ValueError(f"Recommendation {rec!r} is not one of the option labels.")
+    assert_scope_store_in_portfolio(config, project_id, scope)
+    tasks_dir = get_tasks_dir(config, project_id, **_scope_kw(scope))
+    if not tasks_dir:
+        return None
+
+    from .frontmatter_splice import REMOVE
+
+    updates = {
+        "blocked_on": "human",
+        "question": question.strip(),
+        "options": opts if opts else REMOVE,
+        "recommendation": rec if rec else REMOVE,
+        "answer": REMOVE,
+    }
+
+    with file_lock(tasks_dir / ".clawpm-tasks.lock"):
+        task = get_task(config, project_id, task_id, **_scope_kw(scope))
+        if not task or not task.file_path:
+            return None
+        if task.state != TaskState.BLOCKED:
+            raise ValueError(
+                f"Task {task_id} is '{task.state.value}', not blocked: "
+                "block it before recording a question."
+            )
+        _rewrite_decision_frontmatter(task.file_path, updates)
+        return get_task(config, project_id, task_id, **_scope_kw(scope))
+
+
+def record_human_answer(
+    config: PortfolioConfig,
+    project_id: str,
+    task_id: str,
+    answer: str,
+    *,
+    scope: Scope | None = None,
+) -> Task | None:
+    """Record the human's answer on a task (CLAWP-154).
+
+    Keeps ``question``/``options``/``recommendation``. Does not move the task:
+    the existing unblock transition does that. ``None`` if the task is absent.
+    """
+    if not isinstance(answer, str) or not answer.strip():
+        raise ValueError("A non-empty answer is required.")
+    assert_scope_store_in_portfolio(config, project_id, scope)
+    tasks_dir = get_tasks_dir(config, project_id, **_scope_kw(scope))
+    if not tasks_dir:
+        return None
+
+    with file_lock(tasks_dir / ".clawpm-tasks.lock"):
+        task = get_task(config, project_id, task_id, **_scope_kw(scope))
+        if not task or not task.file_path:
+            return None
+        _rewrite_decision_frontmatter(task.file_path, {"answer": answer.strip()})
+        return get_task(config, project_id, task_id, **_scope_kw(scope))
+
+
+def _decision_tuple(task: Task) -> tuple:
+    return (task.blocked_on, task.question, task.options,
+            task.recommendation, task.answer)
+
+
+def stale_human_decision(task: Task | None) -> tuple | None:
+    """The decision record a NOT-blocked ``task`` still carries, else ``None``.
+
+    The value is a snapshot that :func:`clear_stale_human_decision` accepts, so
+    a caller can clear the exact record it saw even after the task was
+    re-blocked (CLAWP-154).
+    """
+    if task is None or task.state == TaskState.BLOCKED:
+        return None
+    snap = _decision_tuple(task)
+    return snap if any(snap) else None
+
+
+def clear_stale_human_decision(
+    config: PortfolioConfig,
+    project_id: str,
+    task_id: str,
+    *,
+    scope: Scope | None = None,
+    snapshot: tuple | None = None,
+) -> Task | None:
+    """Drop a decision record left on a task that is not blocked (CLAWP-154).
+
+    A task unblocked without ``--answer`` keeps its question; a later plain
+    re-block would then list it as awaiting a human again. Clearing here keeps
+    the old record in the work log only. Without ``snapshot`` a blocked task
+    is never touched (a live question stays). With ``snapshot`` (from
+    :func:`stale_human_decision`) the record is cleared only when it still
+    equals that snapshot, whatever the state: this lets ``block`` transition
+    first and then drop exactly the stale record it saw, while a question a
+    concurrent session recorded in between survives. Writes nothing when no
+    decision key is present.
+    """
+    assert_scope_store_in_portfolio(config, project_id, scope)
+    tasks_dir = get_tasks_dir(config, project_id, **_scope_kw(scope))
+    if not tasks_dir:
+        return None
+    from .frontmatter_splice import REMOVE
+
+    updates = {key: REMOVE for key in _HUMAN_DECISION_KEYS}
+
+    with file_lock(tasks_dir / ".clawpm-tasks.lock"):
+        task = get_task(config, project_id, task_id, **_scope_kw(scope))
+        if not task or not task.file_path:
+            return None
+        if snapshot is None:
+            if task.state == TaskState.BLOCKED:
+                return task
+        elif _decision_tuple(task) != snapshot:
+            return task
+        if not any(_decision_tuple(task)):
+            return task
+        _rewrite_decision_frontmatter(task.file_path, updates)
+        return get_task(config, project_id, task_id, **_scope_kw(scope))
 
 
 def _newest_mtime(entry: Path) -> float:

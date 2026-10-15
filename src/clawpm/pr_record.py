@@ -128,26 +128,31 @@ def _top_level_pairs(fm_text: str) -> list[tuple[Any, list[Any]]]:
     return pairs
 
 
-def _value_extent(key_ev: Any, value_events: list[Any], fm_text: str, fm_lines: list[str]) -> tuple[int, int, str]:
+def _value_extent(
+    key_ev: Any, value_events: list[Any], fm_text: str, fm_lines: list[str], key: str = _KEY,
+) -> tuple[int, int, str]:
     """Return ``(first_line, last_line, tail)`` of the existing key+value, 0-based within the frontmatter.
+
+    ``key`` defaults to ``pr_verification``; other writers (the CLAWP-154
+    decision record) pass their own key.
 
     ``tail`` is whatever follows the value on its last line (a trailing comment),
     kept so only the key and value are rewritten.  Refuses layouts it cannot
     replace exactly.
     """
     if key_ev.start_mark.column != 0:
-        raise _refuse(f"'{_KEY}' key is indented; refusing to splice it")
+        raise _refuse(f"'{key}' key is indented; refusing to splice it")
     raw_key = fm_text[key_ev.start_mark.index:key_ev.end_mark.index]
-    if raw_key not in _KEY_SPELLINGS:
-        raise _refuse(f"task frontmatter holds a '{_KEY}' key in a spelling this writer cannot replace")
+    if raw_key not in (key, f'"{key}"', f"'{key}'"):
+        raise _refuse(f"task frontmatter holds a '{key}' key in a spelling this writer cannot replace")
     flow_stack: list[bool] = []
     last: tuple[int, int] = (key_ev.end_mark.line, key_ev.end_mark.column)
     for ev in value_events:
         if isinstance(ev, yaml.AliasEvent) or getattr(ev, "anchor", None) or getattr(ev, "tag", None):
-            raise _refuse(f"'{_KEY}' value uses an anchor, alias or tag; refusing to splice it")
+            raise _refuse(f"'{key}' value uses an anchor, alias or tag; refusing to splice it")
         if isinstance(ev, yaml.ScalarEvent):
             if ev.style in ("|", ">"):
-                raise _refuse(f"'{_KEY}' value contains a block scalar; refusing to splice it")
+                raise _refuse(f"'{key}' value contains a block scalar; refusing to splice it")
             last = max(last, (ev.end_mark.line, ev.end_mark.column))
         elif isinstance(ev, (yaml.MappingStartEvent, yaml.SequenceStartEvent)):
             flow_stack.append(bool(ev.flow_style))
