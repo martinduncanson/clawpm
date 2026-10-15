@@ -33,7 +33,11 @@ from .frontmatter import (
     today_utc_iso,
 )
 from .models import Task, TaskState, TaskComplexity, Predictions, PortfolioConfig, normalize_tags
-from .discovery import get_project_dir, find_project_dir_fallback
+from .discovery import (
+    assert_scope_store_in_portfolio,
+    find_project_dir_fallback,
+    get_project_dir,
+)
 from .sessions import Scope
 from .id_reservations import record_reservation, record_task_id, reserved_high_water
 
@@ -3213,6 +3217,11 @@ def add_task_with_status(
     (no remote, remote ref missing, ``ls-tree`` failure, unreadable ledger) are
     appended to it so the caller can surface them; the add still succeeds.
     """
+    # Before ANY read or write (CLAWP-136-001, Codex r2 P2 on PR #121): the
+    # ledger, locks and session registry come from `config`, the store from
+    # `store_scope`; a pinned store of another portfolio would split the call
+    # across two portfolios.
+    assert_scope_store_in_portfolio(config, project_id, store_scope)
     tasks_dir = get_tasks_dir(config, project_id, **_scope_kw(store_scope))
     if not tasks_dir:
         # Registry lookup succeeded but tasks/ doesn't exist yet - or registry
@@ -3344,12 +3353,12 @@ def add_task_with_status(
             # CLAWP-092: the ledger high-water mark joins the scan so a sibling
             # worktree's id (invisible on this disk) is never re-minted; the
             # reservation is recorded here, inside the portfolio lock.
-            # LEDGER INVARIANT (CLAWP-136-001, Codex r1 P2 on PR #121): the
+            # LEDGER INVARIANT (CLAWP-136-001, Codex r1+r2 P2 on PR #121): the
             # ledger root is the EXPLICIT `config.portfolio_root`, never an
-            # ambient lookup -- the same root a bound scope resolves sessions
-            # against -- and rows are keyed by `_ledger_pid`, which comes from
-            # the scoped settings. A scope has no portfolio of its own to
-            # substitute (a pinned store is just a directory).
+            # ambient lookup, and rows are keyed by `_ledger_pid` from the
+            # scoped settings. The store being written is verified to belong
+            # to that same portfolio (`assert_scope_store_in_portfolio`, top
+            # of this function) or the call has already refused.
             next_num = _next_root_ordinal(
                 config, tasks_dir, prefix, _ledger_pid, mint_warnings
             )
@@ -4275,6 +4284,8 @@ def add_subtask(
     matches, raises :class:`FogMatchError` BEFORE any mutation — no child, no
     parent split, no parent write.
     """
+    # Same pre-write portfolio check as `add_task_with_status`.
+    assert_scope_store_in_portfolio(config, project_id, store_scope)
     tasks_dir = get_tasks_dir(config, project_id, **_scope_kw(store_scope))
     if not tasks_dir:
         return None
@@ -4357,7 +4368,8 @@ def add_subtask(
         )
         next_num = (max(existing_nums) if existing_nums else 0) + 1
         subtask_id = f"{parent_id}-{next_num:03d}"
-        # Same ledger invariant as add_task: explicit config root, scoped key.
+        # Same ledger invariant as add_task: explicit config root, scoped key,
+        # store verified to belong to that portfolio at the top of this function.
         record_reservation(
             config.portfolio_root, parent_id, next_num, subtask_id, _ledger_pid
         )

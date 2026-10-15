@@ -13,6 +13,7 @@ from .models import PortfolioConfig, ProjectSettings, ProjectStatus
 from .sessions import (
     Scope,
     _suppress_session_resolution,
+    active_sessions,
     find_session_for_cwd,
     resolve_path_or_none,
     scope_cwd,
@@ -431,6 +432,64 @@ class ScopedSettingsMismatchError(ValueError):
     (``_mutation_errors``, ``cli/agent.py``) map it to a structured error
     instead of a traceback.
     """
+
+
+class ScopeStoreMismatchError(ValueError):
+    """An explicit pinned store does not belong to the config's portfolio.
+
+    A ``ValueError`` for the same reason as :class:`ScopedSettingsMismatchError`:
+    the CLI mutation wrappers turn it into a structured error.
+    """
+
+
+def assert_scope_store_in_portfolio(
+    config: PortfolioConfig, project_id: str, scope: Scope | None
+) -> None:
+    """Refuse a pinned store that is not *config*'s portfolio's store.
+
+    CLAWP-136-001 (Codex r2 P2, PR #121). A scoped writer takes its portfolio
+    from ``config`` (ledger root, locks, session registry) and its task store
+    from ``scope``. Canonical and bound scopes cannot disagree with ``config``:
+    they resolve through its project registry and its session registry. A
+    PINNED store is only a directory, so it can belong to another portfolio,
+    and the call would then write that portfolio's store and this one's ledger.
+
+    A pinned store is accepted iff it is one of two stores ``config`` itself
+    names for *project_id*: the registry's canonical ``.project/``, or the
+    ``.project/`` of a live session worktree in ``config.portfolio_root``'s
+    session registry (a dispatched worktree copy). Anything else raises
+    :class:`ScopeStoreMismatchError` BEFORE any write. ``None``, canonical and
+    bound scopes return untouched.
+    """
+    if scope is None or scope.pinned_project_dir is None:
+        return
+    pinned = scope.pinned_project_dir
+    project = get_project(config, project_id)
+    if project and project.project_dir and _same_dir(
+        pinned, project.project_dir / ".project"
+    ):
+        return
+    portfolio_root = getattr(config, "portfolio_root", None)
+    if portfolio_root:
+        for record in active_sessions(portfolio_root):
+            if record.project_id != project_id:
+                continue
+            try:
+                if _same_dir(pinned, record.project_root / ".project"):
+                    return
+            except OSError as exc:
+                logger.error(
+                    "Failed to resolve session worktree %s: %s. It cannot "
+                    "vouch for the pinned store %s.",
+                    record.project_root, exc, pinned,
+                )
+    raise ScopeStoreMismatchError(
+        f"The pinned task store {pinned} is not a store of project "
+        f"{project_id!r} in the portfolio at {portfolio_root}: it is neither "
+        f"that project's registered .project/ nor a live registered worktree's. "
+        f"Refusing to write it, because the id reservation would land in this "
+        f"portfolio's ledger while the task landed in another portfolio's store."
+    )
 
 
 def get_scoped_project_settings(

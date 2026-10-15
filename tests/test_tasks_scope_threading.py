@@ -278,3 +278,61 @@ class TestReservationLedgerFollowsTheExplicitPortfolio:
         assert {r["project_id"] for r in new_rows} == {"test"}
         # Nothing at all changed in the portfolio the environment points at.
         assert _tree(other_portfolio) == other0
+
+
+class TestPinnedStoreMustBelongToTheConfigsPortfolio:
+    """Codex r2 P2 (PR #121): an explicit config and an explicit pinned store
+    can disagree. A pinned store owned by portfolio B, passed with portfolio
+    A's config, used to land the task in B's store and the reservation in A's
+    ledger -- one call writing two portfolios (the CLAWP-098 class). It must
+    refuse, loudly, before writing anything to either."""
+
+    @pytest.mark.parametrize("kind", ["auto_id", "explicit_id", "subtask"])
+    def test_store_of_another_portfolio_is_refused_and_nothing_changes(
+        self, fx, other_portfolio, kind
+    ):
+        from clawpm.discovery import ScopeStoreMismatchError
+
+        cfg_a, root_a = fx["config"], fx["root"]
+        store_b = other_portfolio / "repo" / ".project"
+        # Seed B's parent task through B's own (ambient) config, before the
+        # snapshots, so the subtask case has something to attach to.
+        cfg_b = load_portfolio_config(other_portfolio)
+        add_task(cfg_b, "test", "b-parent", task_id="TST-001")
+        a0, b0 = _tree(root_a), _tree(other_portfolio)
+        pinned = Scope.pinned(store_b)
+
+        with pytest.raises(ScopeStoreMismatchError) as exc:
+            if kind == "subtask":
+                add_subtask(cfg_a, "test", "TST-001", "kid", store_scope=pinned)
+            else:
+                add_task_with_status(
+                    cfg_a, "test", "new",
+                    task_id="TST-077" if kind == "explicit_id" else None,
+                    store_scope=pinned,
+                )
+        assert isinstance(exc.value, ValueError)
+        assert str(store_b) in str(exc.value)
+        assert str(root_a) in str(exc.value)
+        # The refusal came before any write: both trees are byte-identical.
+        assert _tree(root_a) == a0
+        assert _tree(other_portfolio) == b0
+
+    def test_store_in_no_portfolio_at_all_is_refused(self, fx, tmp_path):
+        from clawpm.discovery import ScopeStoreMismatchError
+
+        stray = _make_store(tmp_path / "stray")
+        a0 = _tree(fx["root"])
+        with pytest.raises(ScopeStoreMismatchError):
+            add_task_with_status(
+                fx["config"], "test", "new", store_scope=Scope.pinned(stray)
+            )
+        assert _tree(fx["root"]) == a0
+        assert not (stray / "tasks" / ".clawpm-tasks.lock").exists()
+
+    def test_the_configs_own_canonical_store_pinned_is_accepted(self, fx):
+        task, _ = add_task_with_status(
+            fx["config"], "test", "new", task_id="TST-078",
+            store_scope=Scope.pinned(fx["canon"]),
+        )
+        assert task is not None and fx["canon"] in task.file_path.parents
