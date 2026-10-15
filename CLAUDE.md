@@ -9,8 +9,7 @@ This repo is developed primarily in the operator's fork at `github.com/martindun
 **Update (2026-07-06):** courtesy upstream PRs to `malphas-gh/clawpm` are no longer necessary — the upstream maintainer is now using this fork directly for his own current agentic integration work. Don't file a courtesy PR back; there's no separate upstream consumer to serve.
 
 Operational rule:
-- `fork` remote → `github.com/martinduncanson/clawpm` — where active branches and PRs live; `main` is the source of truth for local development.
-- `origin` remote → `github.com/malphas-gh/clawpm` — kept for history/reference; not an active courtesy-PR target anymore per the update above.
+- `fork` remote → `github.com/martinduncanson/clawpm` — the sole remote; where active branches and PRs live; `main` is the source of truth for local development.
 
 <!-- clawpm:project-requirement -->
 ## Project management — clawpm

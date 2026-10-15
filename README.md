@@ -991,12 +991,9 @@ The fork is designed for Codex review: `AGENTS.md.template` includes the Codex i
 
 ## Fork — upstream relationship
 
-This repo is developed primarily at `github.com/martinduncanson/clawpm`. The upstream `malphas-gh/clawpm` is the original source; changes are pushed there as a courtesy when stable, but the fork is canonical for development cadence.
+This repo is developed primarily at `github.com/martinduncanson/clawpm`. The fork is the sole remote and is canonical. The former upstream `malphas-gh/clawpm` (`origin`) was removed on 2026-10-15; there is no obligation to upstream changes.
 
-- `fork` remote → `github.com/martinduncanson/clawpm` — active branches and PRs; `main` is the source of truth.
-- `origin` remote → `github.com/malphas-gh/clawpm` — cross-fork PRs for courtesy upstreaming after the work is merged on the fork.
-
-Upstream merge cadence is not a blocker. Periodically reconcile `origin/main` back into `main` to absorb upstream-only changes.
+- `fork` remote → `github.com/martinduncanson/clawpm` — the sole remote; active branches and PRs; `main` is the source of truth.
 
 ---
 
