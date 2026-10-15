@@ -1631,6 +1631,43 @@ def record_human_answer(
         return get_task(config, project_id, task_id, **_scope_kw(scope))
 
 
+def clear_stale_human_decision(
+    config: PortfolioConfig,
+    project_id: str,
+    task_id: str,
+    *,
+    scope: Scope | None = None,
+) -> Task | None:
+    """Drop a decision record left on a task that is not blocked (CLAWP-154).
+
+    A task unblocked without ``--answer`` keeps its question; a later plain
+    re-block would then list it as awaiting a human again. Clearing here keeps
+    the old record in the work log only. Never touches a blocked task (a live
+    question stays) and writes nothing when no decision key is present.
+    """
+    assert_scope_store_in_portfolio(config, project_id, scope)
+    tasks_dir = get_tasks_dir(config, project_id, **_scope_kw(scope))
+    if not tasks_dir:
+        return None
+    keys = ("blocked_on", "question", "options", "recommendation", "answer")
+
+    def _mutate(fm: dict) -> None:
+        for key in keys:
+            fm.pop(key, None)
+
+    with file_lock(tasks_dir / ".clawpm-tasks.lock"):
+        task = get_task(config, project_id, task_id, **_scope_kw(scope))
+        if not task or not task.file_path:
+            return None
+        if task.state == TaskState.BLOCKED:
+            return task
+        if not (task.blocked_on or task.question or task.options
+                or task.recommendation or task.answer):
+            return task
+        _rewrite_decision_frontmatter(task.file_path, _mutate)
+        return get_task(config, project_id, task_id, **_scope_kw(scope))
+
+
 def _newest_mtime(entry: Path) -> float:
     """Most-recent content mtime for a task ``entry`` (CLAWP-085).
 

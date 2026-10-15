@@ -186,3 +186,63 @@ def test_question_refused_on_unblocked_task(port):
     t = add_task(port.config, "alpha", "Open task")
     with pytest.raises(ValueError):
         record_human_question(port.config, "alpha", t.id, "Q?", [{"label": "A"}])
+
+
+def _needs_human(port):
+    r = CliRunner().invoke(
+        main, ["tasks", "list", "--needs-human", "--all-projects"], env=_env(port)
+    )
+    assert r.exit_code == 0, r.output
+    return json.loads(r.output)
+
+
+def test_unblock_without_answer_then_plain_reblock_not_listed(port):
+    t = add_task(port.config, "alpha", "Alpha decision")
+    assert _block_with_question(port, "alpha", t.id).exit_code == 0
+    assert CliRunner().invoke(
+        main, ["unblock", "-p", "alpha", t.id], env=_env(port)
+    ).exit_code == 0
+    assert CliRunner().invoke(
+        main, ["block", "-p", "alpha", t.id, "--note", "waiting on vendor"],
+        env=_env(port),
+    ).exit_code == 0
+
+    task = get_task(port.config, "alpha", t.id)
+    assert task.state == TaskState.BLOCKED
+    assert task.question is None and task.options == []
+    assert task.recommendation is None and task.answer is None
+    assert _needs_human(port) == []
+    # The old record survives in the worklog history.
+    entries = [e for e in read_entries(port.config, project="alpha") if e.task == t.id]
+    assert any("Ship the migration this week?" in e.summary for e in entries)
+
+
+def test_state_open_then_plain_reblock_not_listed(port):
+    t = add_task(port.config, "alpha", "Alpha decision")
+    assert _block_with_question(port, "alpha", t.id).exit_code == 0
+    change_task_state(port.config, "alpha", t.id, TaskState.OPEN, note="reopened")
+    assert CliRunner().invoke(
+        main, ["block", "-p", "alpha", t.id, "--note", "again"], env=_env(port)
+    ).exit_code == 0
+    assert get_task(port.config, "alpha", t.id).question is None
+    assert _needs_human(port) == []
+
+
+def test_answered_task_reblocked_with_new_question_replaces_record(port):
+    t = add_task(port.config, "alpha", "Alpha decision")
+    assert _block_with_question(port, "alpha", t.id).exit_code == 0
+    assert CliRunner().invoke(
+        main, ["unblock", "-p", "alpha", t.id, "--answer", "Ship now"], env=_env(port)
+    ).exit_code == 0
+    r = CliRunner().invoke(
+        main,
+        ["block", "-p", "alpha", t.id, "--question", "Second question?",
+         "--option", "Yes", "--option", "No", "--recommend", "No"],
+        env=_env(port),
+    )
+    assert r.exit_code == 0, r.output
+    task = get_task(port.config, "alpha", t.id)
+    assert task.question == "Second question?"
+    assert [o["label"] for o in task.options] == ["Yes", "No"]
+    assert task.recommendation == "No" and task.answer is None
+    assert [row["id"] for row in _needs_human(port)] == [t.id]

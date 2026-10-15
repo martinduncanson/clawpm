@@ -174,6 +174,16 @@ def quick_block(ctx: click.Context, project_id: str | None, task_ids: tuple[str,
                 }
         _render_state_results([r], "blocked", resolved_project, fmt, batch=False)
         return
+    # CLAWP-154 — a plain block must not resurrect a question left on an
+    # unblocked task (the old record lives on in the work log only).
+    from clawpm.tasks import clear_stale_human_decision
+    _config = require_portfolio(ctx)
+    _project, _ = require_project(ctx, project_id)
+    for raw in dict.fromkeys(task_ids):
+        try:
+            clear_stale_human_decision(_config, _project, expand_task_id(raw, _project))
+        except (ValueError, OSError) as exc:
+            click.echo(f"warning: stale decision record not cleared on {raw}: {exc}", err=True)
     ctx.invoke(tasks_state, project_id=project_id, task_ids=task_ids, new_state="blocked", note=note, reflect_note=reflect_note, meta_reflect=meta_reflect, process_lesson=process_lesson, surprise_tags=surprise_tags, actual_complexity=actual_complexity)
 
 
@@ -249,6 +259,15 @@ def quick_unblock(ctx: click.Context, project_id: str | None, task_ids: tuple[st
                     "error": "decision_record_failed", "state_changed": True,
                     "message": f"Task unblocked but the answer was not recorded: {exc}",
                 }
+        if r.get("ok") and answer is None:
+            # CLAWP-154 — unblocked unanswered: the question is no longer live.
+            from clawpm.tasks import clear_stale_human_decision
+            try:
+                clear_stale_human_decision(config, project_id, full_task_id)
+            except (ValueError, OSError) as exc:
+                r.setdefault("data", {}).setdefault("log_errors", []).append(
+                    {"error_class": type(exc).__name__, "message": str(exc)}
+                )
         if r.get("ok"):
             # Log the explicit unblock action only when the transition landed.
             # Best-effort: the transition is already durable, so a work-log
