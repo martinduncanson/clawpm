@@ -49,10 +49,17 @@ def reflect_summarize(ctx: click.Context, project_id: str | None, include_decisi
     summary = summarize_calibration(
         config.portfolio_root, project_id, include_decisions=include_decisions
     )
-    output_success(
+    message = (
         f"Calibration summary ({summary['project_id']}): "
         f"{summary['with_usable_duration']}/{summary['total_done']} done tasks "
-        f"with usable duration.",
+        f"with usable duration."
+    )
+    # CLAWP-112-005 / spec 2.3: surface the closure alarm in the text output.
+    alarm = (summary.get("calibration") or {}).get("closure", {}).get("alarm")
+    if alarm:
+        message += f" ALARM: {alarm}"
+    output_success(
+        message,
         data=summary,
         fmt=fmt,
     )

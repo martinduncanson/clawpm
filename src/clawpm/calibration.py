@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 MIN_N = 20
-CLOSURE_ALARM_BELOW = 0.6
+CLOSURE_ALARM_BELOW = 0.6  # spec 2.3: closure alarm threshold, judged on the rolling 30-day window
 METAREFLECTION_WINDOW_DAYS = 30
 METAREFLECTION_MIN_COUNT = 3
 VELOCITY_WINDOWS = {"90d": 90, "365d": 365}
@@ -299,24 +299,37 @@ def _closure(ledger: dict[str, Any]) -> dict[str, Any]:
     registered = int(ledger.get("registered", 0))
     resolved = int(ledger.get("resolved", 0))
     voided = int(ledger.get("voided", 0))
+    w_reg = int(ledger.get("registered_30d", 0))
+    w_res = int(ledger.get("resolved_30d", 0))
+    w_void = int(ledger.get("voided_30d", 0))
+    w_rate = round(w_res / w_reg, 4) if w_reg > 0 else None
     base = {
         "registered": registered,
         "resolved": resolved,
         "voided": voided,
         "legacy_resolved": int(ledger.get("legacy_resolved", 0)),
+        "window_30d": {"registered": w_reg, "resolved": w_res,
+                       "voided": w_void, "rate": w_rate},
     }
     if registered <= 0:
         return {**base, "rate": None, "open_predictions": 0, "void_rate": None,
-                "insufficient_data": True, "alarm": None}
+                "insufficient_data": True, "alarm": None, "alarm_basis": None}
     rate = round(resolved / registered, 4)
     alarm = None
-    if rate < CLOSURE_ALARM_BELOW:
-        alarm = (f"closure {rate:.2f} is below {CLOSURE_ALARM_BELOW}: most "
+    basis = None
+    # Spec 2.3: the alarm judges the rolling 30 days when it has any
+    # registrations; an empty window falls back to the all-time rate.
+    # Comparison is strict (< threshold): 0.59 alarms, exactly 0.60 does not.
+    judged, basis_name = (w_rate, "window_30d") if w_rate is not None else (rate, "all_time")
+    if judged < CLOSURE_ALARM_BELOW:
+        basis = basis_name
+        span = "30-day " if basis_name == "window_30d" else ""
+        alarm = (f"{span}closure {judged:.2f} is below {CLOSURE_ALARM_BELOW}: most "
                  "predictions never resolve, so the other numbers are survivors only")
     return {**base, "rate": rate,
             "open_predictions": max(0, registered - resolved - voided),
             "void_rate": round(voided / registered, 4),
-            "insufficient_data": False, "alarm": alarm}
+            "insufficient_data": False, "alarm": alarm, "alarm_basis": basis}
 
 
 def compute_calibration(
@@ -404,7 +417,9 @@ def render_scorecard(block: dict[str, Any]) -> list[str]:
         line1 = (f"closure: {cl['rate']:.2f} ({cl['resolved']}/{cl['registered']} resolved, "
                  f"{cl['open_predictions']} open, void rate {cl['void_rate']:.2f})")
         if cl["alarm"]:
-            line1 += " ALARM: below 0.60"
+            line1 += f" ALARM: below {CLOSURE_ALARM_BELOW:.2f}"
+            if cl.get("alarm_basis") == "window_30d":
+                line1 += " (30d)"
 
     b = block["bias"]
     if b["factor"] is None:
