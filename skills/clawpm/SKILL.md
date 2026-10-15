@@ -131,6 +131,24 @@ them via `--reference-task`. Empty `reference_tasks` = "I used the inside view o
 
 Attribution: `--predicted-by` exists on `clawpm tasks add`, not on the `clawpm add` shortcut. Without it, `clawpm tasks add` records predictions as `operator` when prediction flags are set; `tasks decompose`, `agent dispatch`, `inbox materialize` and the MCP `tasks_add` tool record `agent`. After the operator confirms or edits your proposal, pass `--predicted-by operator-edited`. Pass `agent` only for predictions the operator has not reviewed.
 
+## Working the map — decision maps (CLAWP-111)
+
+A root task charted by `clawpm-planner` (chart mode) holds decision leaves (`kind: decision`), build leaves that wait on them, and a fog list of questions not yet sharp enough to be leaves. Work it one leaf at a time:
+
+1. **Find the frontier**: `clawpm next --frontier <root>` (same as `clawpm tasks list --frontier <root>`). It lists ready, blocked (`waiting_on`) and claimed (lease holder) leaves. Do not combine it with other list filters.
+2. **Claim**: `clawpm start <leaf>`. Claim one leaf, not the whole frontier.
+3. **Resolve**: do the thinking for that leaf. Put the answer in the leaf body or a note as you go.
+4. **Close**: `clawpm done <leaf> --resolution "<outcome>"`. A decision leaf cannot complete without `--resolution`; the line is appended under the root's `## Decisions so far`.
+5. **Graduate fog**: when a fog entry becomes a sharp question, file it with `clawpm tasks add -t "..." --parent <root> --kind decision --graduates "<fog text>"`. Park new unknowns with `clawpm tasks fog <root> --add "..."`.
+
+Rules:
+
+- **One decision leaf per session.** Agent-research leaves (`delegability: agent`, the answer is found by reading or measuring) are exempt and can run in a batch.
+- **Refer to leaves by name** in narration ("the storage-engine decision"), never by bare id. Wrap an id in backticks when you must cite it.
+- **Human-delegable leaves are never answered by the agent.** Frame the options, state a recommendation, and wait for the operator. Do not run `done --resolution` on a `delegability: human` leaf on their behalf.
+
+To chart or re-chart a map use the `clawpm-planner` skill (plugin commands `/clawpm:plan`, `/clawpm:chart`, `/clawpm:next`).
+
 ## Tips
 
 - **Flag order**: `clawpm [global flags] <command> [command flags]` — e.g. `clawpm -f text tasks list -s open`

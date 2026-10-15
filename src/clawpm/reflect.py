@@ -1225,6 +1225,7 @@ def load_calibration_rows(
     portfolio_root: Path,
     project_id: str | None = None,
     include_decisions: bool = False,
+    now: datetime | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Build the rows + closure ledger that ``calibration.compute_calibration`` scores.
 
@@ -1242,10 +1243,19 @@ def load_calibration_rows(
     plus any id a done event carries), ``resolved`` the non-voided done events
     with an id, ``voided`` the ids of voided tasks, ``legacy_resolved`` done
     events with no id (counted apart, not in the closure rate).
+
+    CLAWP-112-005: ``registered_30d`` / ``resolved_30d`` / ``voided_30d`` are
+    the same counts restricted to ids whose timestamp (``registered_at``, else
+    the done event's ``occurred_at``) falls in the 30 days up to ``now``
+    (default: current time); an id with no parseable timestamp is not in the
+    window. Spec 2.3 rolling closure.
     """
     rows: list[dict[str, Any]] = []
     ledger = {"registered": 0, "resolved": 0, "voided": 0, "legacy_resolved": 0,
+              "registered_30d": 0, "resolved_30d": 0, "voided_30d": 0,
               "malformed_lines": 0, "non_object": 0, "unknown_events": 0}
+    now = now or datetime.now(timezone.utc)
+    window_start = now - timedelta(days=30)
     ref_dir = _reflections_dir_ro(portfolio_root)
     if not ref_dir.exists():
         return rows, ledger
@@ -1291,11 +1301,14 @@ def load_calibration_rows(
                 continue
             if project_id is not None and proj != project_id:
                 continue
-            st = states.setdefault(proj, {"registered": {}, "revisions": {}, "done": None})
+            st = states.setdefault(
+                proj, {"registered": {}, "registered_at": {}, "revisions": {}, "done": None}
+            )
             snap = rec.get("predictions")
             if evt == "prediction_registered":
                 if pid and isinstance(snap, dict):
                     st["registered"].setdefault(pid, snap)
+                    st["registered_at"].setdefault(pid, _parse_ts(rec.get("registered_at")))
             elif evt == "prediction_revised":
                 if pid and isinstance(snap, dict):
                     st["revisions"].setdefault(pid, []).append(
@@ -1308,19 +1321,54 @@ def load_calibration_rows(
             done_pid = done.get("prediction_id") if done else None
             ids = set(st["registered"]) | ({done_pid} if done_pid else set())
             ledger["registered"] += len(ids)
+            done_at = _parse_ts(done.get("occurred_at")) if done else None
+            in_window = 0
+            for i in ids:
+                ts = st["registered_at"].get(i) or done_at
+                if ts is not None and window_start <= ts <= now:
+                    in_window += 1
             if unscoped_void or proj in voided_projects:
+                # Voided work is cancelled: counted only in voided(_30d), never
+                # in registered_30d, so it cannot sit in the window denominator
+                # without a matching resolution.
                 ledger["voided"] += len(ids)
+                ledger["voided_30d"] += in_window
                 continue
+            ledger["registered_30d"] += in_window
             if done is None:
                 continue
             if done_pid:
                 ledger["resolved"] += 1
+                if done_pid in ids and in_window:
+                    ts = st["registered_at"].get(done_pid) or done_at
+                    if ts is not None and window_start <= ts <= now:
+                        ledger["resolved_30d"] += 1
             else:
                 ledger["legacy_resolved"] += 1
             rows.append(
                 _calibration_row(done, st, ref_file.stem, proj, include_decisions)
             )
     return rows, ledger
+
+
+def metareflection_nudge(
+    portfolio_root: Path,
+    project_id: str | None,
+    now: datetime | None = None,
+) -> str | None:
+    """One-line metareflection nudge for ``project_id``, or None (CLAWP-112-005).
+
+    Fail-open by design: any failure reading or scoring the ledger yields None
+    so the hook / state-change paths that call this never change behaviour.
+    """
+    try:
+        from clawpm.calibration import compute_calibration, render_metareflection_nudge
+
+        rows, ledger = load_calibration_rows(portfolio_root, project_id, now=now)
+        block = compute_calibration(rows, ledger, now=now)
+        return render_metareflection_nudge(block["metareflection_due"])
+    except Exception:
+        return None
 
 
 def _calibration_row(
@@ -1522,7 +1570,9 @@ def summarize_calibration(
     if with_calibration:
         from .calibration import compute_calibration
 
-        rows, ledger = load_calibration_rows(portfolio_root, project_id, include_decisions)
+        rows, ledger = load_calibration_rows(
+            portfolio_root, project_id, include_decisions, now=now
+        )
         result["calibration"] = compute_calibration(rows, ledger, now=now)
     return result
 
