@@ -24,7 +24,7 @@ priority: 5
 scope:
 - src/clawpm/tasks.py
 - tests/test_id_reservations.py
-updated: '2026-10-14'
+updated: '2026-10-15'
 ---
 # tasks add: refuse to reuse an ID present on fork/main or another ref (add-time git ls-tree check)
 
