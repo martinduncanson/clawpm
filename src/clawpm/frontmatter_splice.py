@@ -6,11 +6,14 @@ every routine write. :func:`splice_keys` replaces only the lines of the named
 keys and re-parses before returning, so a splice that would change any other
 key raises instead of reaching disk. It reuses the event-mark technique (and
 the parsing helpers) of ``pr_record`` (CLAWP-151): refusing duplicate, aliased,
-anchored, flow-style or indented keys rather than guessing.
+flow-style or indented keys, and block scalars, rather than guessing. Anchors,
+aliases and tags elsewhere in the mapping are left alone; a replaced value may
+carry them unless another key aliases an anchor it defines.
 """
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 import yaml
@@ -54,6 +57,49 @@ def _fm_text(lines: list[str], close: int) -> str:
     return "\n".join(ln.rstrip("\r") for ln in lines[1:close])
 
 
+def _orphaned_anchor(key: str, value_events: list[Any], pairs: list[Any]) -> str | None:
+    """An anchor defined inside ``key``'s value that another top-level value aliases.
+
+    Replacing or removing ``key`` would leave that alias dangling. Conservative:
+    any alias of the same name counts, whatever its position.
+    """
+    defined = {e.anchor for e in value_events if getattr(e, "anchor", None)}
+    if not defined:
+        return None
+    for other, events in pairs:
+        if other.value == key:
+            continue
+        for ev in events:
+            if isinstance(ev, yaml.AliasEvent) and ev.anchor in defined:
+                return ev.anchor
+    return None
+
+
+def _plain_events(value_events: list[Any]) -> list[Any]:
+    """``value_events`` with anchors, tags and aliases neutralised.
+
+    Only the key being replaced is passed through ``_value_extent``, whose
+    anchor/alias/tag refusal is for callers that cannot replace such a value.
+    Here the whole value is rewritten, so those markers are safe once no other
+    key aliases an anchor defined inside it (checked by :func:`_orphaned_anchor`).
+    Block scalars and flow layouts are still judged by ``_value_extent``.
+    """
+    out: list[Any] = []
+    for ev in value_events:
+        if isinstance(ev, yaml.AliasEvent):
+            out.append(yaml.ScalarEvent(
+                None, None, (True, False), "", ev.start_mark, ev.end_mark, None
+            ))
+        elif getattr(ev, "anchor", None) or getattr(ev, "tag", None):
+            clone = copy.copy(ev)
+            clone.anchor = None
+            clone.tag = None
+            out.append(clone)
+        else:
+            out.append(ev)
+    return out
+
+
 def _splice_one(lines: list[str], key: str, value: Any) -> list[str]:
     close = _frontmatter_bounds(lines)
     fm_lines = [ln.rstrip("\r") for ln in lines[1:close]]
@@ -68,7 +114,15 @@ def _splice_one(lines: list[str], key: str, value: Any) -> list[str]:
         new = [ln + eol for ln in _render(key, value)]
         out[close:close] = new
         return out
-    first, last, tail = _value_extent(existing[0], existing[1], fm_text, fm_lines, key)
+    orphan = _orphaned_anchor(key, existing[1], pairs)
+    if orphan is not None:
+        raise PrRecordError(
+            "bad_frontmatter",
+            f"'{key}' defines anchor '&{orphan}' that another key aliases; refusing to replace it",
+        )
+    first, last, tail = _value_extent(
+        existing[0], _plain_events(existing[1]), fm_text, fm_lines, key
+    )
     if value is REMOVE:
         out[1 + first:1 + last + 1] = []
         return out

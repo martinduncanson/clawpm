@@ -248,3 +248,70 @@ def test_unspliceable_frontmatter_is_refused_and_left_byte_identical(port):
     with pytest.raises(ValueError):
         record_human_question(port.config, "alpha", t.id, "Q?", ["A"])
     assert path.read_bytes() == before
+
+
+def _blocked_with_extra_lines(port, extra: str):
+    t = add_task(port.config, "alpha", "Alpha decision")
+    change_task_state(port.config, "alpha", t.id, TaskState.BLOCKED, note="b")
+    path = get_task(port.config, "alpha", t.id).file_path
+    text = path.read_bytes().decode("utf-8").replace("\r\n", "\n")
+    patched = text.replace("\n---\n", "\n" + extra + "\n---\n", 1)
+    assert patched != text
+    path.write_bytes(patched.encode("utf-8"))
+    return t, path
+
+
+def test_unrelated_anchor_and_alias_do_not_block_recording(port):
+    from clawpm.tasks import record_human_answer, record_human_question
+
+    extra = "x_shared: &s [a, b]\nx_copy: *s"
+    t, path = _blocked_with_extra_lines(port, extra)
+    record_human_question(port.config, "alpha", t.id, "Ship it?", ["Yes", "No"], "Yes")
+    record_human_answer(port.config, "alpha", t.id, "Yes please")
+    raw = path.read_bytes().decode("utf-8").replace("\r\n", "\n")
+    assert extra in raw and "answer: Yes please" in raw
+    task = get_task(port.config, "alpha", t.id)
+    assert task.question == "Ship it?" and task.answer == "Yes please"
+
+
+def test_untouched_decision_key_with_anchor_survives_answer(port):
+    from clawpm.tasks import record_human_answer
+
+    extra = (
+        "blocked_on: human\nquestion: Q?\n"
+        "options: &o\n  - label: A\n  - label: B\n"
+        "x_copy: *o"
+    )
+    t, path = _blocked_with_extra_lines(port, extra)
+    record_human_answer(port.config, "alpha", t.id, "A")
+    raw = path.read_bytes().decode("utf-8").replace("\r\n", "\n")
+    assert "options: &o\n  - label: A\n  - label: B\nx_copy: *o" in raw
+    assert get_task(port.config, "alpha", t.id).answer == "A"
+
+
+def test_replacing_decision_keys_that_carry_anchors_or_aliases_is_allowed(port):
+    from clawpm.tasks import record_human_question
+
+    # `options` defines an anchor nothing else uses; `recommendation` is an
+    # alias into an unrelated key. Replacing both orphans nothing.
+    extra = (
+        "x_pick: &p A\nblocked_on: human\nquestion: Q?\n"
+        "options: &o\n  - label: A\nrecommendation: *p"
+    )
+    t, path = _blocked_with_extra_lines(port, extra)
+    record_human_question(port.config, "alpha", t.id, "New?", ["X", "Y"], "X")
+    task = get_task(port.config, "alpha", t.id)
+    assert task.question == "New?" and task.recommendation == "X"
+    raw = path.read_bytes().decode("utf-8")
+    assert "x_pick: &p A" in raw and "&o" not in raw
+
+
+def test_orphaning_an_alias_is_refused_and_leaves_file_identical(port):
+    from clawpm.tasks import record_human_question
+
+    extra = "options: &o\n  - label: A\nx_copy: *o"
+    t, path = _blocked_with_extra_lines(port, extra)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="aliases"):
+        record_human_question(port.config, "alpha", t.id, "Q?", ["A"])
+    assert path.read_bytes() == before
