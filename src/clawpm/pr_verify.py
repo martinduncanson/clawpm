@@ -10,6 +10,11 @@ every one holds.
 * ``mergeable`` the PR is OPEN and GitHub reports MERGEABLE (UNKNOWN is not a pass)
 * ``merge_command``  built from live data with the FULL 40-char SHA, only when ok
 
+``require_merged=True`` (CLAWP-151) attests a PR that is ALREADY merged: the
+``mergeable`` fact is replaced by a ``merged`` fact (state MERGED and a full
+40-char ``mergeCommit.oid``), the result gains ``merge_commit``, and
+``merge_command`` stays None.  The head and CI facts are unchanged.
+
 This module is read-only: it never merges, comments or writes to the remote.
 Anything that stops it proving a fact (gh missing, unauthenticated, unparseable
 JSON, a check run reported for a different SHA, a truncated check or status
@@ -213,12 +218,25 @@ def _check_mergeable(state: str | None, mergeable: str | None) -> dict[str, Any]
     return {"ok": not reasons, "state": state, "mergeable": mergeable, "reasons": reasons}
 
 
+def _check_merged(state: str | None, merge_commit: Any) -> dict[str, Any]:
+    oid = merge_commit.get("oid") if isinstance(merge_commit, dict) else None
+    oid = oid.lower() if isinstance(oid, str) else None
+    reasons = []
+    if state != "MERGED":
+        reasons.append(f"PR state is {state}, not MERGED")
+    if oid is None or not _FULL_SHA.match(oid):
+        reasons.append("PR has no full 40-char merge commit sha")
+        oid = None
+    return {"ok": not reasons, "state": state, "merge_commit": oid, "reasons": reasons}
+
+
 def verify_pr(
     pr_number: int,
     *,
     expect_head: str | None = None,
     repo: str | None = None,
     remote: str = "fork",
+    require_merged: bool = False,
 ) -> dict[str, Any]:
     """Attest the four facts for ``pr_number``; raise PrVerifyError if unprovable."""
     if expect_head is not None:
@@ -229,7 +247,8 @@ def verify_pr(
     repo_slug = _resolve_repo(repo, remote)
     pr = _gh_json([
         "pr", "view", str(pr_number), "--repo", repo_slug,
-        "--json", "headRefOid,headRefName,mergeable,state,url",
+        "--json",
+        "headRefOid,headRefName,mergeable,state,url" + (",mergeCommit" if require_merged else ""),
     ])
     pr_head = str(pr.get("headRefOid") or "").lower()
     branch = pr.get("headRefName")
@@ -238,7 +257,12 @@ def verify_pr(
 
     head = _check_head(pr_head, _remote_head(remote, branch), expect_head)
     ci = _check_ci(repo_slug, pr_head)
-    merge = _check_mergeable(pr.get("state"), pr.get("mergeable"))
+    if require_merged:
+        merge = _check_merged(pr.get("state"), pr.get("mergeCommit"))
+        merge_key = "merged"
+    else:
+        merge = _check_mergeable(pr.get("state"), pr.get("mergeable"))
+        merge_key = "mergeable"
     ok = head["ok"] and ci["ok"] and merge["ok"]
 
     result: dict[str, Any] = {
@@ -250,10 +274,14 @@ def verify_pr(
         "local_head": _local_head(branch),  # informational: a stale checkout is not a PR defect
         "head": head,
         "ci": ci,
-        "mergeable": merge,
-        "failed": [name for name, fact in (("head", head), ("ci", ci), ("mergeable", merge)) if not fact["ok"]],
+        merge_key: merge,
+        "failed": [name for name, fact in (("head", head), ("ci", ci), (merge_key, merge)) if not fact["ok"]],
         "merge_command": (
-            f"gh pr merge {pr_number} --repo {repo_slug} --squash --match-head-commit {pr_head}" if ok else None
+            f"gh pr merge {pr_number} --repo {repo_slug} --squash --match-head-commit {pr_head}"
+            if ok and not require_merged
+            else None
         ),
     }
+    if require_merged:
+        result["merge_commit"] = merge["merge_commit"]
     return result

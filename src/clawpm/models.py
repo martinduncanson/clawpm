@@ -608,6 +608,10 @@ class Task:
     # frontmatter when absent/empty — no diff on existing fixtures.
     destination: str | None = None
     not_yet_specified: list[str] = field(default_factory=list)
+    # CLAWP-151 — merged-PR attestation written by ``pr verify --task``.
+    # A mapping read from frontmatter; None when absent (non-mapping values
+    # are ignored). Emitted by to_dict only when set.
+    pr_verification: dict[str, Any] | None = None
 
     @property
     def is_parent(self) -> bool:
@@ -835,6 +839,11 @@ class Task:
             kind=kind,
             resolution=resolution,
             resolved_at=resolved_at,
+            pr_verification=(
+                dict(frontmatter["pr_verification"])
+                if isinstance(frontmatter.get("pr_verification"), dict)
+                else None
+            ),
         )
 
     @property
@@ -907,6 +916,9 @@ class Task:
         # so there is no schema change without --all-projects.
         if self.project_id is not None:
             result["project_id"] = self.project_id
+        # CLAWP-151 — emitted ONLY when set; unset output stays byte-identical.
+        if self.pr_verification is not None:
+            result["pr_verification"] = self.pr_verification
         body = self.body
         if body:
             result["body"] = body
