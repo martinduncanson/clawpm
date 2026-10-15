@@ -9,7 +9,7 @@
       "leaf_key": "autosave::debounced-client-save",
       "title": "User edits autosave without pressing save",
       "success_criteria": [
-        { "criterion": "Edits persist after a 2s idle with no manual save", "gradeable_signal": "integration test fires draft PUT", "comparator": "eq:1 draft row" }
+        { "criterion": "WHEN a user stops typing for 2s THEN the edit is saved as a draft with no manual save", "gradeable_signal": "integration test fires draft PUT", "comparator": "eq:1 draft row" }
       ],
       "scope": ["src/editor/autosave/**"],
       "delegability": "agent",
@@ -21,7 +21,7 @@
       "leaf_key": "autosave::offline-queue",
       "title": "Autosave queues writes while offline and flushes on reconnect",
       "success_criteria": [
-        { "criterion": "Edits made offline persist after reconnect", "gradeable_signal": "e2e: go offline, edit, reconnect, assert draft saved", "comparator": "eq:draft-text" }
+        { "criterion": "WHEN edits are made offline and the connection returns THEN the draft is saved", "gradeable_signal": "e2e: go offline, edit, reconnect, assert draft saved", "comparator": "eq:draft-text" }
       ],
       "scope": ["src/editor/autosave/queue.ts"],
       "delegability": "agent",

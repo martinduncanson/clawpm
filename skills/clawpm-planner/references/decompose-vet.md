@@ -28,10 +28,20 @@ against its rubric without the others?"
   comparator}`. The gradeable signal is *what evidence proves it* (a test, a
   count, a cited cell). Weak criteria ("make it work") defeat the Stop-hook judge —
   spend the calories here.
+  **Phrase each criterion as `WHEN <condition> THEN <observable result>`** — it
+  forces a testable trigger and an outcome a judge can check ("WHEN a file has 2
+  bad rows of 10 THEN 8 rows save and 2 errors are reported"). Rubric entries that
+  cannot take this shape are usually not yet gradeable.
 - **`scope`** — file globs (software) or named deliverables (knowledge-work).
 - **`out_of_scope`** — what this leaf explicitly does NOT do (prevents drift).
 - **`stop_conditions`** — "if X is false, STOP and report" — the executor's
   circuit-breaker. Especially: a precondition another leaf must satisfy first.
+  **Default stop-list:** any leaf whose scope touches one of **auth/session,
+  schema migration, bulk deletion, secrets/credentials, payment, prod config**
+  gets a seeded entry, e.g. "STOP and surface to the operator before any
+  auth/session change." Seed it during decompose, for every matching category,
+  **unless the PRD explicitly waives that category** (cite the waiver line in the
+  leaf's notes). Seeding is the planner's job; core stores it as written.
 - **`delegability`** — `agent` (cheap executor), `human` (judgment/approval), or
   `either`. Drives handoff routing.
 - **`predictions`** — `duration_min`, `complexity` (s/m/l/xl), `confidence` (1–5),

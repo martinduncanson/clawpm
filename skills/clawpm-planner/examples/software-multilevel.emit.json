@@ -24,7 +24,7 @@
       "title": "Comment threads: post and read flat comments on a note",
       "success_criteria": [
         {
-          "criterion": "A user can post a comment on a note and all users see it on reload",
+          "criterion": "WHEN a user posts a comment on a note THEN all users see it after a reload",
           "gradeable_signal": "e2e: post a comment, reload as another user, assert it renders",
           "comparator": "eq:visible"
         }
@@ -52,7 +52,7 @@
       "title": "Reply nesting: a comment can be a reply to another comment",
       "success_criteria": [
         {
-          "criterion": "A reply renders indented under its parent comment to at least 1 level",
+          "criterion": "WHEN a reply is posted to a comment THEN it renders indented under its parent, to at least 1 level",
           "gradeable_signal": "e2e: reply to a comment, assert the reply nests under the parent",
           "comparator": "eq:nested"
         }
@@ -79,7 +79,7 @@
       "title": "Comment notifications: a follower is notified on a new comment",
       "success_criteria": [
         {
-          "criterion": "A user following a note receives a notification when someone comments",
+          "criterion": "WHEN someone comments on a note THEN each user following it receives a notification",
           "gradeable_signal": "integration test: comment as user X, assert follower Y gets a notification event",
           "comparator": "eq:1 notification"
         }
