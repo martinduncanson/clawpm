@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import stat
+import tempfile
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -1512,36 +1513,58 @@ def is_awaiting_human(task: Task) -> bool:
     )
 
 
-def _rewrite_decision_frontmatter(file_path: Path, mutate) -> None:
-    """Strict frontmatter rewrite for the human-decision keys (CLAWP-154).
+_HUMAN_DECISION_KEYS = ("blocked_on", "question", "options", "recommendation", "answer")
 
-    Like ``_write_resolution_frontmatter`` but byte-faithful on the envelope:
-    a UTF-8 BOM and CRLF line endings are detected and restored, so a file
-    authored on Windows keeps its shape. ``mutate(fm)`` edits the mapping in
-    place; the ``updated`` stamp is applied here.
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write ``data`` to ``path`` through a UNIQUE temp file in the same dir.
+
+    A fixed ``<id>.tmp`` name lets two writers of one file replace or delete
+    each other's temp; ``mkstemp`` gives each write its own. The temp is
+    removed on every failure path; the final swap is an atomic replace.
     """
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        mode = None
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        if mode is not None:
+            try:
+                os.chmod(tmp_name, mode)
+            except OSError:
+                pass
+        retry_transient(os.replace, tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _rewrite_decision_frontmatter(file_path: Path, updates: dict) -> None:
+    """Surgical frontmatter rewrite for the human-decision keys (CLAWP-154).
+
+    Only the keys named in ``updates`` (value, or ``REMOVE``) plus ``updated``
+    are touched: comments, key order, quoting, the BOM and CRLF line endings of
+    everything else are preserved byte for byte. Frontmatter that cannot be
+    spliced safely raises ``ValueError`` BEFORE anything is written.
+    """
+    from .frontmatter_splice import splice_keys
+    from .pr_record import PrRecordError
+
     with guard_fs_tamper(f"Task file '{file_path}'"):
         text = file_path.read_bytes().decode("utf-8")
-    bom = text.startswith("﻿")
-    crlf = "\r\n" in text
-    text = strip_bom(text).replace("\r\n", "\n")
-    fm, body = split_frontmatter(text, where=str(file_path))
-    mutate(fm)
-    stamp_updated(fm)
-    new_text = (
-        "---\n" + yaml.dump(fm, default_flow_style=False, allow_unicode=True)
-        + "---" + body
-    )
-    if crlf:
-        new_text = new_text.replace("\n", "\r\n")
-    data = (("﻿" if bom else "") + new_text).encode("utf-8")
-    tmp = file_path.with_suffix(".tmp")
     try:
-        tmp.write_bytes(data)
-        retry_transient(tmp.replace, file_path)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
+        new_text = splice_keys(text, {**updates, "updated": today_utc_iso()})
+    except PrRecordError as exc:
+        raise ValueError(f"Cannot update decision record in '{file_path}': {exc}")
+    _atomic_write_bytes(file_path, new_text.encode("utf-8"))
 
 
 def record_human_question(
@@ -1574,18 +1597,15 @@ def record_human_question(
     if not tasks_dir:
         return None
 
-    def _mutate(fm: dict) -> None:
-        fm["blocked_on"] = "human"
-        fm["question"] = question.strip()
-        if opts:
-            fm["options"] = opts
-        else:
-            fm.pop("options", None)
-        if rec:
-            fm["recommendation"] = rec
-        else:
-            fm.pop("recommendation", None)
-        fm.pop("answer", None)
+    from .frontmatter_splice import REMOVE
+
+    updates = {
+        "blocked_on": "human",
+        "question": question.strip(),
+        "options": opts if opts else REMOVE,
+        "recommendation": rec if rec else REMOVE,
+        "answer": REMOVE,
+    }
 
     with file_lock(tasks_dir / ".clawpm-tasks.lock"):
         task = get_task(config, project_id, task_id, **_scope_kw(scope))
@@ -1596,7 +1616,7 @@ def record_human_question(
                 f"Task {task_id} is '{task.state.value}', not blocked: "
                 "block it before recording a question."
             )
-        _rewrite_decision_frontmatter(task.file_path, _mutate)
+        _rewrite_decision_frontmatter(task.file_path, updates)
         return get_task(config, project_id, task_id, **_scope_kw(scope))
 
 
@@ -1620,15 +1640,30 @@ def record_human_answer(
     if not tasks_dir:
         return None
 
-    def _mutate(fm: dict) -> None:
-        fm["answer"] = answer.strip()
-
     with file_lock(tasks_dir / ".clawpm-tasks.lock"):
         task = get_task(config, project_id, task_id, **_scope_kw(scope))
         if not task or not task.file_path:
             return None
-        _rewrite_decision_frontmatter(task.file_path, _mutate)
+        _rewrite_decision_frontmatter(task.file_path, {"answer": answer.strip()})
         return get_task(config, project_id, task_id, **_scope_kw(scope))
+
+
+def _decision_tuple(task: Task) -> tuple:
+    return (task.blocked_on, task.question, task.options,
+            task.recommendation, task.answer)
+
+
+def stale_human_decision(task: Task | None) -> tuple | None:
+    """The decision record a NOT-blocked ``task`` still carries, else ``None``.
+
+    The value is a snapshot that :func:`clear_stale_human_decision` accepts, so
+    a caller can clear the exact record it saw even after the task was
+    re-blocked (CLAWP-154).
+    """
+    if task is None or task.state == TaskState.BLOCKED:
+        return None
+    snap = _decision_tuple(task)
+    return snap if any(snap) else None
 
 
 def clear_stale_human_decision(
@@ -1637,34 +1672,40 @@ def clear_stale_human_decision(
     task_id: str,
     *,
     scope: Scope | None = None,
+    snapshot: tuple | None = None,
 ) -> Task | None:
     """Drop a decision record left on a task that is not blocked (CLAWP-154).
 
     A task unblocked without ``--answer`` keeps its question; a later plain
     re-block would then list it as awaiting a human again. Clearing here keeps
-    the old record in the work log only. Never touches a blocked task (a live
-    question stays) and writes nothing when no decision key is present.
+    the old record in the work log only. Without ``snapshot`` a blocked task
+    is never touched (a live question stays). With ``snapshot`` (from
+    :func:`stale_human_decision`) the record is cleared only when it still
+    equals that snapshot, whatever the state: this lets ``block`` transition
+    first and then drop exactly the stale record it saw, while a question a
+    concurrent session recorded in between survives. Writes nothing when no
+    decision key is present.
     """
     assert_scope_store_in_portfolio(config, project_id, scope)
     tasks_dir = get_tasks_dir(config, project_id, **_scope_kw(scope))
     if not tasks_dir:
         return None
-    keys = ("blocked_on", "question", "options", "recommendation", "answer")
+    from .frontmatter_splice import REMOVE
 
-    def _mutate(fm: dict) -> None:
-        for key in keys:
-            fm.pop(key, None)
+    updates = {key: REMOVE for key in _HUMAN_DECISION_KEYS}
 
     with file_lock(tasks_dir / ".clawpm-tasks.lock"):
         task = get_task(config, project_id, task_id, **_scope_kw(scope))
         if not task or not task.file_path:
             return None
-        if task.state == TaskState.BLOCKED:
+        if snapshot is None:
+            if task.state == TaskState.BLOCKED:
+                return task
+        elif _decision_tuple(task) != snapshot:
             return task
-        if not (task.blocked_on or task.question or task.options
-                or task.recommendation or task.answer):
+        if not any(_decision_tuple(task)):
             return task
-        _rewrite_decision_frontmatter(task.file_path, _mutate)
+        _rewrite_decision_frontmatter(task.file_path, updates)
         return get_task(config, project_id, task_id, **_scope_kw(scope))
 
 

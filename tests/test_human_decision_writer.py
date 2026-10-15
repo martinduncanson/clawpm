@@ -224,6 +224,7 @@ def test_answer_and_clear_keep_comments_and_quoting(port):
 
     change_task_state(port.config, "alpha", t.id, TaskState.OPEN, note="o")
     clear_stale_human_decision(port.config, "alpha", t.id)
+    path = get_task(port.config, "alpha", t.id).file_path  # moved out of blocked/
     end = path.read_bytes().decode("utf-8")
     for gone in ("question:", "answer:", "options:", "recommendation:", "blocked_on:"):
         assert gone not in end
@@ -238,10 +239,11 @@ def test_unspliceable_frontmatter_is_refused_and_left_byte_identical(port):
     t = add_task(port.config, "alpha", "Alpha decision")
     change_task_state(port.config, "alpha", t.id, TaskState.BLOCKED, note="b")
     path = get_task(port.config, "alpha", t.id).file_path
-    text = path.read_bytes().decode("utf-8")
+    text = path.read_bytes().decode("utf-8").replace("\r\n", "\n")
     # A duplicate top-level key parses (last wins) but cannot be spliced safely.
-    text = text.replace("\n---\n", "\ntitle: dup\n---\n", 1)
-    path.write_bytes(text.encode("utf-8"))
+    patched = text.replace("\n---\n", "\npriority: 9\n---\n", 1)
+    assert patched != text
+    path.write_bytes(patched.encode("utf-8"))
     before = path.read_bytes()
     with pytest.raises(ValueError):
         record_human_question(port.config, "alpha", t.id, "Q?", ["A"])
