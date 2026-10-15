@@ -112,7 +112,11 @@ def _copy_subtask_file(src: Path, dst: Path) -> None:
 
 
 def _materialize_subtask(
-    config, project_id: str, subtask_id: str, target_dir: Path
+    config,
+    project_id: str,
+    subtask_id: str,
+    target_dir: Path,
+    scope: Optional[Scope] = None,
 ) -> Optional[str]:
     """Copy the generated subtask into ``target_dir/.project/tasks`` (CLAWP-115).
 
@@ -123,11 +127,16 @@ def _materialize_subtask(
     to the tasks dir as the canonical file, its bytes equal the canonical
     file's, and it parses to ``subtask_id``. This is deliberately NOT the
     current-revision gate `tasks dispatch --worktree` uses (that one requires
-    the file to be at git HEAD, which an uncommitted copy never is). Must run
-    under ``suppress_session_resolution`` so ``get_tasks_dir`` is canonical.
+    the file to be at git HEAD, which an uncommitted copy never is). The source
+    store is ``scope``'s (CLAWP-136-001); with no scope it must run under
+    ``suppress_session_resolution`` so ``get_tasks_dir`` is canonical.
     """
     try:
-        canonical_dir = get_tasks_dir(config, project_id)
+        canonical_dir = (
+            get_tasks_dir(config, project_id)
+            if scope is None
+            else get_tasks_dir(config, project_id, scope=scope)
+        )
         if canonical_dir is None:
             return f"canonical tasks dir for {project_id!r} not found"
         src = next(
@@ -416,6 +425,7 @@ def _dispatch_agent(
     refute_votes: int = 1,
     agent_profile: Optional[str] = None,
     delegability: Optional[str] = None,
+    scope: Optional[Scope] = None,
 ) -> dict:
     """Run a parent-spawned subagent through the full clawpm enforcement loop.
 
@@ -429,7 +439,16 @@ def _dispatch_agent(
     failures and rubric not-satisfied verdicts are reported via the
     returned dict — the subtask is marked BLOCKED but the function
     returns normally so the caller can surface the verdict.
+
+    ``scope`` (CLAWP-136-001) is the task store the caller has verified: the
+    subtask is created in it, its transitions run in it and the worktree copy
+    is materialized from it. ``None`` means ``Scope.canonical()`` (what the
+    ``dispatch_agent`` wrapper's suppression always gave). Every task-store
+    call below carries it, so a given scope never falls back to ambient
+    discovery.
     """
+    if scope is None:
+        scope = Scope.canonical()
     project = get_project(config, project_id)
     if not project or not project.repo_path or not project.repo_path.exists():
         raise AgentDispatchError(
@@ -490,6 +509,7 @@ def _dispatch_agent(
         description=prompt,
         predictions=predictions,
         agent_profile=agent_profile,
+        store_scope=scope,
     )
     if not task:
         raise AgentDispatchError(
@@ -523,6 +543,7 @@ def _dispatch_agent(
                 config, project_id, subtask_id, TaskState.BLOCKED,
                 note=f"clawpm agent dispatch: worktree creation failed — "
                      f"{error_detail}",
+                scope=scope,
             )
         except Exception:
             # Best-effort cleanup; do not mask the original error.
@@ -614,6 +635,7 @@ def _dispatch_agent(
                 config, project_id, subtask_id, TaskState.BLOCKED,
                 note=f"clawpm agent dispatch: write_dispatch_settings "
                      f"failed — {error_detail}",
+                scope=scope,
             )
         except Exception:
             # Best-effort cleanup; don't mask the original error.
@@ -657,7 +679,7 @@ def _dispatch_agent(
     if has_project_dir or materialize_error is not None:
         if materialize_error is None:
             materialize_error = _materialize_subtask(
-                config, project_id, subtask_id, target_dir
+                config, project_id, subtask_id, target_dir, scope=scope
             )
         if materialize_error is None:
             candidate_session = str(uuid.uuid4())
@@ -750,7 +772,8 @@ def _dispatch_agent(
         # count_iterations_for_task on the reflection-event read path.
         done_note = f"agent dispatch verdict ok: {verdict.reason[:200]}"
         change_task_state(
-            config, project_id, subtask_id, TaskState.DONE, note=done_note
+            config, project_id, subtask_id, TaskState.DONE, note=done_note,
+            scope=scope,
         )
         if session_id is not None:
             _sync_worktree_copy(
@@ -785,7 +808,8 @@ def _dispatch_agent(
             f"(impossible={verdict.impossible})"
         )
         change_task_state(
-            config, project_id, subtask_id, TaskState.BLOCKED, note=blocked_note
+            config, project_id, subtask_id, TaskState.BLOCKED, note=blocked_note,
+            scope=scope,
         )
         if session_id is not None:
             _sync_worktree_copy(

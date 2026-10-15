@@ -36,6 +36,7 @@ from typing import Any
 import yaml
 
 from .frontmatter import FrontmatterError, split_frontmatter, stamp_updated, strip_bom
+from .sessions import Scope
 from .tasks import cascade_unblock_dependents
 
 logger = logging.getLogger(__name__)
@@ -213,7 +214,13 @@ def apply_drift(drift_entry: dict, *, dry_run: bool = False) -> dict:
     }
 
 
-def apply_stale_blocked(stale_entry: dict, config: Any, *, dry_run: bool = False) -> dict:
+def apply_stale_blocked(
+    stale_entry: dict,
+    config: Any,
+    *,
+    dry_run: bool = False,
+    scope: Scope | None = None,
+) -> dict:
     """Remediate one ``stale_blocked`` entry by running cascade for its deps.
 
     A task lands in ``stale_blocked`` when all its deps are DONE but it's still
@@ -221,6 +228,9 @@ def apply_stale_blocked(stale_entry: dict, config: Any, *, dry_run: bool = False
     path runs: :func:`cascade_unblock_dependents` with each completed dep as
     trigger. Running it once per dep is idempotent — the second pass finds the
     task already promoted and no-ops.
+
+    ``scope`` (CLAWP-136-001) is the explicit task store to cascade in;
+    ``None`` keeps the ambient resolution.
     """
     task_id = stale_entry.get("task_id")
     project_id = stale_entry.get("project_id")
@@ -250,7 +260,7 @@ def apply_stale_blocked(stale_entry: dict, config: Any, *, dry_run: bool = False
     try:
         for dep_id in deps:
             transitions.extend(
-                cascade_unblock_dependents(config, project_id, dep_id)
+                cascade_unblock_dependents(config, project_id, dep_id, scope=scope)
             )
     except Exception as exc:
         return {
@@ -339,6 +349,7 @@ def run_apply_phase(
     apply_stale_blocked_flag: bool = True,
     apply_half_rename_flag: bool = True,
     dry_run: bool = False,
+    scope: Scope | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Run the apply phase over collected doctor warnings.
 
@@ -402,7 +413,10 @@ def run_apply_phase(
                 "reason": "disabled by --no-apply-cascade or --no-apply-stale-blocked",
             })
             continue
-        _route(apply_stale_blocked(sb, config, dry_run=dry_run), applied, apply_skipped)
+        _route(
+            apply_stale_blocked(sb, config, dry_run=dry_run, scope=scope),
+            applied, apply_skipped,
+        )
 
     # --- non-applyable classes ---
     for st in stale_tasks:

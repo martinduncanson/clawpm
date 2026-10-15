@@ -33,9 +33,12 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from .concurrency import append_jsonl_line
+
+if TYPE_CHECKING:
+    from .sessions import Scope
 
 LEASE_REGISTRY_FILENAME = "leases.jsonl"
 
@@ -369,7 +372,14 @@ _POLICY_PLAN = {
 }
 
 
-def apply_fallback(config, portfolio_root: Path, lease: Lease, now: datetime) -> dict:
+def apply_fallback(
+    config,
+    portfolio_root: Path,
+    lease: Lease,
+    now: datetime,
+    *,
+    scope: Scope | None = None,
+) -> dict:
     """Transition an expired lease's task per its fallback policy and record a
     terminal ``reassigned`` event so the lease is no longer swept.
 
@@ -387,14 +397,24 @@ def apply_fallback(config, portfolio_root: Path, lease: Lease, now: datetime) ->
     read AND transition a completely different task B inside A's checkout
     instead of B's own canonical location, forking B's state into a
     worktree that has nothing to do with it.
+
+    CLAWP-136-001 (round 2): ``scope`` is the explicit store the caller has
+    verified. ``None`` means the canonical store (``Scope.canonical()``), the
+    answer the suppression above always gave. The scope is passed to every
+    task-store call here; the suppression stays only as a backstop for the
+    non-task lookups, so a given scope never falls back to ambient discovery.
     """
-    from .sessions import suppress_session_resolution
+    from .sessions import Scope, suppress_session_resolution
 
+    if scope is None:
+        scope = Scope.canonical()
     with suppress_session_resolution():
-        return _apply_fallback_body(config, portfolio_root, lease, now)
+        return _apply_fallback_body(config, portfolio_root, lease, now, scope)
 
 
-def _apply_fallback_body(config, portfolio_root: Path, lease: "Lease", now: datetime) -> dict:
+def _apply_fallback_body(
+    config, portfolio_root: Path, lease: "Lease", now: datetime, scope: "Scope"
+) -> dict:
     """The actual fallback logic — split out of :func:`apply_fallback` purely
     so its body can run inside the ``suppress_session_resolution()`` context
     manager without re-indenting ~90 lines. Not meant to be called directly;
@@ -410,7 +430,7 @@ def _apply_fallback_body(config, portfolio_root: Path, lease: "Lease", now: date
     # retire the lease WITHOUT moving the task, so a stale lease never yanks a
     # done/blocked task back into the work queue.
     _REAPABLE = {TaskState.OPEN, TaskState.PROGRESS}
-    current = get_task(config, lease.project_id, lease.task_id)
+    current = get_task(config, lease.project_id, lease.task_id, scope=scope)
     if current is None or current.state not in _REAPABLE:
         release_lease(portfolio_root, lease.task_id, lease.project_id)
         return {
@@ -439,7 +459,8 @@ def _apply_fallback_body(config, portfolio_root: Path, lease: "Lease", now: date
         # OSError — a programming bug (KeyError, AttributeError) must propagate,
         # not masquerade as a stuck holder.
         result = change_task_state(
-            config, lease.project_id, lease.task_id, target_state, note=note
+            config, lease.project_id, lease.task_id, target_state, note=note,
+            scope=scope,
         )
         transitioned = result is not None
     except OSError as exc:
@@ -501,6 +522,8 @@ def sweep(
     portfolio_root: Path,
     now: Optional[datetime] = None,
     project_id: Optional[str] = None,
+    *,
+    scope: Scope | None = None,
 ) -> list[dict]:
     """Detect every expired lease and apply its fallback. Returns one summary
     dict per lease acted on (empty if nothing expired). The no-daemon expiry
@@ -508,11 +531,12 @@ def sweep(
 
     ``project_id`` scopes the sweep — pass it from a project-scoped ``doctor``
     run so the remediation matches the detection and never reaps another
-    project's leases (cross-project isolation).
+    project's leases (cross-project isolation). ``scope`` is passed to
+    :func:`apply_fallback` (``None`` = canonical).
     """
     if now is None:
         now = datetime.now(timezone.utc)
     actions: list[dict] = []
     for lease in expired_leases(portfolio_root, now, project_id=project_id):
-        actions.append(apply_fallback(config, portfolio_root, lease, now))
+        actions.append(apply_fallback(config, portfolio_root, lease, now, scope=scope))
     return actions
