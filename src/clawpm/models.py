@@ -612,6 +612,16 @@ class Task:
     # A mapping read from frontmatter; None when absent (non-mapping values
     # are ignored). Emitted by to_dict only when set.
     pr_verification: dict[str, Any] | None = None
+    # CLAWP-154 — awaiting-human decision record on a BLOCKED task (no new
+    # TaskState). blocked_on: who the block waits on ("human"); question /
+    # options ([{label, detail?}]) / recommendation: the decision put to them;
+    # answer: their reply, recorded on unblock. All omitted from frontmatter
+    # and to_dict when unset so pre-154 files round-trip byte-for-byte.
+    blocked_on: str | None = None
+    question: str | None = None
+    options: list[dict[str, str]] = field(default_factory=list)
+    recommendation: str | None = None
+    answer: str | None = None
 
     @property
     def is_parent(self) -> bool:
@@ -807,6 +817,22 @@ class Task:
             str(resolved_at_raw) if resolved_at_raw is not None else None
         )
 
+        # CLAWP-154 — awaiting-human record. Lenient coercion like the fields
+        # above: wrong-typed frontmatter degrades to the unset default.
+        def _opt_str(key: str) -> str | None:
+            raw = frontmatter.get(key)
+            return raw if isinstance(raw, str) and raw.strip() else None
+
+        options_raw = frontmatter.get("options")
+        options: list[dict[str, str]] = []
+        if isinstance(options_raw, list):
+            for item in options_raw:
+                if isinstance(item, dict) and isinstance(item.get("label"), str) and item["label"].strip():
+                    opt = {"label": item["label"]}
+                    if isinstance(item.get("detail"), str) and item["detail"].strip():
+                        opt["detail"] = item["detail"]
+                    options.append(opt)
+
         return cls(
             id=frontmatter.get("id", path.stem.replace(".progress", "")),
             title=title,
@@ -844,6 +870,11 @@ class Task:
                 if isinstance(frontmatter.get("pr_verification"), dict)
                 else None
             ),
+            blocked_on=_opt_str("blocked_on"),
+            question=_opt_str("question"),
+            options=options,
+            recommendation=_opt_str("recommendation"),
+            answer=_opt_str("answer"),
         )
 
     @property
@@ -919,6 +950,13 @@ class Task:
         # CLAWP-151 — emitted ONLY when set; unset output stays byte-identical.
         if self.pr_verification is not None:
             result["pr_verification"] = self.pr_verification
+        # CLAWP-154 — emitted ONLY when set; unset output stays byte-identical.
+        for _key in ("blocked_on", "question", "recommendation", "answer"):
+            _val = getattr(self, _key)
+            if _val is not None:
+                result[_key] = _val
+        if self.options:
+            result["options"] = self.options
         body = self.body
         if body:
             result["body"] = body
