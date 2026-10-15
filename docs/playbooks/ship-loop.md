@@ -99,7 +99,7 @@ clawpm tasks state <ID> done
 
 There is no `tasks done` subcommand. Before booking, run `git status` in the main checkout and read the full fast-forward output: a worker script can write files into the main checkout and silently block the ff-merge.
 
-Planned: `clawpm tasks land` (CLAWP-147-002) will fold the merge check and the booking into one command. Until it ships, book by hand.
+`clawpm tasks land <id> --pr <N>` folds the merge check and the booking into one command. It never fetches: run `git fetch <remote>` first, or it refuses `remote_not_fetched`. The task file must be clean in the working tree and identical to the tip's copy, or it refuses before changing anything. Until the command is on your PATH, book by hand.
 
 ## Checklist for the orchestrator
 

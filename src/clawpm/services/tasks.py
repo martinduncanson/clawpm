@@ -111,74 +111,45 @@ def transition(
     # manually-created subtasks that bypassed the persistence path. Tasks
     # with no children at all return ready=True from the scan immediately.
     rollup_incomplete: list[str] = []
-    if state == TaskState.DONE:
-        _rollup_task = get_task(config, project_id, task_id)
-        if _rollup_task:
-            from clawpm.tasks import parent_rollup_status
-            _status = parent_rollup_status(config, project_id, _rollup_task)
-            rollup_incomplete = (
-                [f"{c['id']} [{c['state']}]" for c in _status["incomplete"]]
-                + [f"{m} [missing]" for m in _status["missing"]]
-            )
-            if rollup_incomplete and not force:
-                return {
-                    "ok": False,
-                    "task_id": task_id,
-                    "error": "subtasks_incomplete",
-                    "message": (
-                        f"Cannot complete {task_id} - subtasks incomplete:\n  "
-                        + "\n  ".join(rollup_incomplete)
-                        + "\nUse --force to complete anyway."
-                    ),
-                }
-
     # Capture task predictions before state transition (needed for reflection)
     pre_transition_task = get_task(config, project_id, task_id)
-
-    # CLAWP-111 — a kind=="decision" task cannot be closed without a
-    # resolution. This is the SHARED choke point: both `shortcuts.done` and
-    # `tasks state` (the CLI's two DONE entry points) call this function, and
-    # the MCP server also calls it directly rather than going through either
-    # CLI handler — so gating here (rather than in each CLI command) closes
-    # the bypass the task's own pre-mortem calls out. Checked before the
-    # mutator runs so a missing resolution leaves the task untouched.
-    # change_task_state also re-validates this itself (defense in depth for a
-    # caller that bypasses this service layer entirely), but that check alone
-    # would leave the CLI-layer bypass open — this is the one both paths share.
-    if (
-        state == TaskState.DONE
-        and pre_transition_task is not None
-        and pre_transition_task.kind == "decision"
-        and not (isinstance(resolution, str) and resolution.strip())
-    ):
-        return {
-            "ok": False,
-            "task_id": task_id,
-            "error": "decision_needs_resolution",
-            "message": (
-                f"Task {task_id} is a decision (kind: decision) and requires "
-                "a non-empty --resolution to complete."
-            ),
-        }
-    # A build task's resolution is optional, but one that IS supplied must be
-    # a non-blank string: refuse loudly (task untouched) rather than store
-    # nothing and report success.
-    if (
-        state == TaskState.DONE
-        and pre_transition_task is not None
-        and pre_transition_task.kind != "decision"
-        and resolution is not None
-        and not (isinstance(resolution, str) and resolution.strip())
-    ):
-        return {
-            "ok": False,
-            "task_id": task_id,
-            "error": "invalid_resolution",
-            "message": (
-                f"Task {task_id}: --resolution must be non-blank when "
-                "supplied (omit it to complete without one)."
-            ),
-        }
+    if state == TaskState.DONE and pre_transition_task is not None:
+        # CLAWP-147-002 -- ONE validator for every refusal that precedes the
+        # move (rollup, decision resolution, blank resolution, done/
+        # destination). `tasks land` calls the same function in its pre-check,
+        # so the two cannot drift. CLAWP-111: this is the SHARED choke point --
+        # shortcuts.done, `tasks state` and the MCP server all reach it, and
+        # change_task_state only re-checks as defence in depth. Checked before
+        # the mutator runs so a refusal leaves the task untouched.
+        from clawpm.tasks import (
+            gather_done_destination,
+            parent_rollup_status,
+            validate_done_transition,
+        )
+        _status = parent_rollup_status(config, project_id, pre_transition_task)
+        rollup_incomplete = (
+            [f"{c['id']} [{c['state']}]" for c in _status["incomplete"]]
+            + [f"{m} [missing]" for m in _status["missing"]]
+        )
+        _refusal = validate_done_transition(
+            task_id,
+            pre_transition_task.kind,
+            resolution,
+            force,
+            _status,
+            gather_done_destination(config, project_id, pre_transition_task),
+        )
+        if _refusal is not None:
+            return {
+                "ok": False,
+                "task_id": task_id,
+                "error": (
+                    "already_exists"
+                    if _refusal.code.startswith("done_destination")
+                    else _refusal.code
+                ),
+                "message": _refusal.message,
+            }
 
     # Map the mutator contract to isolated failure results so one bad task does
     # not abort a bulk run (CLAWP-083). Anything OUTSIDE the contract (an

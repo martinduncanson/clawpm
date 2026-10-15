@@ -5,8 +5,10 @@ from __future__ import annotations
 import logging
 import os
 import re
+import stat
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -1791,19 +1793,169 @@ def parent_rollup_status(
                 if t.parent == task.id:
                     children.add(t.id)
 
+    states: dict[str, str | None] = {}
+    for child_id in sorted(children):
+        child = get_task(config, project_id, child_id, **_scope_kw(scope))
+        states[child_id] = None if child is None else child.state.value
+    return rollup_verdict(children, states)
+
+
+def rollup_verdict(children, states: dict[str, str | None]) -> dict:
+    """The pure half of :func:`parent_rollup_status` (CLAWP-147-002).
+
+    ``children`` is the gathered child-id set; ``states`` maps each id to its
+    resolved state value, or ``None`` for a ref that resolves to no task. No
+    I/O, so the landing pre-check and ``transition()`` judge the same facts
+    with the same rule.
+    """
     incomplete: list[dict] = []
     missing: list[str] = []
     for child_id in sorted(children):
-        child = get_task(config, project_id, child_id, **_scope_kw(scope))
-        if child is None:
+        state = states.get(child_id)
+        if state is None:
             missing.append(child_id)
-        elif child.state != TaskState.DONE:
-            incomplete.append({"id": child_id, "state": child.state.value})
+        elif state != TaskState.DONE.value:
+            incomplete.append({"id": child_id, "state": state})
     return {
         "ready": not incomplete and not missing,
         "incomplete": incomplete,
         "missing": missing,
     }
+
+
+@dataclass(frozen=True)
+class DoneRefusal:
+    """Why a transition to DONE must not run (``code`` is a stable error code)."""
+
+    code: str
+    message: str
+    details: dict
+
+
+@dataclass(frozen=True)
+class DestinationFacts:
+    """What sits at ``done/`` and ``done/<leaf>``: each of absent | dir | other.
+
+    ``other`` is anything that is not a real directory (a file, a symlink, a
+    dangling symlink). ``leaf_is_current`` is True when the task already lives
+    at the leaf, so the leaf legitimately exists.
+    """
+
+    done_dir: str
+    leaf: str
+    leaf_is_current: bool
+    done_path: str = "done"
+    leaf_path: str = ""
+
+
+def validate_done_transition(
+    task_id: str,
+    kind: str | None,
+    resolution,
+    force: bool,
+    rollup: dict | None,
+    dest: DestinationFacts | None,
+) -> DoneRefusal | None:
+    """Pure refusal rules for a transition to DONE (CLAWP-147-002).
+
+    The one validator ``services.tasks.transition`` and the ``tasks land``
+    pre-check both call, so the pre-check cannot drift from the real
+    transition. Order: rollup (unless ``force``), decision resolution, blank
+    resolution, destination. Returns ``None`` when the transition may run.
+    """
+    if rollup is not None and not force:
+        lines = (
+            [f"{c['id']} [{c['state']}]" for c in rollup["incomplete"]]
+            + [f"{m} [missing]" for m in rollup["missing"]]
+        )
+        if lines:
+            return DoneRefusal(
+                "subtasks_incomplete",
+                f"Cannot complete {task_id} - subtasks incomplete:\n  "
+                + "\n  ".join(lines)
+                + "\nUse --force to complete anyway.",
+                {
+                    "incomplete": [c["id"] for c in rollup["incomplete"]],
+                    "missing": list(rollup["missing"]),
+                },
+            )
+    has_resolution = isinstance(resolution, str) and bool(resolution.strip())
+    if kind == "decision" and not has_resolution:
+        return DoneRefusal(
+            "decision_needs_resolution",
+            f"Task {task_id} is a decision (kind: decision) and requires "
+            "a non-empty --resolution to complete.",
+            {},
+        )
+    if kind is not None and kind != "decision" and resolution is not None and not has_resolution:
+        return DoneRefusal(
+            "invalid_resolution",
+            f"Task {task_id}: --resolution must be non-blank when "
+            "supplied (omit it to complete without one).",
+            {},
+        )
+    if dest is not None:
+        if dest.done_dir == "other":
+            return DoneRefusal(
+                "done_destination_not_directory",
+                f"Cannot complete {task_id}: '{dest.done_path}' exists and is not "
+                "a directory. Move it aside and retry.",
+                {"path": dest.done_path},
+            )
+        if dest.leaf != "absent" and not dest.leaf_is_current:
+            return DoneRefusal(
+                "done_destination_exists",
+                f"Cannot complete {task_id}: destination '{dest.leaf_path}' "
+                "already exists. Reconcile the two by hand.",
+                {"path": dest.leaf_path},
+            )
+    return None
+
+
+def _lstat_kind(path: Path, *, follow_dir_symlink: bool = False) -> str:
+    """absent | dir | other, by lstat (a symlink is ``other``).
+
+    ``follow_dir_symlink`` counts a symlink whose target is a directory as a
+    directory (what ``mkdir(exist_ok=True)`` always accepted); a dangling
+    symlink or one to a file stays ``other``.
+    """
+    try:
+        st = os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return "absent"
+    if stat.S_ISDIR(st.st_mode):
+        return "dir"
+    if follow_dir_symlink and stat.S_ISLNK(st.st_mode):
+        try:
+            return "dir" if stat.S_ISDIR(os.stat(path).st_mode) else "other"
+        except OSError:
+            return "other"
+    return "other"
+
+
+def gather_done_destination(
+    config: PortfolioConfig,
+    project_id: str,
+    task: Task,
+    *,
+    scope: Scope | None = None,
+) -> DestinationFacts | None:
+    """Read the done/ destination facts for ``task`` from disk (CLAWP-147-002)."""
+    tasks_dir = get_tasks_dir(config, project_id, **_scope_kw(scope))
+    if not tasks_dir or task.file_path is None:
+        return None
+    is_directory_task = task.file_path.name == "_task.md"
+    done_dir = tasks_dir / "done"
+    leaf = done_dir / (task.id if is_directory_task else f"{task.id}.md")
+    current = task.file_path.parent if is_directory_task else task.file_path
+    done_kind = _lstat_kind(done_dir, follow_dir_symlink=True)
+    return DestinationFacts(
+        done_dir=done_kind,
+        leaf=_lstat_kind(leaf) if done_kind == "dir" else "absent",
+        leaf_is_current=current.resolve() == leaf.resolve(),
+        done_path=done_dir.as_posix(),
+        leaf_path=leaf.as_posix(),
+    )
 
 
 def parent_ready_signal(
