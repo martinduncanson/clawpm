@@ -215,14 +215,23 @@ def _splice(text: str, record: dict[str, Any]) -> str:
 # and IO_REPARSE_TAG_MOUNT_POINT (a junction).  ``S_ISLNK`` is False for a
 # junction on Python 3.11, so the tag is the only reliable signal.
 _LINK_REPARSE_TAGS = frozenset({0xA000000C, 0xA0000003})
-# dir_fd-relative I/O is available on POSIX; Windows has no directory fds.
-_DIRFD = (
-    os.name == "posix"
-    and hasattr(os, "O_DIRECTORY")
-    and hasattr(os, "O_NOFOLLOW")
-    and all(fn in os.supports_dir_fd for fn in (os.open, os.replace, os.unlink, os.stat))
-)
 _LOCK_NAME = ".clawpm-tasks.lock"
+
+
+def _dirfd_supported(os_mod: Any = os) -> bool:
+    """True where the fd-relative writer can run (POSIX); Windows has no directory fds.
+
+    Read at call time (not import time) so branch selection is testable.
+    ``os.replace`` never appears in ``supports_dir_fd`` (it takes ``src_dir_fd`` /
+    ``dst_dir_fd``, gated by ``renameat``, which is listed as ``os.rename``), so it
+    is checked through ``os.rename``.
+    """
+    return (
+        os_mod.name == "posix"
+        and hasattr(os_mod, "O_DIRECTORY")
+        and hasattr(os_mod, "O_NOFOLLOW")
+        and all(fn in os_mod.supports_dir_fd for fn in (os_mod.open, os_mod.stat, os_mod.unlink, os_mod.rename))
+    )
 
 
 def _ident(st: os.stat_result) -> tuple[int, int]:
@@ -525,7 +534,7 @@ def record_pr_verification(
             "bad_record", f"record keys must be exactly {sorted(RECORD_KEYS)}, got {sorted(record)}"
         )
     pin = _PinnedStore(_verified_tasks_dir(config, project_id, scope))
-    dirfd = pin.open_dirfd() if _DIRFD else None
+    dirfd = pin.open_dirfd() if _dirfd_supported() else None
     try:
         pin.recheck()
         with file_lock(pin.path / _LOCK_NAME):

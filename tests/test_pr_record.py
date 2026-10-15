@@ -672,10 +672,13 @@ def test_reparse_point_tasks_dir_is_refused_even_if_identity_matches(store):
 
     config, scope, tasks_dir = store
     real = os.lstat
+    # Resolved BEFORE patching: on POSIX Path.resolve() itself calls os.lstat, so
+    # resolving inside ``fake`` would re-enter the patch and recurse forever.
+    target = os.path.normcase(str(tasks_dir.resolve()))
 
     def fake(path, *a, **kw):
         st = real(path, *a, **kw)
-        if os.path.normcase(str(path)) == os.path.normcase(str(tasks_dir.resolve())):
+        if os.path.normcase(str(path)) == target:
             return types.SimpleNamespace(
                 st_mode=st.st_mode, st_dev=st.st_dev, st_ino=st.st_ino, st_reparse_tag=0xA0000003
             )
@@ -685,6 +688,85 @@ def test_reparse_point_tasks_dir_is_refused_even_if_identity_matches(store):
         with pytest.raises(PrRecordError) as ei:
             pr_record._PinnedStore(tasks_dir.resolve())
     assert ei.value.code == "unsafe_store"
+
+
+def _fake_os(*, name="posix", supports=(), **attrs):
+    import types
+
+    return types.SimpleNamespace(
+        name=name,
+        supports_dir_fd=set(supports),
+        open=object(), stat=object(), unlink=object(), rename=object(), replace=object(),
+        **attrs,
+    )
+
+
+def test_dirfd_branch_selection_follows_the_os_capabilities():
+    # Real CPython/Linux lists os.rename (renameat) in supports_dir_fd and never
+    # os.replace; the fd-relative writer must still be selected there.
+    linux = _fake_os(O_DIRECTORY=1, O_NOFOLLOW=1)
+    linux.supports_dir_fd = {linux.open, linux.stat, linux.unlink, linux.rename}
+    assert pr_record._dirfd_supported(linux) is True
+    assert linux.replace not in linux.supports_dir_fd
+
+    missing_rename = _fake_os(O_DIRECTORY=1, O_NOFOLLOW=1)
+    missing_rename.supports_dir_fd = {missing_rename.open, missing_rename.stat, missing_rename.unlink}
+    assert pr_record._dirfd_supported(missing_rename) is False
+
+    assert pr_record._dirfd_supported(_fake_os(name="nt", O_DIRECTORY=1, O_NOFOLLOW=1)) is False
+    no_nofollow = _fake_os(O_DIRECTORY=1)
+    no_nofollow.supports_dir_fd = {no_nofollow.open, no_nofollow.stat, no_nofollow.unlink, no_nofollow.rename}
+    assert pr_record._dirfd_supported(no_nofollow) is False
+
+
+@pytest.mark.parametrize("supported", [True, False])
+def test_record_selects_writer_by_dirfd_support_at_call_time(store, supported):
+    import os
+
+    config, scope, tasks_dir = store
+    p = _write(tasks_dir, BODY_LF)
+    called = []
+    devnull = []
+
+    def fake_open_dirfd(self):
+        devnull.append(os.open(os.devnull, os.O_RDONLY))
+        return devnull[-1]
+
+    def fake_dirfd_writer(pin, dirfd, task_id, project_id, record):
+        called.append("dirfd")
+        return p
+
+    def fake_path_writer(pin, task_id, project_id, record):
+        called.append("path")
+        return p
+
+    with patch.object(pr_record, "_dirfd_supported", lambda *a: supported), \
+            patch.object(pr_record._PinnedStore, "open_dirfd", fake_open_dirfd), \
+            patch.object(pr_record, "_write_via_dirfd", fake_dirfd_writer), \
+            patch.object(pr_record, "_write_via_path", fake_path_writer):
+        assert _record(store) == p
+    assert called == (["dirfd"] if supported else ["path"])
+    assert bool(devnull) is supported
+
+
+def test_os_replace_onto_a_symlink_replaces_the_link_not_its_target(tmp_path):
+    # Regression guard for gate r4 P1 (claimed: os.replace(tmp, link) writes at the
+    # link's target, outside the store).  os.replace has rename semantics (POSIX
+    # rename(2), Windows MoveFileEx): the destination ENTRY is replaced, a symlink
+    # is not followed.  So a task file swapped for a link just before the replace
+    # loses the link; the external file is untouched.  Probed on Windows 11 / py3.12.
+    import os
+
+    outside = tmp_path / "outside.md"
+    outside.write_bytes(b"EXTERNAL SENTINEL\n")
+    link = tmp_path / "task.md"
+    _symlink(link, outside, is_dir=False)
+    tmp = tmp_path / "task.md.tmp"
+    tmp.write_bytes(b"NEW CONTENT\n")
+    os.replace(tmp, link)
+    assert outside.read_bytes() == b"EXTERNAL SENTINEL\n"
+    assert not link.is_symlink()
+    assert link.read_bytes() == b"NEW CONTENT\n"
 
 
 def test_task_file_replaced_mid_write_is_not_clobbered(store):
