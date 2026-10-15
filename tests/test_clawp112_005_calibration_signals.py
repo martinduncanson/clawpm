@@ -182,3 +182,153 @@ class TestRenderScorecardAlarm:
         lines = render_scorecard(block)
         assert len(lines) == 5
         assert f"ALARM: below {CLOSURE_ALARM_BELOW:.2f}" in lines[0]
+
+
+# ---------------------------------------------------------------------------
+# Round B -- metareflection nudge (eval-stop hook + `tasks state done`)
+# ---------------------------------------------------------------------------
+
+import pytest  # noqa: E402
+
+from clawpm.calibration import render_metareflection_nudge  # noqa: E402
+from clawpm.models import Predictions, SuccessCriterion  # noqa: E402
+from clawpm.tasks import add_task  # noqa: E402
+from test_stop_hook import temp_portfolio  # noqa: F401,E402
+
+
+@pytest.fixture
+def stub_actuals(monkeypatch):
+    from clawpm.models import Actuals
+
+    def _set(**kw):
+        monkeypatch.setattr("clawpm.reflect._compute_actuals", lambda *a, **k: Actuals(**kw))
+
+    return _set
+
+
+def _seed_misses(root, n=3, category="wrong_weight", project="test", prefix="MR"):
+    real_now = datetime.now(timezone.utc)
+    for i in range(n):
+        tid = f"{prefix}-{i}"
+        pid = f"pid-{tid}"
+        preds = {"duration_min": 10, "complexity": "m", "confidence": 3,
+                 "prediction_id": pid}
+        _append(root, tid, {
+            "event": "prediction_registered", "task_id": tid, "project_id": project,
+            "prediction_id": pid, "registered_at": _iso(real_now - timedelta(days=2)),
+            "predictions": preds,
+        })
+        _append(root, tid, {
+            "event": "task_done", "task_id": tid, "project_id": project,
+            "prediction_id": pid, "occurred_at": _iso(real_now - timedelta(days=1)),
+            "predictions": preds, "miss_category": category,
+            "actuals": {"duration_min": 1000, "active_min": 1000},
+        })
+
+
+class TestRenderNudge:
+    def test_none_when_empty(self):
+        assert render_metareflection_nudge([]) is None
+
+    def test_one_line_most_frequent_first(self):
+        due = [
+            {"project_id": "p", "miss_category": "structural", "count": 3},
+            {"project_id": "p", "miss_category": "wrong_weight", "count": 5},
+        ]
+        line = render_metareflection_nudge(due)
+        assert line is not None and "\n" not in line
+        assert line.index("wrong_weight x5") < line.index("structural x3")
+
+
+def _stub_judge(monkeypatch):
+    from clawpm.judges import stop_condition as sc_mod
+    monkeypatch.setattr(
+        sc_mod, "make_judge_invoker",
+        lambda *a, **k: (lambda prompt: '{"ok": true, "reason": "stubbed pass"}'),
+    )
+
+
+def _run_eval_stop(tp):
+    task = add_task(
+        tp["config"], "test", title="Hook target",
+        predictions=Predictions(success_criteria=[SuccessCriterion(
+            criterion="Suite green", gradeable_signal="0 failures")]),
+    )
+    transcript = tp["root"] / "transcript.jsonl"
+    transcript.write_text('{"role":"assistant","text":"100 passed"}\n', encoding="utf-8")
+    return CliRunner().invoke(
+        main, ["-p", "test", "hook", "eval-stop", "--task", task.id,
+               "--transcript-file", str(transcript)])
+
+
+class TestEvalStopNudge:
+    def test_nudge_in_system_message_when_due(self, temp_portfolio, monkeypatch):
+        _stub_judge(monkeypatch)
+        _seed_misses(temp_portfolio["root"])
+        r = _run_eval_stop(temp_portfolio)
+        assert r.exit_code == 0, r.output
+        out = json.loads(r.output)
+        assert out["continue"] is True
+        assert "decision" not in out
+        assert "wrong_weight x3" in out["systemMessage"]
+        assert "satisfied" in out["systemMessage"]
+
+    def test_no_nudge_when_none_due(self, temp_portfolio, monkeypatch):
+        _stub_judge(monkeypatch)
+        r = _run_eval_stop(temp_portfolio)
+        assert r.exit_code == 0, r.output
+        out = json.loads(r.output)
+        assert "x3" not in out["systemMessage"]
+        assert "metareflection" not in out["systemMessage"].lower()
+
+    def test_nudge_failure_is_fail_open(self, temp_portfolio, monkeypatch):
+        _stub_judge(monkeypatch)
+        baseline = json.loads(_run_eval_stop(temp_portfolio).output)
+
+        def boom(*a, **k):
+            raise RuntimeError("ledger exploded")
+        monkeypatch.setattr("clawpm.reflect.load_calibration_rows", boom)
+        _seed_misses(temp_portfolio["root"])
+        r = _run_eval_stop(temp_portfolio)
+        assert r.exit_code == 0, r.output
+        out = json.loads(r.output)
+        assert out["continue"] is True
+        assert out["systemMessage"] == baseline["systemMessage"]
+
+
+class TestTasksStateNudge:
+    def _close(self, p, stub_actuals, extra=()):
+        stub_actuals(active_min=10)
+        task = add_task(p.config, "test", "t", predictions=Predictions(duration_min=10))
+        return CliRunner().invoke(
+            main, [*extra, "done", task.id, "--project", "test"])
+
+    def test_text_mode_nudge_on_stderr(self, isolated_portfolio, stub_actuals):
+        _seed_misses(isolated_portfolio.root)
+        r = self._close(isolated_portfolio, stub_actuals, ["--format", "text"])
+        assert r.exit_code == 0, r.output
+        lines = [ln for ln in r.stderr.splitlines() if "wrong_weight x3" in ln]
+        assert len(lines) == 1
+        assert "wrong_weight" not in r.stdout
+
+    def test_no_nudge_when_none_due(self, isolated_portfolio, stub_actuals):
+        r = self._close(isolated_portfolio, stub_actuals, ["--format", "text"])
+        assert r.exit_code == 0, r.output
+        assert "x3" not in r.stderr
+
+    def test_json_output_unchanged(self, isolated_portfolio, stub_actuals):
+        _seed_misses(isolated_portfolio.root)
+        r = self._close(isolated_portfolio, stub_actuals)
+        assert r.exit_code == 0, r.output
+        out = json.loads(r.stdout)
+        assert out["status"] == "ok"
+        assert "wrong_weight x3" not in r.stdout
+
+    def test_failure_is_fail_open(self, isolated_portfolio, stub_actuals, monkeypatch):
+        def boom(*a, **k):
+            raise RuntimeError("ledger exploded")
+        _seed_misses(isolated_portfolio.root)
+        monkeypatch.setattr("clawpm.reflect.load_calibration_rows", boom)
+        r = self._close(isolated_portfolio, stub_actuals, ["--format", "text"])
+        assert r.exit_code == 0, r.output
+        assert "x3" not in r.stderr

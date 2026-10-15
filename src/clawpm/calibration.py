@@ -295,6 +295,25 @@ def _metareflection(missed: list[dict[str, Any]], now: datetime) -> list[dict[st
     ]
 
 
+def render_metareflection_nudge(due: list[dict[str, Any]]) -> str | None:
+    """One-line nudge naming each due miss category and its count (CLAWP-112-005).
+
+    Most frequent first; ties break on category name so output is deterministic.
+    Returns None when nothing is due.
+    """
+    totals: dict[str, int] = {}
+    for item in due or []:
+        cat = item.get("miss_category")
+        if not cat:
+            continue
+        totals[cat] = totals.get(cat, 0) + int(item.get("count", 0))
+    if not totals:
+        return None
+    parts = [f"{cat} x{n}" for cat, n in sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))]
+    return ("metareflection due (repeated misses in the last "
+            f"{METAREFLECTION_WINDOW_DAYS} days): " + ", ".join(parts))
+
+
 def _closure(ledger: dict[str, Any]) -> dict[str, Any]:
     registered = int(ledger.get("registered", 0))
     resolved = int(ledger.get("resolved", 0))

@@ -1347,6 +1347,26 @@ def load_calibration_rows(
     return rows, ledger
 
 
+def metareflection_nudge(
+    portfolio_root: Path,
+    project_id: str | None,
+    now: datetime | None = None,
+) -> str | None:
+    """One-line metareflection nudge for ``project_id``, or None (CLAWP-112-005).
+
+    Fail-open by design: any failure reading or scoring the ledger yields None
+    so the hook / state-change paths that call this never change behaviour.
+    """
+    try:
+        from clawpm.calibration import compute_calibration, render_metareflection_nudge
+
+        rows, ledger = load_calibration_rows(portfolio_root, project_id, now=now)
+        block = compute_calibration(rows, ledger, now=now)
+        return render_metareflection_nudge(block["metareflection_due"])
+    except Exception:
+        return None
+
+
 def _calibration_row(
     done: dict[str, Any],
     state: dict[str, Any],
