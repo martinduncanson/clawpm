@@ -261,3 +261,67 @@ def test_cli_gh_missing_exit_2_structured_error_no_partial_pass():
     err = json.loads(r.stderr)
     assert err["error"] == "gh_missing"
     assert '"ok": true' not in r.stdout
+
+
+# --- CLAWP-151: merged mode (require_merged=True) ---
+
+MERGE = "c" * 40
+
+
+def _merged_env(**pr_over):
+    env = FakeEnv()
+    env.pr["state"] = "MERGED"
+    env.pr["mergeable"] = "UNKNOWN"
+    env.pr["mergeCommit"] = {"oid": MERGE}
+    env.pr.update(pr_over)
+    return env
+
+
+def test_merged_mode_ok_with_merge_commit_and_no_merge_command():
+    env = _merged_env()
+    res = _verify(env, expect_head=HEAD, require_merged=True)
+    assert res["ok"] is True and res["failed"] == []
+    assert res["merge_commit"] == MERGE
+    assert res["merge_command"] is None
+    assert res["merged"]["ok"] is True and "mergeable" not in res
+    pr_view = next(c for c in env.calls if c[:3] == ["gh", "pr", "view"])
+    assert "mergeCommit" in pr_view[pr_view.index("--json") + 1]
+
+
+def test_merged_mode_open_pr_fails_the_merged_fact():
+    env = FakeEnv()  # OPEN + MERGEABLE: fine for default mode, not for merged mode
+    res = _verify(env, require_merged=True)
+    assert res["ok"] is False and res["failed"] == ["merged"]
+    assert res["merge_commit"] is None
+
+
+@pytest.mark.parametrize("merge_commit", [None, {}, {"oid": ""}, {"oid": "abc123"}, {"oid": "C" * 40 + "0"}])
+def test_merged_mode_without_full_merge_commit_is_not_ok(merge_commit):
+    env = _merged_env(mergeCommit=merge_commit)
+    res = _verify(env, require_merged=True)
+    assert res["ok"] is False and res["failed"] == ["merged"]
+    assert res["merge_commit"] is None
+
+
+def test_merged_mode_still_checks_head_and_ci():
+    env = _merged_env()
+    env.runs = [{"name": "test", "status": "completed", "conclusion": "failure", "head_sha": HEAD}]
+    res = _verify(env, expect_head=OTHER, require_merged=True)
+    assert res["ok"] is False and res["failed"] == ["head", "ci"]
+
+
+def test_merged_mode_deleted_remote_branch_is_still_a_loud_error():
+    with pytest.raises(PrVerifyError) as ei:
+        env = _merged_env()
+        env.remote_sha = None
+        _verify(env, require_merged=True)
+    assert ei.value.code == "remote_branch_missing"
+
+
+def test_default_mode_result_has_no_merged_keys():
+    res = _verify(FakeEnv())
+    assert "merged" not in res and "merge_commit" not in res
+    env = FakeEnv()
+    _verify(env)
+    pr_view = next(c for c in env.calls if c[:3] == ["gh", "pr", "view"])
+    assert pr_view[pr_view.index("--json") + 1] == "headRefOid,headRefName,mergeable,state,url"
