@@ -6,7 +6,7 @@ from pathlib import Path
 
 import click
 
-from clawpm.output import output_error, output_json, output_success
+from clawpm.output import OutputFormat, output_error, output_json, output_success
 from clawpm.tasks import get_task
 from clawpm.context import expand_task_id
 from clawpm.cli.base import main, get_format, require_portfolio, require_project, ExpandedPath
@@ -56,7 +56,9 @@ def reflect_summarize(ctx: click.Context, project_id: str | None, include_decisi
     )
     # CLAWP-112-005 / spec 2.3: surface the closure alarm in the text output.
     alarm = (summary.get("calibration") or {}).get("closure", {}).get("alarm")
-    if alarm:
+    if alarm and fmt != OutputFormat.JSON:
+        # Text mode only: output_success serialises `message` into JSON, so
+        # decorating it there would change an existing field.
         message += f" ALARM: {alarm}"
     output_success(
         message,

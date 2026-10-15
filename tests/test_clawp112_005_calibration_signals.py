@@ -128,6 +128,25 @@ class TestWindowFromEvents:
         assert cl["window_30d"]["voided"] == 1
         assert cl["window_30d"]["resolved"] == 0
 
+    def test_only_voided_in_window_is_not_registered_and_does_not_alarm(self, tmp_path):
+        # A voided prediction is cancelled work: out of both registered_30d
+        # and resolved_30d (it lives only in voided_30d), so it cannot drag
+        # closure to 0.0 or raise the alarm.
+        _register(tmp_path, "V-1", days_ago=3)
+        _append(tmp_path, "V-1", {"event": "void", "task_id": "V-1", "project_id": "proj"})
+        cl = summarize_calibration(tmp_path, "proj", now=NOW)["calibration"]["closure"]
+        assert cl["window_30d"] == {"registered": 0, "resolved": 0, "voided": 1, "rate": None}
+        assert cl["alarm"] is None
+
+    def test_voided_and_resolved_mix_judges_only_the_live_predictions(self, tmp_path):
+        _register(tmp_path, "V-1", days_ago=3)
+        _append(tmp_path, "V-1", {"event": "void", "task_id": "V-1", "project_id": "proj"})
+        _register(tmp_path, "R-1", days_ago=5)
+        _resolve(tmp_path, "R-1", days_ago=4)
+        cl = summarize_calibration(tmp_path, "proj", now=NOW)["calibration"]["closure"]
+        assert cl["window_30d"] == {"registered": 1, "resolved": 1, "voided": 1, "rate": 1.0}
+        assert cl["alarm"] is None
+
 
 class TestCli:
     def _seed_low_closure(self, root, project="test"):
@@ -161,6 +180,20 @@ class TestCli:
         assert PRE_KEYS <= set(cl)
         assert set(cl["window_30d"]) == {"registered", "resolved", "voided", "rate"}
         assert cl["window_30d"]["registered"] == 4
+
+    def test_summarize_json_message_unchanged_by_alarm(self, temp_portfolio_with_repo):
+        # The text alarm decorates the human message only; the JSON `message`
+        # field must be identical with and without a low closure.
+        root = temp_portfolio_with_repo["config"].portfolio_root
+        before = CliRunner().invoke(main, ["reflect", "summarize", "-p", "test"])
+        assert before.exit_code == 0, before.output
+        self._seed_low_closure(root)
+        after = CliRunner().invoke(main, ["reflect", "summarize", "-p", "test"])
+        assert after.exit_code == 0, after.output
+        out = json.loads(after.output)
+        assert out["data"]["calibration"]["closure"]["alarm"] is not None
+        assert "ALARM" not in out["message"]
+        assert out["message"] == json.loads(before.output)["message"]
 
     def test_scorecard_five_lines_with_and_without_alarm(self, temp_portfolio_with_repo):
         root = temp_portfolio_with_repo["config"].portfolio_root
@@ -309,6 +342,31 @@ class TestTasksStateNudge:
         assert r.exit_code == 0, r.output
         lines = [ln for ln in r.stderr.splitlines() if "wrong_weight x3" in ln]
         assert len(lines) == 1
+        assert "wrong_weight" not in r.stdout
+
+    def test_single_task_state_done_nudges(self, isolated_portfolio, stub_actuals):
+        _seed_misses(isolated_portfolio.root)
+        stub_actuals(active_min=10)
+        p = isolated_portfolio
+        t1 = add_task(p.config, "test", "one", predictions=Predictions(duration_min=10))
+        r = CliRunner().invoke(
+            main, ["--format", "text", "tasks", "state", t1.id, "done", "--project", "test"])
+        assert r.exit_code == 0, r.output
+        assert len([ln for ln in r.stderr.splitlines() if "wrong_weight x3" in ln]) == 1
+
+    def test_batch_state_done_has_no_nudge(self, isolated_portfolio, stub_actuals):
+        # A multi-task close keeps its text output byte-identical: no nudge.
+        _seed_misses(isolated_portfolio.root)
+        stub_actuals(active_min=10)
+        p = isolated_portfolio
+        t1 = add_task(p.config, "test", "one", predictions=Predictions(duration_min=10))
+        t2 = add_task(p.config, "test", "two", predictions=Predictions(duration_min=10))
+        r = CliRunner().invoke(
+            main, ["--format", "text", "tasks", "state", t1.id, t2.id, "done",
+                   "--project", "test"])
+        assert r.exit_code == 0, r.output
+        assert "2/2 succeeded" in r.stdout
+        assert "wrong_weight" not in r.stderr
         assert "wrong_weight" not in r.stdout
 
     def test_no_nudge_when_none_due(self, isolated_portfolio, stub_actuals):

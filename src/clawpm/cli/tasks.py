@@ -875,7 +875,8 @@ def tasks_state(ctx: click.Context, project_id: str | None, task_ids: tuple[str,
     # CLAWP-112-005: metareflection nudge on a successful close. Text mode only
     # (stderr, like the CLAWP-112-003 warnings); JSON output is untouched.
     # Advisory and fail-open: it never changes the exit code.
-    if new_state == "done" and fmt != OutputFormat.JSON and any(r.get("ok") for r in results):
+    # Single-task completions only: a batch keeps its output byte-identical.
+    if new_state == "done" and fmt != OutputFormat.JSON and not batch and results[0].get("ok"):
         try:
             from clawpm.reflect import metareflection_nudge
 

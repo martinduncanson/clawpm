@@ -340,7 +340,11 @@ def _closure(ledger: dict[str, Any]) -> dict[str, Any]:
     # registrations; an empty window falls back to the all-time rate.
     # Comparison is strict (< threshold): 0.59 alarms, exactly 0.60 does not.
     judged, basis_name = (w_rate, "window_30d") if w_rate is not None else (rate, "all_time")
-    if judged < CLOSURE_ALARM_BELOW:
+    # A corpus of only voided predictions has nothing live to judge: voided
+    # work is excluded from the window, so the all-time fallback must not
+    # alarm on it either.
+    judgeable = w_rate is not None or registered - voided > 0
+    if judgeable and judged < CLOSURE_ALARM_BELOW:
         basis = basis_name
         span = "30-day " if basis_name == "window_30d" else ""
         alarm = (f"{span}closure {judged:.2f} is below {CLOSURE_ALARM_BELOW}: most "

@@ -1326,11 +1326,14 @@ def load_calibration_rows(
                 ts = st["registered_at"].get(i) or done_at
                 if ts is not None and window_start <= ts <= now:
                     in_window += 1
-            ledger["registered_30d"] += in_window
             if unscoped_void or proj in voided_projects:
+                # Voided work is cancelled: counted only in voided(_30d), never
+                # in registered_30d, so it cannot sit in the window denominator
+                # without a matching resolution.
                 ledger["voided"] += len(ids)
                 ledger["voided_30d"] += in_window
                 continue
+            ledger["registered_30d"] += in_window
             if done is None:
                 continue
             if done_pid:
