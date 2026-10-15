@@ -406,4 +406,15 @@ def hook_eval_stop(
             )
 
     output = map_verdict_to_hook_output(verdict)
+    # CLAWP-112-005: metareflection nudge. Decorates systemMessage only and
+    # never touches continue/decision; any failure leaves the output as-is.
+    try:
+        from clawpm.reflect import metareflection_nudge
+
+        nudge = metareflection_nudge(config.portfolio_root, project_id)
+        if nudge:
+            existing_msg = output.get("systemMessage", "")
+            output["systemMessage"] = f"{existing_msg} {nudge}".strip()
+    except Exception:
+        pass
     click.echo(_json_hook.dumps(output))
