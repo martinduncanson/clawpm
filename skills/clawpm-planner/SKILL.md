@@ -101,7 +101,7 @@ specify interview discipline, l/xl approach lenses (minimal / clean / pragmatic)
    research), build leaves with `depends_refs` on the decisions they wait on —
    then **STOP**: no build decomposition, no dispatch. Fog test: name a question
    only if you can state it precisely now. **No-fog exit:** if charting finds <2
-   open decisions, say so and offer plain decompose. s never charts. Procedure and
+   open decisions and nothing worth parking as fog, say so and offer plain decompose. s never charts. Procedure and
    shape: `references/chart-mode.md`; copy `examples/decision-map.emit.json`.
 
 ## The emit call
