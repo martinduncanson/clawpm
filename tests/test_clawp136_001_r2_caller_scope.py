@@ -233,3 +233,33 @@ class TestDispatchAgentScope:
         assert get_task(
             fx["config"], "test", res["subtask_id"], scope=Scope.canonical()
         ) is not None
+
+
+class TestDispatchOpportunisticSweepStore:
+    """Gate r1 P1 (PR #123): the sweep `tasks dispatch` runs before loading its
+    task must act on the CANONICAL store when dispatch runs from a registered
+    worktree whose own store holds a same-id task."""
+
+    def test_sweep_from_worktree_cwd_never_touches_worktree_store(
+        self, fx, monkeypatch
+    ):
+        import clawpm.leases as leases_mod
+        from click.testing import CliRunner
+        from clawpm.cli.base import main
+
+        _expired_lease(fx)  # TST-001 leased on the canonical store (ttl 1s)
+        real_sweep = leases_mod.sweep
+        future = datetime.now(timezone.utc) + timedelta(hours=1)
+        monkeypatch.setattr(
+            leases_mod, "sweep", lambda *a, **k: real_sweep(*a, now=future, **k)
+        )
+        monkeypatch.chdir(fx["wt"])
+        wt0 = _snap(fx["wt_meta"])
+        CliRunner().invoke(
+            main,
+            ["--format", "json", "tasks", "dispatch", "TST-002", "--project", "test"],
+        )
+        assert _snap(fx["wt_meta"]) == wt0, "sweep leaked into the worktree store"
+        assert get_task(
+            fx["config"], "test", "TST-001", scope=Scope.canonical()
+        ).state == TaskState.OPEN, "the canonical store's expired lease not reaped"
