@@ -316,3 +316,259 @@ def test_unrecognised_spelling_of_the_key_refuses_without_writing(store):
         _record(store)
     assert ei.value.code == "bad_frontmatter"
     assert _sha(p) == before
+
+
+# --- gate r2 class A: containment of the write target -------------------------
+
+def _other_project(tmp_path: Path) -> tuple[Path, Path]:
+    other = tmp_path / "other" / ".project" / "tasks"
+    other.mkdir(parents=True)
+    victim = other / "CLAWP-900.md"
+    victim.write_bytes(BODY_LF.encode())
+    return other, victim
+
+
+def test_tasks_dir_resolving_to_another_project_is_refused_by_construction(store, tmp_path):
+    # Platform-independent form of the symlinked-tasks-dir finding: the tasks dir the
+    # resolver hands back is not <verified project dir>/tasks.
+    config, scope, tasks_dir = store
+    other, victim = _other_project(tmp_path)
+    before = _sha(victim)
+    with patch.object(pr_record, "get_tasks_dir", lambda *a, **kw: other):
+        with pytest.raises(PrRecordError) as ei:
+            record_pr_verification(config, "clawp", "CLAWP-900", RECORD, scope=scope)
+    assert ei.value.code == "unsafe_store"
+    assert _sha(victim) == before
+    assert not (other / ".clawpm-tasks.lock").exists()
+    assert not list(other.glob("*.tmp"))
+
+
+def test_symlinked_tasks_dir_is_refused(store, tmp_path):
+    config, scope, tasks_dir = store
+    other, victim = _other_project(tmp_path)
+    tasks_dir.rmdir()
+    _symlink(tasks_dir, other, is_dir=True)
+    before = _sha(victim)
+    with pytest.raises(PrRecordError) as ei:
+        record_pr_verification(config, "clawp", "CLAWP-900", RECORD, scope=scope)
+    assert ei.value.code == "unsafe_store"
+    assert _sha(victim) == before
+    assert not (other / ".clawpm-tasks.lock").exists()
+
+
+def test_junctioned_tasks_dir_is_refused(store, tmp_path):
+    import subprocess
+    import sys
+
+    if sys.platform != "win32":
+        pytest.skip("junctions are a Windows feature")
+    config, scope, tasks_dir = store
+    other, victim = _other_project(tmp_path)
+    tasks_dir.rmdir()
+    made = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(tasks_dir), str(other)], capture_output=True
+    )
+    if made.returncode != 0:
+        pytest.skip("cannot create a junction on this host")
+    before = _sha(victim)
+    with pytest.raises(PrRecordError) as ei:
+        record_pr_verification(config, "clawp", "CLAWP-900", RECORD, scope=scope)
+    assert ei.value.code == "unsafe_store"
+    assert _sha(victim) == before
+
+
+def test_predictable_tmp_name_is_never_written_through(store):
+    # A pre-existing <id>.md.tmp (the old predictable temp name) is left alone.
+    config, scope, tasks_dir = store
+    p = _write(tasks_dir, BODY_LF)
+    squatter = tasks_dir / "CLAWP-900.md.tmp"
+    squatter.write_bytes(b"squatter\n")
+    _record(store)
+    assert squatter.read_bytes() == b"squatter\n"
+    assert _fm(p)["pr_verification"] == RECORD
+
+
+def test_tmp_symlink_to_outside_file_is_not_followed(store, tmp_path):
+    config, scope, tasks_dir = store
+    p = _write(tasks_dir, BODY_LF)
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"precious\n")
+    _symlink(tasks_dir / "CLAWP-900.md.tmp", outside, is_dir=False)
+    _record(store)
+    assert outside.read_bytes() == b"precious\n"
+    assert not p.is_symlink()
+    assert _fm(p)["pr_verification"] == RECORD
+
+
+def test_task_file_symlinked_inside_the_store_is_refused(store):
+    config, scope, tasks_dir = store
+    real = _write(tasks_dir, BODY_LF)
+    _symlink(tasks_dir / "CLAWP-903.md", real, is_dir=False)
+    before = _sha(real)
+    with pytest.raises(PrRecordError) as ei:
+        record_pr_verification(config, "clawp", "CLAWP-903", RECORD, scope=scope)
+    assert ei.value.code == "bad_task_ref"
+    assert _sha(real) == before
+    assert (tasks_dir / "CLAWP-903.md").is_symlink()
+
+
+def test_temp_file_removed_when_replace_fails(store):
+    config, scope, tasks_dir = store
+    p = _write(tasks_dir, BODY_LF)
+    before = _sha(p)
+
+    def failing(fn, *args, **kwargs):
+        if getattr(fn, "__name__", "") == "replace":
+            raise OSError("disk says no")
+        return fn(*args, **kwargs)
+
+    with patch.object(pr_record, "retry_transient", failing):
+        with pytest.raises(OSError):
+            _record(store)
+    assert _sha(p) == before
+    assert not list(tasks_dir.glob("*.tmp"))
+
+
+# --- gate r2 class B: frontmatter structure, not line heuristics --------------
+
+def _load_unique(p: Path) -> dict:
+    body = p.read_bytes().decode("utf-8").lstrip("﻿").replace("\r\n", "\n")
+    return yaml.load(body.split("---\n", 2)[1], Loader=_DupLoader)  # raises on a duplicate key
+
+
+def _refuses(store, extra: str, code="bad_frontmatter"):
+    text = BODY_LF.replace("priority: 3\n", "priority: 3\n" + extra)
+    p = _write(store[2], text)
+    before = _sha(p)
+    with pytest.raises(PrRecordError) as ei:
+        _record(store)
+    assert ei.value.code == code
+    assert _sha(p) == before
+    assert not list(store[2].glob("*.tmp"))
+
+
+def test_multiline_flow_value_is_replaced_whole(store):
+    text = BODY_LF.replace("priority: 3\n", "priority: 3\npr_verification: {pr: 1,\npriority: 1}\n")
+    p = _write(store[2], text)
+    _record(store)
+    fm = _load_unique(p)
+    assert fm["priority"] == 3
+    assert fm["pr_verification"] == RECORD
+    assert "priority: 1" not in p.read_bytes().decode("utf-8")
+
+
+def test_multiline_flow_with_closing_brace_on_own_line(store):
+    text = BODY_LF.replace("priority: 3\n", "pr_verification: {\n  pr: 1,\n  head: x\n}\npriority: 3\n")
+    p = _write(store[2], text)
+    _record(store)
+    fm = _load_unique(p)
+    assert fm["priority"] == 3 and fm["pr_verification"] == RECORD
+
+
+def test_multiline_flow_crlf_preserved(store):
+    text = BODY_LF.replace("priority: 3\n", "priority: 3\npr_verification: {pr: 1,\npriority: 1}\n")
+    p = _write(store[2], text, crlf=True)
+    _record(store)
+    raw = p.read_bytes()
+    assert raw.count(b"\n") == raw.count(b"\r\n")
+    assert _load_unique(p)["priority"] == 3
+
+
+def test_block_sequence_at_key_indent_is_replaced_whole(store):
+    text = BODY_LF.replace("priority: 3\n", "pr_verification:\n- a\n- b\npriority: 3\n")
+    p = _write(store[2], text)
+    _record(store)
+    fm = _load_unique(p)
+    assert fm["pr_verification"] == RECORD and fm["priority"] == 3
+
+
+def test_empty_value_is_replaced(store):
+    text = BODY_LF.replace("priority: 3\n", "pr_verification:\npriority: 3\n")
+    p = _write(store[2], text)
+    _record(store)
+    fm = _load_unique(p)
+    assert fm["pr_verification"] == RECORD and fm["priority"] == 3
+
+
+def test_trailing_comment_on_value_line_is_kept(store):
+    text = BODY_LF.replace("priority: 3\n", "pr_verification: {pr: 1} # keep me\npriority: 3\n")
+    p = _write(store[2], text)
+    _record(store)
+    assert "# keep me" in p.read_bytes().decode("utf-8")
+    assert _load_unique(p)["pr_verification"] == RECORD
+
+
+def test_escaped_spelling_plus_plain_spelling_refuses(store):
+    _refuses(store, '"pr\\x5fverification": {pr: 1}\npr_verification: {pr: 2}\n')
+
+
+def test_alias_used_as_key_refuses(store):
+    _refuses(store, "anchor: &k pr_verification\n*k : {pr: 1}\npr_verification: {pr: 2}\n")
+
+
+def test_lone_alias_key_refuses(store):
+    _refuses(store, "anchor: &k pr_verification\n*k : {pr: 1}\n")
+
+
+def test_duplicate_plain_keys_refuse(store):
+    _refuses(store, "pr_verification: {pr: 1}\npr_verification: {pr: 2}\n")
+
+
+def test_duplicate_unrelated_key_refuses(store):
+    _refuses(store, "priority: 4\n")
+
+
+def test_anchored_value_refuses(store):
+    _refuses(store, "pr_verification: &a {pr: 1}\nalias_user: *a\n")
+
+
+def test_tagged_value_refuses(store):
+    _refuses(store, "pr_verification: !!map {pr: 1}\n")
+
+
+def test_block_scalar_value_refuses(store):
+    _refuses(store, "pr_verification: |\n  text\n  more\n")
+
+
+def test_nested_block_scalar_in_value_refuses(store):
+    _refuses(store, "pr_verification:\n  note: |\n    text\n")
+
+
+def test_flow_style_root_refuses(store):
+    p = _write(store[2], "---\n{id: CLAWP-900, title: x}\n---\nbody\n")
+    before = _sha(p)
+    with pytest.raises(PrRecordError) as ei:
+        _record(store)
+    assert ei.value.code == "bad_frontmatter"
+    assert _sha(p) == before
+
+
+def test_indented_key_refuses(store):
+    p = _write(store[2], "---\n  id: CLAWP-900\n  pr_verification: {pr: 1}\n---\nbody\n")
+    before = _sha(p)
+    with pytest.raises(PrRecordError) as ei:
+        _record(store)
+    assert ei.value.code == "bad_frontmatter"
+    assert _sha(p) == before
+
+
+def test_unicode_line_separator_in_frontmatter_refuses(store):
+    p = _write(store[2], "---\nid: CLAWP-900\ntitle: a b\n---\nbody\n")
+    before = _sha(p)
+    with pytest.raises(PrRecordError) as ei:
+        _record(store)
+    assert ei.value.code == "bad_frontmatter"
+    assert _sha(p) == before
+
+
+def test_other_keys_survive_a_splice_unchanged(store):
+    text = BODY_LF.replace(
+        "priority: 3\n", 'tags: [a, b]\npr_verification: {pr: 1}\nowner: "me"\npriority: 3\n'
+    )
+    p = _write(store[2], text)
+    before = _fm(p)
+    _record(store)
+    after = _fm(p)
+    assert {k: v for k, v in after.items() if k != "pr_verification"} == {
+        k: v for k, v in before.items() if k != "pr_verification"
+    }
