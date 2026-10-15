@@ -10,6 +10,7 @@ scope is the ``store_scope=`` keyword.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -196,3 +197,84 @@ class TestScopeNeverFallsBackToAmbientDiscovery:
         )
         assert got == (None, False)
         assert _snap(fx["wt_meta"]) == wt0
+
+
+def _ledger_rows(root: Path) -> list[dict]:
+    path = root / "id_reservations.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+
+def _tree(root: Path) -> dict[str, bytes]:
+    return {
+        p.relative_to(root).as_posix(): p.read_bytes()
+        for p in sorted(root.rglob("*")) if p.is_file() and ".git" not in p.parts
+    }
+
+
+@pytest.fixture
+def other_portfolio(fx, tmp_path, monkeypatch):
+    """A second portfolio (same project id, own ledger with history) that the
+    AMBIENT environment points at: CLAWPM_PORTFOLIO and cwd are both inside it,
+    while every call below passes the first portfolio's config explicitly."""
+    root = tmp_path / "other-portfolio"
+    repo = root / "repo"
+    repo.mkdir(parents=True)
+    (root / "portfolio.toml").write_text(
+        f'portfolio_root = "{root.as_posix()}"\n'
+        f'project_roots = ["{root.as_posix()}"]\n'
+        '[defaults]\nstatus = "active"\n',
+        encoding="utf-8",
+    )
+    _make_store(repo, f'repo_path = "{repo.as_posix()}"\n')
+    ledger = root / "id_reservations.jsonl"
+    ledger.write_bytes(
+        b'{"key": "TST", "ordinal": 41, "task_id": "TST-041", "project_id": "test", '
+        b'"ts": "2026-01-01T00:00:00+00:00"}\n'
+    )
+    monkeypatch.setenv("CLAWPM_PORTFOLIO", str(root))
+    monkeypatch.chdir(repo)
+    return root
+
+
+class TestReservationLedgerFollowsTheExplicitPortfolio:
+    """Codex r1 P2 (PR #121): reservation writes under an explicit scope.
+
+    The ledger is ``<config.portfolio_root>/id_reservations.jsonl`` -- the SAME
+    root the scope itself resolves against (a bound scope looks sessions up in
+    that portfolio's registry), keyed by the scoped project's own id. Neither
+    comes from the ambient environment, so an explicit scope cannot reach
+    another portfolio's ledger.
+    """
+
+    @pytest.mark.parametrize("kind", ["auto_id", "explicit_id", "subtask"])
+    @pytest.mark.parametrize("which", ["canonical", "bound", "pinned"])
+    def test_reservation_lands_in_the_callers_portfolio_only(
+        self, fx, other_portfolio, which, kind
+    ):
+        cfg, root = fx["config"], fx["root"]
+        scope, store = {
+            "canonical": (Scope.canonical(), fx["canon"]),
+            "bound": (Scope.bound(fx["wt"]), fx["wt_meta"]),
+            "pinned": (Scope.pinned(fx["wt_meta"]), fx["wt_meta"]),
+        }[which]
+        other0 = _tree(other_portfolio)
+        mine0 = _ledger_rows(root)
+
+        if kind == "subtask":
+            task = add_subtask(cfg, "test", "TST-001", "kid", store_scope=scope)
+        else:
+            task, _ = add_task_with_status(
+                cfg, "test", "new",
+                task_id="TST-077" if kind == "explicit_id" else None,
+                store_scope=scope,
+            )
+        assert task is not None
+        assert task.file_path is not None and store in task.file_path.parents
+
+        new_rows = _ledger_rows(root)[len(mine0):]
+        assert [r["task_id"] for r in new_rows] == [task.id]
+        assert {r["project_id"] for r in new_rows} == {"test"}
+        # Nothing at all changed in the portfolio the environment points at.
+        assert _tree(other_portfolio) == other0

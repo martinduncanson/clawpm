@@ -3344,6 +3344,12 @@ def add_task_with_status(
             # CLAWP-092: the ledger high-water mark joins the scan so a sibling
             # worktree's id (invisible on this disk) is never re-minted; the
             # reservation is recorded here, inside the portfolio lock.
+            # LEDGER INVARIANT (CLAWP-136-001, Codex r1 P2 on PR #121): the
+            # ledger root is the EXPLICIT `config.portfolio_root`, never an
+            # ambient lookup -- the same root a bound scope resolves sessions
+            # against -- and rows are keyed by `_ledger_pid`, which comes from
+            # the scoped settings. A scope has no portfolio of its own to
+            # substitute (a pinned store is just a directory).
             next_num = _next_root_ordinal(
                 config, tasks_dir, prefix, _ledger_pid, mint_warnings
             )
@@ -4351,6 +4357,7 @@ def add_subtask(
         )
         next_num = (max(existing_nums) if existing_nums else 0) + 1
         subtask_id = f"{parent_id}-{next_num:03d}"
+        # Same ledger invariant as add_task: explicit config root, scoped key.
         record_reservation(
             config.portfolio_root, parent_id, next_num, subtask_id, _ledger_pid
         )
