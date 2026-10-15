@@ -14,8 +14,14 @@
       "description": "Multi-project task and research management (JSON-first CLI)",
       "source": "./",
       "strict": false,
+      "commands": [
+        "./commands/plan.md",
+        "./commands/chart.md",
+        "./commands/next.md"
+      ],
       "skills": [
-        "./skills/clawpm"
+        "./skills/clawpm",
+        "./skills/clawpm-planner"
       ]
     }
   ]
