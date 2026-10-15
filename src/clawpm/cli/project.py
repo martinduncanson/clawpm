@@ -282,6 +282,10 @@ def project_doctor(
     # housekeeping — like `leases.apply_fallback` — never scoped to whatever
     # worktree happens to be cwd; suppress for the whole body, the same
     # pattern that function already uses.
+    # CLAWP-136-001: the task-store calls inside the body also carry an
+    # explicit `Scope.canonical()` (`_project_doctor_impl`), so they no longer
+    # depend on this suppression; it stays for the lookups that take no scope
+    # (`links.find_dangling_links`).
     from clawpm.sessions import suppress_session_resolution
 
     with suppress_session_resolution():
@@ -312,9 +316,13 @@ def _project_doctor_impl(
     several hundred lines. Not meant to be called directly."""
     import json as _json_doc
     from datetime import date, datetime, timezone, timedelta
+    from clawpm.sessions import Scope
 
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
+    # Doctor is portfolio-wide housekeeping: always the canonical stores,
+    # whatever worktree is cwd. Passed explicitly to every task-store call.
+    canonical_scope = Scope.canonical()
 
     issues: list[dict] = []
     stale_tasks: list[dict] = []
@@ -566,7 +574,7 @@ def _project_doctor_impl(
         STALE_BLOCKED_HOURS = 24
         blocked_dir = tasks_dir / "blocked"
         if blocked_dir.exists():
-            tasks_for_lookup = list_tasks(config, proj.id)
+            tasks_for_lookup = list_tasks(config, proj.id, scope=canonical_scope)
             by_id = {t.id: t for t in tasks_for_lookup}
             cutoff_blocked = now_utc - timedelta(hours=STALE_BLOCKED_HOURS)
             for blocked_file in blocked_dir.glob("*.md"):
@@ -979,6 +987,7 @@ def _project_doctor_impl(
                 apply_stale_blocked_flag=not no_apply_stale_blocked,
                 apply_half_rename_flag=not no_apply_half_rename,
                 dry_run=dry_run,
+                scope=canonical_scope,
             )
 
             # CLAWP-039: expired-lease fallback is a deterministic remediation
@@ -987,7 +996,10 @@ def _project_doctor_impl(
             # project's leases (cross-project isolation — Codex critical).
             if expired_lease_findings and not dry_run:
                 from clawpm.leases import sweep as _lease_sweep
-                for _act in _lease_sweep(config, config.portfolio_root, project_id=project_id):
+                for _act in _lease_sweep(
+                    config, config.portfolio_root, project_id=project_id,
+                    scope=canonical_scope,
+                ):
                     target = f"{_act['task_id']} ({_act['project_id']})"
                     if _act.get("retired_without_fallback"):
                         applied.append({"class": "lease-expired", "target": target,

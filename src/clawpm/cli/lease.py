@@ -40,7 +40,7 @@ def lease_grant(ctx, project_id, task_id, ttl, fallback_policy, holder_id, targe
     """Grant a lease on a dispatched task."""
     from clawpm.discovery import is_task_store_canonical
     from clawpm.leases import FallbackPolicy, grant_lease
-    from clawpm.sessions import suppress_session_resolution
+    from clawpm.sessions import Scope
     from clawpm.tasks import get_task
 
     fmt = get_format(ctx)
@@ -79,8 +79,9 @@ def lease_grant(ctx, project_id, task_id, ttl, fallback_policy, holder_id, targe
     #    None), silently retiring it on the very first sweep with no
     #    fallback ever applied — a lease that looks granted but can never
     #    function. Verify existence in the canonical store explicitly.
-    with suppress_session_resolution():
-        canonical_task = get_task(config, project_id, task_id)
+    canonical_task = get_task(
+        config, project_id, task_id, scope=Scope.canonical()
+    )
     if canonical_task is None:
         output_error(
             "lease_unsupported_scope",
@@ -194,5 +195,9 @@ def lease_sweep(ctx, dry_run):
         ]
         output_success(f"{len(rows)} expired lease(s) (dry-run)", data={"expired": rows}, fmt=fmt)
         return
-    actions = sweep(config, config.portfolio_root, now=now)
+    from clawpm.sessions import Scope
+
+    actions = sweep(
+        config, config.portfolio_root, now=now, scope=Scope.canonical()
+    )
     output_success(f"Swept {len(actions)} expired lease(s)", data={"actions": actions}, fmt=fmt)
