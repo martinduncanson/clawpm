@@ -65,14 +65,25 @@ def tasks(ctx: click.Context) -> None:
     "--frontier", "frontier_root", default=None,
     help="Show the actionable frontier under this root task (CLAWP-111-004): ready, blocked (waiting_on) and claimed (lease holder). Single project; combining with other filters (--state, --tag, --limit, ...) is refused.",
 )
+@click.option(
+    "--needs-human", "needs_human", is_flag=True, default=False,
+    help="Only tasks blocked on an unanswered human question (CLAWP-154); JSON rows: id, project, title, question, options, recommendation, blocked_since. Composes with --all-projects.",
+)
 @click.pass_context
-def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, flat: bool, tags: tuple[str, ...], all_tags: bool, text: str | None, use_regex: bool, priority: str | None, complexities: tuple[str, ...], parent: str | None, linked: str | None, limit: int | None, all_projects: bool, include_archived: bool, frontier_root: str | None = None) -> None:
+def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, flat: bool, tags: tuple[str, ...], all_tags: bool, text: str | None, use_regex: bool, priority: str | None, complexities: tuple[str, ...], parent: str | None, linked: str | None, limit: int | None, all_projects: bool, include_archived: bool, frontier_root: str | None = None, needs_human: bool = False) -> None:
     """List tasks for a project (default: open+progress+blocked, use -s all for everything).
 
     ``--all-projects`` (CLAWP-084) spans every ACTIVE project instead of one.
     """
     fmt = get_format(ctx)
     config = require_portfolio(ctx)
+
+    if needs_human:
+        if frontier_root is not None:
+            raise click.UsageError("--needs-human cannot be combined with --frontier.")
+        if state not in (None, "blocked"):
+            raise click.UsageError("--needs-human implies --state blocked.")
+        state = "blocked"
 
     if frontier_root is not None:
         if all_projects:
@@ -132,6 +143,36 @@ def tasks_list(ctx: click.Context, project_id: str | None, state: str | None, fl
             config, project_id, state, tags, all_tags, text, use_regex,
             priority, complexities, parent, linked, include_archived,
         )
+
+    if needs_human:
+        from clawpm.tasks import is_awaiting_human
+        found_tasks = [t for t in found_tasks if is_awaiting_human(t)]
+        if limit is not None and limit >= 0:
+            found_tasks = found_tasks[:limit]
+        rows = [
+            {
+                "id": t.id,
+                "project": t.project_id or project_id,
+                "title": t.title,
+                "question": t.question,
+                "options": t.options,
+                "recommendation": t.recommendation,
+                "blocked_since": t.updated,
+            }
+            for t in found_tasks
+        ]
+        if fmt == OutputFormat.JSON:
+            output_json(rows)
+        elif not rows:
+            click.echo("No tasks are waiting on a human.")
+        else:
+            for row in rows:
+                click.echo(f"{row['project']}  {row['id']}  {row['title']}")
+                click.echo(f"    Q: {row['question']}")
+                for opt in row["options"]:
+                    star = " (recommended)" if opt["label"] == row["recommendation"] else ""
+                    click.echo(f"    - {opt['label']}{star}")
+        return
 
     if limit is not None and limit >= 0:
         found_tasks = found_tasks[:limit]

@@ -1472,6 +1472,165 @@ def change_task_state(
         return retry_transient(Task.from_file, new_path)
 
 
+def normalize_human_options(options) -> list[dict[str, str]]:
+    """Validate an options list for a human decision (CLAWP-154).
+
+    Accepts strings or ``{label, detail?}`` mappings; returns
+    ``[{"label": ..., "detail"?: ...}]``. Labels are stripped, non-empty and
+    unique (case-sensitive) so ``recommendation`` and an answer can name one
+    unambiguously. Raises ``ValueError`` otherwise.
+    """
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in options or []:
+        if isinstance(item, str):
+            label, detail = item, None
+        elif isinstance(item, dict):
+            label, detail = item.get("label"), item.get("detail")
+        else:
+            raise ValueError(f"Invalid option {item!r}: expected a label or {{label, detail}}.")
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError(f"Invalid option {item!r}: label must be a non-empty string.")
+        label = label.strip()
+        if label in seen:
+            raise ValueError(f"Duplicate option label {label!r}.")
+        seen.add(label)
+        opt = {"label": label}
+        if isinstance(detail, str) and detail.strip():
+            opt["detail"] = detail.strip()
+        out.append(opt)
+    return out
+
+
+def is_awaiting_human(task: Task) -> bool:
+    """True when ``task`` is blocked on a human decision nobody has answered."""
+    return (
+        task.state == TaskState.BLOCKED
+        and task.blocked_on == "human"
+        and bool(task.question)
+        and not task.answer
+    )
+
+
+def _rewrite_decision_frontmatter(file_path: Path, mutate) -> None:
+    """Strict frontmatter rewrite for the human-decision keys (CLAWP-154).
+
+    Like ``_write_resolution_frontmatter`` but byte-faithful on the envelope:
+    a UTF-8 BOM and CRLF line endings are detected and restored, so a file
+    authored on Windows keeps its shape. ``mutate(fm)`` edits the mapping in
+    place; the ``updated`` stamp is applied here.
+    """
+    with guard_fs_tamper(f"Task file '{file_path}'"):
+        text = file_path.read_bytes().decode("utf-8")
+    bom = text.startswith("﻿")
+    crlf = "\r\n" in text
+    text = strip_bom(text).replace("\r\n", "\n")
+    fm, body = split_frontmatter(text, where=str(file_path))
+    mutate(fm)
+    stamp_updated(fm)
+    new_text = (
+        "---\n" + yaml.dump(fm, default_flow_style=False, allow_unicode=True)
+        + "---" + body
+    )
+    if crlf:
+        new_text = new_text.replace("\n", "\r\n")
+    data = (("﻿" if bom else "") + new_text).encode("utf-8")
+    tmp = file_path.with_suffix(".tmp")
+    try:
+        tmp.write_bytes(data)
+        retry_transient(tmp.replace, file_path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def record_human_question(
+    config: PortfolioConfig,
+    project_id: str,
+    task_id: str,
+    question: str,
+    options=None,
+    recommendation: str | None = None,
+    *,
+    scope: Scope | None = None,
+) -> Task | None:
+    """Record the decision a blocked task waits on a human for (CLAWP-154).
+
+    Call AFTER the task is blocked (the existing block transition owns the
+    move). Writes ``blocked_on: human``, ``question``, ``options`` and
+    ``recommendation`` and clears any earlier ``answer``. Raises ``ValueError``
+    for a blank question, bad options, a recommendation that is not an option
+    label, or a task that is not blocked. Returns ``None`` if the task is
+    absent. ``scope`` is honoured exactly (no ambient fallback).
+    """
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("A non-empty question is required.")
+    opts = normalize_human_options(options)
+    rec = recommendation.strip() if isinstance(recommendation, str) else None
+    if rec and rec not in {o["label"] for o in opts}:
+        raise ValueError(f"Recommendation {rec!r} is not one of the option labels.")
+    assert_scope_store_in_portfolio(config, project_id, scope)
+    tasks_dir = get_tasks_dir(config, project_id, **_scope_kw(scope))
+    if not tasks_dir:
+        return None
+
+    def _mutate(fm: dict) -> None:
+        fm["blocked_on"] = "human"
+        fm["question"] = question.strip()
+        if opts:
+            fm["options"] = opts
+        else:
+            fm.pop("options", None)
+        if rec:
+            fm["recommendation"] = rec
+        else:
+            fm.pop("recommendation", None)
+        fm.pop("answer", None)
+
+    with file_lock(tasks_dir / ".clawpm-tasks.lock"):
+        task = get_task(config, project_id, task_id, **_scope_kw(scope))
+        if not task or not task.file_path:
+            return None
+        if task.state != TaskState.BLOCKED:
+            raise ValueError(
+                f"Task {task_id} is '{task.state.value}', not blocked: "
+                "block it before recording a question."
+            )
+        _rewrite_decision_frontmatter(task.file_path, _mutate)
+        return get_task(config, project_id, task_id, **_scope_kw(scope))
+
+
+def record_human_answer(
+    config: PortfolioConfig,
+    project_id: str,
+    task_id: str,
+    answer: str,
+    *,
+    scope: Scope | None = None,
+) -> Task | None:
+    """Record the human's answer on a task (CLAWP-154).
+
+    Keeps ``question``/``options``/``recommendation``. Does not move the task:
+    the existing unblock transition does that. ``None`` if the task is absent.
+    """
+    if not isinstance(answer, str) or not answer.strip():
+        raise ValueError("A non-empty answer is required.")
+    assert_scope_store_in_portfolio(config, project_id, scope)
+    tasks_dir = get_tasks_dir(config, project_id, **_scope_kw(scope))
+    if not tasks_dir:
+        return None
+
+    def _mutate(fm: dict) -> None:
+        fm["answer"] = answer.strip()
+
+    with file_lock(tasks_dir / ".clawpm-tasks.lock"):
+        task = get_task(config, project_id, task_id, **_scope_kw(scope))
+        if not task or not task.file_path:
+            return None
+        _rewrite_decision_frontmatter(task.file_path, _mutate)
+        return get_task(config, project_id, task_id, **_scope_kw(scope))
+
+
 def _newest_mtime(entry: Path) -> float:
     """Most-recent content mtime for a task ``entry`` (CLAWP-085).
 
