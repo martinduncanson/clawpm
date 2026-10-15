@@ -554,7 +554,7 @@ clawpm lease sweep [--dry-run]
 # Dispatched worker's write root (from the dispatch marker; for a harness write-fence hook)
 clawpm sessions write-root [--cwd <dir>]  # JSON {ok, root, task_id, project_id}; exit 0 found, 1 not in a dispatched worktree (ok=false, reason no_dispatch_marker), 3 marker unusable, any unexpected resolve error, or a resolved root that cannot be written to a closed pipe (ok=false, reason marker_unusable)
 # Pre-merge head attestation (read-only; prints the merge line, never runs it)
-clawpm pr verify <N> [--expect-head <full-sha>] [--repo owner/name] [--remote fork]
+clawpm pr verify <N> [--expect-head <full-sha>] [--repo owner/name] [--remote fork] [--task <id>] [--project <id>]  # --task requires the PR MERGED and writes `pr_verification` into the task frontmatter only after that attestation passes (branch must still exist on the remote; `tasks land` does not read it)
 # Post-merge landing from the MAIN checkout: verify PR merged + on remote base, ff, mark done, commit only the task paths
 clawpm tasks land <id> --pr <N> [--push] [--remove-worktree] [--repo owner/name] [--remote fork]  # never fetches: run `git fetch <remote>` first (stale tracking ref = remote_not_fetched); the task file must be clean and match the tip; exit 1 = refused, nothing changed; exit 2 = failed after the ff began, or landed with a secondary failure (result has ok:false, landed:true, errors[]); known residual: an untracked file left in `done/<ID>/` can make the done step refuse `already_exists` after the ff (nothing destructive; clear it and run `tasks state <id> done`)
 
