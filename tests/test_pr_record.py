@@ -422,7 +422,14 @@ def test_temp_file_removed_when_replace_fails(store):
             raise OSError("disk says no")
         return fn(*args, **kwargs)
 
-    with patch.object(pr_record, "retry_transient", failing):
+    def no_replace(*args, **kwargs):
+        raise OSError("disk says no")
+
+    # The path writer replaces through retry_transient(os.replace, ...); the POSIX
+    # dir_fd writer calls os.replace(..., src_dir_fd=, dst_dir_fd=) directly, so
+    # patch both seams and the failure is exercised on either branch.
+    with patch.object(pr_record, "retry_transient", failing), \
+            patch.object(pr_record.os, "replace", no_replace):
         with pytest.raises(OSError):
             _record(store)
     assert _sha(p) == before
