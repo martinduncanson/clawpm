@@ -129,6 +129,5 @@ gate. `human` leaves bounce to the operator and never auto-dispatch.
 
 ## Personas (opt-in, off by default)
 
-On **l/xl** or on request ("plan this as a PM"), adopt analyst / PM / architect
-prompt lenses in ideate/specify — not extra subagents or stages. See
-`references/personas.md`. Off at s/m.
+On **l/xl** or on request, adopt analyst / PM / architect prompt lenses in
+ideate/specify (not subagents or stages): `references/personas.md`. Off at s/m.
