@@ -19,7 +19,7 @@ This core holds the always-on rules and the everyday commands. Everything else l
 | `references/dispatch-and-scope.md` | Planning parallel dispatch (the Scope-Aware Dispatch section): `clawpm conflicts`, scope claims, glob-overlap heuristic, and the rationale/history behind the dispatch-discipline rules. |
 | `references/setup-and-projects.md` | First install, `clawpm setup`, `project init`, project auto-detection, subtasks, `clawpm context`. |
 | `references/command-reference.md` | You need a flag or subcommand not in Quick Start: any `tasks`, `log`, `research`, `issues`, `lease`, `mission`, `doctor` command. |
-| `references/predictions-and-reflection.md` | Filling `--predict-*` / `--success-criteria` flags, completing with reflection notes, `reflect summarize`, `reflect suggest`, `reflect void`. |
+| `references/predictions-and-reflection.md` | Filling `--predict-*` / `--success-criteria` flags, completing with reflection notes, `--miss-category` / `--actual-complexity` / `--resolution`, `reflect summarize`, `reflect scorecard`, `reflect suggest`, `reflect void`, the closure alarm and metareflection nudge. |
 | `references/messaging-and-integrations.md` | `clawpm inbox` messaging between agents, or before any commit, push, PR or merge (review/PR workflow integration points). |
 | `references/multi-session.md` | Two sessions on one project, task-ID collisions, `.clawpm-tasks.lock`. |
 | `references/troubleshooting.md` | A clawpm command failed or dropped an argument, `ModuleNotFoundError`, Windows glob/`--scope` problems, `add_failed`. |
