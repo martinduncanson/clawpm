@@ -20,6 +20,7 @@ depth and the emitted leaves' `complexity` predictions share one scale.
 |-------|-----------|-----------------|-------|------|
 | **s** | recon(light) → decompose → emit | flat | 1–2 leaves, no ideation, no vet ceremony | no |
 | **m** | recon → (ideate) → specify → decompose → vet → emit | 1 level | parent + several leaves | short PRD |
+| **m+ chart** | recon → ideate → specify (destination only) → emit decision map, STOP | 1 level (decisions + coarse slices) | root with destination + fog, decision leaves, build leaves with `depends_refs` | destination only |
 | **l** | full pipeline | 2 levels | milestone → slice → unit | PRD |
 | **xl** | full pipeline + personas (opt-in) + explicit direction-candidate review | 2–3 levels | multi-milestone tree, PRD + lightweight ADR, directions surfaced separately | PRD (+ ADR) |
 
@@ -38,6 +39,14 @@ depth and the emitted leaves' `complexity` predictions share one scale.
 - **xl (2–3 levels):** as `l`, plus a third `attach_to` layer (slice → unit) where
   a slice is itself large; plus opt-in personas (`personas.md`) and an explicit
   direction-candidate review beat.
+
+## Chart mode sits between m and l
+
+Chart mode (`chart-mode.md`) is entered by trigger, not by size alone: **≥2 open
+decisions block decompose**, or the operator asks. **s never charts.** At m a
+chart is usually a handful of decisions; at l/xl chart first, then decompose each
+milestone once its decisions resolve. A chart emits one new-root document and
+stops, so it does not use the `attach_to` layering below.
 
 ## What changes per scale
 

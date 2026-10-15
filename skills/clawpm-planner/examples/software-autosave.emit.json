@@ -24,12 +24,12 @@
       "title": "User edits autosave without pressing save",
       "success_criteria": [
         {
-          "criterion": "Edits persist after a 2s idle with no manual save",
+          "criterion": "WHEN a user stops typing for 2s THEN the edit is saved as a draft with no manual save",
           "gradeable_signal": "integration test: type, wait 2s, assert a draft PUT fired and store row exists",
           "comparator": "eq:1 draft row"
         },
         {
-          "criterion": "Rapid edits do not spam the endpoint",
+          "criterion": "WHEN 10 keystrokes arrive within 1s THEN at most 1 save request is sent after the debounce",
           "gradeable_signal": "test: 10 keystrokes in 1s yields <=1 PUT after debounce",
           "comparator": "lte:1"
         }
@@ -57,7 +57,7 @@
       "title": "Draft saves are idempotent on retry",
       "success_criteria": [
         {
-          "criterion": "Re-sending the same draft does not create a duplicate row",
+          "criterion": "WHEN the same draft is sent twice THEN exactly one draft row exists",
           "gradeable_signal": "test: PUT same draft twice, assert one row",
           "comparator": "eq:1"
         }
@@ -65,7 +65,8 @@
       "scope": ["src/api/notes/draft.ts", "src/store/drafts.ts"],
       "out_of_scope": ["client debounce logic (L1)"],
       "stop_conditions": [
-        "If the store has no unique key for (note_id, user_id), STOP and surface a schema decision to the operator."
+        "If the store has no unique key for (note_id, user_id), STOP and surface a schema decision to the operator.",
+        "STOP and surface to the operator before any schema migration change."
       ],
       "delegability": "either",
       "predictions": {
@@ -84,7 +85,7 @@
       "title": "Editor restores the latest draft on open",
       "success_criteria": [
         {
-          "criterion": "Reopening a note with a newer draft rehydrates the draft, not the saved version",
+          "criterion": "WHEN a note with a newer draft is reopened THEN the editor shows the draft text, not the saved version",
           "gradeable_signal": "e2e: edit, reload, assert editor shows last autosaved text",
           "comparator": "eq:draft-text"
         }

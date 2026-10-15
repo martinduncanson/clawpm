@@ -28,6 +28,12 @@ the stages the objective warrants and may re-enter any stage. The scale dial
 - **Tools:** the **graph** (codegraph default / graphify for mixed corpora) for
   structural facts; parallel **Explore** subagents for semantic judgment; `Read`
   for specific sites. See `graph-consultation.md`.
+- **Fan-out agent:** when the `feature-dev:code-explorer` agent type is installed,
+  dispatch it as the recon fan-out (one per area: entry points, data model,
+  neighbouring features). Fall back to **Explore** when it is not. **Return-key-
+  files-then-read rule:** each explorer returns a short list of 5–10 key files
+  with one line each on why; the planner then reads those files itself before
+  forming any claim. Never plan from an explorer's summary alone.
 - **In → Out:** objective + ground (codebase OR brief/research/notes) →
   orientation notes (god-objects, layering, fan-in, fragile areas, prior art).
 - **Optional when:** a trivial objective with self-evident ground (s-scale runs a
@@ -48,6 +54,11 @@ the stages the objective warrants and may re-enter any stage. The scale dial
   stops the tree filling with speculative "maybe also do X" work.
 - **Elicitation:** present approaches **propose-then-review** so the operator's
   thinking is drawn out before a PRD is committed.
+- **Approach lenses (l/xl only):** compare three lenses on the same objective and
+  **recommend one** with the reason. **Minimal** = smallest change that meets the
+  objective, reuse everything. **Clean** = the design you would want in a year,
+  accepting a bigger diff. **Pragmatic** = the middle path that fits the codebase's
+  existing seams and the deadline. One recommendation, not three options.
 - **Optional when:** s-scale objective with one obvious approach.
 
 ## 4. specify
@@ -57,6 +68,18 @@ the stages the objective warrants and may re-enter any stage. The scale dial
 - **Tool:** `references/plan-template.md`.
 - **In → Out:** chosen approach → PRD artifact, emitted as the `prd` block of the
   emit-tree document (stored as a research entry, linked to the root).
+- **Interview discipline** (whenever specify asks the operator anything, and in
+  chart mode's destination step — `chart-mode.md`):
+  1. **One question at a time.** Never a questionnaire.
+  2. **Look facts up, ask decisions.** If the answer is in the code, the brief or
+     a research entry, read it. Ask only what only the operator can decide.
+  3. **Separate want from should-want.** When the stated want conflicts with the
+     stated goal, name the conflict and ask which wins.
+  4. **Reject the false yes.** "Sounds good", "sure", or silence is not
+     confirmation. Restate the decision in one sentence and ask for an explicit
+     yes or a correction.
+  5. Stop when you can state the destination in one sentence and the operator
+     has confirmed that sentence.
 - **Optional when:** s-scale, or the operator already supplied a spec.
 
 ## 5. decompose
