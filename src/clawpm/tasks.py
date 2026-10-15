@@ -2143,6 +2143,75 @@ def _root_ordinals(tasks_dir: Path, prefix: str, *, strict: bool = False) -> lis
     return nums
 
 
+# CLAWP-148 — ids that exist only on the project's primary remote main. The
+# reservation ledger and the on-disk scan are both machine-local: a task minted
+# on another clone, before the ledger existed, or arrived by merge is invisible
+# to them, so the next mint can reuse its id. Fail-open, never fail-silent:
+# every degraded read appends a warning for the caller to surface.
+_PRIMARY_REMOTES = ("fork", "origin")
+_REMOTE_BASE_BRANCH = "main"
+
+
+def _remote_main_task_stems(tasks_dir: Path, warnings: list[str] | None) -> set[str]:
+    """Id-shaped path components under the tasks dir on the primary remote's
+    main, read from the LOCAL tracking ref (one ``ls-tree``, no fetch).
+
+    Both file stems (``CLAWP-148.md``, ``CLAWP-111-006.md``) and directory
+    names (split parents, ``CLAWP-111/``) are returned; callers filter them
+    with :func:`_task_id_regex`. An unreadable ref returns an empty set and a
+    warning, never an exception.
+    """
+    from . import land
+
+    def degrade(reason: str) -> set[str]:
+        msg = (
+            f"remote-main id check skipped ({reason}); a task id that exists only "
+            f"on {'/'.join(_PRIMARY_REMOTES)} {_REMOTE_BASE_BRANCH} may be re-minted"
+        )
+        if warnings is not None:
+            warnings.append(msg)
+        else:
+            logger.warning(msg)
+        return set()
+
+    try:
+        top = land._git(
+            ["rev-parse", "--show-toplevel", "--show-prefix"], tasks_dir
+        ).stdout.splitlines()
+        if not top:
+            return degrade("not inside a git work tree")
+        toplevel = Path(top[0])
+        rel_prefix = top[1] if len(top) > 1 else ""
+        remotes = land._git(["remote"], toplevel).stdout.split()
+        remote = next((r for r in _PRIMARY_REMOTES if r in remotes), None)
+        if remote is None:
+            return degrade("no fork or origin remote configured")
+        ref = f"refs/remotes/{remote}/{_REMOTE_BASE_BRANCH}"
+        if land._git(
+            ["rev-parse", "--verify", "-q", f"{ref}^{{commit}}"], toplevel, ok_codes=(0, 1)
+        ).returncode != 0:
+            return degrade(f"{remote}/{_REMOTE_BASE_BRANCH} is not fetched locally")
+        listing = land._git(
+            ["ls-tree", "-r", "--name-only", "-z", ref, "--", rel_prefix or "."],
+            toplevel,
+        ).stdout
+    except land.LandError as exc:
+        return degrade(f"{exc.message}")
+    except OSError as exc:
+        return degrade(f"{type(exc).__name__}: {exc}")
+
+    stems: set[str] = set()
+    for path in listing.split("\0"):
+        if not path.startswith(rel_prefix):
+            continue
+        for part in path[len(rel_prefix):].split("/"):
+            if part.lower().endswith(".md"):
+                part = part[:-3]
+            if part:
+                stems.add(part)
+    return stems
+
+
 def _ledger_project_id(config: PortfolioConfig, project_id: str, settings=None) -> str:
     """The id the project's own settings declare, for reservation-ledger keys.
 
@@ -2159,7 +2228,11 @@ def _ledger_project_id(config: PortfolioConfig, project_id: str, settings=None) 
 
 
 def _next_root_ordinal(
-    config: PortfolioConfig, tasks_dir: Path, prefix: str, project_id: str
+    config: PortfolioConfig,
+    tasks_dir: Path,
+    prefix: str,
+    project_id: str,
+    warnings: list[str] | None = None,
 ) -> int:
     """Next free root ordinal under ``prefix``: one past the higher of the
     on-disk scan and the portfolio reservation ledger's high-water mark.
@@ -2170,8 +2243,18 @@ def _next_root_ordinal(
     cannot disagree.
     """
     scan_max = max(_root_ordinals(tasks_dir, prefix), default=-1)
-    reserved = reserved_high_water(config.portfolio_root, prefix, project_id)
-    return max(scan_max, -1 if reserved is None else reserved) + 1
+    reserved = reserved_high_water(
+        config.portfolio_root, prefix, project_id, warnings
+    )
+    # CLAWP-148: ids present only on the primary remote's main. A subtask id
+    # (``CLAWP-111-006``) implies its root ordinal, so nesting is allowed.
+    pat = _task_id_regex(prefix, subtasks=True)
+    remote_max = max(
+        (int(m.group(1)) for s in _remote_main_task_stems(tasks_dir, warnings)
+         if (m := pat.match(s))),
+        default=-1,
+    )
+    return max(scan_max, -1 if reserved is None else reserved, remote_max) + 1
 
 
 def _infer_prefix_from_tasks(tasks_dir: Path, *, keep_legacy: bool = False) -> str | None:
@@ -3051,6 +3134,7 @@ def add_task(
     delegability: str | None = None,
     source_request: str | None = None,
     kind: str | None = None,
+    mint_warnings: list[str] | None = None,
 ) -> Task | None:
     """Add a new task to a project (see :func:`add_task_with_status`).
 
@@ -3064,6 +3148,7 @@ def add_task(
         parallel_group=parallel_group, agent_profile=agent_profile,
         out_of_scope=out_of_scope, stop_conditions=stop_conditions,
         delegability=delegability, source_request=source_request, kind=kind,
+        mint_warnings=mint_warnings,
     )[0]
 
 
@@ -3086,6 +3171,7 @@ def add_task_with_status(
     delegability: str | None = None,
     source_request: str | None = None,
     kind: str | None = None,
+    mint_warnings: list[str] | None = None,
 ) -> tuple[Task | None, bool]:
     """Add a new task to a project; return ``(task, created)``.
 
@@ -3096,6 +3182,10 @@ def add_task_with_status(
     creation lock, before an id is allocated, so two concurrent callers for one
     key cannot both create: the loser gets ``(existing_task, False)``.
     ``(None, False)`` means the project has no tasks directory.
+
+    ``mint_warnings`` (CLAWP-148): when given, degraded id-collision checks
+    (no remote, remote ref missing, ``ls-tree`` failure, unreadable ledger) are
+    appended to it so the caller can surface them; the add still succeeds.
     """
     tasks_dir = get_tasks_dir(config, project_id)
     if not tasks_dir:
@@ -3225,7 +3315,9 @@ def add_task_with_status(
             # CLAWP-092: the ledger high-water mark joins the scan so a sibling
             # worktree's id (invisible on this disk) is never re-minted; the
             # reservation is recorded here, inside the portfolio lock.
-            next_num = _next_root_ordinal(config, tasks_dir, prefix, _ledger_pid)
+            next_num = _next_root_ordinal(
+                config, tasks_dir, prefix, _ledger_pid, mint_warnings
+            )
             task_id = f"{prefix}-{next_num:03d}"
             record_reservation(
                 config.portfolio_root, prefix, next_num, task_id, _ledger_pid
@@ -4029,6 +4121,7 @@ def _existing_child_ordinals(
     parent_id: str,
     portfolio_root: Path | None = None,
     project_id: str | None = None,
+    warnings: list[str] | None = None,
 ) -> set[int]:
     """Union of every ordinal already used by a child of ``parent_id``.
 
@@ -4085,9 +4178,15 @@ def _existing_child_ordinals(
                 _record(cid)
 
     if portfolio_root is not None:
-        reserved = reserved_high_water(portfolio_root, parent_id, project_id)
+        reserved = reserved_high_water(portfolio_root, parent_id, project_id, warnings)
         if reserved is not None:
             nums.add(reserved)
+        # CLAWP-148: children already on the primary remote's main.
+        child_pat = re.compile(rf"^{re.escape(parent_id)}-{{1,2}}(\d+)(?:\.progress)?$")
+        for stem in _remote_main_task_stems(tasks_dir, warnings):
+            m = child_pat.match(stem)
+            if m:
+                nums.add(int(m.group(1)))
 
     return nums
 
@@ -4111,6 +4210,7 @@ def add_subtask(
     tags: list[str] | None = None,
     graduates: str | None = None,
     kind: str | None = None,
+    mint_warnings: list[str] | None = None,
 ) -> Task | None:
     """Add a subtask to a parent task.
 
@@ -4200,7 +4300,8 @@ def add_subtask(
         # emit_tree's attach path routes through the same helper so the two
         # allocators can't drift.
         existing_nums = _existing_child_ordinals(
-            tasks_dir, parent_dir, parent_id, config.portfolio_root, _ledger_pid
+            tasks_dir, parent_dir, parent_id, config.portfolio_root, _ledger_pid,
+            mint_warnings,
         )
         next_num = (max(existing_nums) if existing_nums else 0) + 1
         subtask_id = f"{parent_id}-{next_num:03d}"
