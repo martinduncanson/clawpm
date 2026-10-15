@@ -572,3 +572,138 @@ def test_other_keys_survive_a_splice_unchanged(store):
     assert {k: v for k, v in after.items() if k != "pr_verification"} == {
         k: v for k, v in before.items() if k != "pr_verification"
     }
+
+
+# --- gate r3: directory-swap TOCTOU (verified identity must survive the write) --
+
+def _link_dir(link: Path, target: Path) -> None:
+    import subprocess
+    import sys
+
+    if sys.platform == "win32":
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True)
+        if made.returncode != 0:
+            pytest.skip("cannot create a junction on this host")
+    else:
+        _symlink(link, target, is_dir=True)
+
+
+def _swap_tasks_dir(tasks_dir: Path, other: Path) -> Path:
+    import os
+
+    moved = tasks_dir.with_name("tasks.orig")
+    os.rename(tasks_dir, moved)
+    _link_dir(tasks_dir, other)
+    return moved
+
+
+def test_tasks_dir_swapped_before_the_lock_never_writes_the_other_store(store, tmp_path):
+    config, scope, tasks_dir = store
+    other, victim = _other_project(tmp_path)
+    mine = _write(tasks_dir, BODY_LF)
+    before = (_sha(victim), _sha(mine))
+    moved = []
+
+    @contextmanager
+    def swap_then_lock(path, *a, **kw):
+        moved.append(_swap_tasks_dir(tasks_dir, other))
+        with file_lock(path, *a, **kw):
+            yield
+
+    with patch.object(pr_record, "file_lock", swap_then_lock):
+        with pytest.raises(PrRecordError) as ei:
+            record_pr_verification(config, "clawp", "CLAWP-900", RECORD, scope=scope)
+    assert ei.value.code == "unsafe_store"
+    assert _sha(victim) == before[0]
+    assert _sha(moved[0] / "CLAWP-900.md") == before[1]
+    assert not list(other.glob("*.tmp")) and not list(moved[0].glob("*.tmp"))
+
+
+def test_swap_during_the_write_cannot_redirect_it(store, tmp_path):
+    # Swap at the splice step (after the store is pinned / its fd is open).  Windows:
+    # the OS refuses the rename while the handle is open.  POSIX: the write still
+    # lands in the original directory through its fd.
+    config, scope, tasks_dir = store
+    other, victim = _other_project(tmp_path)
+    mine = _write(tasks_dir, BODY_LF)
+    before = _sha(victim)
+    real_splice = pr_record._splice
+    seen = {}
+
+    def swapping_splice(text, record):
+        try:
+            seen["moved"] = _swap_tasks_dir(tasks_dir, other)
+        except PermissionError:
+            seen["blocked"] = True
+        return real_splice(text, record)
+
+    with patch.object(pr_record, "_splice", swapping_splice):
+        record_pr_verification(config, "clawp", "CLAWP-900", RECORD, scope=scope)
+    assert _sha(victim) == before
+    landed = mine if seen.get("blocked") else seen["moved"] / "CLAWP-900.md"
+    assert _fm(landed)["pr_verification"] == RECORD
+
+
+def test_identity_mismatch_after_verification_is_refused(store):
+    import os
+    import types
+
+    config, scope, tasks_dir = store
+    _write(tasks_dir, BODY_LF)
+    pin = pr_record._PinnedStore(tasks_dir.resolve())
+    pin.recheck()
+    real = os.lstat
+
+    def fake(path, *a, **kw):
+        st = real(path, *a, **kw)
+        if os.path.normcase(str(path)) == os.path.normcase(str(pin.path)):
+            return types.SimpleNamespace(st_mode=st.st_mode, st_dev=st.st_dev, st_ino=st.st_ino + 1)
+        return st
+
+    with patch.object(os, "lstat", fake):
+        with pytest.raises(PrRecordError) as ei:
+            pin.recheck()
+    assert ei.value.code == "unsafe_store"
+
+
+def test_reparse_point_tasks_dir_is_refused_even_if_identity_matches(store):
+    import os
+    import types
+
+    config, scope, tasks_dir = store
+    real = os.lstat
+
+    def fake(path, *a, **kw):
+        st = real(path, *a, **kw)
+        if os.path.normcase(str(path)) == os.path.normcase(str(tasks_dir.resolve())):
+            return types.SimpleNamespace(
+                st_mode=st.st_mode, st_dev=st.st_dev, st_ino=st.st_ino, st_reparse_tag=0xA0000003
+            )
+        return st
+
+    with patch.object(os, "lstat", fake):
+        with pytest.raises(PrRecordError) as ei:
+            pr_record._PinnedStore(tasks_dir.resolve())
+    assert ei.value.code == "unsafe_store"
+
+
+def test_task_file_replaced_mid_write_is_not_clobbered(store):
+    import os
+
+    config, scope, tasks_dir = store
+    p = _write(tasks_dir, BODY_LF)
+    real_splice = pr_record._splice
+    interloper = b"---" + bytes([10]) + b"id: CLAWP-900" + bytes([10]) + b"title: edited elsewhere" + bytes([10]) + b"---" + bytes([10])
+
+    def swap_file(text, record):
+        side = tasks_dir / "side.tmpfile"
+        side.write_bytes(interloper)
+        os.replace(side, p)
+        return real_splice(text, record)
+
+    with patch.object(pr_record, "_splice", swap_file):
+        with pytest.raises(PrRecordError) as ei:
+            _record(store)
+    assert ei.value.code == "bad_task_ref"
+    assert p.read_bytes() == interloper
+    assert not list(tasks_dir.glob("*.tmp"))
