@@ -7,8 +7,9 @@ keys and re-parses before returning, so a splice that would change any other
 key raises instead of reaching disk. It reuses the event-mark technique (and
 the parsing helpers) of ``pr_record`` (CLAWP-151): refusing duplicate, aliased,
 flow-style or indented keys, and block scalars, rather than guessing. Anchors,
-aliases and tags elsewhere in the mapping are left alone; a replaced value may
-carry them unless another key aliases an anchor it defines.
+aliases and tags elsewhere in the mapping are left alone; an existing value
+being replaced may carry them unless another key aliases an anchor it defines.
+A replacement is always rendered anchor-, alias- and tag-free.
 """
 
 from __future__ import annotations
@@ -35,12 +36,31 @@ class _Remove:
 REMOVE = _Remove()
 
 
+class _NoAliasDumper(yaml.SafeDumper):
+    """Never emits anchors or aliases, even for an object shared within a value."""
+
+    def ignore_aliases(self, data: Any) -> bool:
+        return True
+
+
 def _render(key: str, value: Any) -> list[str]:
-    """Block-style YAML lines for ``{key: value}`` (no trailing newline)."""
-    text = yaml.safe_dump(
-        {key: value}, default_flow_style=False, allow_unicode=True,
-        sort_keys=False, width=4096,
+    """Block-style YAML lines for ``{key: value}`` (no trailing newline).
+
+    A replacement must not define an anchor: its auto-generated name could
+    collide with one another key aliases, silently rebinding that alias.
+    """
+    text = yaml.dump(
+        {key: value}, Dumper=_NoAliasDumper, default_flow_style=False,
+        allow_unicode=True, sort_keys=False, width=4096,
     )
+    for ev in yaml.parse(text):
+        if isinstance(ev, yaml.AliasEvent) or getattr(ev, "anchor", None) or (
+            getattr(ev, "tag", None)
+        ):
+            raise PrRecordError(
+                "bad_frontmatter",
+                f"replacement value for '{key}' needs a YAML anchor, alias or tag; refusing",
+            )
     return text.rstrip("\n").split("\n")
 
 

@@ -315,3 +315,51 @@ def test_orphaning_an_alias_is_refused_and_leaves_file_identical(port):
     with pytest.raises(ValueError, match="aliases"):
         record_human_question(port.config, "alpha", t.id, "Q?", ["A"])
     assert path.read_bytes() == before
+
+
+def _shared_value():
+    shared = ["new"]
+    return {"first": shared, "second": shared}  # default dumper emits &id001 / *id001
+
+
+def test_replacement_never_defines_an_anchor_that_rebinds_an_untouched_alias():
+    import yaml
+
+    from clawpm.frontmatter_splice import splice_keys
+
+    # `copy: *id001` resolves to `base`'s anchor today. The default dumper names
+    # its anchors id001, so a replacement for `options` (sitting between `base`
+    # and `copy`) that shares an object would rebind it.
+    text = "---\nbase: &id001 [keep]\noptions: [old]\ncopy: *id001\n---\nbody\n"
+    before = yaml.safe_load(text.split("---\n")[1])
+    value = {"x": ["new"]}
+    value["y"] = value["x"]
+    out = splice_keys(text, {"options": value})
+    after = yaml.safe_load(out.split("---\n")[1])
+    assert after["copy"] == ["keep"] == before["copy"]
+    assert after["base"] == before["base"]
+    assert after["options"] == {"x": ["new"], "y": ["new"]}
+    assert "&" not in out.split("---\n")[1].split("options:")[1].split("copy:")[0]
+
+
+def test_replacement_needing_a_tag_is_refused():
+    from clawpm.frontmatter_splice import splice_keys
+    from clawpm.pr_record import PrRecordError
+
+    with pytest.raises(PrRecordError, match="anchor, alias or tag"):
+        splice_keys("---\nopts: [old]\n---\nbody\n", {"opts": b"raw"})
+
+
+def test_shared_object_replacement_renders_anchor_free_and_round_trips():
+    import yaml
+
+    from clawpm.frontmatter_splice import splice_keys
+
+    text = "---\nopts: [old]\nother: 1\n---\nbody\n"
+    out = splice_keys(text, {"opts": _shared_value()})
+    fm = out.split("---\n")[1]
+    assert "&" not in fm and "*" not in fm
+    assert yaml.safe_load(fm) == {
+        "opts": {"first": ["new"], "second": ["new"]},
+        "other": 1,
+    }
