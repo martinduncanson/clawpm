@@ -9,6 +9,8 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 ### Added
 
 - `pr verify <N> --task <id> [--project <id>]` attests a MERGED PR (head, CI on that head, merge commit) and only then records a one-line `pr_verification` mapping in the task frontmatter, exposed by `tasks show` / `tasks list`. Refuses (exit 1, nothing written) on a task reference that is not a bare id (`bad_task_ref`, also when a symlink leads outside the tasks dir), a resolved store that does not declare the requested project (`project_mismatch`), or an explicit `--repo` that is not the remote's repo (`repo_remote_mismatch`); a `tasks` dir that is a link to another store (`unsafe_store`), or frontmatter it cannot splice exactly (duplicate or alias keys, anchored/tagged/block-scalar value; `bad_frontmatter`); the write goes through an exclusively created temp file and the value span comes from the YAML parser, so unrelated keys are never disturbed (#114, CLAWP-151).
+- `tasks add` / `add_subtask` skip task ids already present on the primary remote `main` (read from the local `fork/main`, else `origin/main`, with no fetch), so a stale local ledger cannot re-mint a landed id; fail-open with a loud warning (`data.warnings` in JSON, stderr in text) when no remote ref is readable (#119, CLAWP-148).
+- Calibration layer documented in the skill's predictions-and-reflection reference: `--miss-category` (six values, noise is valid), `--actual-complexity`, `--resolution`, `reflect scorecard`, the closure alarm and the metareflection nudge, linked to `docs/design/calibration-metrics-spec.md` (#120, CLAWP-112-006)
 - "Working the map" section in the clawpm skill (frontier, claim, resolve, close, graduate fog; one decision leaf per session; refer by name; humans answer human leaves) and plugin commands `/clawpm:plan`, `/clawpm:chart`, `/clawpm:next` listed in the marketplace manifest (#116, CLAWP-111-006)
 - clawpm-planner chart mode (decision maps as a rule with trigger and no-fog exit), recon fan-out via `feature-dev:code-explorer`, specify interview discipline, l/xl approach lenses, WHEN/THEN criterion phrasing and the default stop-list; examples updated (#112, CLAWP-111-005)
 
@@ -33,10 +35,12 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 
 ### Changed
 
+- Rubric grading instructions and the refuter EVIDENCE lens now state a freshness rule: a gradeable signal counts only if produced after the last relevant edit, and lint/build/type checks are hygiene, not behavioural evidence (#118, CLAWP-149).
 - `reflect summarize` `median_ratio` slices (overall, by_complexity, by_confidence, by_agent_profile) and the `reflect suggest` deflator now use the spec 2.3 geometric median `exp(median(ln r))` through `calibration._median_factor`, so an even-n sample at ratios 0.25 and 1 reports 0.5 instead of 0.625; odd-n results are unchanged (#115, CLAWP-150).
 - `skills/clawpm/SKILL.md` split into a ~13k-char core (always-on rules, quick start, routing table) plus eight on-demand files under `skills/clawpm/references/`; content moved verbatim apart from a few reworded lines, pointers to the reference files and a `--predicted-by` attribution note, with no behaviour change other than load order (token-audit cut 1).
 - MCP server tech-debt (#86, CLAWP-106): `tasks_state` gains `meta_reflect`/`process_lesson` (CLI parity); the `context` tool returns `project` as the plain id string with the metadata dict moved to `project_info` (BREAKING for consumers reading `context["project"]["id"]`); `ToolSpec.min_tier` is a `Literal` validated at construction; README no longer claims `--tools standard` widens the set; `build_agent_context` imports hoisted and docstring/module claims corrected.
 - SKILL.md doc cleanup: document `-f/--format` as the only output control (no `--json`), the `uv tool install`/`pipx` shim-only install, `doctor -p/--project`, the post-batch `tasks list` check, and the CLAWP-109 Windows glob fix state (#82, CLAWP-110).
+- Docs: upstream `origin` remote removed; fork is the sole remote (#117, no task id).
 
 ### Fixed
 

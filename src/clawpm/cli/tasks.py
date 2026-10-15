@@ -1272,6 +1272,7 @@ def tasks_add(
     if parent_id:
         parent_id = expand_task_id(parent_id, project_id)
     # Create subtask if parent specified
+    mint_warnings: list[str] = []
     with _mutation_errors(fmt, "add_failed"):
         tags_list = list(tags) if tags else None
         if parent_id:
@@ -1295,6 +1296,7 @@ def tasks_add(
                 tags=tags_list,
                 graduates=graduates,
                 kind=kind,
+                mint_warnings=mint_warnings,
             )
         else:
             deps = list(depends) if depends else None
@@ -1316,6 +1318,7 @@ def tasks_add(
                 stop_conditions=list(stop_conditions) if stop_conditions else None,
                 delegability=delegability,
                 kind=kind,
+                mint_warnings=mint_warnings,
             )
 
     if not task:
@@ -1347,6 +1350,15 @@ def tasks_add(
     # the operator/agent didn't already pin them. Anchors new predictions
     # to the calibration corpus instead of pure inside view.
     task_dict = task.to_dict()
+    # CLAWP-148: a degraded id-collision check is loud, never silent. JSON
+    # carries it in data.warnings; text mode echoes to stderr (stdout stays
+    # parseable either way).
+    if mint_warnings:
+        if fmt == OutputFormat.JSON:
+            task_dict["warnings"] = list(mint_warnings)
+        else:
+            for w in mint_warnings:
+                click.echo(f"warning: {w}", err=True)
     if not reference_tasks and task.predictions and not task.predictions.is_empty():
         try:
             from clawpm.reflect import find_reference_tasks

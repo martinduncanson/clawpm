@@ -246,6 +246,62 @@ clawpm reflect history-import [--source <dir>]
 `reflect void` (documented above) completes the group — mark bad-data events
 void without deleting them.
 
+### Calibration layer — closing honestly and reading the scorecard (CLAWP-112)
+
+Definitions live in `docs/design/calibration-metrics-spec.md` (sections 2.1-2.3 define the
+held / Brier / closure metrics, 2.4 the miss categories, 2.6 honest actuals). The CLI follows the
+spec; if they disagree, the CLI is current.
+
+Extra completion flags (accepted by `clawpm done` and `clawpm tasks state <id> done`;
+`--actual-complexity` is also accepted by `clawpm block`):
+
+- `--miss-category <c>` — why the prediction METHOD failed. Single pick; an unknown value is
+  refused (`bad_miss_category`) and nothing is written. The six values:
+  - `wrong_signal` — predicted on the wrong evidence (sized by file count when the cost was review rounds).
+  - `wrong_weight` — right factors, wrong emphasis.
+  - `missed_variable` — an unmodelled factor dominated.
+  - `operator_override` — the operator changed the goal or approach mid-task.
+  - `noise` — inside expected variance, no lesson. **A valid and encouraged answer**: use it
+    rather than inventing a root cause. Forcing a story onto variance corrupts the repeat rule below.
+  - `structural` — clawpm, the harness or the tooling broke the measurement.
+- `--actual-complexity s|m|l|xl` — your independent post-hoc complexity call. Without it
+  `actuals.complexity` stays null and `complexity_match` is null; it is never copied from the prediction.
+- `--resolution "<text>"` — outcome text. Required to close a `kind: decision` task, optional for build tasks.
+
+```bash
+clawpm done CLAWP-042 --actual-complexity l --miss-category missed_variable \
+    --reflect-note "mobile webview cookie handling dominated"
+clawpm done CLAWP-043 --miss-category noise      # slow day, no lesson
+```
+
+A missed prediction closed without `--miss-category` prints a one-line reminder (stderr in text
+mode, `data.warnings` in JSON) and still closes. Agent-driven closes are never blocked or prompted.
+
+**Reading the numbers**
+
+```bash
+clawpm reflect scorecard [-p <project>] [--include-decisions] [--json]
+```
+
+Five text lines whatever the global `--format`: closure, bias factor, Brier and n, overconfidence
+headline, top miss category / metareflection due. `--json` returns the full calibration block.
+`reflect summarize` carries the same `calibration` block in its data. Cells below n=20 are marked
+`insufficient_data`; treat them as anecdote.
+
+**Closure alarm.** Closure is resolved / registered predictions. It is judged on the rolling
+30-day registration cohort (the all-time rate only when that window is empty), and alarms when it
+is strictly below 0.6. The message says most predictions never resolve, so the other numbers are
+survivors only. It appears in the scorecard's closure line and, in text mode, appended as
+`ALARM: ...` to the `reflect summarize` message. Fix it by closing or voiding stale tasks, not by
+reading the other metrics harder.
+
+**Metareflection nudge.** When the same miss category recurs three or more times in one project in
+the trailing 30 days, a one-line `metareflection due (repeated misses in the last 30 days):
+<category> xN` is printed after `tasks state ... done` (text mode, stderr, single-task closes) and
+added to the Stop hook's `systemMessage` for that project. It is advisory and fail-open: it never
+changes an exit code or a continue/decision. When you see it, stop and ask what in the prediction
+process produced the repeat, then record a `--process-lesson`.
+
 ## Project-level reflection (Phase 2 stub — planned)
 
 Tasks are micro-experiments. **Projects are macro-experiments.** Each project has a goal hypothesis in `.project/spec.md` at init time; tasks within the project are sub-predictions about HOW to achieve that goal.

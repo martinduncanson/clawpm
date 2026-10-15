@@ -19,7 +19,7 @@ priority: 6
 scope:
 - src/clawpm/rubric.py
 - src/clawpm/judges/stop_condition.py
-updated: '2026-10-14'
+updated: '2026-10-15'
 ---
 # Rubric evidence freshness: a gradeable signal only counts if produced after the last edit (prompt line + spike)
 

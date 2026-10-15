@@ -464,7 +464,10 @@ _REFUTE_LENSES = {
     "evidence": (
         "Lens: EVIDENCE — focus on whether the transcript contains concrete, "
         "quotable evidence (command output, diffs, test results, file "
-        "contents) for each claim, not merely an assertion that it was done."
+        "contents) for each claim, not merely an assertion that it was done. "
+        "A signal counts only if it was produced AFTER the last relevant "
+        "edit; a run that predates that edit is stale. Lint, build and type "
+        "checks are hygiene, not behavioural evidence."
     ),
     "correctness": (
         "Lens: CORRECTNESS — focus on whether the claimed work is actually "
