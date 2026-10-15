@@ -240,3 +240,90 @@ def test_task_unset_means_to_dict_has_no_pr_verification_key(store):
     r = CliRunner().invoke(main, ["--format", "json", "tasks", "show", TASK, "-p", "test"])
     assert r.exit_code == 0, r.output
     assert "pr_verification" not in json.loads(r.stdout)
+
+
+# --- gate r1: project identity and repo/remote pairing -------------------------
+
+def _second_project(store: Path) -> Path:
+    """A sibling project 'other' that also holds TEST-001; returns its tasks dir."""
+    root = store.parent.parent.parent  # <portfolio>/repo/.project/tasks -> <portfolio>
+    repo = root / "repo-b"
+    meta = repo / ".project"
+    (meta / "tasks" / "done").mkdir(parents=True)
+    (meta / "settings.toml").write_text(
+        'id = "other"\nname = "Other"\nstatus = "active"\npriority = 3\n'
+        f'repo_path = "{repo.as_posix()}"\n',
+        encoding="utf-8",
+    )
+    return meta / "tasks"
+
+
+def test_resolved_store_of_another_project_is_refused_and_nothing_written(store):
+    mine = _plain(store)
+    other_tasks = _second_project(store)
+    theirs = other_tasks / f"{TASK}.md"
+    theirs.write_bytes((_FM + "---\n" + _BODY).encode("utf-8"))
+    before = (_sha(mine), _sha(theirs))
+    with patch("clawpm.discovery.get_project_dir", return_value=other_tasks.parent):
+        r = _run(FakeEnv())
+    assert r.exit_code == 1, (r.output, r.stderr)
+    assert json.loads(r.stderr)["error"] == "project_mismatch"
+    assert (_sha(mine), _sha(theirs)) == before
+
+
+def test_unreadable_project_id_in_resolved_store_is_refused(store):
+    mine = _plain(store)
+    other_tasks = _second_project(store)
+    (other_tasks.parent / "settings.toml").write_text("name = 'no id here'\n", encoding="utf-8")
+    before = _sha(mine)
+    with patch("clawpm.discovery.get_project_dir", return_value=other_tasks.parent):
+        r = _run(FakeEnv())
+    assert r.exit_code == 1, (r.output, r.stderr)
+    assert json.loads(r.stderr)["error"] == "project_mismatch"
+    assert _sha(mine) == before
+
+
+def test_explicit_repo_that_is_not_the_remotes_repo_is_refused(store):
+    p = _plain(store)
+    before = _sha(p)
+    r = _run(FakeEnv(), "--repo", "other/name")
+    assert r.exit_code == 1, (r.output, r.stderr)
+    assert json.loads(r.stderr)["error"] == "repo_remote_mismatch"
+    assert _sha(p) == before
+
+
+def test_explicit_repo_equal_to_the_remotes_repo_is_accepted_case_insensitively(store):
+    p = _plain(store)
+    r = _run(FakeEnv(), "--repo", "Acme/Widgets")
+    assert r.exit_code == 0, (r.output, r.stderr)
+    assert b"pr_verification:" in p.read_bytes()
+
+
+def test_explicit_repo_without_task_is_unchanged(store):
+    p = _plain(store)
+    before = _sha(p)
+    open_pr = {"headRefOid": HEAD, "headRefName": "feat/x", "mergeable": "MERGEABLE", "state": "OPEN", "url": "u"}
+    r = _run(FakeEnv(pr=open_pr), "--repo", "other/name", task=False)
+    assert r.exit_code == 0, (r.output, r.stderr)
+    assert json.loads(r.stdout)["repo"] == "other/name"
+    assert _sha(p) == before
+
+
+@pytest.mark.parametrize("ref", ["../../repo-b/.project/tasks/TEST-001", "/etc/TEST-001", "..\\x\\TEST-001"])
+def test_path_like_task_ref_is_refused_before_verification(store, ref):
+    p = _plain(store)
+    before = _sha(p)
+    calls = []
+    env = FakeEnv()
+
+    def spy(args, **kw):
+        calls.append(args)
+        return env(args, **kw)
+
+    argv = ["--format", "json", "pr", "verify", "7", "--task", ref, "--project", "test"]
+    with patch("clawpm.pr_verify.subprocess.run", spy):
+        r = CliRunner().invoke(main, argv)
+    assert r.exit_code == 1, (r.output, r.stderr)
+    assert json.loads(r.stderr)["error"] == "bad_task_ref"
+    assert calls == []
+    assert _sha(p) == before

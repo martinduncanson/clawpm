@@ -49,9 +49,48 @@ def pr_verify_cmd(ctx, pr_number, expect_head, repo, remote, task_id, project_id
         from clawpm.cli.base import require_portfolio, require_project
         from clawpm.context import expand_task_id
 
+        from clawpm.discovery import _read_project_id_from_settings, get_project_dir
+        from clawpm.pr_record import PrRecordError, validate_task_ref
+        from clawpm.pr_verify import _resolve_repo
+        from clawpm.sessions import Scope
+
         config = require_portfolio(ctx)
         project_id, _ = require_project(ctx, project_id, auto_init=False)  # a refusal must write nothing
         task_id = expand_task_id(task_id, project_id)
+        try:
+            validate_task_ref(task_id)
+        except PrRecordError as exc:
+            output_error(exc.code, exc.message, {"task": task_id}, fmt=fmt)
+            sys.exit(1)
+        # The store we are about to write must itself declare the requested project id.
+        project_dir = get_project_dir(config, project_id)
+        declared = _read_project_id_from_settings(project_dir / "settings.toml") if project_dir is not None else None
+        if declared != project_id:
+            output_error(
+                "project_mismatch",
+                f"resolved store {str(project_dir)!r} declares project {declared!r}, not {project_id!r}; "
+                "refusing to write another project's task",
+                {"project": project_id, "declared": declared},
+                fmt=fmt,
+            )
+            sys.exit(1)
+        scope = Scope(pinned_project_dir=project_dir)
+        # An explicit --repo must be the remote's own repo: forks share branch names and shas.
+        if repo:
+            try:
+                actual = _resolve_repo(None, remote)
+            except PrVerifyError as exc:
+                output_error(exc.code, exc.message, exc.details or None, fmt=fmt)
+                sys.exit(2)
+            if actual.lower() != repo.lower():
+                output_error(
+                    "repo_remote_mismatch",
+                    f"--repo {repo} does not match remote '{remote}' ({actual}); "
+                    "refusing to attest a PR from a different repository",
+                    {"repo": repo, "remote_repo": actual},
+                    fmt=fmt,
+                )
+                sys.exit(1)
     try:
         result = verify_pr(
             pr_number, expect_head=expect_head, repo=repo, remote=remote,
@@ -64,9 +103,7 @@ def pr_verify_cmd(ctx, pr_number, expect_head, repo, remote, task_id, project_id
     if task_id is not None and result["ok"]:
         from datetime import datetime, timezone
 
-        from clawpm.discovery import get_project_dir
-        from clawpm.pr_record import PrRecordError, record_pr_verification
-        from clawpm.sessions import Scope
+        from clawpm.pr_record import record_pr_verification
 
         record = {
             "pr": pr_number,
@@ -76,8 +113,6 @@ def pr_verify_cmd(ctx, pr_number, expect_head, repo, remote, task_id, project_id
             "remote": remote,
             "repo": result["repo"],
         }
-        project_dir = get_project_dir(config, project_id)
-        scope = Scope(pinned_project_dir=project_dir) if project_dir is not None else None
         try:
             path = record_pr_verification(config, project_id, task_id, record, scope=scope)
         except PrRecordError as exc:

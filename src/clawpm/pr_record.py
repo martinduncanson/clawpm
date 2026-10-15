@@ -27,7 +27,10 @@ from clawpm.tasks import _candidate_task_paths, get_tasks_dir
 
 RECORD_KEYS = ("pr", "head", "merge_commit", "verified_at", "remote", "repo")
 _KEY = "pr_verification"
-_KEY_LINE_RE = re.compile(r"^pr_verification\s*:")
+# Plain, double-quoted or single-quoted spelling of the key at column 0.
+_KEY_LINE_RE = re.compile(r"^(?:pr_verification|\"pr_verification\"|'pr_verification')\s*:")
+# A task reference is a bare id (PREFIX-NNN[-NNN]); never a path.
+_TASK_REF_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.]*(?:-[A-Za-z0-9_.]+)*-\d+(?:-\d+)?")
 _BOM = "﻿"
 
 
@@ -38,6 +41,12 @@ class PrRecordError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+def validate_task_ref(task_id: str) -> None:
+    """Raise ``bad_task_ref`` unless ``task_id`` is a bare task id (no separators, ``..`` or drive)."""
+    if not isinstance(task_id, str) or ".." in task_id or not _TASK_REF_RE.fullmatch(task_id):
+        raise PrRecordError("bad_task_ref", f"{task_id!r} is not a task id (expected PREFIX-NNN)")
 
 
 def _splice(text: str, record: dict[str, Any]) -> str:
@@ -61,6 +70,10 @@ def _splice(text: str, record: dict[str, Any]) -> str:
     new_line = f"{_KEY}: " + json.dumps(record, sort_keys=True, separators=(", ", ": ")) + eol
 
     hits = [i for i in range(1, close_idx) if _KEY_LINE_RE.match(lines[i])]
+    if not hits and _KEY in parsed:
+        raise PrRecordError(
+            "bad_frontmatter", f"task frontmatter holds a '{_KEY}' key in a spelling this writer cannot replace"
+        )
     if len(hits) > 1:
         raise PrRecordError("bad_frontmatter", f"task frontmatter has {len(hits)} '{_KEY}' keys")
     if hits:
@@ -102,6 +115,7 @@ def record_pr_verification(
     frontmatter that is absent, non-mapping or unparseable.  Holds the project's
     ``.clawpm-tasks.lock`` across the read-splice-replace.
     """
+    validate_task_ref(task_id)
     if set(record) != set(RECORD_KEYS):
         raise PrRecordError(
             "bad_record", f"record keys must be exactly {sorted(RECORD_KEYS)}, got {sorted(record)}"
@@ -117,6 +131,9 @@ def record_pr_verification(
         path = next((p for p in _candidate_task_paths(tasks_dir, task_id) if p.exists()), None)
         if path is None:
             raise PrRecordError("task_not_found", f"task {task_id!r} not found in project {project_id!r}")
+        # Defence in depth: a symlinked file or state dir must not lead outside the store.
+        if not path.resolve().is_relative_to(tasks_dir.resolve()):
+            raise PrRecordError("bad_task_ref", f"task {task_id!r} resolves outside the project's tasks directory")
         # Bytes in, bytes out: text mode would fold/expand line endings.
         text = retry_transient(lambda: path.read_bytes()).decode("utf-8")
         new_text = _splice(text, record)
