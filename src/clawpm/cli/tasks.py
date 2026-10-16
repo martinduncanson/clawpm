@@ -2134,9 +2134,24 @@ def _tasks_dispatch_impl(
                     fmt=fmt,
                 )
                 sys.exit(1)
-            if _branch_wt is not None and _os.path.normcase(
-                str(_branch_wt.resolve())
-            ) != _os.path.normcase(str(_existing_wt.resolve())):
+            _wt_differs = False
+            if _branch_wt is not None:
+                # CLAWP-161: an identity comparison; an unresolvable side
+                # refuses rather than assuming the two are the same.
+                try:
+                    _wt_differs = _os.path.normcase(
+                        str(_branch_wt.resolve())
+                    ) != _os.path.normcase(str(_existing_wt.resolve()))
+                except (OSError, RuntimeError) as exc:
+                    output_error(
+                        "branch_worktree_unresolvable",
+                        f"Could not resolve {_branch_wt} or {_existing_wt} to "
+                        f"compare them ({type(exc).__name__}: {exc}). "
+                        f"Nothing was dispatched.",
+                        fmt=fmt,
+                    )
+                    sys.exit(1)
+            if _wt_differs:
                 output_error(
                     "branch_checked_out_elsewhere",
                     f"Branch clawpm/{task_id} is already checked out at "

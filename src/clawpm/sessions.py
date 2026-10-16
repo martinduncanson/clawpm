@@ -380,12 +380,14 @@ def register_session(
     harmless, since resolution only needs ANY active session whose path
     matches, not a unique one.
     """
+    # CLAWP-161: the recorded path is a ledger identity, so a failed resolve
+    # refuses (OSError; callers roll back) rather than recording a spelling.
     event = {
         "action": _REGISTERED,
         "session_id": session_id,
         "task_id": task_id,
         "project_id": project_id,
-        "worktree_path": str(Path(worktree_path).resolve()),
+        "worktree_path": str(canonical_path(Path(worktree_path))),
         "ts": _now_iso(),
     }
     prefix = normalise_project_prefix(project_prefix)
@@ -432,7 +434,18 @@ def persist_relocated_worktree(
     # (CLAWP-118). The checkout root a record stores is that dir minus the
     # record's project prefix, so derive it per record and validate it before
     # appending anything (a mismatch must not leave a partial rewrite).
-    marker_dir = Path(worktree).resolve()
+    try:
+        marker_dir = canonical_path(Path(worktree))
+    except OSError as exc:
+        logger.error(
+            "Cannot persist relocated worktree %s for task %s, project %s: "
+            "its path cannot be resolved (%s). Keeping the dispatch marker; "
+            "teardown is aborted.",
+            worktree, task_id, project_id, exc,
+        )
+        raise SessionRebindError(
+            f"relocated worktree {worktree} cannot be resolved: {exc}"
+        ) from exc
     stale_paths = {
         os.path.normcase(str(s.worktree_path))
         for s in sessions.values()

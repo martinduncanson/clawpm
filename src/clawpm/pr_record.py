@@ -32,7 +32,7 @@ import yaml
 from clawpm.concurrency import file_lock, retry_transient
 from clawpm.discovery import get_project_dir
 from clawpm.models import PortfolioConfig
-from clawpm.sessions import Scope
+from clawpm.sessions import Scope, canonical_path
 from clawpm.tasks import _candidate_task_paths, get_tasks_dir
 
 RECORD_KEYS = ("pr", "head", "merge_commit", "verified_at", "remote", "repo")
@@ -352,8 +352,16 @@ def _verified_tasks_dir(config: PortfolioConfig, project_id: str, scope: Scope |
     project_dir = get_project_dir(config, project_id, **kw)
     if project_dir is None:
         raise PrRecordError("unsafe_store", f"cannot establish the verified project dir for {project_id!r}")
-    verified = Path(project_dir).resolve() / "tasks"
-    actual = os.path.normcase(str(Path(tasks_dir).resolve()))
+    try:
+        verified = canonical_path(Path(project_dir)) / "tasks"
+        actual = os.path.normcase(str(canonical_path(Path(tasks_dir))))
+    except OSError as exc:
+        # CLAWP-161: the write-through-a-link check is an identity comparison;
+        # an unresolvable store cannot be verified, so refuse.
+        raise PrRecordError(
+            "unsafe_store",
+            f"cannot resolve the store of project {project_id!r} to verify it: {exc}",
+        ) from exc
     if actual != os.path.normcase(str(verified)) or Path(tasks_dir).is_symlink():
         raise PrRecordError(
             "unsafe_store",
