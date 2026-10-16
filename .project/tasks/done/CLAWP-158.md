@@ -15,7 +15,7 @@ predictions:
   - WHEN two writers rewrite different task or mission files in one directory concurrently
     THEN neither loses its temp file and no leftover .tmp remains
 priority: 6
-updated: '2026-10-15'
+updated: '2026-10-16'
 ---
 # Atomic-write hygiene: replace shared with_suffix(.tmp) writers with unique temp files
 
