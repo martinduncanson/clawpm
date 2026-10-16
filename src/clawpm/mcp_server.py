@@ -576,6 +576,10 @@ def tasks_add(
 
 
 _DECISION_KEYS = ("blocked_on", "question", "options", "recommendation", "answer")
+_DECISION_REFRESH_WARNING = (
+    "state change saved, but the task could not be refreshed: the question/answer "
+    "record is missing from this response (it was written; use tasks_get to read it)"
+)
 
 
 def _refresh_decision_data(config, project_id: str, task_id: str, result: dict) -> dict:
@@ -585,7 +589,10 @@ def _refresh_decision_data(config, project_id: str, task_id: str, result: dict) 
     decision record is written, and the CLI renders that payload unchanged. The
     MCP promises the updated task, so re-read it and overlay the task fields
     while keeping the transition's side-effect keys (cascade, warnings, ...).
-    Best effort: an unreadable task leaves the transition payload as it was.
+    Best effort, but never silent: the state change has already landed, so an
+    unreadable task keeps the transition payload and marks it with
+    `decision_refresh_failed` plus a `warnings` entry, telling the caller the
+    saved question/answer is missing from the response, not from the task.
     """
     data = result.get("data") if result.get("ok") else None
     if not isinstance(data, dict):
@@ -595,9 +602,13 @@ def _refresh_decision_data(config, project_id: str, task_id: str, result: dict) 
     try:
         fresh = get_task(config, project_id, task_id)
     except Exception:
-        return result
+        fresh = None
     if fresh is None:
-        return result
+        return {**result, "data": {
+            **data,
+            "decision_refresh_failed": True,
+            "warnings": [*(data.get("warnings") or []), _DECISION_REFRESH_WARNING],
+        }}
     merged = {k: v for k, v in data.items() if k not in _DECISION_KEYS}
     merged.update(fresh.to_dict())
     return {**result, "data": merged}

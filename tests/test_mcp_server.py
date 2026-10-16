@@ -11,6 +11,7 @@ trip through the protocol exactly as a host (Cursor, Claude Code, …) would see
 from __future__ import annotations
 
 import json
+import sys
 
 import anyio
 import pytest
@@ -1380,6 +1381,86 @@ def test_mcp_decision_response_reflects_the_saved_record(tmp_path, monkeypatch):
 
     saved = get_task(port.config, "alpha", t.id)
     assert saved.answer == "Ship"
+
+
+@pytest.mark.parametrize("failure", ["oserror", "none"])
+def test_mcp_decision_refresh_failure_is_signalled(tmp_path, monkeypatch, failure):
+    """The state change lands, but a failed re-read of the saved record must be
+    reported (decision_refresh_failed + a warning), not passed off as a
+    complete payload with the question/answer silently missing."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    import clawpm.tasks as tasks_mod
+    from clawpm.models import TaskState
+    from clawpm.tasks import add_task, get_task
+
+    port = _decision_port(tmp_path, monkeypatch)
+    t = add_task(port.config, "alpha", "Decide")
+    real_get_task = tasks_mod.get_task
+
+    def broken_get_task(*args, **kwargs):
+        # Break only the MCP refresh re-read; the transition itself must land.
+        if sys._getframe(1).f_code.co_name != "_refresh_decision_data":
+            return real_get_task(*args, **kwargs)
+        if failure == "oserror":
+            raise OSError("disk went away")
+        return None
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+            monkeypatch.setattr(tasks_mod, "get_task", broken_get_task)
+            blocked = await _call(client, "tasks_state", {
+                "project": "alpha", "task_id": t.id, "new_state": "blocked",
+                "question": "Ship?", "options": ["Ship", "Wait"]})
+            monkeypatch.setattr(tasks_mod, "get_task", real_get_task)
+            assert blocked["ok"] is True, blocked
+            assert blocked["data"]["state"] == "blocked"
+            assert blocked["data"]["decision_refresh_failed"] is True
+            assert any("could not be refreshed" in w for w in blocked["data"]["warnings"])
+            assert "question" not in blocked["data"]
+            monkeypatch.setattr(tasks_mod, "get_task", broken_get_task)
+            opened = await _call(client, "tasks_state", {
+                "project": "alpha", "task_id": t.id, "new_state": "open",
+                "answer": "Ship"})
+            monkeypatch.setattr(tasks_mod, "get_task", real_get_task)
+            assert opened["ok"] is True, opened
+            assert opened["data"]["state"] == "open"
+            assert opened["data"]["decision_refresh_failed"] is True
+            assert any("could not be refreshed" in w for w in opened["data"]["warnings"])
+            assert "answer" not in opened["data"]
+
+    _run(scenario)
+
+    # No rollback: the record and the answer both landed on disk.
+    saved = get_task(port.config, "alpha", t.id)
+    assert saved.state == TaskState.OPEN
+    assert saved.answer == "Ship"
+    assert saved.question == "Ship?"
+
+
+def test_mcp_decision_refresh_success_has_no_failure_marker(tmp_path, monkeypatch):
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    from clawpm.tasks import add_task
+
+    port = _decision_port(tmp_path, monkeypatch)
+    t = add_task(port.config, "alpha", "Decide")
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+            blocked = await _call(client, "tasks_state", {
+                "project": "alpha", "task_id": t.id, "new_state": "blocked",
+                "question": "Ship?"})
+            assert blocked["ok"] is True, blocked
+            assert "decision_refresh_failed" not in blocked["data"]
+            assert not any("could not be refreshed" in w
+                           for w in blocked["data"].get("warnings", []))
+
+    _run(scenario)
 
 
 def test_cli_block_question_json_output_is_unchanged(tmp_path, monkeypatch):
