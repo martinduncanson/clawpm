@@ -8,6 +8,7 @@ import click
 from clawpm.models import Task
 from clawpm.output import output_error, output_success
 from clawpm.context import expand_task_id
+from clawpm.sessions import resolve_abs_path
 from clawpm.cli.base import main, get_format, require_portfolio, require_project, _FALLBACK_POLICIES, ExpandedPath
 
 # ============================================================================
@@ -98,7 +99,7 @@ def lease_grant(ctx, project_id, task_id, ttl, fallback_policy, holder_id, targe
     # Store an ABSOLUTE target dir (Codex P2) so a later sweep from a different
     # CWD tears down the right path — matching what `tasks dispatch` does.
     if target_dir:
-        target_dir = Path(target_dir).resolve().as_posix()
+        target_dir = resolve_abs_path(Path(target_dir)).as_posix()
     try:
         grant_lease(
             config.portfolio_root, task_id, project_id, ttl_seconds=ttl,

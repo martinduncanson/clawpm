@@ -294,6 +294,77 @@ class TestDispatchTargetDirResolveGuard:
         )
 
 
+class TestTargetDirResolveGuardEverySite:
+    """CLAWP-159: every ``--target-dir`` ``resolve()`` site, not just the first.
+
+    Policy: sites that only need a stable absolute path (registry rows, lock
+    key, lease holder/target) warn and fall back to ``os.path.abspath``; the
+    command carries on rather than dying on a traceback. ``Nth`` failures
+    prove each call site is guarded in turn.
+    """
+
+    @staticmethod
+    def _patch(monkeypatch, fail_on):
+        real_resolve = Path.resolve
+        seen = []
+
+        def flaky(self, *a, **kw):
+            if self.name == "unavailable-volume":
+                seen.append(1)
+                if fail_on is None or len(seen) == fail_on:
+                    raise OSError("simulated unavailable volume")
+            return real_resolve(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "resolve", flaky)
+        return seen
+
+    def test_lease_grant_target_dir_unresolvable(self, fx, monkeypatch, caplog):
+        task = add_task(fx["config"], "test", "lease me")
+        bad = fx["elsewhere"] / "unavailable-volume"
+        self._patch(monkeypatch, None)
+        with caplog.at_level("ERROR"):
+            result = CliRunner().invoke(
+                main,
+                ["--project", "test", "lease", "grant", "--task", task.id,
+                 "--ttl", "600", "--target-dir", str(bad)],
+            )
+        assert not isinstance(result.exception, OSError), result.output
+        assert result.exit_code == 0, result.output
+        assert any(
+            "simulated unavailable volume" in r.getMessage() for r in caplog.records
+        )
+
+    def test_dispatch_with_lease_all_sites_unresolvable(self, fx, monkeypatch):
+        task = add_task(fx["config"], "test", "probe")
+        bad = fx["elsewhere"] / "unavailable-volume"
+        seen = self._patch(monkeypatch, None)
+        result = CliRunner().invoke(
+            main,
+            ["--project", "test", "tasks", "dispatch", task.id,
+             "--target-dir", str(bad), "--lease-ttl", "600"],
+        )
+        assert not isinstance(result.exception, OSError), result.output
+        assert result.exit_code == 0, result.output
+        # scope + registry + lock key + hook holder + lease target: the
+        # parametrised test below only bites if all five sites run.
+        assert len(seen) == 5, len(seen)
+
+    @pytest.mark.parametrize("nth", [1, 2, 3, 4, 5])
+    def test_dispatch_with_lease_nth_resolve_unresolvable(
+        self, fx, monkeypatch, nth
+    ):
+        task = add_task(fx["config"], "test", "dispatch me")
+        bad = fx["elsewhere"] / "unavailable-volume"
+        self._patch(monkeypatch, nth)
+        result = CliRunner().invoke(
+            main,
+            ["--project", "test", "tasks", "dispatch", task.id,
+             "--target-dir", str(bad), "--lease-ttl", "600"],
+        )
+        assert not isinstance(result.exception, OSError), result.output
+        assert result.exit_code == 0, result.output
+
+
 class TestIsTaskStoreCanonicalScope:
     def test_scope_overrides_ambient(self, fx, monkeypatch):
         from clawpm.discovery import is_task_store_canonical

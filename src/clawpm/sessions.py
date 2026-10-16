@@ -238,6 +238,22 @@ def resolve_path_or_none(
         return None
 
 
+def resolve_abs_path(
+    path: Path,
+    fallback: str = "Using the unresolved absolute path instead.",
+) -> Path:
+    """Absolute form of *path*: ``resolve()``, else a pure-string ``abspath``.
+
+    CLAWP-159: the ``--target-dir`` sites that only need a stable absolute
+    path (registry rows, lock keys, lease holder tokens) must not crash on an
+    unavailable target; the logged fallback keeps the command going without
+    touching the filesystem. Same fail-open marker as
+    :func:`resolve_path_or_none`.
+    """
+    resolved = resolve_path_or_none(path, fallback)
+    return resolved if resolved is not None else Path(os.path.abspath(path))
+
+
 _REGISTERED = "registered"
 _RELEASED = "released"
 

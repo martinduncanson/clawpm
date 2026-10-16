@@ -2645,7 +2645,8 @@ def _tasks_dispatch_impl(
         # The holder is a shell-safe TOKEN of that path (Codex P2) — the same
         # token the heartbeat hook bakes in — so a path with spaces can't break
         # the hook or the holder match.
-        _abs_target = resolved_dir.resolve().as_posix()
+        from clawpm.sessions import resolve_abs_path
+        _abs_target = resolve_abs_path(resolved_dir).as_posix()
         try:
             grant_lease(
                 config.portfolio_root, task_id, project_id,
