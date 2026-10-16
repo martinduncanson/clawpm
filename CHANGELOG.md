@@ -38,7 +38,7 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 
 ### Fixed
 
-- `tasks state <id> open` then `blocked` no longer resurrects a stale question in `tasks list --needs-human`: `change_task_state` drops the decision record when a task enters blocked from another state (CLAWP-156).
+- `tasks state <id> open` then `blocked` no longer resurrects a stale question in `tasks list --needs-human`: `change_task_state` drops the decision record when a task enters blocked from another state (#125, CLAWP-156).
 
 ### Changed
 
