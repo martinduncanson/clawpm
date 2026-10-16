@@ -11,7 +11,7 @@ predictions:
   duration_min: 120
   filled_by: agent
 priority: 5
-updated: '2026-10-14'
+updated: '2026-10-16'
 ---
 # CLAWP-122 follow-ups: guard dispatch --target-dir resolve; migrate hand-scoped sites to explicit Scope
 

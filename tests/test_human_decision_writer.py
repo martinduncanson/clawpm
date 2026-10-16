@@ -73,10 +73,14 @@ def test_plain_block_clear_failure_is_loud(port, monkeypatch):
     r = CliRunner().invoke(
         main, ["block", "-p", "alpha", t.id, "--note", "x"], env=_env(port)
     )
+    # CLAWP-156 — the transition itself drops the record now, so a failed
+    # clear aborts the block (loud, nothing half-applied): the task stays open
+    # and keeps the old record rather than landing blocked with a stale question.
     assert r.exit_code != 0
-    assert "stale" in r.output.lower()
-    # The block itself landed; the error says the record is still there.
-    assert get_task(port.config, "alpha", t.id).state == TaskState.BLOCKED
+    assert isinstance(r.exception, OSError)
+    task = get_task(port.config, "alpha", t.id)
+    assert task.state == TaskState.OPEN
+    assert task.question == "Ship the migration this week?"
 
 
 def test_unblock_without_answer_clear_failure_is_loud(port, monkeypatch):

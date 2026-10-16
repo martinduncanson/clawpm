@@ -36,6 +36,10 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 - Opt-in explicit scope: `sessions.Scope` plus `discovery.resolve_scope`, and a keyword-only `scope=` on `get_project_dir`, `get_repo_path`, `get_scoped_project_settings`, `get_tasks_dir`, `get_task` and `touch_task_updated`; `log add` migrated as the exemplar (#75, CLAWP-122).
 - `emit-tree` can emit a decision map: leaf `kind` and `depends_refs` (leaf refs or `id:<task-id>`, resolved to minted ids, validated for unknown refs, cycles and ancestor deadlocks), root `destination` / `not_yet_specified`, and `skills/clawpm-planner/examples/decision-map.emit.json` (#99, CLAWP-111-003).
 
+### Fixed
+
+- `tasks state <id> open` then `blocked` no longer resurrects a stale question in `tasks list --needs-human`: `change_task_state` drops the decision record when a task enters blocked from another state (#125, CLAWP-156).
+
 ### Changed
 
 - Rubric grading instructions and the refuter EVIDENCE lens now state a freshness rule: a gradeable signal counts only if produced after the last relevant edit, and lint/build/type checks are hygiene, not behavioural evidence (#118, CLAWP-149).
