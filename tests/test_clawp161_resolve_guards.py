@@ -88,6 +88,36 @@ def fail_realpath(monkeypatch, match, *, from_call=1, exc=OSError):
     return seen
 
 
+def fail_beneath_realpath(monkeypatch, match):
+    """Make the OS call UNDER ``os.path.realpath`` fail for paths *match* selects.
+
+    Unlike :func:`fail_realpath` this leaves ``realpath`` itself alone, so a
+    non-strict call exercises its real failure mode: it swallows the error and
+    returns an unresolved spelling. Windows: ``_getfinalpathname`` raising
+    access-denied (winerror 5). POSIX: ``lstat`` raising ``PermissionError``.
+    """
+    if os.name == "nt":
+        import ntpath
+
+        real = ntpath._getfinalpathname
+
+        def denied(p):
+            if match(Path(p)):
+                raise OSError(13, "Access is denied", None, 5)
+            return real(p)
+
+        monkeypatch.setattr(ntpath, "_getfinalpathname", denied)
+    else:
+        real = os.lstat
+
+        def denied(p, *a, **kw):
+            if match(Path(os.fsdecode(p))):
+                raise PermissionError(13, "Permission denied")
+            return real(p, *a, **kw)
+
+        monkeypatch.setattr(os, "lstat", denied)
+
+
 def _named(name):
     return lambda p: name in p.parts
 
@@ -303,6 +333,39 @@ class TestSameDirConsumers:
             )
         assert got is False
         assert any("simulated unavailable volume" in m for m in caplog.messages)
+
+    def test_failure_beneath_realpath_refuses_the_pinned_store(
+        self, fx, monkeypatch
+    ):
+        """Non-strict ``realpath`` swallows the OS error and hands back the
+        spelling; the store must still be refused, not accepted by equality."""
+        fail_beneath_realpath(monkeypatch, _named("canonrepo"))
+        with pytest.raises(ScopeStoreMismatchError):
+            assert_scope_store_in_portfolio(
+                fx["config"], "test", Scope.pinned(fx["canon"])
+            )
+
+    def test_failure_beneath_realpath_is_not_canonical(
+        self, fx, monkeypatch, caplog
+    ):
+        fail_beneath_realpath(monkeypatch, _named("canonrepo"))
+        with caplog.at_level(logging.ERROR):
+            got = is_task_store_canonical(
+                fx["config"], "test", scope=Scope.pinned(fx["canon"])
+            )
+        assert got is False
+        assert caplog.messages
+
+    def test_missing_pinned_store_is_not_canonical(self, fx):
+        """A store that does not exist cannot be proven to be the canonical one."""
+        missing = fx["elsewhere"] / "nope" / ".project"
+        assert is_task_store_canonical(
+            fx["config"], "test", scope=Scope.pinned(missing)
+        ) is False
+        with pytest.raises(ScopeStoreMismatchError):
+            assert_scope_store_in_portfolio(
+                fx["config"], "test", Scope.pinned(missing)
+            )
 
 
 # ---------------------------------------------------------------------------

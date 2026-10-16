@@ -399,10 +399,17 @@ def _same_dir(a: Path, b: Path) -> bool:
 
     CLAWP-161: raises :class:`OSError` when either side cannot be resolved (a
     symlink loop's ``RuntimeError`` is converted); equal spelling is never
-    accepted as a substitute, so callers decide how to refuse.
+    accepted as a substitute, so callers decide how to refuse. ``strict=True``
+    is what makes that true: non-strict ``realpath`` swallows access-denied and
+    similar errors and returns the unresolved spelling. A side that does not
+    exist raises ``FileNotFoundError`` and is refused too: a store that is not
+    there cannot be proven to be the canonical one, and a vanished volume
+    reports the same error.
     """
     try:
-        return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+        return os.path.normcase(os.path.realpath(a, strict=True)) == os.path.normcase(
+            os.path.realpath(b, strict=True)
+        )
     except RuntimeError as exc:
         raise OSError(f"{exc}") from exc
 
