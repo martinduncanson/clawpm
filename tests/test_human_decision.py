@@ -312,3 +312,94 @@ def test_plain_task_state_round_trip_is_byte_identical(port):
     change_task_state(port.config, "alpha", t.id, TaskState.BLOCKED)
     after = get_task(port.config, "alpha", t.id).file_path.read_bytes()
     assert after.replace(b"\r\n", b"\n") == before.replace(b"\r\n", b"\n")
+
+
+# CLAWP-156 (Codex r2 P2) — a directory task moves every nested descendant with
+# it, and a descendant's state comes from the enclosing directory, so the stale
+# decision record must be dropped from the whole tree, not just ``_task.md``.
+
+def _blocked_parent_with_questioned_child(port):
+    from clawpm.tasks import add_subtask, record_human_question
+
+    parent = add_task(port.config, "alpha", "Parent")
+    child = add_subtask(port.config, "alpha", parent.id, "Child")
+    change_task_state(port.config, "alpha", parent.id, TaskState.BLOCKED)
+    record_human_question(port.config, "alpha", child.id, "Proceed?")
+    assert [r["id"] for r in _needs_human(port)] == [child.id]
+    return parent, child
+
+
+def test_directory_reblock_clears_nested_child_question(port):
+    parent, child = _blocked_parent_with_questioned_child(port)
+    change_task_state(port.config, "alpha", parent.id, TaskState.OPEN, force=True)
+    change_task_state(port.config, "alpha", parent.id, TaskState.BLOCKED)
+    task = get_task(port.config, "alpha", child.id)
+    assert task.state == TaskState.BLOCKED
+    assert task.blocked_on is None and task.question is None
+    assert _needs_human(port) == []
+
+
+def test_directory_reblock_via_cli_state_clears_nested_child_question(port):
+    parent, child = _blocked_parent_with_questioned_child(port)
+    for new_state in ("open", "blocked"):
+        r = CliRunner().invoke(
+            main, ["tasks", "state", "-p", "alpha", parent.id, new_state, "--force"],
+            env=_env(port),
+        )
+        assert r.exit_code == 0, r.output
+    assert _needs_human(port) == []
+
+
+def test_directory_reblock_clears_grandchild_in_nested_directory(port):
+    from clawpm.tasks import add_subtask, record_human_question, split_task
+
+    parent = add_task(port.config, "alpha", "Parent")
+    child = add_subtask(port.config, "alpha", parent.id, "Child")
+    split_task(port.config, "alpha", child.id)
+    grandchild = add_subtask(port.config, "alpha", child.id, "Grandchild")
+    change_task_state(port.config, "alpha", parent.id, TaskState.BLOCKED)
+    record_human_question(port.config, "alpha", grandchild.id, "Deep?")
+    assert [r["id"] for r in _needs_human(port)] == [grandchild.id]
+    change_task_state(port.config, "alpha", parent.id, TaskState.OPEN, force=True)
+    change_task_state(port.config, "alpha", parent.id, TaskState.BLOCKED)
+    assert get_task(port.config, "alpha", grandchild.id).question is None
+    assert _needs_human(port) == []
+
+
+def test_directory_reblock_leaves_unquestioned_child_untouched(port):
+    from clawpm.tasks import add_subtask
+
+    parent = add_task(port.config, "alpha", "Parent")
+    child = add_subtask(port.config, "alpha", parent.id, "Plain child")
+    change_task_state(port.config, "alpha", parent.id, TaskState.BLOCKED)
+    change_task_state(port.config, "alpha", parent.id, TaskState.OPEN, force=True)
+    path = get_task(port.config, "alpha", child.id).file_path
+    before = path.read_bytes()
+    change_task_state(port.config, "alpha", parent.id, TaskState.BLOCKED)
+    after = get_task(port.config, "alpha", child.id).file_path.read_bytes()
+    assert after == before
+
+
+def test_directory_block_failure_restores_nested_child_bytes(port, monkeypatch):
+    import clawpm.tasks as tasks_mod
+
+    parent, child = _blocked_parent_with_questioned_child(port)
+    change_task_state(port.config, "alpha", parent.id, TaskState.OPEN, force=True)
+    child_path = get_task(port.config, "alpha", child.id).file_path
+    before = child_path.read_bytes()
+
+    def boom(src, dst):
+        raise OSError("simulated move failure")
+
+    monkeypatch.setattr(tasks_mod, "_move_task_entry", boom)
+    with pytest.raises(OSError, match="simulated move failure"):
+        change_task_state(port.config, "alpha", parent.id, TaskState.BLOCKED)
+    assert child_path.read_bytes() == before
+    assert get_task(port.config, "alpha", child.id).question == "Proceed?"
+
+
+def test_directory_staying_blocked_keeps_nested_child_question(port):
+    parent, child = _blocked_parent_with_questioned_child(port)
+    change_task_state(port.config, "alpha", parent.id, TaskState.BLOCKED, note="again")
+    assert get_task(port.config, "alpha", child.id).question == "Proceed?"
+    assert [r["id"] for r in _needs_human(port)] == [child.id]
