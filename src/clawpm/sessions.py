@@ -238,6 +238,31 @@ def resolve_path_or_none(
         return None
 
 
+def canonical_path(path: Path, *, known_canonical: bool = False) -> Path:
+    """``Path(path).resolve()`` for a path used as an IDENTITY; never falls back.
+
+    ``known_canonical=True`` is the caller vouching that *path* already IS the
+    canonical identity (it came from an earlier :func:`canonical_path`, or from
+    a registry/lease row that recorded one): it is returned as is, with no
+    second ``resolve()``. A volume that went unavailable after the first
+    resolve then cannot stop a rollback or teardown from reaching the files.
+
+    CLAWP-159: a dispatch target keys a lock, a lease holder token, a registry
+    row and a lease. A fallback spelling (``os.path.abspath`` of a junction
+    alias) would key a DIFFERENT lock and holder than a dispatch whose resolve
+    succeeded, so a failed canonicalisation must refuse, not substitute. Raises
+    :class:`OSError` (a symlink loop's ``RuntimeError`` on Python 3.11 is
+    converted) so callers need one handler. Contrast
+    :func:`resolve_path_or_none`, for paths that are only informational.
+    """
+    if known_canonical:
+        return Path(path)
+    try:
+        return Path(path).resolve()
+    except RuntimeError as exc:
+        raise OSError(f"{exc}") from exc
+
+
 _REGISTERED = "registered"
 _RELEASED = "released"
 

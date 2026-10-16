@@ -1012,9 +1012,9 @@ class TestWriterFailureIsRolledBack:
         real = agmod.dispatch_target_lock
 
         @contextmanager
-        def _record(portfolio_root, target_dir):
+        def _record(portfolio_root, target_dir, canonical=False):
             held.append((Path(portfolio_root), Path(target_dir)))
-            with real(portfolio_root, target_dir):
+            with real(portfolio_root, target_dir, canonical):
                 yield
 
         monkeypatch.setattr(agmod, "dispatch_target_lock", _record)
@@ -1042,10 +1042,10 @@ class TestWriterFailureIsRolledBack:
         real_td = agmod.teardown_dispatch_settings
 
         @contextmanager
-        def _lock(portfolio_root, target_dir):
+        def _lock(portfolio_root, target_dir, canonical=False):
             events.append("enter")
             try:
-                with real_lock(portfolio_root, target_dir):
+                with real_lock(portfolio_root, target_dir, canonical):
                     yield
             finally:
                 events.append("exit")

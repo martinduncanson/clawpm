@@ -8,6 +8,7 @@ import click
 from clawpm.models import Task
 from clawpm.output import output_error, output_success
 from clawpm.context import expand_task_id
+from clawpm.sessions import canonical_path
 from clawpm.cli.base import main, get_format, require_portfolio, require_project, _FALLBACK_POLICIES, ExpandedPath
 
 # ============================================================================
@@ -97,8 +98,19 @@ def lease_grant(ctx, project_id, task_id, ttl, fallback_policy, holder_id, targe
 
     # Store an ABSOLUTE target dir (Codex P2) so a later sweep from a different
     # CWD tears down the right path — matching what `tasks dispatch` does.
+    # CLAWP-159: the target keys the lease's teardown, so a path that cannot
+    # be canonicalised refuses rather than storing a different spelling.
     if target_dir:
-        target_dir = Path(target_dir).resolve().as_posix()
+        try:
+            target_dir = canonical_path(Path(target_dir)).as_posix()
+        except OSError as exc:
+            output_error(
+                "target_dir_unresolvable",
+                f"Could not resolve --target-dir {target_dir} "
+                f"({type(exc).__name__}: {exc}). No lease was granted.",
+                fmt=fmt,
+            )
+            sys.exit(1)
     try:
         grant_lease(
             config.portfolio_root, task_id, project_id, ttl_seconds=ttl,

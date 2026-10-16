@@ -88,6 +88,7 @@ from .rubric import render_rubric_markdown
 from .sessions import (
     Scope,
     active_sessions,
+    canonical_path,
     register_session,
     stat_is_dir,
     suppress_session_resolution,
@@ -595,14 +596,23 @@ def _dispatch_agent(
         # teardown of this target could unlink the settings between this
         # write and the subagent starting — which would then run without its
         # Stop / progress hooks.
-        with dispatch_target_lock(config.portfolio_root, target_dir):
+        #
+        # CLAWP-159: canonicalise the target ONCE (an OSError lands in the
+        # handler below like any other write failure) and hand that identity to
+        # the lock, the writer and the rollback, so a target that goes
+        # unavailable after the write cannot strand the hooks.
+        _canon_target = canonical_path(target_dir)
+        with dispatch_target_lock(
+            config.portfolio_root, _canon_target, canonical=True
+        ):
             try:
                 settings_path = write_dispatch_settings(
-                    target_dir=target_dir,
+                    target_dir=_canon_target,
                     task_id=subtask_id,
                     project_id=project_id,
                     rubric_markdown=rubric_markdown,
                     portfolio_root=config.portfolio_root,
+                    canonical=True,
                 ).path
             except PartialDispatchWrite as partial:
                 # settings.local.json landed (Stop hook LIVE) before the
@@ -616,11 +626,12 @@ def _dispatch_agent(
                 # caller must see. (Reentrant: teardown re-takes the lock.)
                 try:
                     teardown_dispatch_settings(
-                        target_dir,
+                        _canon_target,
                         task_id=subtask_id,
                         portfolio_root=config.portfolio_root,
                         project_id=project_id,
                         remove_sidecar=partial.written.sidecar_written,
+                        canonical=True,
                     )
                 except Exception as teardown_exc:
                     _rollback_note = (

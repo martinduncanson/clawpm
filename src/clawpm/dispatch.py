@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import NamedTuple, Optional
 
 from .concurrency import atomic_write, file_lock
-from .sessions import stat_exists
+from .sessions import canonical_path, stat_exists
 
 # Codex P1 fix: task_id and project_id flow unchanged into shell commands.
 # Reject anything outside the safe charset BEFORE interpolating, so an
@@ -120,15 +120,20 @@ def register_dispatch(
     task_id: str,
     project_id: str,
     target_dir: Path,
+    canonical: bool = False,
 ) -> None:
-    """Append a ``dispatched`` event to the portfolio dispatch registry."""
+    """Append a ``dispatched`` event to the portfolio dispatch registry.
+
+    ``canonical=True``: *target_dir* is already the canonical identity (see
+    :func:`clawpm.sessions.canonical_path`); it is recorded without a re-resolve.
+    """
     path = _dispatch_registry_path(portfolio_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     event = {
         "action": "dispatched",
         "task_id": task_id,
         "project_id": project_id,
-        "target_dir": str(target_dir.resolve()),
+        "target_dir": str(canonical_path(target_dir, known_canonical=canonical)),
         "ts": datetime.now(timezone.utc).isoformat(),
     }
     with open(path, "a", encoding="utf-8") as f:
@@ -140,8 +145,12 @@ def register_teardown(
     task_id: str,
     target_dir: Path,
     project_id: Optional[str] = None,
+    canonical: bool = False,
 ) -> None:
     """Append a ``torn_down`` event to the registry.
+
+    ``canonical=True``: *target_dir* is already the canonical identity; it is
+    recorded without a re-resolve.
 
     ``project_id`` is optional only for backwards-compat with callers that
     don't have it; future teardown events should always include it so
@@ -152,7 +161,7 @@ def register_teardown(
     event = {
         "action": "torn_down",
         "task_id": task_id,
-        "target_dir": str(target_dir.resolve()),
+        "target_dir": str(canonical_path(target_dir, known_canonical=canonical)),
         "ts": datetime.now(timezone.utc).isoformat(),
     }
     if project_id is not None:
@@ -476,22 +485,47 @@ class PartialDispatchWrite(Exception):
         self.written = written
 
 
-def dispatch_lock_path(portfolio_root: Path, target_dir: Path) -> Path:
+def teardown_identity(target_dir: Path) -> Path:
+    """Identity to tear down a RECORDED dispatch target under.
+
+    The canonical path when it resolves; otherwise the recorded spelling as is.
+    Teardown of a dispatch that already exists (lease sweep, completion
+    auto-teardown) must still reach the hooks when the target has since become
+    unresolvable, so the result is passed with ``canonical=True`` and never
+    resolved again. Rows this version recorded are canonical already.
+    """
+    try:
+        return canonical_path(target_dir)
+    except OSError:
+        return Path(target_dir)
+
+
+def dispatch_lock_path(
+    portfolio_root: Path, target_dir: Path, canonical: bool = False
+) -> Path:
     """Sentinel path serialising every writer/teardown of *target_dir*'s dispatch.
 
     Lives under ``<portfolio_root>/locks/`` keyed by a digest of the normcased,
     resolved target — never inside the target itself, where it would show up as
     an untracked file in the operator's repo (and, for ``--worktree``, in a
     checkout meant to be disposable).
+
+    ``canonical=True``: *target_dir* is already the canonical identity, so the
+    key is computed without a re-resolve (a rollback must not depend on a
+    second successful ``resolve()``).
     """
     key = hashlib.sha256(
-        os.path.normcase(str(target_dir.resolve())).encode("utf-8")
+        os.path.normcase(
+            str(canonical_path(target_dir, known_canonical=canonical))
+        ).encode("utf-8")
     ).hexdigest()[:16]
     return portfolio_root / "locks" / f"dispatch-{key}.lock"
 
 
 @contextmanager
-def dispatch_target_lock(portfolio_root: Path, target_dir: Path):
+def dispatch_target_lock(
+    portfolio_root: Path, target_dir: Path, canonical: bool = False
+):
     """Hold the per-target dispatch lock (see :func:`dispatch_lock_path`).
 
     EVERY production writer of a target's dispatch artifacts — ``tasks
@@ -500,7 +534,7 @@ def dispatch_target_lock(portfolio_root: Path, target_dir: Path):
     (CLAWP-098, Codex P1/P2 on PR #55 rounds 13-14). Reentrant per thread.
     ``LockTimeout`` and ``OSError`` (lock directory) propagate.
     """
-    lock_path = dispatch_lock_path(portfolio_root, target_dir)
+    lock_path = dispatch_lock_path(portfolio_root, target_dir, canonical)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with file_lock(lock_path):
         yield
@@ -588,8 +622,12 @@ def write_dispatch_settings(
     lease_heartbeat: bool = False,
     max_iterations: Optional[int] = None,
     iteration_baseline: int = 0,
+    canonical: bool = False,
 ) -> WrittenDispatchSettings:
     """Emit settings.local.json for the dispatched task.
+
+    ``canonical=True``: *target_dir* is already the canonical identity; the
+    hook's lease holder token and the registry row use it without a re-resolve.
 
     Returns the path written. Raises:
       - ``FileExistsError`` if a non-clawpm-managed settings.local.json is
@@ -653,7 +691,9 @@ def write_dispatch_settings(
     lease_holder = None
     if lease_heartbeat:
         from .leases import holder_token
-        lease_holder = holder_token(target_dir.resolve().as_posix())
+        lease_holder = holder_token(
+            canonical_path(target_dir, known_canonical=canonical).as_posix()
+        )
     payload = build_settings_payload(
         task_id, project_id, rubric_markdown,
         confirm_close=confirm_close, refute_votes=refute_votes,
@@ -679,7 +719,9 @@ def write_dispatch_settings(
         # Codex round-4: register the dispatch so on-done teardown can find
         # ALL target_dirs, not just the legacy repo_path + worktree pair.
         if portfolio_root is not None:
-            register_dispatch(portfolio_root, task_id, project_id, target_dir)
+            register_dispatch(
+                portfolio_root, task_id, project_id, target_dir, canonical
+            )
     except Exception as exc:
         # Settings are live but the writer did not finish: hand the caller
         # exactly what landed so it can roll back (see PartialDispatchWrite).
@@ -748,8 +790,15 @@ def teardown_dispatch_settings(
     portfolio_root: Optional[Path] = None,
     project_id: Optional[str] = None,
     remove_sidecar: bool = True,
+    canonical: bool = False,
 ) -> bool:
     """Remove a clawpm-managed dispatch settings file, under the target lock.
+
+    ``canonical=True``: the caller already holds the canonical identity of
+    *target_dir* (dispatch's own rollback, or a path recorded in the lease /
+    dispatch registry), so neither the lock key nor the ``torn_down`` row
+    re-resolves it. Without it the target is resolved here, and one that can no
+    longer be resolved raises ``OSError`` (callers report it).
 
     Every teardown path — explicit ``teardown-dispatch``, completion
     auto-teardown, lease-fallback teardown, dispatch's own rollback — funnels
@@ -772,12 +821,12 @@ def teardown_dispatch_settings(
     if portfolio_root is None:
         return _teardown_dispatch_settings_locked(
             target_dir, task_id, force, portfolio_root, project_id,
-            remove_sidecar,
+            remove_sidecar, canonical,
         )
-    with dispatch_target_lock(portfolio_root, target_dir):
+    with dispatch_target_lock(portfolio_root, target_dir, canonical):
         return _teardown_dispatch_settings_locked(
             target_dir, task_id, force, portfolio_root, project_id,
-            remove_sidecar,
+            remove_sidecar, canonical,
         )
 
 
@@ -788,6 +837,7 @@ def _teardown_dispatch_settings_locked(
     portfolio_root: Optional[Path] = None,
     project_id: Optional[str] = None,
     remove_sidecar: bool = True,
+    canonical: bool = False,
 ) -> bool:
     """Remove a clawpm-managed dispatch settings file (and sidecar).
 
@@ -891,6 +941,7 @@ def _teardown_dispatch_settings_locked(
                 resolved_task,
                 target_dir,
                 project_id=resolved_project,
+                canonical=canonical,
             )
     return True
 

@@ -435,6 +435,39 @@ class TestTransitionFailure:
         assert actions[0]["transitioned"] is True
         assert not settings_path(target).exists()  # torn down
 
+    def test_requeue_tears_down_a_target_that_became_unresolvable(
+        self, portfolio, monkeypatch
+    ):
+        """CLAWP-159: the sweep tears down under the lease's RECORDED target.
+
+        The volume went away after dispatch, so resolve() fails for good; the
+        sweep must neither leave live hooks nor raise/report teardown_failed.
+        """
+        from pathlib import Path
+        from clawpm.dispatch import write_dispatch_settings, settings_path
+        config, root = portfolio["config"], portfolio["root"]
+        task_id = _dispatched_task(config, in_state=TaskState.PROGRESS)
+        target = (root / "unavailable-volume").resolve()
+        write_dispatch_settings(
+            target, task_id, "test", portfolio_root=root, canonical=True
+        )
+        grant_lease(root, task_id, "test", ttl_seconds=30,
+                    fallback_policy=FallbackPolicy.REQUEUE,
+                    target_dir=target.as_posix())
+        real_resolve = Path.resolve
+
+        def flaky(self, *a, **kw):
+            if self.name == "unavailable-volume":
+                raise OSError("simulated unavailable volume")
+            return real_resolve(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "resolve", flaky)
+        now = get_lease(root, task_id, "test").granted_at + timedelta(seconds=90)
+        actions = sweep(config, root, now=now)
+        assert actions[0]["transitioned"] is True
+        assert "teardown_failed" not in actions[0], actions[0]
+        assert not settings_path(target).exists()
+
 
 class TestLeaseCLI:
     """Codex test-gap: the lease command group was entirely untested."""

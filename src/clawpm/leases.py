@@ -486,13 +486,18 @@ def _apply_fallback_body(
     teardown_failed: Optional[str] = None
     if lease.fallback_policy in (FallbackPolicy.REQUEUE, FallbackPolicy.ROUTE_SECONDARY) and lease.target_dir:
         try:
-            from .dispatch import teardown_dispatch_settings
+            from .dispatch import teardown_dispatch_settings, teardown_identity
 
+            # CLAWP-159: the lease RECORDS the canonical target (dispatch and
+            # `lease grant` store it), so a target that has since become
+            # unresolvable is torn down under that recorded path instead of
+            # leaving live hooks behind or raising out of the sweep.
             teardown_dispatch_settings(
-                Path(lease.target_dir),
+                teardown_identity(Path(lease.target_dir)),
                 task_id=lease.task_id,
                 portfolio_root=portfolio_root,
                 project_id=lease.project_id,
+                canonical=True,
             )
         except Exception as exc:
             teardown_failed = f"{type(exc).__name__}: {exc}"
