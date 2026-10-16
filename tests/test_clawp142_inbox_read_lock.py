@@ -78,6 +78,58 @@ def test_read_gives_up_on_permanently_denied_file(tmp_path, monkeypatch):
         t.join(10)
 
 
+def _await_recovery(pending, pending_lock, cancel, unrecovered, timeout=10.0):
+    """Block until no denied reader is pending.
+
+    Cancellation ends the wait quietly (thread cleanup).  A timeout records
+    the stuck readers in ``unrecovered`` so the test fails loudly rather than
+    passing with a reader that never completed a read.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        with pending_lock:
+            if not pending:
+                return
+            stuck = set(pending)
+        if cancel.is_set():
+            return
+        if time.monotonic() >= deadline:
+            unrecovered.append(stuck)
+            return
+        time.sleep(0.005)
+
+
+def test_await_recovery_flags_reader_that_never_recovers():
+    pending = {123}
+    unrecovered: list[set[int]] = []
+    _await_recovery(
+        pending, threading.Lock(), threading.Event(), unrecovered, timeout=0.05
+    )
+    assert unrecovered == [{123}]
+
+
+def test_await_recovery_returns_clean_when_reader_recovers():
+    pending = {123}
+    lock = threading.Lock()
+    unrecovered: list[set[int]] = []
+
+    def recover() -> None:
+        with lock:
+            pending.discard(123)
+
+    threading.Timer(0.05, recover).start()
+    _await_recovery(pending, lock, threading.Event(), unrecovered, timeout=5)
+    assert unrecovered == []
+
+
+def test_await_recovery_cancel_is_not_a_failure():
+    cancel = threading.Event()
+    cancel.set()
+    unrecovered: list[set[int]] = []
+    _await_recovery({123}, threading.Lock(), cancel, unrecovered, timeout=5)
+    assert unrecovered == []
+
+
 def test_concurrent_append_and_read_never_raise(isolated_portfolio, monkeypatch):
     root = isolated_portfolio.root
     n = 40
@@ -90,6 +142,9 @@ def test_concurrent_append_and_read_never_raise(isolated_portfolio, monkeypatch)
     collided = threading.Event()
     collisions: list[int] = []
     unforced: list[int] = []
+    unrecovered: list[set[int]] = []  # denied readers that never recovered
+    pending: set[int] = set()  # reader threads denied and not yet recovered
+    pending_lock = threading.Lock()
 
     if sys.platform == "win32":
         # Force the overlap: each append holds its byte-0 lock until a reader
@@ -110,14 +165,26 @@ def test_concurrent_append_and_read_never_raise(isolated_portfolio, monkeypatch)
                     if time.monotonic() >= deadline:
                         unforced.append(1)
                         return
+            # The lock is released.  Hold the next append back until every
+            # reader that was denied has completed a read: otherwise the
+            # next append retakes the lock at once and a denied reader can
+            # lose every race for the gap until its _READ_LOCK_WAIT expires,
+            # which on a slow runner fails the test for scheduling reasons.
+            _await_recovery(pending, pending_lock, cancel, unrecovered)
 
         def counting_read_once(path):
+            ident = threading.get_ident()
             try:
-                return real_read_once(path)
+                events = real_read_once(path)
             except PermissionError:
+                with pending_lock:
+                    pending.add(ident)
                 collisions.append(1)
                 collided.set()
                 raise
+            with pending_lock:
+                pending.discard(ident)
+            return events
 
         monkeypatch.setattr(concurrency_mod, "locked_append", barrier_append)
         monkeypatch.setattr(inbox_mod, "_read_events_once", counting_read_once)
@@ -161,5 +228,6 @@ def test_concurrent_append_and_read_never_raise(isolated_portfolio, monkeypatch)
     assert not errors, errors
     if sys.platform == "win32":
         assert not unforced, "a writer released its lock before any reader collided"
+        assert not unrecovered, f"denied readers never recovered: {unrecovered}"
         assert len(collisions) >= n
     assert len(read_inbox(root, "a2")) == n
