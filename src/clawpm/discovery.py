@@ -380,12 +380,31 @@ def is_task_store_canonical(
         project = get_project(config, project_id)
         if not (project and project.project_dir):
             return False
-        return _same_dir(scope.pinned_project_dir, project.project_dir / ".project")
+        try:
+            return _same_dir(scope.pinned_project_dir, project.project_dir / ".project")
+        except OSError as exc:
+            # CLAWP-161: an unresolvable store cannot be proven canonical;
+            # refuse rather than guess from the spelling.
+            logger.error(
+                "Failed to resolve the pinned store %s or the canonical store "
+                "of project %s: %s. Treating the pinned store as non-canonical.",
+                scope.pinned_project_dir, project_id, exc,
+            )
+            return False
     return _session_scoped_project_dir(config, project_id, scope=scope) is None
 
 
 def _same_dir(a: Path, b: Path) -> bool:
-    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+    """Identity comparison of two dirs by real path.
+
+    CLAWP-161: raises :class:`OSError` when either side cannot be resolved (a
+    symlink loop's ``RuntimeError`` is converted); equal spelling is never
+    accepted as a substitute, so callers decide how to refuse.
+    """
+    try:
+        return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+    except RuntimeError as exc:
+        raise OSError(f"{exc}") from exc
 
 
 def get_repo_path(
@@ -465,10 +484,17 @@ def assert_scope_store_in_portfolio(
         return
     pinned = scope.pinned_project_dir
     project = get_project(config, project_id)
-    if project and project.project_dir and _same_dir(
-        pinned, project.project_dir / ".project"
-    ):
-        return
+    if project and project.project_dir:
+        try:
+            if _same_dir(pinned, project.project_dir / ".project"):
+                return
+        except OSError as exc:
+            logger.error(
+                "Failed to resolve the pinned store %s or the registered "
+                "store of project %s: %s. It cannot vouch for the pinned "
+                "store.",
+                pinned, project_id, exc,
+            )
     portfolio_root = getattr(config, "portfolio_root", None)
     if portfolio_root:
         for record in active_sessions(portfolio_root):
@@ -805,7 +831,10 @@ def discover_untracked_repos(config: PortfolioConfig) -> list[UntrackedRepo]:
             if not item.is_dir():
                 continue
             if (item / ".project" / "settings.toml").exists():
-                tracked_paths.add(item.resolve())
+                try:
+                    tracked_paths.add(item.resolve())
+                except (OSError, RuntimeError) as exc:
+                    logger.error("Skipping %s in the untracked listing: %s", item, exc)
 
     # Find git repos without .project/
     for root in config.project_roots:
@@ -821,7 +850,11 @@ def discover_untracked_repos(config: PortfolioConfig) -> list[UntrackedRepo]:
                 continue
 
             # Skip if already tracked
-            if item.resolve() in tracked_paths:
+            try:
+                if item.resolve() in tracked_paths:
+                    continue
+            except (OSError, RuntimeError) as exc:
+                logger.error("Skipping %s in the untracked listing: %s", item, exc)
                 continue
 
             # Check if it's a git repo

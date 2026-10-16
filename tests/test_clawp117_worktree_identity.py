@@ -322,6 +322,33 @@ def test_redispatch_with_branch_checked_out_elsewhere_fails_actionably(
     assert not old.exists()
 
 
+@pytest.mark.parametrize("exc", [OSError, RuntimeError])
+def test_redispatch_with_unresolvable_branch_worktree_is_a_clean_error(
+    fx, tmp_path, monkeypatch, exc
+):
+    """CLAWP-161: the branch-vs-existing worktree comparison is an identity
+    check; an unresolvable side must refuse, never fall through or traceback."""
+    r = _dispatch(fx)
+    assert r.exit_code == 0, r.output
+    old = Path(json.loads(r.output)["data"]["target_dir"])
+    moved = tmp_path / "relocated"
+    _git(fx["repo"], "worktree", "move", str(old), str(moved))
+
+    real = Path.resolve
+
+    def flaky(self, *a, **kw):
+        if "relocated" in self.parts:
+            raise exc("simulated unavailable volume")
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "resolve", flaky)
+    r2 = _dispatch(fx, "--force")
+    assert not isinstance(r2.exception, (OSError, RuntimeError)), r2.output
+    assert r2.exit_code == 1, r2.output
+    assert "branch_worktree_unresolvable" in r2.output
+    assert not old.exists()
+
+
 def test_redispatch_into_the_same_worktree_still_works(fx):
     r = _dispatch(fx)
     assert r.exit_code == 0, r.output

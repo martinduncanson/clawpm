@@ -45,7 +45,20 @@ def project_init(ctx: click.Context, repo_path: str, project_id: str | None, pro
     """Initialize a new project in a repository."""
     fmt = get_format(ctx)
 
-    repo = Path(repo_path).resolve()
+    from clawpm.sessions import canonical_path
+
+    # CLAWP-161: the resolved path becomes the registered repo_path (an
+    # identity), so an unresolvable repo is refused before anything is written.
+    try:
+        repo = canonical_path(Path(repo_path))
+    except OSError as exc:
+        output_error(
+            "repo_path_unresolvable",
+            f"Could not resolve {repo_path} ({type(exc).__name__}: {exc}). "
+            f"Nothing was initialised.",
+            fmt=fmt,
+        )
+        sys.exit(1)
     project_dir = repo / ".project"
 
     if project_dir.exists():

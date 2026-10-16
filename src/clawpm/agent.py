@@ -220,7 +220,9 @@ def _find_link_under(root: Path) -> Optional[Path]:
     return None
 
 
-def _refuse_links_under_store(store_root: Path, canonical: Optional[Path]) -> None:
+def _refuse_links_under_store(
+    store_root: Path, canonical: Optional[Path], project_dir: Path
+) -> None:
     """Refuse a worktree store that is, or contains, any link (CLAWP-115).
 
     *store_root* is the UNRESOLVED ``<worktree>/.project``: resolving it first
@@ -232,7 +234,10 @@ def _refuse_links_under_store(store_root: Path, canonical: Optional[Path]) -> No
     atomic-write sibling) the list missed. Any symlink or junction at or under
     ``.project/`` refuses the sync, whatever the mutator would have written.
     The tasks dir must also resolve inside *project_dir* and outside the
-    canonical store. Nothing is created or written here. The threat is links
+    canonical store. *canonical* and *project_dir* arrive ALREADY resolved
+    (CLAWP-161: resolved once by the caller, so a volume that fails between
+    two resolves cannot flip the containment verdict). Nothing is created or
+    written here. The threat is links
     already present in a freshly created worktree; a link planted after this
     check (TOCTOU) is accepted residual.
     """
@@ -242,15 +247,14 @@ def _refuse_links_under_store(store_root: Path, canonical: Optional[Path]) -> No
             f"{link} is a symlink or junction at or under the worktree store "
             f"{store_root}; refusing to write through links"
         )
-    project_dir = store_root.resolve()
     tasks_dir = (project_dir / "tasks").resolve(strict=False)
     if not _within(tasks_dir, project_dir):
         raise RuntimeError(
             f"{tasks_dir} is outside the worktree store {project_dir}"
         )
-    if canonical is not None and _within(tasks_dir, canonical.resolve()):
+    if canonical is not None and _within(tasks_dir, canonical):
         raise RuntimeError(
-            f"{tasks_dir} is inside the canonical store {canonical.resolve()}"
+            f"{tasks_dir} is inside the canonical store {canonical}"
         )
 
 
@@ -267,15 +271,17 @@ def _pin_worktree_scope(
     hold the copy we materialized. Raises ``RuntimeError`` (or ``OSError`` on a
     stat fault) when any check fails; the caller then writes nothing anywhere.
     """
-    wt_root = target_dir.resolve()
+    wt_root = canonical_path(target_dir)
     store_root = target_dir / ".project"
-    project_dir = store_root.resolve()
+    project_dir = canonical_path(store_root)
     if wt_root not in project_dir.parents:
         raise RuntimeError(f"{project_dir} is not inside the worktree {wt_root}")
     canonical = get_project_dir(config, project_id, scope=Scope.canonical())
-    if canonical is not None and canonical.resolve() == project_dir:
+    if canonical is not None:
+        canonical = canonical_path(canonical)
+    if canonical is not None and canonical == project_dir:
         raise RuntimeError(f"{project_dir} is the canonical store, not a worktree's")
-    _refuse_links_under_store(store_root, canonical)
+    _refuse_links_under_store(store_root, canonical, project_dir)
     tasks_dir = project_dir / "tasks"
     if not stat_is_dir(tasks_dir):
         raise RuntimeError(f"{tasks_dir} is not a directory")
