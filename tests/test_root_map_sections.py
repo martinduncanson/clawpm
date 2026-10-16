@@ -296,7 +296,10 @@ class TestGraduatesFunction:
         real = concurrency.retry_transient
 
         def flaky(fn, *args, **kwargs):
-            if args and Path(args[0]).name == "_task.md":
+            # args[-1] is the rename DESTINATION at every seam (the old
+            # ``t.replace(dst)`` and ``os.replace(tmp, dst)``); args[0] is the
+            # temp file under atomic_write, never named ``_task.md``.
+            if args and Path(args[-1]).name == "_task.md":
                 raise OSError("injected parent rename failure")
             return real(fn, *args, **kwargs)
 
