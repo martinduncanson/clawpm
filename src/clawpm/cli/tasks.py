@@ -1547,13 +1547,15 @@ def _dispatch_target_lock(portfolio_root: Path, target_dir: Path, fmt):
     # Same sentinel `teardown_dispatch_settings` takes, so a teardown of this
     # target (completion, lease fallback, explicit) can never interleave with
     # this command's write -> register window.
-    lock_path = dispatch_lock_path(portfolio_root, target_dir)
     try:
+        # `target_dir` is the already-canonicalised `_canon_dir`: no re-resolve.
+        lock_path = dispatch_lock_path(portfolio_root, target_dir, canonical=True)
         lock_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         output_error(
             "dispatch_blocked",
-            f"Could not create the dispatch lock directory {lock_path.parent} "
+            f"Could not create the dispatch lock directory under "
+            f"{portfolio_root / 'locks'} for {target_dir} "
             f"({type(exc).__name__}: {exc}). Refusing to dispatch "
             f"unserialised: a concurrent dispatch to the same target could "
             f"then clobber this one's settings.",
@@ -2247,9 +2249,37 @@ def _tasks_dispatch_impl(
                 sys.exit(1)
     elif target_dir:
         resolved_dir = Path(target_dir)
-        resolved_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            resolved_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            output_error(
+                "dispatch_blocked",
+                f"Could not create the --target-dir {resolved_dir} "
+                f"({type(exc).__name__}: {exc}). Nothing was dispatched.",
+                fmt=fmt,
+            )
+            sys.exit(1)
     else:
         resolved_dir = Path.cwd()
+
+    # CLAWP-159: canonicalise the target ONCE. It is an identity for the
+    # dispatch lock, the hook's heartbeat holder token, the registry rows and
+    # the lease; resolving it per consumer let one fail and fall back to a
+    # different spelling (a junction alias) than the others, splitting the
+    # lock and the holder. Every identity consumer below gets this value, and
+    # a path that cannot be canonicalised refuses here, before anything is
+    # written. (Only the session-scope binding above is informational.)
+    from clawpm.sessions import canonical_path
+    try:
+        _canon_dir = canonical_path(resolved_dir)
+    except OSError as exc:
+        output_error(
+            "target_dir_unresolvable",
+            f"Could not resolve the dispatch target {resolved_dir} "
+            f"({type(exc).__name__}: {exc}). Nothing was dispatched.",
+            fmt=fmt,
+        )
+        sys.exit(1)
 
     rubric = None if no_session_context else render_rubric_markdown(task)
 
@@ -2313,7 +2343,7 @@ def _tasks_dispatch_impl(
     # The critical section is pure file and ledger I/O — every git probe runs
     # earlier — so it is bounded. `register_session` locks sessions.jsonl, a
     # different path, so there is no re-entry on this one.
-    with _dispatch_target_lock(config.portfolio_root, resolved_dir, fmt):
+    with _dispatch_target_lock(config.portfolio_root, _canon_dir, fmt):
         # Snapshot whatever dispatch state already exists at the target, so a
         # rollback can RESTORE it rather than delete it (Codex P2, PR #55 round
         # 7). `write_dispatch_settings` overwrites an existing settings file
@@ -2354,7 +2384,7 @@ def _tasks_dispatch_impl(
         _partial_write = None
         try:
             _written = write_dispatch_settings(
-                target_dir=resolved_dir,
+                target_dir=_canon_dir,
                 task_id=task_id,
                 project_id=project_id,
                 rubric_markdown=rubric,
@@ -2365,6 +2395,7 @@ def _tasks_dispatch_impl(
                 lease_heartbeat=lease_ttl is not None,
                 max_iterations=max_iterations,
                 iteration_baseline=iteration_baseline,
+                canonical=True,
             )
         except (FileExistsError, ValueError) as exc:
             output_error("dispatch_blocked", str(exc), fmt=fmt)
@@ -2478,11 +2509,15 @@ def _tasks_dispatch_impl(
                     # unrelated dispatch's sidecar at this target
                     # isn't ours to delete.
                     teardown_dispatch_settings(
-                        target_dir=resolved_dir,
+                        target_dir=_canon_dir,
                         task_id=task_id,
                         portfolio_root=config.portfolio_root,
                         project_id=project_id,
                         remove_sidecar=_sidecar_touched,
+                        # CLAWP-159: `_canon_dir` is the identity this dispatch
+                        # already established. Re-resolving it here let a target
+                        # that went unavailable after the write strand the hooks.
+                        canonical=True,
                     )
             except Exception as teardown_exc:
                 # Rollback itself failed — report BOTH, since the operator
@@ -2645,7 +2680,7 @@ def _tasks_dispatch_impl(
         # The holder is a shell-safe TOKEN of that path (Codex P2) — the same
         # token the heartbeat hook bakes in — so a path with spaces can't break
         # the hook or the holder match.
-        _abs_target = resolved_dir.resolve().as_posix()
+        _abs_target = _canon_dir.as_posix()
         try:
             grant_lease(
                 config.portfolio_root, task_id, project_id,
