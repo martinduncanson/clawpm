@@ -1340,3 +1340,113 @@ def test_mcp_decision_field_errors(tmp_path, monkeypatch):
             assert bad_filter["error"] == "bad_state"
 
     _run(scenario)
+
+
+def test_mcp_decision_response_reflects_the_saved_record(tmp_path, monkeypatch):
+    """The success payload is the on-disk task AFTER the record is written, not
+    the pre-record snapshot the transition serialised."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    from clawpm.tasks import add_task, get_task
+
+    port = _decision_port(tmp_path, monkeypatch)
+    t = add_task(port.config, "alpha", "Decide")
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+            blocked = await _call(client, "tasks_state", {
+                "project": "alpha", "task_id": t.id, "new_state": "blocked",
+                "question": "Ship?", "options": ["Ship", "Wait"],
+                "recommendation": "Ship"})
+            assert blocked["ok"] is True, blocked
+            data = blocked["data"]
+            assert data["state"] == "blocked"
+            assert data["blocked_on"] == "human"
+            assert data["question"] == "Ship?"
+            assert data["recommendation"] == "Ship"
+            assert [o["label"] for o in data["options"]] == ["Ship", "Wait"]
+            opened = await _call(client, "tasks_state", {
+                "project": "alpha", "task_id": t.id, "new_state": "open",
+                "answer": "Ship"})
+            assert opened["ok"] is True, opened
+            data = opened["data"]
+            assert data["state"] == "open"
+            assert data["answer"] == "Ship"
+            assert data["question"] == "Ship?"
+
+    _run(scenario)
+
+    saved = get_task(port.config, "alpha", t.id)
+    assert saved.answer == "Ship"
+
+
+def test_cli_block_question_json_output_is_unchanged(tmp_path, monkeypatch):
+    """The MCP refresh must not leak into the CLI: `block --question` renders
+    the transition's task payload exactly as before the record was written
+    (no decision keys), so existing CLI consumers see byte-identical JSON."""
+    import json
+
+    from click.testing import CliRunner
+
+    from clawpm.cli import main
+    from clawpm.tasks import add_task
+    from tests.test_all_projects import _env
+
+    port = _decision_port(tmp_path, monkeypatch)
+    t = add_task(port.config, "alpha", "Decide")
+    runner = CliRunner()
+    res = runner.invoke(main, [
+        "--format", "json", "block", "-p", "alpha", t.id, "--question", "Ship?",
+    ], env=_env(port))
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.output)["data"]
+    assert data["state"] == "blocked"
+    for key in ("blocked_on", "question", "options", "recommendation", "answer"):
+        assert key not in data
+    res = runner.invoke(main, [
+        "--format", "json", "unblock", "-p", "alpha", t.id, "--answer", "Ship",
+    ], env=_env(port))
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.output)["data"]
+    assert "answer" not in data
+
+
+def test_mcp_empty_supplied_decision_fields_are_validated(tmp_path, monkeypatch):
+    """An explicitly supplied empty list/string counts as supplied: every one of
+    these is refused before any mutation (task stays open)."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    from clawpm.models import TaskState
+    from clawpm.tasks import add_task, get_task
+
+    port = _decision_port(tmp_path, monkeypatch)
+    t = add_task(port.config, "alpha", "Decide")
+
+    cases = [
+        {"new_state": "blocked", "options": []},
+        {"new_state": "blocked", "options": ["A"]},
+        {"new_state": "blocked", "recommendation": ""},
+        {"new_state": "blocked", "question": "Q?", "recommendation": ""},
+        {"new_state": "blocked", "question": ""},
+        {"new_state": "blocked", "question": "   "},
+        {"new_state": "blocked", "answer": ""},
+        {"new_state": "open", "question": "Q?"},
+        {"new_state": "blocked", "options": [], "answer": "A"},
+    ]
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+            for extra in cases:
+                out = await _call(client, "tasks_state", {
+                    "project": "alpha", "task_id": t.id, **extra})
+                assert out["ok"] is False, (extra, out)
+                assert out["error"] == "invalid_argument", (extra, out)
+                saved = get_task(port.config, "alpha", t.id)
+                assert saved.state == TaskState.OPEN, extra
+                assert saved.question is None, extra
+
+    _run(scenario)

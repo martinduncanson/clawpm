@@ -575,6 +575,34 @@ def tasks_add(
     return {"ok": True, "project": project_id, "task": task.to_dict()}
 
 
+_DECISION_KEYS = ("blocked_on", "question", "options", "recommendation", "answer")
+
+
+def _refresh_decision_data(config, project_id: str, task_id: str, result: dict) -> dict:
+    """Make a successful decision-record result carry the task as saved.
+
+    The shared service serialises the task inside the transition, BEFORE the
+    decision record is written, and the CLI renders that payload unchanged. The
+    MCP promises the updated task, so re-read it and overlay the task fields
+    while keeping the transition's side-effect keys (cascade, warnings, ...).
+    Best effort: an unreadable task leaves the transition payload as it was.
+    """
+    data = result.get("data") if result.get("ok") else None
+    if not isinstance(data, dict):
+        return result
+    from clawpm.tasks import get_task
+
+    try:
+        fresh = get_task(config, project_id, task_id)
+    except Exception:
+        return result
+    if fresh is None:
+        return result
+    merged = {k: v for k, v in data.items() if k not in _DECISION_KEYS}
+    merged.update(fresh.to_dict())
+    return {**result, "data": merged}
+
+
 def tasks_state(
     task_id: str,
     new_state: str,
@@ -630,15 +658,18 @@ def tasks_state(
                 "message": f"invalid state '{new_state}' (open|progress|done|blocked|rejected)"}
 
     try:
-        if question is not None or answer is not None or options or recommendation is not None:
+        # Presence, not truthiness: an explicit [] or "" is a supplied field and
+        # must hit the same validation, before any mutation.
+        if (question is not None or answer is not None
+                or options is not None or recommendation is not None):
             if question is not None and answer is not None:
                 raise ValueError("question and answer cannot be combined.")
-            if question is None and (options or recommendation is not None):
+            if question is None and (options is not None or recommendation is not None):
                 raise ValueError("options/recommendation require question.")
             if question is not None:
                 if new_state != "blocked":
                     raise ValueError("question requires new_state 'blocked'.")
-                return block_with_question(
+                return _refresh_decision_data(config, project_id, full_id, block_with_question(
                     config,
                     project_id=project_id,
                     task_id=full_id,
@@ -650,17 +681,17 @@ def tasks_state(
                     meta_reflect=meta_reflect,
                     process_lesson=process_lesson,
                     surprise_tags=tuple(surprise_tags or ()),
-                )
+                ))
             if new_state not in ("open", "progress"):
                 raise ValueError("answer requires new_state 'open' or 'progress'.")
-            return unblock_task(
+            return _refresh_decision_data(config, project_id, full_id, unblock_task(
                 config,
                 project_id=project_id,
                 task_id=full_id,
                 also_start=new_state == "progress",
                 note=note,
                 answer=answer,
-            )
+            ))
         return transition(
             config,
             project_id=project_id,
