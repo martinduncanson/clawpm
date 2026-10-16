@@ -156,49 +156,49 @@ class TestCommitStagedPair:
         commit_staged_pair((p1, "new1"), (p2, "new2"))
         assert p1.read_text() == "new1"
         assert p2.read_text() == "new2"
-        assert not (tmp_path / "a.md.tmp").exists()
-        assert not (tmp_path / "b.md.tmp").exists()
+        assert list(tmp_path.glob("*.tmp")) == []
 
     def test_staging_failure_leaves_both_targets_untouched(self, tmp_path, monkeypatch):
         p1 = tmp_path / "a.md"
         p2 = tmp_path / "b.md"
         p1.write_text("old1")
         p2.write_text("old2")
-        real_wt = Path.write_text
+        import clawpm.concurrency as concurrency_mod
 
-        def failing_wt(self, data, *args, **kwargs):
-            if self.name == "b.md.tmp":
+        real_stage = concurrency_mod._stage_temp
+
+        def failing_stage(path, data, **kwargs):
+            if path.name == "b.md":
                 raise OSError("disk full staging second file")
-            return real_wt(self, data, *args, **kwargs)
+            return real_stage(path, data, **kwargs)
 
-        monkeypatch.setattr(Path, "write_text", failing_wt)
+        monkeypatch.setattr(concurrency_mod, "_stage_temp", failing_stage)
         with pytest.raises(OSError):
             commit_staged_pair((p1, "new1"), (p2, "new2"))
         # Neither target changed; both tmps cleaned up.
         assert p1.read_text() == "old1"
         assert p2.read_text() == "old2"
-        assert not (tmp_path / "a.md.tmp").exists()
-        assert not (tmp_path / "b.md.tmp").exists()
+        assert list(tmp_path.glob("*.tmp")) == []
 
     def test_second_commit_failure_commits_first_only(self, tmp_path, monkeypatch):
         p1 = tmp_path / "a.md"
         p2 = tmp_path / "b.md"
         p1.write_text("old1")
         p2.write_text("old2")
-        real_replace = Path.replace
+        real_replace = os.replace
 
-        def failing_replace(self, target):
+        def failing_replace(src, target, *args, **kwargs):
             if Path(target).name == "b.md":
                 raise OSError("cannot commit second file")
-            return real_replace(self, target)
+            return real_replace(src, target, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "replace", failing_replace)
+        monkeypatch.setattr(os, "replace", failing_replace)
         with pytest.raises(OSError):
             commit_staged_pair((p1, "new1"), (p2, "new2"))
         # `first` committed (the caller's self-healing direction); `second` not.
         assert p1.read_text() == "new1"
         assert p2.read_text() == "old2"
-        assert not (tmp_path / "b.md.tmp").exists()
+        assert list(tmp_path.glob("*.tmp")) == []
 
 
 # ---------------------------------------------------------------------------

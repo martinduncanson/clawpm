@@ -33,9 +33,11 @@ from __future__ import annotations
 
 import errno
 import os
+import stat
 import sys
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, IO, Iterator, TypeVar
@@ -405,6 +407,91 @@ def retry_transient(
     raise AssertionError("retry_transient exhausted without returning or raising")
 
 
+_TEMP_NAME_ATTEMPTS = 5
+
+
+def _discard_temp(name: str) -> None:
+    """Best-effort removal of a staged temp, even if it inherited a read-only mode.
+
+    ``_stage_temp`` carries the target's permission bits onto the temp, so a
+    read-only target yields a read-only temp, which ``os.unlink`` cannot remove
+    on Windows. Make it writable first (a chmod failure is ignored: the unlink
+    below is the real attempt), then unlink; an already-missing temp is fine.
+    """
+    try:
+        os.chmod(name, stat.S_IMODE(os.stat(name).st_mode) | stat.S_IWRITE)
+    except OSError:
+        pass
+    try:
+        os.unlink(name)
+    except OSError:
+        pass
+
+
+def _stage_temp(path: Path, data: bytes | str, *, encoding: str, newline: str | None) -> str:
+    """Write ``data`` to a UNIQUE temp file beside ``path``; return its name.
+
+    A uniquely named ``O_EXCL`` temp in the target's own directory gives every
+    writer a private name (a fixed ``<id>.tmp`` lets two writers replace or
+    delete each other's temp) and keeps the final swap on one filesystem. The
+    temp is created ``0o666`` so the kernel applies the CURRENT umask to a new
+    file, as the old ``write_text`` did (reading the umask is racy). An existing
+    target's permission bits are carried over; a failure to do so aborts the
+    write rather than publishing the wrong mode. ``str`` data is written in text
+    mode with ``newline`` passed through (``None`` keeps the platform default
+    that ``Path.write_text`` had); ``bytes`` are written verbatim. The temp is
+    removed on any failure.
+    """
+    try:
+        mode: int | None = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        mode = None
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    for attempt in range(_TEMP_NAME_ATTEMPTS):
+        tmp_name = str(path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            fd = os.open(tmp_name, flags, 0o666)
+            break
+        except FileExistsError:
+            if attempt == _TEMP_NAME_ATTEMPTS - 1:
+                raise
+    try:
+        if isinstance(data, bytes):
+            fh = os.fdopen(fd, "wb")
+        else:
+            fh = os.fdopen(fd, "w", encoding=encoding, newline=newline)
+        with fh:
+            fh.write(data)
+        if mode is not None:
+            os.chmod(tmp_name, mode)
+    except BaseException:
+        _discard_temp(tmp_name)
+        raise
+    return tmp_name
+
+
+def atomic_write(
+    path: Path,
+    data: bytes | str,
+    *,
+    encoding: str = "utf-8",
+    newline: str | None = None,
+) -> None:
+    """Atomically replace ``path`` with ``data`` through a unique temp file.
+
+    The single temp-file writer for task, mission and sibling files (CLAWP-158).
+    The final ``os.replace`` is retried on transient Windows sharing faults
+    (:func:`retry_transient`); the temp is removed on EVERY failure path and the
+    original is left untouched.
+    """
+    tmp_name = _stage_temp(path, data, encoding=encoding, newline=newline)
+    try:
+        retry_transient(os.replace, tmp_name, path)
+    except BaseException:
+        _discard_temp(tmp_name)
+        raise
+
+
 class ConcurrentModificationError(ValueError):
     """A file a mutator was editing vanished or changed under it mid-critical-section.
 
@@ -476,30 +563,30 @@ def commit_staged_pair(
     disproportionate here given the existing idempotent reconciliation.
     """
     (p1, c1), (p2, c2) = first, second
-    t1 = p1.with_suffix(p1.suffix + ".tmp")
-    t2 = p2.with_suffix(p2.suffix + ".tmp")
     # Phase 1 — stage both. A failure here leaves both targets untouched.
+    t1 = t2 = None
     try:
-        t1.write_text(c1, encoding=encoding)
-        t2.write_text(c2, encoding=encoding)
-    except Exception:
-        t1.unlink(missing_ok=True)
-        t2.unlink(missing_ok=True)
+        t1 = _stage_temp(p1, c1, encoding=encoding, newline=None)
+        t2 = _stage_temp(p2, c2, encoding=encoding, newline=None)
+    except BaseException:
+        for t in (t1, t2):
+            if t is not None:
+                _discard_temp(t)
         raise
     # Phase 2 — commit first, then second. A failure committing `first` still
     # leaves both targets untouched (its rename either fully happens or raises).
     try:
-        retry_transient(t1.replace, p1)
-    except Exception:
-        t1.unlink(missing_ok=True)
-        t2.unlink(missing_ok=True)
+        retry_transient(os.replace, t1, p1)
+    except BaseException:
+        _discard_temp(t1)
+        _discard_temp(t2)
         raise
     # `first` is now committed. A failure here is the residual window the caller
     # is responsible for (backstop reconciliation or compensation rollback).
     try:
-        retry_transient(t2.replace, p2)
-    except Exception:
-        t2.unlink(missing_ok=True)
+        retry_transient(os.replace, t2, p2)
+    except BaseException:
+        _discard_temp(t2)
         raise
 
 

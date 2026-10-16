@@ -35,6 +35,7 @@ from typing import Any
 
 import yaml
 
+from .concurrency import atomic_write
 from .frontmatter import FrontmatterError, split_frontmatter, stamp_updated, strip_bom
 from .sessions import Scope
 from .tasks import cascade_unblock_dependents
@@ -111,13 +112,7 @@ def _rewrite_frontmatter_state(file_path: Path, new_state: str) -> None:
         new_fm_text = yaml.safe_dump(fm, default_flow_style=False, sort_keys=False)
         new_text = f"---\n{new_fm_text}---{body}"
 
-    tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
-    try:
-        tmp_path.write_text(new_text, encoding="utf-8")
-        tmp_path.replace(file_path)
-    except Exception:
-        tmp_path.unlink(missing_ok=True)
-        raise
+    atomic_write(file_path, new_text)
 
 
 def apply_drift(drift_entry: dict, *, dry_run: bool = False) -> dict:

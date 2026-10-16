@@ -29,6 +29,7 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+from .concurrency import atomic_write
 from .id_reservations import record_task_id
 from .frontmatter import (
     FrontmatterError,
@@ -1754,13 +1755,7 @@ def _collect_emitted_tasks(live_dir: Path, task_id: str, out: list) -> None:
 
 def _atomic_write(path: Path, content: str) -> None:
     """Write content to path via atomic tmp → rename."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    try:
-        tmp.write_text(content, encoding="utf-8")
-        tmp.replace(path)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
+    atomic_write(path, content)
 
 
 def _rewrite_depends(task_file: Path, ids: list[str]) -> None:

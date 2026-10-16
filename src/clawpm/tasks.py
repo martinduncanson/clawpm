@@ -6,7 +6,6 @@ import logging
 import os
 import re
 import stat
-import tempfile
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -22,6 +21,7 @@ from .concurrency import (
     commit_staged_pair,
     file_lock,
     guard_fs_tamper,
+    atomic_write,
     retry_transient,
 )
 from .frontmatter import (
@@ -787,15 +787,10 @@ def _stamp_updated_file(file_path: Path, when: str | None = None) -> None:
     new_text = _set_updated_line(text, when or today_utc_iso())
     if new_text is None:
         return  # no well-formed frontmatter fence — leave the file untouched
-    tmp = file_path.with_suffix(file_path.suffix + ".tmp")
-    try:
-        tmp.write_bytes(new_text.encode("utf-8"))
-        # Retry transient Windows sharing/access faults on the rename — this
-        # runs under the per-project lock alongside concurrent scanners (CLAWP-051).
-        retry_transient(tmp.replace, file_path)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
+    # Transient Windows sharing/access faults on the rename are retried inside
+    # atomic_write — this runs under the per-project lock alongside concurrent
+    # scanners (CLAWP-051).
+    atomic_write(file_path, new_text.encode("utf-8"))
 
 
 _STATE_LINE_RE = re.compile(r"^state\s*:")
@@ -865,13 +860,7 @@ def _sync_state_line(file_path: Path, new_state: str) -> bool:
     check = yaml.safe_load(out.replace("\r\n", "\n").split("---", 2)[1])
     if not isinstance(check, dict) or check.get("state") != new_state:
         raise ValueError("state rewrite did not read back as the new state")
-    tmp = file_path.with_suffix(file_path.suffix + ".tmp")
-    try:
-        tmp.write_bytes((bom + out).encode("utf-8"))
-        retry_transient(tmp.replace, file_path)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
+    atomic_write(file_path, (bom + out).encode("utf-8"))
     return True
 
 
@@ -955,15 +944,10 @@ def _write_rejection_frontmatter(
         + "---"
         + body
     )
-    tmp = file_path.with_suffix(".tmp")
-    try:
-        tmp.write_text(new_text, encoding="utf-8")
-        # Retry transient Windows sharing/access faults — this rewrites a file
-        # that concurrent sessions contend on under the lock (CLAWP-051).
-        retry_transient(tmp.replace, file_path)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
+    # atomic_write retries transient Windows sharing/access faults — this
+    # rewrites a file that concurrent sessions contend on under the lock
+    # (CLAWP-051).
+    atomic_write(file_path, new_text)
 
 
 def _resolution_applies(task: Task, resolution: object) -> bool:
@@ -1016,13 +1000,7 @@ def _write_resolution_frontmatter(file_path: Path, resolution: str) -> None:
         + "---"
         + body
     )
-    tmp = file_path.with_suffix(".tmp")
-    try:
-        tmp.write_text(new_text, encoding="utf-8")
-        retry_transient(tmp.replace, file_path)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
+    atomic_write(file_path, new_text)
 
 
 def _append_decision_to_parent(
@@ -1095,25 +1073,13 @@ def _append_decision_to_parent(
     if _stamped is not None:
         new_text = _stamped
 
-    tmp = parent_path.with_suffix(parent_path.suffix + ".tmp")
-    try:
-        tmp.write_text(new_text, encoding="utf-8")
-        retry_transient(tmp.replace, parent_path)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
+    atomic_write(parent_path, new_text)
 
 
 def _restore_file_bytes(path: Path, data: bytes) -> None:
     """Atomically put ``data`` back at ``path`` byte-for-byte (binary write, so
     no newline translation on Windows)."""
-    tmp = path.with_suffix(path.suffix + ".rollback.tmp")
-    try:
-        tmp.write_bytes(data)
-        retry_transient(tmp.replace, path)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
+    atomic_write(path, data)
 
 
 @contextmanager
@@ -1590,37 +1556,6 @@ def is_awaiting_human(task: Task) -> bool:
 _HUMAN_DECISION_KEYS = ("blocked_on", "question", "options", "recommendation", "answer")
 
 
-def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    """Write ``data`` to ``path`` through a UNIQUE temp file in the same dir.
-
-    A fixed ``<id>.tmp`` name lets two writers of one file replace or delete
-    each other's temp; ``mkstemp`` gives each write its own. The temp is
-    removed on every failure path; the final swap is an atomic replace.
-    """
-    try:
-        mode = stat.S_IMODE(path.stat().st_mode)
-    except OSError:
-        mode = None
-    fd, tmp_name = tempfile.mkstemp(
-        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
-    )
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(data)
-        if mode is not None:
-            try:
-                os.chmod(tmp_name, mode)
-            except OSError:
-                pass
-        retry_transient(os.replace, tmp_name, path)
-    except BaseException:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
-
-
 def _rewrite_decision_frontmatter(file_path: Path, updates: dict) -> None:
     """Surgical frontmatter rewrite for the human-decision keys (CLAWP-154).
 
@@ -1638,7 +1573,7 @@ def _rewrite_decision_frontmatter(file_path: Path, updates: dict) -> None:
         new_text = splice_keys(text, {**updates, "updated": today_utc_iso()})
     except PrRecordError as exc:
         raise ValueError(f"Cannot update decision record in '{file_path}': {exc}")
-    _atomic_write_bytes(file_path, new_text.encode("utf-8"))
+    atomic_write(file_path, new_text.encode("utf-8"))
 
 
 def record_human_question(
@@ -3797,14 +3732,9 @@ def add_task_with_status(
                 "Pass a different task_id or omit it to auto-generate one."
             )
 
-        tmp_path = file_path.with_suffix(".tmp")
-        try:
-            tmp_path.write_text(content, encoding="utf-8")
-            # Retry transient Windows sharing/access faults on the rename (CLAWP-051)
-            retry_transient(tmp_path.replace, file_path)
-        except Exception:
-            tmp_path.unlink(missing_ok=True)
-            raise
+        # atomic_write retries transient Windows sharing/access faults on the
+        # rename (CLAWP-051).
+        atomic_write(file_path, content)
 
         # CLAWP-112-001 — the task file is now durable; register the
         # predictions snapshot in the reflection JSONL (separate lock file,
@@ -4102,13 +4032,7 @@ def edit_task(
 
         # Rebuild file — utf-8 always so Unicode content survives on Windows
         new_text = f"---\n{yaml.dump(frontmatter, default_flow_style=False, allow_unicode=True).strip()}\n---\n{content}"
-        tmp_path = task.file_path.with_suffix(".tmp")
-        try:
-            tmp_path.write_text(new_text, encoding="utf-8")
-            retry_transient(tmp_path.replace, task.file_path)
-        except Exception:
-            tmp_path.unlink(missing_ok=True)
-            raise
+        atomic_write(task.file_path, new_text)
 
         # CLAWP-112-001 — the task file is now durable; bring the ledger in
         # line with it (registration or revision, decided from the ledger).
@@ -4222,13 +4146,7 @@ def edit_fog(
             new_text = new_text.replace("\n", "\r\n")
         if has_bom:
             new_text = "﻿" + new_text
-        tmp_path = task.file_path.with_suffix(".tmp")
-        try:
-            tmp_path.write_bytes(new_text.encode("utf-8"))
-            retry_transient(tmp_path.replace, task.file_path)
-        except Exception:
-            tmp_path.unlink(missing_ok=True)
-            raise
+        atomic_write(task.file_path, new_text.encode("utf-8"))
 
         return retry_transient(Task.from_file, task.file_path)
 
@@ -4424,16 +4342,10 @@ def _append_child_to_parent_frontmatter(
         return  # lenient: skip a vanished / malformed-frontmatter parent
     if new_text is None:
         return
-    tmp = parent_path.with_suffix(parent_path.suffix + ".tmp")
-    try:
-        tmp.write_text(new_text, encoding="utf-8")
-        # Retry transient Windows sharing/access faults — every subtask worker
-        # rewrites this same parent _task.md under the lock, so the rename hits
-        # post-write handle contention from the OS/AV scanner (CLAWP-051).
-        retry_transient(tmp.replace, parent_path)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
+    # atomic_write retries transient Windows sharing/access faults — every
+    # subtask worker rewrites this same parent _task.md under the lock, so the
+    # rename hits post-write handle contention from the OS/AV scanner (CLAWP-051).
+    atomic_write(parent_path, new_text)
 
 
 def _child_state_dirs(tasks_dir: Path, parent_dir: Path) -> list[Path]:
@@ -4781,14 +4693,7 @@ def add_subtask(
         )
         if parent_new_text is None:
             # True no-op on the parent — single atomic child write.
-            tmp_path = file_path.with_suffix(".tmp")
-            try:
-                tmp_path.write_text(content, encoding="utf-8")
-                # Retry transient Windows sharing/access faults (CLAWP-051).
-                retry_transient(tmp_path.replace, file_path)
-            except Exception:
-                tmp_path.unlink(missing_ok=True)
-                raise
+            atomic_write(file_path, content)
         else:
             try:
                 commit_staged_pair(
