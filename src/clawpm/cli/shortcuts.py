@@ -133,45 +133,22 @@ def quick_block(ctx: click.Context, project_id: str | None, task_ids: tuple[str,
     else:
         if len(task_ids) > 1:
             raise click.UsageError("--question applies to exactly one task id.")
-        from clawpm.tasks import normalize_human_options, record_human_question
-        try:
-            opts = normalize_human_options(list(option_labels))
-            if not question.strip():
-                raise ValueError("A non-empty question is required.")
-            if recommend is not None and recommend.strip() not in {o["label"] for o in opts}:
-                raise ValueError(f"--recommend {recommend!r} is not one of the --option labels.")
-        except ValueError as exc:
-            raise click.UsageError(str(exc))
-        parts = [f"Question: {question.strip()}"]
-        if opts:
-            parts.append("Options: " + " / ".join(o["label"] for o in opts))
-        if recommend:
-            parts.append(f"Recommendation: {recommend.strip()}")
-        decision = " | ".join(parts)
-        note = f"{note} | {decision}" if note else decision
+        from clawpm.services.tasks import block_with_question
         fmt = get_format(ctx)
         config = require_portfolio(ctx)
         resolved_project, _ = require_project(ctx, project_id)
         full_id = expand_task_id(task_ids[0], resolved_project)
-        r = transition_isolated(
-            False, config,
-            project_id=resolved_project, task_id=full_id, new_state="blocked",
-            note=note, reflect_note=reflect_note, meta_reflect=meta_reflect,
-            process_lesson=process_lesson, surprise_tags=surprise_tags,
-            actual_complexity=actual_complexity,
-        )
-        if r.get("ok"):
-            try:
-                record_human_question(
-                    config, resolved_project, full_id, question, opts, recommend,
-                )
-            except (ValueError, OSError) as exc:
-                # The block is already durable; say so rather than rolling back.
-                r = {
-                    "ok": False, "task_id": full_id,
-                    "error": "decision_record_failed", "state_changed": True,
-                    "message": f"Task blocked but the decision was not recorded: {exc}",
-                }
+        try:
+            r = block_with_question(
+                config, project_id=resolved_project, task_id=full_id,
+                question=question, options=list(option_labels),
+                recommendation=recommend, note=note,
+                reflect_note=reflect_note, meta_reflect=meta_reflect,
+                process_lesson=process_lesson, surprise_tags=surprise_tags,
+                actual_complexity=actual_complexity,
+            )
+        except ValueError as exc:
+            raise click.UsageError(str(exc))
         _render_state_results([r], "blocked", resolved_project, fmt, batch=False)
         return
     # CLAWP-154 — a plain block must not resurrect a question left on an
@@ -262,11 +239,11 @@ def quick_unblock(ctx: click.Context, project_id: str | None, task_ids: tuple[st
             raise click.UsageError("--answer applies to exactly one task id.")
         if not answer.strip():
             raise click.UsageError("--answer must be non-empty.")
-        note = f"{note}. Answer: {answer.strip()}" if note else f"Answer: {answer.strip()}"
 
     project_id, _ = require_project(ctx, project_id)
     new_state_str = "progress" if also_start else "open"
 
+    from clawpm.services.tasks import unblock_task
     seen: set[str] = set()
     results: list[dict] = []
     for raw in task_ids:
@@ -275,73 +252,11 @@ def quick_unblock(ctx: click.Context, project_id: str | None, task_ids: tuple[st
             continue
         seen.add(full_task_id)
 
-        # Verify the task is actually blocked (per-task, isolated).
-        task = get_task(config, project_id, full_task_id)
-        if not task:
-            results.append({
-                "ok": False, "task_id": full_task_id, "error": "task_not_found",
-                "message": f"No task with id '{full_task_id}' in project '{project_id}'",
-            })
-            continue
-        if task.state != TaskState.BLOCKED:
-            results.append({
-                "ok": False, "task_id": full_task_id, "error": "not_blocked",
-                "message": (
-                    f"Task {full_task_id} is in state '{task.state.value}', not 'blocked'. "
-                    "Use 'clawpm tasks state <id> open' to change state directly."
-                ),
-            })
-            continue
-
-        r = transition_isolated(
-            len(task_ids) > 1, config,
-            project_id=project_id, task_id=full_task_id, new_state=new_state_str,
-            note=note,
-        )
-        if r.get("ok") and answer is not None:
-            from clawpm.tasks import record_human_answer
-            try:
-                record_human_answer(config, project_id, full_task_id, answer)
-            except (ValueError, OSError) as exc:
-                r = {
-                    "ok": False, "task_id": full_task_id,
-                    "error": "decision_record_failed", "state_changed": True,
-                    "message": f"Task unblocked but the answer was not recorded: {exc}",
-                }
-        clear_failure: dict | None = None
-        if r.get("ok") and answer is None:
-            # CLAWP-154 — unblocked unanswered: the question is no longer live.
-            from clawpm.tasks import clear_stale_human_decision
-            try:
-                clear_stale_human_decision(config, project_id, full_task_id)
-            except (ValueError, OSError) as exc:
-                # Loud (non-zero exit), applied after the work-log append below.
-                clear_failure = {
-                    "ok": False, "task_id": full_task_id,
-                    "error": "stale_decision_not_cleared", "state_changed": True,
-                    "message": (
-                        f"Task {full_task_id} is unblocked but its stale decision "
-                        f"record was not cleared: {exc}"
-                    ),
-                }
-        if r.get("ok"):
-            # Log the explicit unblock action only when the transition landed.
-            # Best-effort: the transition is already durable, so a work-log
-            # append failure must not abort the batch — surface it as a marker.
-            try:
-                add_entry(
-                    config,
-                    project=project_id,
-                    action=WorkLogAction.UNBLOCK,
-                    task=full_task_id,
-                    summary=note or "Blocker resolved",
-                    auto=True,
-                )
-            except Exception as exc:
-                r.setdefault("data", {}).setdefault("log_errors", []).append(
-                    {"error_class": type(exc).__name__, "message": str(exc)}
-                )
-        results.append(clear_failure if clear_failure is not None else r)
+        results.append(unblock_task(
+            config, project_id=project_id, task_id=full_task_id,
+            also_start=also_start, note=note, answer=answer,
+            batch=len(task_ids) > 1,
+        ))
 
     _render_state_results(results, new_state_str, project_id, fmt, batch=len(task_ids) > 1)
 

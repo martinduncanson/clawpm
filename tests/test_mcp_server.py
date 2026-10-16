@@ -11,6 +11,7 @@ trip through the protocol exactly as a host (Cursor, Claude Code, …) would see
 from __future__ import annotations
 
 import json
+import sys
 
 import anyio
 import pytest
@@ -1188,3 +1189,366 @@ def test_tasks_state_resolution_is_stored_on_a_build_task(isolated_portfolio):
 
     _run(scenario)
     assert get_task(isolated_portfolio.config, pid, task.id).resolution == "Shipped."
+
+
+# ---------------------------------------------------------------------------
+# CLAWP-157 -- human-decision record over MCP
+# ---------------------------------------------------------------------------
+
+def _decision_port(tmp_path, monkeypatch):
+    from tests.test_all_projects import _make_portfolio
+
+    return _make_portfolio(tmp_path, monkeypatch, [
+        {"id": "alpha", "priority": 1, "prefix": "ALPHA"},
+        {"id": "beta", "priority": 5, "prefix": "BETA"},
+    ])
+
+
+def _normalised(raw: bytes, task_id: str) -> bytes:
+    """Task-file bytes with the per-task id and baseline timestamp masked."""
+    import re
+
+    raw = raw.replace(task_id.encode(), b"ID")
+    return re.sub(rb"baseline_ref: ts:[^\r\n]*", b"baseline_ref: TS", raw)
+
+
+def test_mcp_block_question_writes_same_bytes_as_cli_and_is_listed(tmp_path, monkeypatch):
+    """The MCP question/options/recommendation fields write the record exactly
+    as `clawpm block --question ...` does (byte-identical task file), and
+    tasks_list needs_human returns it."""
+    from click.testing import CliRunner
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    from clawpm.cli import main
+    from clawpm.tasks import add_task, get_task
+    from tests.test_all_projects import _env
+
+    port = _decision_port(tmp_path, monkeypatch)
+    cli_task = add_task(port.config, "alpha", "Decide")
+    mcp_task = add_task(port.config, "beta", "Decide")
+
+    res = CliRunner().invoke(main, [
+        "block", "-p", "alpha", cli_task.id, "--question", "Ship it?",
+        "--option", "Ship now", "--option", "Wait", "--recommend", "Wait",
+    ], env=_env(port))
+    assert res.exit_code == 0, res.output
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+            blocked = await _call(client, "tasks_state", {
+                "project": "beta", "task_id": mcp_task.id, "new_state": "blocked",
+                "question": "Ship it?", "options": ["Ship now", "Wait"],
+                "recommendation": "Wait"})
+            assert blocked["ok"] is True, blocked
+            listed = await _call(client, "tasks_list", {
+                "project": "beta", "needs_human": True})
+            assert listed["ok"] is True, listed
+            assert [r["id"] for r in listed["tasks"]] == [mcp_task.id]
+            row = listed["tasks"][0]
+            assert row["question"] == "Ship it?"
+            assert row["recommendation"] == "Wait"
+            assert [o["label"] for o in row["options"]] == ["Ship now", "Wait"]
+
+    _run(scenario)
+
+    cli_bytes = get_task(port.config, "alpha", cli_task.id).file_path.read_bytes()
+    mcp_bytes = get_task(port.config, "beta", mcp_task.id).file_path.read_bytes()
+    assert _normalised(mcp_bytes, mcp_task.id) == _normalised(cli_bytes, cli_task.id)
+
+
+def test_mcp_unblock_answer_matches_cli_and_leaves_needs_human(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    from clawpm.cli import main
+    from clawpm.models import TaskState
+    from clawpm.tasks import add_task, get_task
+    from tests.test_all_projects import _env
+
+    port = _decision_port(tmp_path, monkeypatch)
+    cli_task = add_task(port.config, "alpha", "Decide")
+    mcp_task = add_task(port.config, "beta", "Decide")
+    runner = CliRunner()
+    for proj, t in (("alpha", cli_task), ("beta", mcp_task)):
+        assert runner.invoke(main, [
+            "block", "-p", proj, t.id, "--question", "Ship it?",
+            "--option", "Ship now", "--option", "Wait",
+        ], env=_env(port)).exit_code == 0
+    res = runner.invoke(main, ["unblock", "-p", "alpha", cli_task.id,
+                               "--answer", "Wait"], env=_env(port))
+    assert res.exit_code == 0, res.output
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+            before = await _call(client, "tasks_list", {
+                "project": "beta", "needs_human": True})
+            assert [r["id"] for r in before["tasks"]] == [mcp_task.id]
+            out = await _call(client, "tasks_state", {
+                "project": "beta", "task_id": mcp_task.id, "new_state": "open",
+                "answer": "Wait"})
+            assert out["ok"] is True, out
+            after = await _call(client, "tasks_list", {
+                "project": "beta", "needs_human": True})
+            assert after["tasks"] == []
+
+    _run(scenario)
+
+    assert get_task(port.config, "beta", mcp_task.id).state == TaskState.OPEN
+    cli_bytes = get_task(port.config, "alpha", cli_task.id).file_path.read_bytes()
+    mcp_bytes = get_task(port.config, "beta", mcp_task.id).file_path.read_bytes()
+    assert _normalised(mcp_bytes, mcp_task.id) == _normalised(cli_bytes, cli_task.id)
+
+
+def test_mcp_decision_field_errors(tmp_path, monkeypatch):
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    from clawpm.models import TaskState
+    from clawpm.tasks import add_task, get_task
+
+    port = _decision_port(tmp_path, monkeypatch)
+    t = add_task(port.config, "alpha", "Decide")
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+            bad_rec = await _call(client, "tasks_state", {
+                "project": "alpha", "task_id": t.id, "new_state": "blocked",
+                "question": "Q?", "options": ["A"], "recommendation": "Z"})
+            assert bad_rec["ok"] is False
+            assert bad_rec["error"] == "invalid_argument"
+            # Refused before any move.
+            assert get_task(port.config, "alpha", t.id).state == TaskState.OPEN
+            wrong_state = await _call(client, "tasks_state", {
+                "project": "alpha", "task_id": t.id, "new_state": "progress",
+                "question": "Q?"})
+            assert wrong_state["error"] == "invalid_argument"
+            orphan = await _call(client, "tasks_state", {
+                "project": "alpha", "task_id": t.id, "new_state": "blocked",
+                "options": ["A"]})
+            assert orphan["error"] == "invalid_argument"
+            both = await _call(client, "tasks_state", {
+                "project": "alpha", "task_id": t.id, "new_state": "blocked",
+                "question": "Q?", "answer": "A"})
+            assert both["error"] == "invalid_argument"
+            bad_filter = await _call(client, "tasks_list", {
+                "project": "alpha", "needs_human": True, "state": "open"})
+            assert bad_filter["ok"] is False
+            assert bad_filter["error"] == "bad_state"
+
+    _run(scenario)
+
+
+def test_mcp_decision_response_reflects_the_saved_record(tmp_path, monkeypatch):
+    """The success payload is the on-disk task AFTER the record is written, not
+    the pre-record snapshot the transition serialised."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    from clawpm.tasks import add_task, get_task
+
+    port = _decision_port(tmp_path, monkeypatch)
+    t = add_task(port.config, "alpha", "Decide")
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+            blocked = await _call(client, "tasks_state", {
+                "project": "alpha", "task_id": t.id, "new_state": "blocked",
+                "question": "Ship?", "options": ["Ship", "Wait"],
+                "recommendation": "Ship"})
+            assert blocked["ok"] is True, blocked
+            data = blocked["data"]
+            assert data["state"] == "blocked"
+            assert data["blocked_on"] == "human"
+            assert data["question"] == "Ship?"
+            assert data["recommendation"] == "Ship"
+            assert [o["label"] for o in data["options"]] == ["Ship", "Wait"]
+            opened = await _call(client, "tasks_state", {
+                "project": "alpha", "task_id": t.id, "new_state": "open",
+                "answer": "Ship"})
+            assert opened["ok"] is True, opened
+            data = opened["data"]
+            assert data["state"] == "open"
+            assert data["answer"] == "Ship"
+            assert data["question"] == "Ship?"
+
+    _run(scenario)
+
+    saved = get_task(port.config, "alpha", t.id)
+    assert saved.answer == "Ship"
+
+
+@pytest.mark.parametrize("failure", ["oserror", "none"])
+def test_mcp_decision_refresh_failure_is_signalled(tmp_path, monkeypatch, failure):
+    """The state change lands, but a failed re-read of the saved record must be
+    reported (decision_refresh_failed + a warning), not passed off as a
+    complete payload with the question/answer silently missing."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    import clawpm.tasks as tasks_mod
+    from clawpm.models import TaskState
+    from clawpm.tasks import add_task, get_task
+
+    port = _decision_port(tmp_path, monkeypatch)
+    t = add_task(port.config, "alpha", "Decide")
+    real_get_task = tasks_mod.get_task
+
+    def broken_get_task(*args, **kwargs):
+        # Break only the MCP refresh re-read; the transition itself must land.
+        if sys._getframe(1).f_code.co_name != "_refresh_decision_data":
+            return real_get_task(*args, **kwargs)
+        if failure == "oserror":
+            raise OSError("disk went away")
+        return None
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+            monkeypatch.setattr(tasks_mod, "get_task", broken_get_task)
+            blocked = await _call(client, "tasks_state", {
+                "project": "alpha", "task_id": t.id, "new_state": "blocked",
+                "question": "Ship?", "options": ["Ship", "Wait"]})
+            monkeypatch.setattr(tasks_mod, "get_task", real_get_task)
+            assert blocked["ok"] is True, blocked
+            assert blocked["data"]["state"] == "blocked"
+            assert blocked["data"]["decision_refresh_failed"] is True
+            assert [w["code"] for w in blocked["data"]["warnings"]] == ["decision_refresh_failed"]
+            assert "could not be refreshed" in blocked["data"]["warnings"][0]["message"]
+            assert "question" not in blocked["data"]
+            monkeypatch.setattr(tasks_mod, "get_task", broken_get_task)
+            opened = await _call(client, "tasks_state", {
+                "project": "alpha", "task_id": t.id, "new_state": "open",
+                "answer": "Ship"})
+            monkeypatch.setattr(tasks_mod, "get_task", real_get_task)
+            assert opened["ok"] is True, opened
+            assert opened["data"]["state"] == "open"
+            assert opened["data"]["decision_refresh_failed"] is True
+            assert [w["code"] for w in opened["data"]["warnings"]] == ["decision_refresh_failed"]
+            assert "could not be refreshed" in opened["data"]["warnings"][0]["message"]
+            assert "answer" not in opened["data"]
+
+    _run(scenario)
+
+    # No rollback: the record and the answer both landed on disk.
+    saved = get_task(port.config, "alpha", t.id)
+    assert saved.state == TaskState.OPEN
+    assert saved.answer == "Ship"
+    assert saved.question == "Ship?"
+
+
+def test_mcp_decision_refresh_failure_keeps_warnings_homogeneous(tmp_path, monkeypatch):
+    """A pre-existing structured transition warning survives a failed refresh,
+    and the added warning has the same {code, message} shape (no mixed list)."""
+    import clawpm.tasks as tasks_mod
+
+    port = _decision_port(tmp_path, monkeypatch)
+    monkeypatch.setattr(tasks_mod, "get_task", lambda *a, **k: None)
+    existing = {"code": "existing", "message": "keep"}
+    result = M._refresh_decision_data(
+        port.config, "alpha", "ALPHA-001",
+        {"ok": True, "data": {"state": "blocked", "warnings": [existing]}})
+
+    warnings = result["data"]["warnings"]
+    assert result["data"]["decision_refresh_failed"] is True
+    assert warnings[0] == existing
+    assert all(isinstance(w, dict) and set(w) == {"code", "message"} for w in warnings)
+    assert [w["code"] for w in warnings] == ["existing", "decision_refresh_failed"]
+    assert [w["message"] for w in warnings]  # no TypeError on a homogeneous list
+
+
+def test_mcp_decision_refresh_success_has_no_failure_marker(tmp_path, monkeypatch):
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    from clawpm.tasks import add_task
+
+    port = _decision_port(tmp_path, monkeypatch)
+    t = add_task(port.config, "alpha", "Decide")
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+            blocked = await _call(client, "tasks_state", {
+                "project": "alpha", "task_id": t.id, "new_state": "blocked",
+                "question": "Ship?"})
+            assert blocked["ok"] is True, blocked
+            assert "decision_refresh_failed" not in blocked["data"]
+            assert "warnings" not in blocked["data"]
+
+    _run(scenario)
+
+
+def test_cli_block_question_json_output_is_unchanged(tmp_path, monkeypatch):
+    """The MCP refresh must not leak into the CLI: `block --question` renders
+    the transition's task payload exactly as before the record was written
+    (no decision keys), so existing CLI consumers see byte-identical JSON."""
+    import json
+
+    from click.testing import CliRunner
+
+    from clawpm.cli import main
+    from clawpm.tasks import add_task
+    from tests.test_all_projects import _env
+
+    port = _decision_port(tmp_path, monkeypatch)
+    t = add_task(port.config, "alpha", "Decide")
+    runner = CliRunner()
+    res = runner.invoke(main, [
+        "--format", "json", "block", "-p", "alpha", t.id, "--question", "Ship?",
+    ], env=_env(port))
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.output)["data"]
+    assert data["state"] == "blocked"
+    for key in ("blocked_on", "question", "options", "recommendation", "answer"):
+        assert key not in data
+    res = runner.invoke(main, [
+        "--format", "json", "unblock", "-p", "alpha", t.id, "--answer", "Ship",
+    ], env=_env(port))
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.output)["data"]
+    assert "answer" not in data
+
+
+def test_mcp_empty_supplied_decision_fields_are_validated(tmp_path, monkeypatch):
+    """An explicitly supplied empty list/string counts as supplied: every one of
+    these is refused before any mutation (task stays open)."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    from clawpm.models import TaskState
+    from clawpm.tasks import add_task, get_task
+
+    port = _decision_port(tmp_path, monkeypatch)
+    t = add_task(port.config, "alpha", "Decide")
+
+    cases = [
+        {"new_state": "blocked", "options": []},
+        {"new_state": "blocked", "options": ["A"]},
+        {"new_state": "blocked", "recommendation": ""},
+        {"new_state": "blocked", "question": "Q?", "recommendation": ""},
+        {"new_state": "blocked", "question": ""},
+        {"new_state": "blocked", "question": "   "},
+        {"new_state": "blocked", "answer": ""},
+        {"new_state": "open", "question": "Q?"},
+        {"new_state": "blocked", "options": [], "answer": "A"},
+    ]
+
+    async def scenario():
+        server = M.build_server("core")
+        async with create_connected_server_and_client_session(server) as client:
+            await client.initialize()
+            for extra in cases:
+                out = await _call(client, "tasks_state", {
+                    "project": "alpha", "task_id": t.id, **extra})
+                assert out["ok"] is False, (extra, out)
+                assert out["error"] == "invalid_argument", (extra, out)
+                saved = get_task(port.config, "alpha", t.id)
+                assert saved.state == TaskState.OPEN, extra
+                assert saved.question is None, extra
+
+    _run(scenario)

@@ -268,6 +268,7 @@ def tasks_list(
     state: str | None = None,
     tag: str | None = None,
     limit: int | None = None,
+    needs_human: bool = False,
 ) -> dict:
     """List tasks for a project.
 
@@ -276,10 +277,19 @@ def tasks_list(
     rejected tasks are excluded unless `state` asks for them explicitly).
     `tag` narrows to tasks carrying that workstream tag. `limit` caps the
     result count after filtering + sorting (default: unlimited). `project`
-    auto-detects from the server's cwd if omitted.
+    auto-detects from the server's cwd if omitted. `needs_human` narrows to
+    tasks blocked on an unanswered human question and returns the same rows as
+    `tasks list --needs-human` (id, project, title, question, options,
+    recommendation, blocked_since); it implies `state` blocked.
     """
     from clawpm.models import TaskState
     from clawpm.tasks import list_tasks
+
+    if needs_human:
+        if state not in (None, "blocked"):
+            return {"ok": False, "error": "bad_state",
+                    "message": "needs_human implies state blocked"}
+        state = "blocked"
 
     config = _load_config()
     project_id, source = _resolve_project(project)
@@ -304,6 +314,10 @@ def tasks_list(
         tag_l = tag.strip().lower()
         tasks = [t for t in tasks if tag_l in [x.lower() for x in t.tags]]
 
+    if needs_human:
+        from clawpm.tasks import is_awaiting_human
+        tasks = [t for t in tasks if is_awaiting_human(t)]
+
     total = len(tasks)
     # Mirror the CLI's guard (cli/tasks.py: `limit is not None and limit >= 0`)
     # — a bare `tasks[:limit]` treats a negative limit as Python end-slicing
@@ -312,13 +326,28 @@ def tasks_list(
     if limit is not None and limit >= 0:
         tasks = tasks[:limit]
 
+    if needs_human:
+        rows = [
+            {
+                "id": t.id,
+                "project": t.project_id or project_id,
+                "title": t.title,
+                "question": t.question,
+                "options": t.options,
+                "recommendation": t.recommendation,
+                "blocked_since": t.updated,
+            }
+            for t in tasks
+        ]
+    else:
+        rows = [t.to_dict() for t in tasks]
     return {
         "ok": True,
         "project": project_id,
         "source": source,
         "count": len(tasks),
         "total": total,
-        "tasks": [t.to_dict() for t in tasks],
+        "tasks": rows,
     }
 
 
@@ -546,6 +575,48 @@ def tasks_add(
     return {"ok": True, "project": project_id, "task": task.to_dict()}
 
 
+_DECISION_KEYS = ("blocked_on", "question", "options", "recommendation", "answer")
+_DECISION_REFRESH_WARNING = {
+    "code": "decision_refresh_failed",
+    "message": (
+        "state change saved, but the task could not be refreshed: the question/answer "
+        "record is missing from this response (it was written; use tasks_get to read it)"
+    ),
+}
+
+
+def _refresh_decision_data(config, project_id: str, task_id: str, result: dict) -> dict:
+    """Make a successful decision-record result carry the task as saved.
+
+    The shared service serialises the task inside the transition, BEFORE the
+    decision record is written, and the CLI renders that payload unchanged. The
+    MCP promises the updated task, so re-read it and overlay the task fields
+    while keeping the transition's side-effect keys (cascade, warnings, ...).
+    Best effort, but never silent: the state change has already landed, so an
+    unreadable task keeps the transition payload and marks it with
+    `decision_refresh_failed` plus a `warnings` entry, telling the caller the
+    saved question/answer is missing from the response, not from the task.
+    """
+    data = result.get("data") if result.get("ok") else None
+    if not isinstance(data, dict):
+        return result
+    from clawpm.tasks import get_task
+
+    try:
+        fresh = get_task(config, project_id, task_id)
+    except Exception:
+        fresh = None
+    if fresh is None:
+        return {**result, "data": {
+            **data,
+            "decision_refresh_failed": True,
+            "warnings": [*(data.get("warnings") or []), dict(_DECISION_REFRESH_WARNING)],
+        }}
+    merged = {k: v for k, v in data.items() if k not in _DECISION_KEYS}
+    merged.update(fresh.to_dict())
+    return {**result, "data": merged}
+
+
 def tasks_state(
     task_id: str,
     new_state: str,
@@ -559,6 +630,10 @@ def tasks_state(
     rationale: str | None = None,
     supersedes: str | None = None,
     resolution: str | None = None,
+    question: str | None = None,
+    options: list[str] | None = None,
+    recommendation: str | None = None,
+    answer: str | None = None,
 ) -> dict:
     """Transition a task to a new state (open|progress|done|blocked|rejected).
 
@@ -571,11 +646,20 @@ def tasks_state(
     enrich that calibration event. `rationale` /
     `supersedes` document a `rejected` won't-do decision. `resolution` is
     required to complete (`done`) a `kind: decision` task, optional (but
-    stored, and must be non-blank) for a build task. Returns the updated
-    task plus any cascade/teardown side-effects."""
+    stored, and must be non-blank) for a build task.
+
+    Awaiting-human decision record (CLAWP-154), written through the same
+    service path as `clawpm block --question` / `clawpm unblock --answer`:
+    with `new_state` blocked, `question` (plus optional `options` labels and a
+    `recommendation` that must be one of them) blocks the task on a human and
+    records the decision; with `new_state` open or progress, `answer` records
+    the human's answer on a blocked task and unblocks it. `options`,
+    `recommendation` and `answer` need their partner field; `question` and
+    `answer` cannot be combined. Returns the updated task plus any
+    cascade/teardown side-effects."""
     from clawpm.context import expand_task_id
     from clawpm.models import TaskState
-    from clawpm.services.tasks import transition
+    from clawpm.services.tasks import block_with_question, transition, unblock_task
 
     config = _load_config()
     project_id, _ = _resolve_project(project)
@@ -588,6 +672,40 @@ def tasks_state(
                 "message": f"invalid state '{new_state}' (open|progress|done|blocked|rejected)"}
 
     try:
+        # Presence, not truthiness: an explicit [] or "" is a supplied field and
+        # must hit the same validation, before any mutation.
+        if (question is not None or answer is not None
+                or options is not None or recommendation is not None):
+            if question is not None and answer is not None:
+                raise ValueError("question and answer cannot be combined.")
+            if question is None and (options is not None or recommendation is not None):
+                raise ValueError("options/recommendation require question.")
+            if question is not None:
+                if new_state != "blocked":
+                    raise ValueError("question requires new_state 'blocked'.")
+                return _refresh_decision_data(config, project_id, full_id, block_with_question(
+                    config,
+                    project_id=project_id,
+                    task_id=full_id,
+                    question=question,
+                    options=list(options or ()),
+                    recommendation=recommendation,
+                    note=note,
+                    reflect_note=reflect_note,
+                    meta_reflect=meta_reflect,
+                    process_lesson=process_lesson,
+                    surprise_tags=tuple(surprise_tags or ()),
+                ))
+            if new_state not in ("open", "progress"):
+                raise ValueError("answer requires new_state 'open' or 'progress'.")
+            return _refresh_decision_data(config, project_id, full_id, unblock_task(
+                config,
+                project_id=project_id,
+                task_id=full_id,
+                also_start=new_state == "progress",
+                note=note,
+                answer=answer,
+            ))
         return transition(
             config,
             project_id=project_id,
