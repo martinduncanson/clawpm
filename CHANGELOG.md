@@ -8,6 +8,7 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 
 ### Added
 
+- MCP `tasks_state` takes `question` / `options` / `recommendation` (block on a human) and `answer` (unblock with the answer), and `tasks_list` takes `needs_human`; the CLI `block --question` / `unblock` and MCP now share one write path, `services.tasks.block_with_question` / `unblock_task` (#126, CLAWP-157).
 - Awaiting-human decisions: `block --question/--option/--recommend`, `unblock --answer` and `tasks list --needs-human` record and list the decision a blocked task waits on (#122, CLAWP-154).
 - `agent.dispatch_agent`, `leases.apply_fallback` / `sweep`, `lease grant` / `lease sweep` and `doctor --apply` (`doctor_apply.run_apply_phase`, `apply_stale_blocked`) take an explicit `scope=` and pass it to every task-store call instead of relying on `suppress_session_resolution()`; no scope keeps the canonical behaviour (#123, CLAWP-136-001).
 - `scope=` (explicit `Scope`) on the remaining `tasks.py` task-store functions (`list_tasks`, `edit_fog`, `split_task`, `archive_done_tasks`, `cascade_unblock_dependents`, ...; `store_scope=` on `add_task`, `add_task_with_status`, `edit_task`, `add_subtask`), so a pinned scope never falls back to ambient discovery; callers migrate in round 2 (#121, CLAWP-136-001).

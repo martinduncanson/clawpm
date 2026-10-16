@@ -562,3 +562,165 @@ def transition_isolated(batch: bool, config, **kwargs) -> dict:
             "error_class": type(exc).__name__,
             "message": str(exc),
         }
+
+
+# ---------------------------------------------------------------------------
+# Human-decision record (CLAWP-154 / CLAWP-157)
+#
+# ONE write path for the awaiting-human record: the CLI shortcuts (block
+# --question, unblock) and the MCP tasks_state tool both call these, so the
+# two surfaces cannot drift.
+# ---------------------------------------------------------------------------
+
+def block_with_question(
+    config,
+    *,
+    project_id: str,
+    task_id: str,
+    question: str,
+    options=None,
+    recommendation: str | None = None,
+    note: str | None = None,
+    reflect_note: str | None = None,
+    meta_reflect: str | None = None,
+    process_lesson: str | None = None,
+    surprise_tags: tuple[str, ...] = (),
+    actual_complexity: str | None = None,
+) -> dict:
+    """Block ONE task on a human decision and record the question.
+
+    Validation (blank question, bad options, a recommendation that is not an
+    option label) raises ``ValueError`` BEFORE any move, so a refused call
+    leaves the task untouched. The block transition runs first; the record is
+    written after it. A record failure on an already-blocked task returns a
+    ``decision_record_failed`` result with ``state_changed`` set rather than
+    rolling the block back.
+    """
+    from clawpm.tasks import normalize_human_options, record_human_question
+
+    opts = normalize_human_options(options)
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("A non-empty question is required.")
+    if recommendation is not None and recommendation.strip() not in {o["label"] for o in opts}:
+        raise ValueError(f"--recommend {recommendation!r} is not one of the --option labels.")
+    parts = [f"Question: {question.strip()}"]
+    if opts:
+        parts.append("Options: " + " / ".join(o["label"] for o in opts))
+    if recommendation:
+        parts.append(f"Recommendation: {recommendation.strip()}")
+    decision = " | ".join(parts)
+    note = f"{note} | {decision}" if note else decision
+    task_id = expand_task_id(task_id, project_id)
+    r = transition_isolated(
+        False, config,
+        project_id=project_id, task_id=task_id, new_state="blocked",
+        note=note, reflect_note=reflect_note, meta_reflect=meta_reflect,
+        process_lesson=process_lesson, surprise_tags=surprise_tags,
+        actual_complexity=actual_complexity,
+    )
+    if r.get("ok"):
+        try:
+            record_human_question(
+                config, project_id, task_id, question, opts, recommendation,
+            )
+        except (ValueError, OSError) as exc:
+            # The block is already durable; say so rather than rolling back.
+            r = {
+                "ok": False, "task_id": task_id,
+                "error": "decision_record_failed", "state_changed": True,
+                "message": f"Task blocked but the decision was not recorded: {exc}",
+            }
+    return r
+
+
+def unblock_task(
+    config,
+    *,
+    project_id: str,
+    task_id: str,
+    also_start: bool = False,
+    note: str | None = None,
+    answer: str | None = None,
+    batch: bool = False,
+) -> dict:
+    """Unblock ONE task (blocked -> open, or -> progress with ``also_start``).
+
+    With ``answer`` the human's answer is recorded on the task (question,
+    options and recommendation are kept); without it the now-dead question is
+    cleared so a later plain re-block cannot resurrect it. The ``unblock``
+    work-log entry is written only when the transition lands. Per-task
+    isolation: a missing or not-blocked task returns a failure result.
+    """
+    from clawpm.tasks import clear_stale_human_decision, record_human_answer
+
+    if answer is not None:
+        if not answer.strip():
+            raise ValueError("--answer must be non-empty.")
+        note = f"{note}. Answer: {answer.strip()}" if note else f"Answer: {answer.strip()}"
+
+    new_state_str = "progress" if also_start else "open"
+    full_task_id = expand_task_id(task_id, project_id)
+
+    # Verify the task is actually blocked (per-task, isolated).
+    task = get_task(config, project_id, full_task_id)
+    if not task:
+        return {
+            "ok": False, "task_id": full_task_id, "error": "task_not_found",
+            "message": f"No task with id '{full_task_id}' in project '{project_id}'",
+        }
+    if task.state != TaskState.BLOCKED:
+        return {
+            "ok": False, "task_id": full_task_id, "error": "not_blocked",
+            "message": (
+                f"Task {full_task_id} is in state '{task.state.value}', not 'blocked'. "
+                "Use 'clawpm tasks state <id> open' to change state directly."
+            ),
+        }
+
+    r = transition_isolated(
+        batch, config,
+        project_id=project_id, task_id=full_task_id, new_state=new_state_str,
+        note=note,
+    )
+    if r.get("ok") and answer is not None:
+        try:
+            record_human_answer(config, project_id, full_task_id, answer)
+        except (ValueError, OSError) as exc:
+            r = {
+                "ok": False, "task_id": full_task_id,
+                "error": "decision_record_failed", "state_changed": True,
+                "message": f"Task unblocked but the answer was not recorded: {exc}",
+            }
+    clear_failure: dict | None = None
+    if r.get("ok") and answer is None:
+        # CLAWP-154 -- unblocked unanswered: the question is no longer live.
+        try:
+            clear_stale_human_decision(config, project_id, full_task_id)
+        except (ValueError, OSError) as exc:
+            # Loud (non-zero exit), applied after the work-log append below.
+            clear_failure = {
+                "ok": False, "task_id": full_task_id,
+                "error": "stale_decision_not_cleared", "state_changed": True,
+                "message": (
+                    f"Task {full_task_id} is unblocked but its stale decision "
+                    f"record was not cleared: {exc}"
+                ),
+            }
+    if r.get("ok"):
+        # Log the explicit unblock action only when the transition landed.
+        # Best-effort: the transition is already durable, so a work-log
+        # append failure must not abort the batch -- surface it as a marker.
+        try:
+            add_entry(
+                config,
+                project=project_id,
+                action=WorkLogAction.UNBLOCK,
+                task=full_task_id,
+                summary=note or "Blocker resolved",
+                auto=True,
+            )
+        except Exception as exc:
+            r.setdefault("data", {}).setdefault("log_errors", []).append(
+                {"error_class": type(exc).__name__, "message": str(exc)}
+            )
+    return clear_failure if clear_failure is not None else r
