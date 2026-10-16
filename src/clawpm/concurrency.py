@@ -35,9 +35,9 @@ import errno
 import os
 import stat
 import sys
-import tempfile
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, IO, Iterator, TypeVar
@@ -407,30 +407,36 @@ def retry_transient(
     raise AssertionError("retry_transient exhausted without returning or raising")
 
 
-# Process umask, read once at import (os.umask can only be read by setting it, so
-# doing it lazily from a worker thread would race other file creation).
-_UMASK = os.umask(0)
-os.umask(_UMASK)
+_TEMP_NAME_ATTEMPTS = 5
 
 
 def _stage_temp(path: Path, data: bytes | str, *, encoding: str, newline: str | None) -> str:
     """Write ``data`` to a UNIQUE temp file beside ``path``; return its name.
 
-    ``mkstemp`` in the target's own directory gives every writer a private name
-    (a fixed ``<id>.tmp`` lets two writers replace or delete each other's temp)
-    and keeps the final swap on one filesystem. ``str`` data is written in text
+    A uniquely named ``O_EXCL`` temp in the target's own directory gives every
+    writer a private name (a fixed ``<id>.tmp`` lets two writers replace or
+    delete each other's temp) and keeps the final swap on one filesystem. The
+    temp is created ``0o666`` so the kernel applies the CURRENT umask to a new
+    file, as the old ``write_text`` did (reading the umask is racy). An existing
+    target's permission bits are carried over; a failure to do so aborts the
+    write rather than publishing the wrong mode. ``str`` data is written in text
     mode with ``newline`` passed through (``None`` keeps the platform default
     that ``Path.write_text`` had); ``bytes`` are written verbatim. The temp is
-    removed on any failure. The target's permission bits are carried over, or
-    the umask default applied for a new file (mkstemp creates 0600).
+    removed on any failure.
     """
     try:
-        mode = stat.S_IMODE(path.stat().st_mode)
+        mode: int | None = stat.S_IMODE(path.stat().st_mode)
     except OSError:
-        mode = 0o666 & ~_UMASK
-    fd, tmp_name = tempfile.mkstemp(
-        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
-    )
+        mode = None
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    for attempt in range(_TEMP_NAME_ATTEMPTS):
+        tmp_name = str(path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            fd = os.open(tmp_name, flags, 0o666)
+            break
+        except FileExistsError:
+            if attempt == _TEMP_NAME_ATTEMPTS - 1:
+                raise
     try:
         if isinstance(data, bytes):
             fh = os.fdopen(fd, "wb")
@@ -438,10 +444,8 @@ def _stage_temp(path: Path, data: bytes | str, *, encoding: str, newline: str | 
             fh = os.fdopen(fd, "w", encoding=encoding, newline=newline)
         with fh:
             fh.write(data)
-        try:
+        if mode is not None:
             os.chmod(tmp_name, mode)
-        except OSError:
-            pass
     except BaseException:
         try:
             os.unlink(tmp_name)
