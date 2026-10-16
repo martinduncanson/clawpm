@@ -410,6 +410,24 @@ def retry_transient(
 _TEMP_NAME_ATTEMPTS = 5
 
 
+def _discard_temp(name: str) -> None:
+    """Best-effort removal of a staged temp, even if it inherited a read-only mode.
+
+    ``_stage_temp`` carries the target's permission bits onto the temp, so a
+    read-only target yields a read-only temp, which ``os.unlink`` cannot remove
+    on Windows. Make it writable first (a chmod failure is ignored: the unlink
+    below is the real attempt), then unlink; an already-missing temp is fine.
+    """
+    try:
+        os.chmod(name, stat.S_IMODE(os.stat(name).st_mode) | stat.S_IWRITE)
+    except OSError:
+        pass
+    try:
+        os.unlink(name)
+    except OSError:
+        pass
+
+
 def _stage_temp(path: Path, data: bytes | str, *, encoding: str, newline: str | None) -> str:
     """Write ``data`` to a UNIQUE temp file beside ``path``; return its name.
 
@@ -447,10 +465,7 @@ def _stage_temp(path: Path, data: bytes | str, *, encoding: str, newline: str | 
         if mode is not None:
             os.chmod(tmp_name, mode)
     except BaseException:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
+        _discard_temp(tmp_name)
         raise
     return tmp_name
 
@@ -473,10 +488,7 @@ def atomic_write(
     try:
         retry_transient(os.replace, tmp_name, path)
     except BaseException:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
+        _discard_temp(tmp_name)
         raise
 
 
@@ -559,22 +571,22 @@ def commit_staged_pair(
     except BaseException:
         for t in (t1, t2):
             if t is not None:
-                Path(t).unlink(missing_ok=True)
+                _discard_temp(t)
         raise
     # Phase 2 — commit first, then second. A failure committing `first` still
     # leaves both targets untouched (its rename either fully happens or raises).
     try:
         retry_transient(os.replace, t1, p1)
     except BaseException:
-        Path(t1).unlink(missing_ok=True)
-        Path(t2).unlink(missing_ok=True)
+        _discard_temp(t1)
+        _discard_temp(t2)
         raise
     # `first` is now committed. A failure here is the residual window the caller
     # is responsible for (backstop reconciliation or compensation rollback).
     try:
         retry_transient(os.replace, t2, p2)
     except BaseException:
-        Path(t2).unlink(missing_ok=True)
+        _discard_temp(t2)
         raise
 
 

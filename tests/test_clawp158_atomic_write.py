@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import tempfile
 import threading
 from pathlib import Path
@@ -528,6 +529,112 @@ class TestCommitStagedPair:
             commit_staged_pair((a, "new1"), (b, "new2"))
         assert a.read_text() == "old1" and b.read_text() == "old2"
         _assert_clean(tmp_path, planted)
+
+
+class TestReadOnlyTargetCleanup:
+    """A read-only target carries its mode onto the temp; cleanup must still remove it.
+
+    On Windows ``os.unlink`` fails on a read-only file, so a temp that inherited
+    ``0o444`` was left behind when the write failed (Codex r2 P2).
+    """
+
+    @staticmethod
+    def _readonly(p: Path, data: bytes = b"orig") -> Path:
+        p.write_bytes(data)
+        p.chmod(0o444)
+        return p
+
+    @staticmethod
+    def _release(*paths: Path) -> None:
+        for p in paths:
+            try:
+                p.chmod(stat.S_IWRITE | stat.S_IREAD)
+            except OSError:
+                pass
+
+    def test_atomic_write_readonly_target_real_replace(self, tmp_path):
+        p = self._readonly(tmp_path / "f.md")
+        try:
+            try:
+                atomic_write(p, b"new")
+            except OSError:
+                # Windows: replace onto a read-only target fails.
+                assert p.read_bytes() == b"orig"
+            assert list(tmp_path.glob("*.tmp")) == []
+        finally:
+            self._release(p)
+
+    def test_atomic_write_replace_failure_removes_readonly_temp(
+        self, tmp_path, monkeypatch
+    ):
+        p = self._readonly(tmp_path / "f.md")
+        try:
+            monkeypatch.setattr(os, "replace", _boom)
+            with pytest.raises(OSError):
+                atomic_write(p, b"new")
+            assert p.read_bytes() == b"orig"
+            assert list(tmp_path.glob("*.tmp")) == []
+        finally:
+            self._release(p)
+
+    def test_pair_first_replace_failure_removes_readonly_temps(
+        self, tmp_path, monkeypatch
+    ):
+        a = self._readonly(tmp_path / "a.md", b"old1")
+        b = self._readonly(tmp_path / "b.md", b"old2")
+        try:
+            monkeypatch.setattr(os, "replace", _boom)
+            with pytest.raises(OSError):
+                commit_staged_pair((a, "new1"), (b, "new2"))
+            assert a.read_bytes() == b"old1" and b.read_bytes() == b"old2"
+            assert list(tmp_path.glob("*.tmp")) == []
+        finally:
+            self._release(a, b)
+
+    def test_pair_second_replace_failure_removes_readonly_temp(
+        self, tmp_path, monkeypatch
+    ):
+        a = tmp_path / "a.md"
+        a.write_bytes(b"old1")
+        b = self._readonly(tmp_path / "b.md", b"old2")
+        real = os.replace
+
+        def replace_a_only(src, dst, *args, **kw):
+            if Path(dst) == b:
+                raise OSError("injected failure committing second file")
+            return real(src, dst, *args, **kw)
+
+        try:
+            monkeypatch.setattr(os, "replace", replace_a_only)
+            with pytest.raises(OSError):
+                commit_staged_pair((a, "new1"), (b, "new2"))
+            assert b.read_bytes() == b"old2"
+            assert list(tmp_path.glob("*.tmp")) == []
+        finally:
+            self._release(a, b)
+
+    def test_pair_second_staging_failure_removes_readonly_first_temp(
+        self, tmp_path, monkeypatch
+    ):
+        a = self._readonly(tmp_path / "a.md", b"old1")
+        b = tmp_path / "b.md"
+        b.write_bytes(b"old2")
+        real = concurrency._stage_temp
+        calls = {"n": 0}
+
+        def flaky(path, data, **kw):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise OSError("disk full staging second file")
+            return real(path, data, **kw)
+
+        try:
+            monkeypatch.setattr(concurrency, "_stage_temp", flaky)
+            with pytest.raises(OSError):
+                commit_staged_pair((a, "new1"), (b, "new2"))
+            assert list(tmp_path.glob("*.tmp")) == []
+        finally:
+            self._release(a, b)
 
 
 class TestDispatchSites:
