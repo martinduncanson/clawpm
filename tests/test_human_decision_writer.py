@@ -113,12 +113,12 @@ def test_clear_with_snapshot_skips_a_record_changed_meanwhile(port):
 def test_concurrent_writers_do_not_share_a_temp_name(port, monkeypatch):
     """A second writer finishing between our temp write and our rename must not
     break ours (a fixed temp name made the outer rename fail or lose data)."""
-    import clawpm.tasks as tasks_mod
     from clawpm.tasks import record_human_answer
 
     t = add_task(port.config, "alpha", "Alpha decision")
     assert _block_with_question(port, "alpha", t.id).exit_code == 0
-    real = tasks_mod.retry_transient
+    import clawpm.concurrency as concurrency_mod
+    real = concurrency_mod.retry_transient
     state = {"nested": False}
 
     def spy(fn, *a, **k):
@@ -127,7 +127,7 @@ def test_concurrent_writers_do_not_share_a_temp_name(port, monkeypatch):
             record_human_answer(port.config, "alpha", t.id, "inner")
         return real(fn, *a, **k)
 
-    monkeypatch.setattr(tasks_mod, "retry_transient", spy)
+    monkeypatch.setattr(concurrency_mod, "retry_transient", spy)
     record_human_answer(port.config, "alpha", t.id, "outer")
     assert state["nested"]
     task = get_task(port.config, "alpha", t.id)

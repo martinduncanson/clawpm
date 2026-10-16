@@ -40,6 +40,7 @@ from typing import Any
 
 import yaml
 
+from .concurrency import atomic_write
 from .discovery import get_project_dir
 from .frontmatter import FrontmatterError, split_frontmatter, stamp_updated, strip_bom
 from .models import PortfolioConfig, Task, TaskState
@@ -334,9 +335,7 @@ def add_mission(
 _(Add via `clawpm mission add-goal {mission_id} --task <task-id>`. Tasks become mini-goals by carrying `parent_mission: {mission_id}` in their frontmatter.)_
 """
     path = md / f"{mission_id}.md"
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    tmp.replace(path)
+    atomic_write(path, content)
     return Mission.from_file(path)
 
 
@@ -459,12 +458,9 @@ def add_mission_mini_goal(
             raise
 
         original_text = text  # for rollback if the mission rewrite fails
-        tmp = task.file_path.with_suffix(".tmp")
         try:
-            tmp.write_text(new_text, encoding="utf-8")
-            retry_transient(tmp.replace, task.file_path)
+            atomic_write(task.file_path, new_text)
         except Exception:
-            tmp.unlink(missing_ok=True)
             mission.mini_goals.pop()  # task never committed — keep memory consistent
             raise
 
@@ -483,12 +479,9 @@ def add_mission_mini_goal(
             # file — a caller that reuses it would re-render a mini-goal that
             # was never committed (Antigravity CLAWP-071 review).
             mission.mini_goals.pop()
-            rb = task.file_path.with_suffix(".rollback.tmp")
             try:
-                rb.write_text(original_text, encoding="utf-8")
-                retry_transient(rb.replace, task.file_path)
+                atomic_write(task.file_path, original_text)
             except Exception:
-                rb.unlink(missing_ok=True)
                 raise RuntimeError(
                     f"Mission rewrite failed and the task {task_id} frontmatter "
                     "rollback also failed; task and mission files may diverge "
@@ -543,16 +536,9 @@ def _rewrite_mission(mission: Mission) -> None:
     """Persist a mission's mini_goals + status back to its file."""
     new_text = _render_mission(mission)
     assert mission.file_path is not None  # _render_mission raises otherwise
-    from .concurrency import retry_transient
-    tmp = mission.file_path.with_suffix(".tmp")
-    try:
-        tmp.write_text(new_text, encoding="utf-8")
-        # Retry transient sharing/access faults + clean up the tmp on failure,
-        # matching the task-side write hardening (Grok review).
-        retry_transient(tmp.replace, mission.file_path)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
+    # atomic_write retries transient sharing/access faults and cleans up its
+    # temp on failure, matching the task-side write hardening (Grok review).
+    atomic_write(mission.file_path, new_text)
 
 
 def mission_status(

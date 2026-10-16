@@ -9,6 +9,7 @@ import click
 from clawpm.output import OutputFormat, output_error, output_json, output_success
 from clawpm.tasks import get_task
 from clawpm.context import expand_task_id
+from clawpm.concurrency import atomic_write
 from clawpm.cli.base import main, get_format, require_portfolio, require_project, ExpandedPath
 
 # ============================================================================
@@ -327,15 +328,13 @@ def reflect_void(
             void_entry["project_id"] = resolved_project
 
         # Append (atomic: write to .tmp then replace)
-        tmp_file = ref_file.with_suffix(".jsonl.tmp")
         try:
             # Copy existing content + new void line
             existing_text = ref_file.read_text(encoding="utf-8")
-            tmp_file.write_text(
+            atomic_write(
+                ref_file,
                 existing_text.rstrip("\n") + "\n" + _json.dumps(void_entry) + "\n",
-                encoding="utf-8",
             )
-            tmp_file.replace(ref_file)
             voided.append({"task_id": tid, "voided_at": void_entry["voided_at"]})
         except OSError as exc:
             errors.append({"task_id": tid, "error": str(exc)})

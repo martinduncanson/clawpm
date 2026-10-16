@@ -51,7 +51,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple, Optional
 
-from .concurrency import file_lock, retry_transient
+from .concurrency import atomic_write, file_lock
 from .sessions import stat_exists
 
 # Codex P1 fix: task_id and project_id flow unchanged into shell commands.
@@ -537,16 +537,7 @@ def _write_exact(path: Path, text: str) -> bytes:
     diffs.
     """
     data = text.encode("utf-8")
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    try:
-        tmp.write_bytes(data)
-        retry_transient(os.replace, tmp, path)
-    except BaseException:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        raise
+    atomic_write(path, data)
     return data
 
 

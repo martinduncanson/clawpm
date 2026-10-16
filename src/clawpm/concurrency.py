@@ -33,7 +33,9 @@ from __future__ import annotations
 
 import errno
 import os
+import stat
 import sys
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -405,6 +407,75 @@ def retry_transient(
     raise AssertionError("retry_transient exhausted without returning or raising")
 
 
+# Process umask, read once at import (os.umask can only be read by setting it, so
+# doing it lazily from a worker thread would race other file creation).
+_UMASK = os.umask(0)
+os.umask(_UMASK)
+
+
+def _stage_temp(path: Path, data: bytes | str, *, encoding: str, newline: str | None) -> str:
+    """Write ``data`` to a UNIQUE temp file beside ``path``; return its name.
+
+    ``mkstemp`` in the target's own directory gives every writer a private name
+    (a fixed ``<id>.tmp`` lets two writers replace or delete each other's temp)
+    and keeps the final swap on one filesystem. ``str`` data is written in text
+    mode with ``newline`` passed through (``None`` keeps the platform default
+    that ``Path.write_text`` had); ``bytes`` are written verbatim. The temp is
+    removed on any failure. The target's permission bits are carried over, or
+    the umask default applied for a new file (mkstemp creates 0600).
+    """
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        mode = 0o666 & ~_UMASK
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    try:
+        if isinstance(data, bytes):
+            fh = os.fdopen(fd, "wb")
+        else:
+            fh = os.fdopen(fd, "w", encoding=encoding, newline=newline)
+        with fh:
+            fh.write(data)
+        try:
+            os.chmod(tmp_name, mode)
+        except OSError:
+            pass
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return tmp_name
+
+
+def atomic_write(
+    path: Path,
+    data: bytes | str,
+    *,
+    encoding: str = "utf-8",
+    newline: str | None = None,
+) -> None:
+    """Atomically replace ``path`` with ``data`` through a unique temp file.
+
+    The single temp-file writer for task, mission and sibling files (CLAWP-158).
+    The final ``os.replace`` is retried on transient Windows sharing faults
+    (:func:`retry_transient`); the temp is removed on EVERY failure path and the
+    original is left untouched.
+    """
+    tmp_name = _stage_temp(path, data, encoding=encoding, newline=newline)
+    try:
+        retry_transient(os.replace, tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 class ConcurrentModificationError(ValueError):
     """A file a mutator was editing vanished or changed under it mid-critical-section.
 
@@ -476,30 +547,30 @@ def commit_staged_pair(
     disproportionate here given the existing idempotent reconciliation.
     """
     (p1, c1), (p2, c2) = first, second
-    t1 = p1.with_suffix(p1.suffix + ".tmp")
-    t2 = p2.with_suffix(p2.suffix + ".tmp")
     # Phase 1 — stage both. A failure here leaves both targets untouched.
+    t1 = t2 = None
     try:
-        t1.write_text(c1, encoding=encoding)
-        t2.write_text(c2, encoding=encoding)
-    except Exception:
-        t1.unlink(missing_ok=True)
-        t2.unlink(missing_ok=True)
+        t1 = _stage_temp(p1, c1, encoding=encoding, newline=None)
+        t2 = _stage_temp(p2, c2, encoding=encoding, newline=None)
+    except BaseException:
+        for t in (t1, t2):
+            if t is not None:
+                Path(t).unlink(missing_ok=True)
         raise
     # Phase 2 — commit first, then second. A failure committing `first` still
     # leaves both targets untouched (its rename either fully happens or raises).
     try:
-        retry_transient(t1.replace, p1)
-    except Exception:
-        t1.unlink(missing_ok=True)
-        t2.unlink(missing_ok=True)
+        retry_transient(os.replace, t1, p1)
+    except BaseException:
+        Path(t1).unlink(missing_ok=True)
+        Path(t2).unlink(missing_ok=True)
         raise
     # `first` is now committed. A failure here is the residual window the caller
     # is responsible for (backstop reconciliation or compensation rollback).
     try:
-        retry_transient(t2.replace, p2)
-    except Exception:
-        t2.unlink(missing_ok=True)
+        retry_transient(os.replace, t2, p2)
+    except BaseException:
+        Path(t2).unlink(missing_ok=True)
         raise
 
 
