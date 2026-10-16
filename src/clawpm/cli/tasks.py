@@ -1548,7 +1548,8 @@ def _dispatch_target_lock(portfolio_root: Path, target_dir: Path, fmt):
     # target (completion, lease fallback, explicit) can never interleave with
     # this command's write -> register window.
     try:
-        lock_path = dispatch_lock_path(portfolio_root, target_dir)
+        # `target_dir` is the already-canonicalised `_canon_dir`: no re-resolve.
+        lock_path = dispatch_lock_path(portfolio_root, target_dir, canonical=True)
         lock_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         output_error(
@@ -2394,6 +2395,7 @@ def _tasks_dispatch_impl(
                 lease_heartbeat=lease_ttl is not None,
                 max_iterations=max_iterations,
                 iteration_baseline=iteration_baseline,
+                canonical=True,
             )
         except (FileExistsError, ValueError) as exc:
             output_error("dispatch_blocked", str(exc), fmt=fmt)
@@ -2512,6 +2514,10 @@ def _tasks_dispatch_impl(
                         portfolio_root=config.portfolio_root,
                         project_id=project_id,
                         remove_sidecar=_sidecar_touched,
+                        # CLAWP-159: `_canon_dir` is the identity this dispatch
+                        # already established. Re-resolving it here let a target
+                        # that went unavailable after the write strand the hooks.
+                        canonical=True,
                     )
             except Exception as teardown_exc:
                 # Rollback itself failed — report BOTH, since the operator

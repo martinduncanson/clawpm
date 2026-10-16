@@ -28,10 +28,11 @@ from clawpm.tasks import add_task, get_task, get_tasks_dir, touch_task_updated
 
 # Path.resolve() calls on the target of a successful `tasks dispatch
 # --lease-ttl --target-dir`. The first four are informational session-scope
-# lookups (warn, fall open); the last four are identity uses: canonicalisation,
-# lock key, hook holder token, registry row.
+# lookups (warn, fall open); the fifth is the one canonicalisation. The lock
+# key, hook holder token, registry rows and rollback all reuse its result and
+# never resolve again.
 _INFORMATIONAL_RESOLVES = 4
-_SUCCESS_PATH_RESOLVES = 8
+_SUCCESS_PATH_RESOLVES = 5
 
 _SETTINGS = 'id = "test"\nname = "Test"\nstatus = "active"\npriority = 3\n'
 
@@ -519,6 +520,110 @@ class TestTargetDirResolveGuardEverySite:
         monkeypatch.setattr(Path, "resolve", loop)
         with pytest.raises(OSError, match="Symlink loop"):
             canonical_path(fx["elsewhere"] / "symlink-loop")
+
+    def test_persistent_resolve_failure_cannot_strand_hooks_on_rollback(
+        self, fx, monkeypatch
+    ):
+        """Resolve works through the first 7 calls, then fails for good.
+
+        Settings and the sidecar have landed when registry registration fails;
+        the rollback must then remove them WITHOUT a second resolve of the
+        target (the unavailable volume stays unavailable). Codex r2 P2.
+        """
+        task = add_task(fx["config"], "test", "probe")
+        bad = fx["elsewhere"] / "unavailable-volume"
+        real_resolve = Path.resolve
+        seen = []
+
+        def flaky(self, *a, **kw):
+            if self.name == "unavailable-volume":
+                seen.append(1)
+                if len(seen) > 7:
+                    raise OSError("simulated unavailable volume")
+            return real_resolve(self, *a, **kw)
+
+        def registry_full(*a, **kw):
+            raise OSError("simulated registry append failure")
+
+        monkeypatch.setattr(Path, "resolve", flaky)
+        monkeypatch.setattr("clawpm.dispatch.register_dispatch", registry_full)
+        result = self._dispatch(fx, task, bad)
+        assert not isinstance(result.exception, (OSError, RuntimeError)), (
+            result.output
+        )
+        assert result.exit_code == 1, result.output
+        assert "dispatch_write_failed" in result.output, result.output
+        assert "rolled back" in result.output, result.output
+        claude_dir = bad / ".claude"
+        assert not (claude_dir / "settings.local.json").exists()
+        assert not (claude_dir / "clawpm-session-start.json").exists()
+        # The target is canonicalised once; nothing downstream re-resolves it.
+        assert len(seen) <= _SUCCESS_PATH_RESOLVES, len(seen)
+
+    def test_dispatch_needs_no_resolve_after_canonicalisation(
+        self, fx, monkeypatch
+    ):
+        """Once canonicalised, the whole dispatch runs with resolve() dead."""
+        task = add_task(fx["config"], "test", "probe")
+        bad = fx["elsewhere"] / "unavailable-volume"
+        real_resolve = Path.resolve
+        seen = []
+
+        def flaky(self, *a, **kw):
+            if self.name == "unavailable-volume":
+                seen.append(1)
+                if len(seen) > _SUCCESS_PATH_RESOLVES:
+                    raise OSError("simulated unavailable volume")
+            return real_resolve(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "resolve", flaky)
+        result = self._dispatch(fx, task, bad)
+        assert result.exit_code == 0, result.output
+        assert len(seen) == _SUCCESS_PATH_RESOLVES, len(seen)
+
+    def test_teardown_with_known_canonical_target_never_resolves(
+        self, fx, monkeypatch
+    ):
+        from clawpm.dispatch import (
+            active_dispatch_dirs, settings_path, teardown_dispatch_settings,
+            write_dispatch_settings,
+        )
+
+        task = add_task(fx["config"], "test", "probe")
+        bad = fx["elsewhere"] / "unavailable-volume"
+        bad.mkdir()
+        canon = bad.resolve()
+        write_dispatch_settings(
+            canon, task.id, "test", portfolio_root=fx["root"], canonical=True
+        )
+        assert settings_path(canon).exists()
+        self._patch(monkeypatch, None)
+        assert teardown_dispatch_settings(
+            canon, task_id=task.id, portfolio_root=fx["root"],
+            project_id="test", canonical=True,
+        )
+        assert not settings_path(canon).exists()
+        assert active_dispatch_dirs(fx["root"], task.id, "test") == []
+
+    def test_teardown_without_known_canonical_target_still_refuses(
+        self, fx, monkeypatch
+    ):
+        """Default stays strict: a caller that has not canonicalised gets OSError."""
+        from clawpm.dispatch import teardown_dispatch_settings
+
+        bad = fx["elsewhere"] / "unavailable-volume"
+        self._patch(monkeypatch, None)
+        with pytest.raises(OSError):
+            teardown_dispatch_settings(bad, portfolio_root=fx["root"])
+
+    def test_teardown_identity_falls_back_to_the_recorded_spelling(
+        self, fx, monkeypatch
+    ):
+        from clawpm.dispatch import teardown_identity
+
+        bad = fx["elsewhere"] / "unavailable-volume"
+        self._patch(monkeypatch, None)
+        assert teardown_identity(bad) == bad
 
     def test_teardown_target_unresolvable_is_a_clean_error(self, fx, monkeypatch):
         bad = fx["elsewhere"] / "unavailable-volume"

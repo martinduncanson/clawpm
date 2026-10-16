@@ -347,6 +347,7 @@ def transition(
             active_dispatch_dirs,
             read_dispatch_marker,
             teardown_dispatch_settings,
+            teardown_identity,
         )
         # Building the candidate set (registry read + legacy probes) is itself a
         # BEST-EFFORT secondary: a registry/FS error here must not raise out of
@@ -406,11 +407,15 @@ def transition(
                 and marker.get("project_id") == project_id
             ):
                 try:
+                    # CLAWP-159: registry rows hold the canonical target, so one
+                    # that has since become unresolvable is still torn down
+                    # under its recorded path (never a second resolve()).
                     teardown_dispatch_settings(
-                        cand,
+                        teardown_identity(cand),
                         task_id=task_id,
                         portfolio_root=config.portfolio_root,
                         project_id=project_id,
+                        canonical=True,
                     )
                     teardowns.append({
                         "target_dir": cand.as_posix(),
