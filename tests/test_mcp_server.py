@@ -1418,7 +1418,8 @@ def test_mcp_decision_refresh_failure_is_signalled(tmp_path, monkeypatch, failur
             assert blocked["ok"] is True, blocked
             assert blocked["data"]["state"] == "blocked"
             assert blocked["data"]["decision_refresh_failed"] is True
-            assert any("could not be refreshed" in w for w in blocked["data"]["warnings"])
+            assert [w["code"] for w in blocked["data"]["warnings"]] == ["decision_refresh_failed"]
+            assert "could not be refreshed" in blocked["data"]["warnings"][0]["message"]
             assert "question" not in blocked["data"]
             monkeypatch.setattr(tasks_mod, "get_task", broken_get_task)
             opened = await _call(client, "tasks_state", {
@@ -1428,7 +1429,8 @@ def test_mcp_decision_refresh_failure_is_signalled(tmp_path, monkeypatch, failur
             assert opened["ok"] is True, opened
             assert opened["data"]["state"] == "open"
             assert opened["data"]["decision_refresh_failed"] is True
-            assert any("could not be refreshed" in w for w in opened["data"]["warnings"])
+            assert [w["code"] for w in opened["data"]["warnings"]] == ["decision_refresh_failed"]
+            assert "could not be refreshed" in opened["data"]["warnings"][0]["message"]
             assert "answer" not in opened["data"]
 
     _run(scenario)
@@ -1438,6 +1440,26 @@ def test_mcp_decision_refresh_failure_is_signalled(tmp_path, monkeypatch, failur
     assert saved.state == TaskState.OPEN
     assert saved.answer == "Ship"
     assert saved.question == "Ship?"
+
+
+def test_mcp_decision_refresh_failure_keeps_warnings_homogeneous(tmp_path, monkeypatch):
+    """A pre-existing structured transition warning survives a failed refresh,
+    and the added warning has the same {code, message} shape (no mixed list)."""
+    import clawpm.tasks as tasks_mod
+
+    port = _decision_port(tmp_path, monkeypatch)
+    monkeypatch.setattr(tasks_mod, "get_task", lambda *a, **k: None)
+    existing = {"code": "existing", "message": "keep"}
+    result = M._refresh_decision_data(
+        port.config, "alpha", "ALPHA-001",
+        {"ok": True, "data": {"state": "blocked", "warnings": [existing]}})
+
+    warnings = result["data"]["warnings"]
+    assert result["data"]["decision_refresh_failed"] is True
+    assert warnings[0] == existing
+    assert all(isinstance(w, dict) and set(w) == {"code", "message"} for w in warnings)
+    assert [w["code"] for w in warnings] == ["existing", "decision_refresh_failed"]
+    assert [w["message"] for w in warnings]  # no TypeError on a homogeneous list
 
 
 def test_mcp_decision_refresh_success_has_no_failure_marker(tmp_path, monkeypatch):
@@ -1457,8 +1479,7 @@ def test_mcp_decision_refresh_success_has_no_failure_marker(tmp_path, monkeypatc
                 "question": "Ship?"})
             assert blocked["ok"] is True, blocked
             assert "decision_refresh_failed" not in blocked["data"]
-            assert not any("could not be refreshed" in w
-                           for w in blocked["data"].get("warnings", []))
+            assert "warnings" not in blocked["data"]
 
     _run(scenario)
 

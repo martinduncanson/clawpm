@@ -576,10 +576,13 @@ def tasks_add(
 
 
 _DECISION_KEYS = ("blocked_on", "question", "options", "recommendation", "answer")
-_DECISION_REFRESH_WARNING = (
-    "state change saved, but the task could not be refreshed: the question/answer "
-    "record is missing from this response (it was written; use tasks_get to read it)"
-)
+_DECISION_REFRESH_WARNING = {
+    "code": "decision_refresh_failed",
+    "message": (
+        "state change saved, but the task could not be refreshed: the question/answer "
+        "record is missing from this response (it was written; use tasks_get to read it)"
+    ),
+}
 
 
 def _refresh_decision_data(config, project_id: str, task_id: str, result: dict) -> dict:
@@ -607,7 +610,7 @@ def _refresh_decision_data(config, project_id: str, task_id: str, result: dict) 
         return {**result, "data": {
             **data,
             "decision_refresh_failed": True,
-            "warnings": [*(data.get("warnings") or []), _DECISION_REFRESH_WARNING],
+            "warnings": [*(data.get("warnings") or []), dict(_DECISION_REFRESH_WARNING)],
         }}
     merged = {k: v for k, v in data.items() if k not in _DECISION_KEYS}
     merged.update(fresh.to_dict())
