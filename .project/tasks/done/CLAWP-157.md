@@ -16,7 +16,7 @@ predictions:
     answer THEN the record is written exactly as the CLI does and tasks list needs-human
     returns it
 priority: 7
-updated: '2026-10-15'
+updated: '2026-10-16'
 ---
 # CLAWP-154 follow-up: MCP tasks_state fields and SKILL.md mirror for the human-decision record
 
