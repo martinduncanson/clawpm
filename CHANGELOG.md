@@ -4,10 +4,6 @@ All notable changes to clawpm are recorded here. Format follows [Keep a Changelo
 
 Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Release discipline" in `CLAUDE.md`. The file-move log is `archive/CHANGELOG.md` (separate, unrelated to releases).
 
-### Fixed
-
-- `--target-dir` paths whose `resolve()` raises OSError no longer crash `tasks dispatch --lease-ttl` or `lease grant`: every site warns and falls back to the absolute unresolved path (#PRNUM, CLAWP-159).
-
 ## [Unreleased]
 
 ### Added
@@ -42,6 +38,7 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 
 ### Fixed
 
+- `--target-dir` paths whose `resolve()` raises OSError no longer crash `tasks dispatch --lease-ttl` or `lease grant`: every site warns and falls back to the absolute unresolved path (#127, CLAWP-159).
 - `tasks state <id> open` then `blocked` no longer resurrects a stale question in `tasks list --needs-human`: `change_task_state` drops the decision record when a task enters blocked from another state (#125, CLAWP-156).
 
 ### Changed
