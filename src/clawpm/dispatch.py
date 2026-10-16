@@ -52,7 +52,7 @@ from pathlib import Path
 from typing import NamedTuple, Optional
 
 from .concurrency import atomic_write, file_lock
-from .sessions import resolve_abs_path, stat_exists
+from .sessions import canonical_path, stat_exists
 
 # Codex P1 fix: task_id and project_id flow unchanged into shell commands.
 # Reject anything outside the safe charset BEFORE interpolating, so an
@@ -128,7 +128,7 @@ def register_dispatch(
         "action": "dispatched",
         "task_id": task_id,
         "project_id": project_id,
-        "target_dir": str(resolve_abs_path(target_dir)),
+        "target_dir": str(canonical_path(target_dir)),
         "ts": datetime.now(timezone.utc).isoformat(),
     }
     with open(path, "a", encoding="utf-8") as f:
@@ -152,7 +152,7 @@ def register_teardown(
     event = {
         "action": "torn_down",
         "task_id": task_id,
-        "target_dir": str(resolve_abs_path(target_dir)),
+        "target_dir": str(canonical_path(target_dir)),
         "ts": datetime.now(timezone.utc).isoformat(),
     }
     if project_id is not None:
@@ -485,7 +485,7 @@ def dispatch_lock_path(portfolio_root: Path, target_dir: Path) -> Path:
     checkout meant to be disposable).
     """
     key = hashlib.sha256(
-        os.path.normcase(str(resolve_abs_path(target_dir))).encode("utf-8")
+        os.path.normcase(str(canonical_path(target_dir))).encode("utf-8")
     ).hexdigest()[:16]
     return portfolio_root / "locks" / f"dispatch-{key}.lock"
 
@@ -653,7 +653,7 @@ def write_dispatch_settings(
     lease_holder = None
     if lease_heartbeat:
         from .leases import holder_token
-        lease_holder = holder_token(resolve_abs_path(target_dir).as_posix())
+        lease_holder = holder_token(canonical_path(target_dir).as_posix())
     payload = build_settings_payload(
         task_id, project_id, rubric_markdown,
         confirm_close=confirm_close, refute_votes=refute_votes,

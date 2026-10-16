@@ -238,20 +238,21 @@ def resolve_path_or_none(
         return None
 
 
-def resolve_abs_path(
-    path: Path,
-    fallback: str = "Using the unresolved absolute path instead.",
-) -> Path:
-    """Absolute form of *path*: ``resolve()``, else a pure-string ``abspath``.
+def canonical_path(path: Path) -> Path:
+    """``Path(path).resolve()`` for a path used as an IDENTITY; never falls back.
 
-    CLAWP-159: the ``--target-dir`` sites that only need a stable absolute
-    path (registry rows, lock keys, lease holder tokens) must not crash on an
-    unavailable target; the logged fallback keeps the command going without
-    touching the filesystem. Same fail-open marker as
-    :func:`resolve_path_or_none`.
+    CLAWP-159: a dispatch target keys a lock, a lease holder token, a registry
+    row and a lease. A fallback spelling (``os.path.abspath`` of a junction
+    alias) would key a DIFFERENT lock and holder than a dispatch whose resolve
+    succeeded, so a failed canonicalisation must refuse, not substitute. Raises
+    :class:`OSError` (a symlink loop's ``RuntimeError`` on Python 3.11 is
+    converted) so callers need one handler. Contrast
+    :func:`resolve_path_or_none`, for paths that are only informational.
     """
-    resolved = resolve_path_or_none(path, fallback)
-    return resolved if resolved is not None else Path(os.path.abspath(path))
+    try:
+        return Path(path).resolve()
+    except RuntimeError as exc:
+        raise OSError(f"{exc}") from exc
 
 
 _REGISTERED = "registered"

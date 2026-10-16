@@ -38,7 +38,7 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 
 ### Fixed
 
-- `--target-dir` paths whose `resolve()` raises OSError no longer crash `tasks dispatch --lease-ttl` or `lease grant`: every site warns and falls back to the absolute unresolved path (#127, CLAWP-159).
+- A `--target-dir` that cannot be resolved or created no longer tracebacks `tasks dispatch --lease-ttl`, `lease grant` or `teardown-dispatch`: the target is canonicalised once, and since it keys the dispatch lock, hook holder token, registry rows and lease, a failure exits with a structured `target_dir_unresolvable` / `dispatch_blocked` error instead of falling back to a different spelling (#127, CLAWP-159).
 - `tasks state <id> open` then `blocked` no longer resurrects a stale question in `tasks list --needs-human`: `change_task_state` drops the decision record when a task enters blocked from another state (#125, CLAWP-156).
 
 ### Changed
