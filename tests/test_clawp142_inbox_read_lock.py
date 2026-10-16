@@ -90,6 +90,8 @@ def test_concurrent_append_and_read_never_raise(isolated_portfolio, monkeypatch)
     collided = threading.Event()
     collisions: list[int] = []
     unforced: list[int] = []
+    pending: set[int] = set()  # reader threads denied and not yet recovered
+    pending_lock = threading.Lock()
 
     if sys.platform == "win32":
         # Force the overlap: each append holds its byte-0 lock until a reader
@@ -110,14 +112,33 @@ def test_concurrent_append_and_read_never_raise(isolated_portfolio, monkeypatch)
                     if time.monotonic() >= deadline:
                         unforced.append(1)
                         return
+            # The lock is released.  Hold the next append back until every
+            # reader that was denied has completed a read: otherwise the
+            # next append retakes the lock at once and a denied reader can
+            # lose every race for the gap until its _READ_LOCK_WAIT expires,
+            # which on a slow runner fails the test for scheduling reasons.
+            deadline = time.monotonic() + 10
+            while True:
+                with pending_lock:
+                    if not pending:
+                        return
+                if cancel.is_set() or time.monotonic() >= deadline:
+                    return
+                time.sleep(0.005)
 
         def counting_read_once(path):
+            ident = threading.get_ident()
             try:
-                return real_read_once(path)
+                events = real_read_once(path)
             except PermissionError:
+                with pending_lock:
+                    pending.add(ident)
                 collisions.append(1)
                 collided.set()
                 raise
+            with pending_lock:
+                pending.discard(ident)
+            return events
 
         monkeypatch.setattr(concurrency_mod, "locked_append", barrier_append)
         monkeypatch.setattr(inbox_mod, "_read_events_once", counting_read_once)
