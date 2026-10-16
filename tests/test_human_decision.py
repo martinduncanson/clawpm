@@ -246,3 +246,69 @@ def test_answered_task_reblocked_with_new_question_replaces_record(port):
     assert [o["label"] for o in task.options] == ["Yes", "No"]
     assert task.recommendation == "No" and task.answer is None
     assert [row["id"] for row in _needs_human(port)] == [t.id]
+
+
+# CLAWP-156 — the record is dropped on ENTERING blocked from another state, in
+# change_task_state itself, so `tasks state` cannot bypass the block shortcut.
+# (Clearing on LEAVING would erase the question `unblock --answer` keeps.)
+
+def test_state_open_then_state_blocked_not_listed(port):
+    t = add_task(port.config, "alpha", "Alpha decision")
+    assert _block_with_question(port, "alpha", t.id).exit_code == 0
+    for new_state in ("open", "blocked"):
+        r = CliRunner().invoke(
+            main, ["tasks", "state", "-p", "alpha", t.id, new_state], env=_env(port)
+        )
+        assert r.exit_code == 0, r.output
+    task = get_task(port.config, "alpha", t.id)
+    assert task.state == TaskState.BLOCKED
+    assert task.blocked_on is None and task.question is None
+    assert task.options == [] and task.recommendation is None and task.answer is None
+    assert _needs_human(port) == []
+
+
+@pytest.mark.parametrize("via", [TaskState.OPEN, TaskState.PROGRESS, TaskState.DONE])
+def test_every_edge_into_blocked_clears_the_record(port, via):
+    t = add_task(port.config, "alpha", "Alpha decision")
+    assert _block_with_question(port, "alpha", t.id).exit_code == 0
+    change_task_state(port.config, "alpha", t.id, via, force=True)
+    # Leaving blocked keeps the record (unblock --answer relies on it).
+    assert get_task(port.config, "alpha", t.id).question is not None
+    change_task_state(port.config, "alpha", t.id, TaskState.BLOCKED)
+    task = get_task(port.config, "alpha", t.id)
+    assert task.state == TaskState.BLOCKED and task.question is None
+    assert _needs_human(port) == []
+
+
+def test_answered_record_cleared_on_state_reblock(port):
+    t = add_task(port.config, "alpha", "Alpha decision")
+    assert _block_with_question(port, "alpha", t.id).exit_code == 0
+    assert CliRunner().invoke(
+        main, ["unblock", "-p", "alpha", t.id, "--answer", "Ship now"], env=_env(port)
+    ).exit_code == 0
+    change_task_state(port.config, "alpha", t.id, TaskState.BLOCKED)
+    task = get_task(port.config, "alpha", t.id)
+    assert task.question is None and task.answer is None
+
+
+def test_staying_blocked_keeps_the_live_question(port):
+    t = add_task(port.config, "alpha", "Alpha decision")
+    assert _block_with_question(port, "alpha", t.id).exit_code == 0
+    change_task_state(port.config, "alpha", t.id, TaskState.BLOCKED, note="again")
+    assert get_task(port.config, "alpha", t.id).question == "Ship the migration this week?"
+    assert [row["id"] for row in _needs_human(port)] == [t.id]
+
+
+def test_plain_task_state_round_trip_is_byte_identical(port):
+    t = add_task(port.config, "alpha", "No decision here")
+    change_task_state(port.config, "alpha", t.id, TaskState.BLOCKED)
+    path = get_task(port.config, "alpha", t.id).file_path
+    before = path.read_bytes()
+    change_task_state(port.config, "alpha", t.id, TaskState.BLOCKED)  # no-op
+    assert path.read_bytes() == before
+    # open -> blocked on a never-questioned task writes no decision keys and
+    # touches nothing beyond the existing `updated` stamp.
+    change_task_state(port.config, "alpha", t.id, TaskState.OPEN)
+    change_task_state(port.config, "alpha", t.id, TaskState.BLOCKED)
+    after = get_task(port.config, "alpha", t.id).file_path.read_bytes()
+    assert after.replace(b"\r\n", b"\n") == before.replace(b"\r\n", b"\n")

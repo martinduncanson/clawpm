@@ -1194,6 +1194,33 @@ def _apply_resolution(
             )
 
 
+def _drop_stale_decision_on_block(
+    task: Task,
+    new_state: TaskState,
+    task_md: Path,
+    snapshots: list[tuple[Path, bytes]],
+) -> None:
+    """Drop a decision record the task carried into a fresh block (CLAWP-156).
+
+    Runs on ENTERING blocked from another state, in the one transition every
+    path (``tasks state``, ``block``, ``unblock``) shares, so a direct
+    ``tasks state <id> open`` + ``blocked`` cannot resurrect an old question.
+    Leaving blocked keeps the record (``unblock --answer`` needs it) and
+    staying blocked keeps a live question. A question recorded after the
+    transition (``block --question``) is written later and is unaffected.
+    Original bytes go in ``snapshots`` so a failed transition restores them.
+    """
+    if new_state != TaskState.BLOCKED or task.state == TaskState.BLOCKED:
+        return
+    if not any(_decision_tuple(task)):
+        return
+    from .frontmatter_splice import REMOVE
+
+    with guard_fs_tamper(f"Task file '{task_md}'"):
+        snapshots.append((task_md, task_md.read_bytes()))
+    _rewrite_decision_frontmatter(task_md, {k: REMOVE for k in _HUMAN_DECISION_KEYS})
+
+
 def change_task_state(
     config: PortfolioConfig,
     project_id: str,
@@ -1338,6 +1365,7 @@ def change_task_state(
             _resolved_this_txn = False
             _snapshots: list[tuple[Path, bytes]] = []
             with _restore_on_error(_snapshots):
+                _drop_stale_decision_on_block(task, new_state, task_dir / "_task.md", _snapshots)
                 if new_state == TaskState.DONE and _resolution_applies(task, resolution):
                     _check_resolution(task, task_id, resolution)
                     _task_md = task_dir / "_task.md"
@@ -1445,6 +1473,7 @@ def change_task_state(
         _resolved_this_txn = False
         _snapshots: list[tuple[Path, bytes]] = []
         with _restore_on_error(_snapshots):
+            _drop_stale_decision_on_block(task, new_state, current_path, _snapshots)
             if new_state == TaskState.DONE and _resolution_applies(task, resolution):
                 _check_resolution(task, task_id, resolution)
                 _apply_resolution(
