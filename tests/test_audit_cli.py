@@ -243,3 +243,153 @@ def test_collate_writes_nothing(tmp_path):
     _run(["--findings-dir", str(d), "--dimensions-run",
           "correctness,security,tests", "--root-title", "A"])
     assert sorted(p.name for p in tmp_path.rglob("*")) == before
+
+
+# --- PR #132 fix round 1: accumulate every problem, reject empty options ---
+
+
+def test_file_errors_do_not_hide_schema_errors_of_loaded_dimensions(tmp_path):
+    d = tmp_path / "f"
+    d.mkdir()
+    _write(d, "tests", [{}])  # loads, but every field is invalid
+    res = _run(["--findings-dir", str(d), "--dimensions-run", "tests,security",
+                "--root-title", "A"], global_args=("--format", "json"))
+    assert res.exit_code != 0
+    err = json.loads(res.stderr.strip().splitlines()[-1])
+    problems = err["details"]["problems"]
+    assert any("security" in p and "no findings file" in p for p in problems)
+    assert any("tests[0]" in p and "file must be a non-empty string" in p for p in problems)
+
+
+def test_malformed_sibling_does_not_hide_schema_errors(tmp_path):
+    d = tmp_path / "f"
+    d.mkdir()
+    _write(d, "tests", [_f("tests", "a.py", "ok title", severity="bogus")])
+    (d / "security.json").write_text("[{not json", encoding="utf-8")
+    res = _run(["--findings-dir", str(d), "--dimensions-run", "tests,security",
+                "--root-title", "A"])
+    text = _text(res)
+    assert res.exit_code != 0
+    assert "security.json" in text and "severity" in text
+
+
+def test_extra_file_does_not_hide_schema_errors(tmp_path):
+    d = tmp_path / "f"
+    d.mkdir()
+    _write(d, "tests", [{}])
+    _write(d, "tooling", [])
+    res = _run(["--findings-dir", str(d), "--dimensions-run", "tests",
+                "--root-title", "A"])
+    text = _text(res)
+    assert res.exit_code != 0
+    assert "not in --dimensions-run" in text and "tests[0]" in text
+
+
+def _empty_tests_dir(tmp_path):
+    d = tmp_path / "f"
+    d.mkdir()
+    _write(d, "tests", [_f("tests", "a.py", "ok title")])
+    return d
+
+
+def test_empty_root_title_rejected(tmp_path):
+    d = _empty_tests_dir(tmp_path)
+    res = _run(["--findings-dir", str(d), "--dimensions-run", "tests",
+                "--root-title", ""])
+    assert res.exit_code != 0
+    assert "--root-title" in _text(res)
+    assert not (res.stdout or "").lstrip().startswith("{")  # no document emitted
+
+
+def test_whitespace_root_title_rejected(tmp_path):
+    d = _empty_tests_dir(tmp_path)
+    res = _run(["--findings-dir", str(d), "--dimensions-run", "tests",
+                "--root-title", "   "])
+    assert res.exit_code != 0
+    assert "--root-title" in _text(res)
+
+
+def test_root_title_is_stripped_and_document_still_parses(tmp_path):
+    from clawpm.emit_tree import parse_emit_document
+
+    d = _empty_tests_dir(tmp_path)
+    res = _run(["--findings-dir", str(d), "--dimensions-run", "tests",
+                "--root-title", "  Audit  "])
+    assert res.exit_code == 0, _text(res)
+    doc = json.loads(res.stdout)["document"]
+    assert doc["root"] == {"title": "Audit"}
+    parse_emit_document(doc)
+
+
+def test_option_problems_accumulate_with_file_problems(tmp_path):
+    d = tmp_path / "f"
+    d.mkdir()
+    res = _run(["--findings-dir", str(d), "--dimensions-run", "tests,vibes",
+                "--root-title", " ", "--max-leaves", "0"],
+               global_args=("--format", "json"))
+    assert res.exit_code != 0
+    problems = json.loads(res.stderr.strip().splitlines()[-1])["details"]["problems"]
+    joined = "\n".join(problems)
+    for needle in ("--root-title", "--max-leaves", "vibes", "tests"):
+        assert needle in joined, joined
+
+
+def test_empty_dimensions_run_rejected(tmp_path):
+    d = tmp_path / "f"
+    d.mkdir()
+    res = _run(["--findings-dir", str(d), "--dimensions-run", "",
+                "--root-title", "A"])
+    assert res.exit_code != 0
+    assert "--dimensions-run" in _text(res)
+
+
+def test_empty_dimensions_run_segment_rejected(tmp_path):
+    d = _empty_tests_dir(tmp_path)
+    for value in ("tests,,security", "tests, ", "tests,"):
+        res = _run(["--findings-dir", str(d), "--dimensions-run", value,
+                    "--root-title", "A"])
+        assert res.exit_code != 0, value
+        assert "empty segment" in _text(res), value
+
+
+def test_missing_findings_dir_rejected(tmp_path):
+    res = _run(["--findings-dir", str(tmp_path / "nope"), "--dimensions-run", "tests",
+                "--root-title", "A"])
+    assert res.exit_code != 0
+    assert "Traceback" not in _text(res)
+
+
+def test_findings_dir_that_is_a_file_rejected(tmp_path):
+    f = tmp_path / "afile.json"
+    f.write_text("[]", encoding="utf-8")
+    res = _run(["--findings-dir", str(f), "--dimensions-run", "tests",
+                "--root-title", "A"])
+    assert res.exit_code != 0
+    assert res.exception is None or isinstance(res.exception, SystemExit)
+
+
+def test_empty_and_whitespace_findings_dir_rejected():
+    for value in ("", "   "):
+        res = _run(["--findings-dir", value, "--dimensions-run", "tests",
+                    "--root-title", "A"])
+        assert res.exit_code != 0, repr(value)
+        assert res.exception is None or isinstance(res.exception, SystemExit)
+
+
+def test_negative_max_leaves_rejected(tmp_path):
+    d = _empty_tests_dir(tmp_path)
+    res = _run(["--findings-dir", str(d), "--dimensions-run", "tests",
+                "--root-title", "A", "--max-leaves", "-3"])
+    assert res.exit_code != 0
+    assert "--max-leaves" in _text(res)
+
+
+def test_file_for_unknown_named_dimension_is_not_reported_as_extra(tmp_path):
+    d = tmp_path / "f"
+    d.mkdir()
+    _write(d, "vibes", [])
+    res = _run(["--findings-dir", str(d), "--dimensions-run", "vibes",
+                "--root-title", "A"])
+    text = _text(res)
+    assert res.exit_code != 0
+    assert "unknown dimension" in text and "not in --dimensions-run" not in text

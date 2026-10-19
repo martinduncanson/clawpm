@@ -33,9 +33,14 @@ def audit() -> None:
 
 
 def _read_dimension_files(
-    findings_dir: Path, dimensions_run: list[str]
+    findings_dir: Path, dimensions_run: list[str], named: list[str] | None = None
 ) -> tuple[dict[str, Any], list[str]]:
-    """Load ``<dimension>.json`` files; return (by_dimension, problems)."""
+    """Load ``<dimension>.json`` files; return (by_dimension, problems).
+
+    ``named`` is everything the caller put in --dimensions-run, including
+    unknown names (already reported); a file for one of those is not "extra".
+    """
+    named = dimensions_run if named is None else named
     problems: list[str] = []
     by_dimension: dict[str, Any] = {}
     files = {p.stem: p for p in sorted(findings_dir.glob("*.json")) if p.is_file()}
@@ -57,7 +62,7 @@ def _read_dimension_files(
             continue
         by_dimension[dim] = raw
     for stem, path in files.items():
-        if stem not in dimensions_run:
+        if stem not in named:
             problems.append(f"{path.name}: dimension {stem!r} is not in --dimensions-run")
     return by_dimension, problems
 
@@ -93,31 +98,38 @@ def audit_collate(
     LLM or network calls, and nothing is written unless you redirect stdout.
     """
     fmt = get_format(ctx)
+    # One report, one exit: every check appends instead of short-circuiting.
+    problems: list[str] = []
+    root_title = root_title.strip()
+    if not root_title:
+        problems.append("--root-title must be a non-empty string")
     if max_leaves < 1:
-        output_error("invalid_max_leaves", "--max-leaves must be >= 1.", fmt=fmt)
-        sys.exit(1)
+        problems.append("--max-leaves must be >= 1")
 
-    dims = list(dict.fromkeys(d.strip() for d in dimensions_run.split(",") if d.strip()))
-    if not dims:
-        output_error("no_dimensions", "--dimensions-run named no dimensions.", fmt=fmt)
-        sys.exit(1)
-    unknown = [d for d in dims if d not in DIMENSIONS]
-    if unknown:
-        output_error(
-            "audit_collate_failed",
-            f"unknown dimension(s) in --dimensions-run: {unknown} (expected from {list(DIMENSIONS)})",
-            details={"problems": [f"unknown dimension {d!r}" for d in unknown]},
-            fmt=fmt,
-        )
-        sys.exit(1)
+    parts = [d.strip() for d in dimensions_run.split(",")]
+    if not any(parts):
+        problems.append("--dimensions-run named no dimensions")
+    elif not all(parts):
+        problems.append("--dimensions-run has an empty segment (stray or trailing comma?)")
+    named = list(dict.fromkeys(d for d in parts if d))
+    for d in named:
+        if d not in DIMENSIONS:
+            problems.append(
+                f"unknown dimension {d!r} in --dimensions-run (expected from {list(DIMENSIONS)})"
+            )
+    dims = [d for d in named if d in DIMENSIONS]
 
-    by_dimension, problems = _read_dimension_files(Path(findings_dir), dims)
+    by_dimension: dict[str, Any] = {}
     findings = []
-    if not problems:
+    if dims:
+        by_dimension, file_problems = _read_dimension_files(Path(findings_dir), dims, named)
+        problems.extend(file_problems)
+        # Validate whatever loaded, even when other files failed.
         try:
             findings = parse_findings(by_dimension)
         except AuditFindingError as exc:
-            problems = str(exc).splitlines()
+            # Drop the "N invalid" header line and each problem's "- " bullet.
+            problems.extend(line.removeprefix("- ") for line in str(exc).splitlines()[1:])
     if problems:
         output_error(
             "audit_collate_failed",
