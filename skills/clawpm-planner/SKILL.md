@@ -119,12 +119,37 @@ ideate or specify. There is no decompose stage: the leaves come from findings,
 but collate cannot know a leaf's contract, so vet completes it (step 4).
 
 1. **constitution** — as stage 1.
-2. **fan-out** — dispatch ONE read-only agent per dimension, all in a **single
-   message** so they run in parallel. Dimensions: `correctness`, `security`,
-   `consistency`, `tests`, `dead_code`, `tooling`, `agentic_setup`. The operator
-   may name a subset; dispatch only those. The **orchestrator** records the list
-   of dimensions it dispatched and writes each agent's reply to
-   `<findings-dir>/<dimension>.json` (use a fresh scratch directory).
+2. **fan-out** — dispatch ONE agent per dimension, all in a **single message**
+   so they run in parallel. Dimensions: `correctness`, `security`, `consistency`,
+   `tests`, `dead_code`, `tooling`, `agentic_setup`. The operator may name a
+   subset; dispatch only those. A full audit is 7 non-trivial agent runs: say so
+   before dispatching, and offer the subset.
+   - **Agent type: `auditor`** (or `general-purpose` where `auditor` is not in the
+     roster). Never `Explore`: observed 2026-10-20, Explore agents stop at a
+     15-turn limit and deliver no report at all, silently.
+   - **The orchestrator scopes each dimension** to an explicit file list, never
+     "the whole project". Build it from `git ls-files`, filtered per dimension,
+     at most about 40 files or 8,000 lines per agent; split a bigger dimension
+     into two agents on the same dimension and merge their two JSON lists into
+     one `<dimension>.json`. Worked example:
+     `tests` = the test tree (`tests/**`); `tooling` = CI workflows, lint/format
+     config, `pyproject.toml`/`package.json`, scripts; `agentic_setup` =
+     `CLAUDE.md`/`AGENTS.md`, `.claude/**`, skills, hooks, `.project/SPEC.md`;
+     `dead_code` = source files plus the list of their imports/callers from the
+     graph where available; `correctness`, `security` and `consistency` = the
+     source tree, split by package.
+   - **The orchestrator pastes the won't-do ledger and constitution text into
+     each brief** (`clawpm constitution list`, `clawpm tasks list --state
+     rejected`, run once from the main checkout, not a worktree). Agents must not
+     run those commands themselves.
+   - The orchestrator records the dimensions it dispatched and writes each
+     agent's reply to `<findings-dir>/<dimension>.json` (use a fresh scratch
+     directory).
+   - **A dimension that returns nothing or malformed JSON**: re-dispatch it ONCE
+     with a narrower file list. If it fails again the audit is INCOMPLETE: drop
+     that dimension from `--dimensions-run` and state "dimension X not covered"
+     in the report and in the PAUSE summary, or stop and ask the operator. Never
+     present a partial audit as complete.
 3. **collate** — deterministic, zero LLM calls:
 
    ```bash
@@ -132,8 +157,10 @@ but collate cannot know a leaf's contract, so vet completes it (step 4).
      --root-title "<title>" [--max-leaves N] > audit.json
    ```
 
-   `--dimensions-run` is the list from step 2, so a timed-out agent (no file) is
-   distinguishable from a valid empty `[]`. `--max-leaves` defaults to 40.
+   `--dimensions-run` is the list of dimensions that actually produced a file in
+   step 2, so a missing file for a dispatched dimension fails loudly (by design)
+   and is distinguishable from a valid empty `[]`. A dimension you dropped after
+   a failed retry has no file and is not in the list. `--max-leaves` defaults to 40.
    `--findings-dir` is the only input style. Output is
    `{nothing_to_emit, document, report}`. Show the operator `report` (dimensions
    run, findings per dimension, `dropped_findings`). Save `.document` to a file;
@@ -177,20 +204,25 @@ but collate cannot know a leaf's contract, so vet completes it (step 4).
 `{"attach_to": "<root-id>"}` before emitting. A finding whose line moved gets a
 new key and may re-emit once; vet and the won't-do gate are the backstop.
 
-Dimension agent brief (copy; fill `<dimension>` and `<scope>`):
+Dimension agent brief (copy; fill `<dimension>`, `<files>`, `<cap>` (default 15),
+`<ledger>` and `<turns>` (default 25)):
 
 ```text
-You are auditing the dimension "<dimension>" of <scope>. READ-ONLY: do not edit,
-create or delete files, and do not run mutating commands.
-Return ONLY a JSON list of findings, no prose. `[]` is a valid answer; never
-pad. Each finding has exactly these keys:
+You are auditing the dimension "<dimension>". Audit ONLY these files:
+<files>
+READ-ONLY: do not edit, create or delete files, and do not run mutating
+commands. Do not run clawpm commands. By-design behaviour, do NOT report:
+<ledger>
+BUDGET: about <turns> tool turns. Read the files, then answer; if the budget runs
+low, return the findings you have so far rather than nothing.
+Your FINAL message is ONLY the JSON list of findings, no prose, no code fence.
+`[]` is a valid answer; never pad. Each finding has exactly these keys:
   {"dimension": "<dimension>", "file": "<repo-relative path>", "line": <positive
    integer or null>, "title": "<short defect statement>",
    "severity": "critical|high|medium|low|info", "evidence": "<file:line and the
    offending text>"}
-Report at most 15 findings, highest severity first. Cite only code you read.
-Do NOT report behaviour that is by design (see `clawpm constitution list` and
-`clawpm tasks list --state rejected`) or style preferences with no defect.
+Report at most <cap> findings, highest severity first. Cite only code you read.
+Do NOT report style preferences with no defect.
 ```
 
 ## The emit call
