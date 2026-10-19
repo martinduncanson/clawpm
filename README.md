@@ -348,6 +348,7 @@ clawpm reflect summarize    # update the calibration corpus
 | `clawpm context` | — | Full agent context (spec, tasks, log, git, issues) |
 | `clawpm use <id>` | — | Set project context |
 | `clawpm conflicts --task <id>` | — | Pre-flight check for scope overlap |
+| `clawpm audit collate --findings-dir <dir> --dimensions-run a,b --root-title <t> [--max-leaves N]` | — | Validate, dedup and cap project-health audit findings (one `<dimension>.json` per dispatched dimension) into an `emit-tree` document under `.document`, with a dedup/drop report; no LLM, read-only (CLAWP-099) |
 | `clawpm serve` | — | Start read-only web dashboard at http://127.0.0.1:8080 (needs the `web` extra: `pip install 'clawpm[web]'`) |
 | `clawpm mcp` | — | Start the stdio MCP server so any MCP host (Cursor, Windsurf, VS Code, Claude Code, Amazon Q) can drive clawpm (needs the `mcp` extra: `pip install 'clawpm[mcp]'`) |
 

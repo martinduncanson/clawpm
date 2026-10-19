@@ -57,6 +57,7 @@ from clawpm.cli import mission as _mission  # noqa: E402,F401
 from clawpm.cli import lease as _lease  # noqa: E402,F401
 from clawpm.cli import issues as _issues  # noqa: E402,F401
 from clawpm.cli import conflicts as _conflicts  # noqa: E402,F401
+from clawpm.cli import audit as _audit  # noqa: E402,F401
 from clawpm.cli import inbox as _inbox  # noqa: E402,F401
 from clawpm.cli import constitution as _constitution  # noqa: E402,F401
 from clawpm.cli import serve as _serve  # noqa: E402,F401
