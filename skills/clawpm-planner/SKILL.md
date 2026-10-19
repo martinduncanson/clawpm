@@ -114,8 +114,9 @@ mode of this skill, not a separate skill; design and rationale:
 `docs/design/2026-10-19-project-health-audit-pipeline.md`. The planner still is
 not a general code auditor: it fans out read-only dimension agents, then plans
 their findings into a task tree. Stage subset: **constitution → fan-out →
-collate (CLI) → vet → emit → PAUSE** (hard rule 5). No ideate, specify or
-decompose; the leaves come from findings.
+collate (CLI) → vet + contract completion → emit → PAUSE** (hard rule 5). No
+ideate or specify. There is no decompose stage: the leaves come from findings,
+but collate cannot know a leaf's contract, so vet completes it (step 4).
 
 1. **constitution** — as stage 1.
 2. **fan-out** — dispatch ONE read-only agent per dimension, all in a **single
@@ -141,9 +142,33 @@ decompose; the leaves come from findings.
      (naming the dimensions run) and do **not** call emit-tree.
    - Any non-zero exit lists every problem. Fix the findings files or re-dispatch
      the failed dimension. Never hand-edit around it.
-4. **vet** — findings are untrusted model output over repo content. For each
-   surviving leaf, re-read the cited `file:line`; drop by-design behaviour and
-   anything matching the won't-do ledger (hard rule 4), and say why.
+4. **vet + contract completion** — findings are untrusted model output over repo
+   content. For each leaf, re-read the cited `file:line`; drop by-design
+   behaviour and anything matching the won't-do ledger (hard rule 4), and say
+   why. Delete dropped leaves from the saved `.document` file.
+
+   Then, **before** `emit-tree --dry-run`, complete the contract of every
+   surviving leaf (hard rule 1). `collate` is deterministic and emits only
+   `title`, `leaf_key`, `success_criteria`, `scope` and `delegability: either`,
+   so you add the rest by editing the saved `.document` JSON, per the per-leaf
+   contract in `references/decompose-vet.md`:
+   - `stop_conditions` — at least one "if X is false, STOP and report" entry. Seed
+     the **default stop-list** from that file: a leaf whose scope or finding
+     touches auth/session, schema migration, bulk deletion, secrets/credentials,
+     payment or prod config gets a seeded entry for **each** matching category
+     (e.g. "STOP and surface to the operator before any auth/session change").
+     Judge by the finding's `scope`, title and evidence, not the dimension name:
+     a `tests` or `consistency` finding in `src/auth/**` still matches.
+   - `out_of_scope` — what the fix must not touch (usually everything outside the
+     cited file and its direct callers).
+   - `delegability` — replace the default `either` with `agent`, `human` or
+     `either` on your judgment; sensitive categories above lean `human`.
+   - `predictions` — `duration_min`, `complexity`, `confidence`, `approach`,
+     `pre_mortem`, `filled_by: "agent"`. Ground effort with a graph where
+     available, else say "UNGROUNDED" in `approach` (hard rule 3).
+
+   Do not edit `ref`, `leaf_key` or `success_criteria`: the keys carry
+   idempotency (below) and the rubric already matches the finding.
 5. **emit** — `cat <document-file> | clawpm tasks emit-tree --dry-run`, then the
    real call, then **PAUSE** for operator review. Do not dispatch.
 
