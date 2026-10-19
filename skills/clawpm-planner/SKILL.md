@@ -153,11 +153,20 @@ but collate cannot know a leaf's contract, so vet completes it (step 4).
      rejected`, run once from the main checkout, not a worktree). Agents must not
      run those commands themselves.
    - The orchestrator records the dimensions it dispatched and writes each
-     agent's reply to `<findings-dir>/<dimension>.json` (use a fresh scratch
-     directory).
-   - **An agent that returns nothing or malformed JSON**: a retry must preserve
-     its ORIGINAL scope. Re-dispatch ONCE as several narrower agents that
-     together cover ALL of the failed agent's files. A valid reply on a narrower
+     agent's JSON list (without the `COVERAGE:` line) to
+     `<findings-dir>/<dimension>.json` (use a fresh scratch directory).
+   - **Accept a reply as covering its scope only if all three hold**: the JSON
+     list parses, a `COVERAGE:` line is present, and every file the orchestrator
+     assigned to that agent (the scoped file list it built above) is accounted
+     for, either read or named in `unread:`. A reply with valid JSON but no
+     `COVERAGE:` line is incomplete, not a success; `[]` plus full coverage is
+     the only way to say "nothing found". Files named in `unread:` are treated
+     exactly like a failed agent's scope, below. The coverage line is the agent's
+     own claim and core cannot verify it, so the vet stage spot-checks.
+   - **An agent that returns nothing, malformed JSON, no `COVERAGE:` line, or
+     unread files**: a retry must preserve its ORIGINAL scope. Re-dispatch ONCE
+     as several narrower agents that together cover ALL of the failed agent's
+     files (for unread files, exactly the unread files). A valid reply on a narrower
      list does not make the dimension covered by itself: a dimension counts as
      covered only when every file in its original scope was covered by a
      successful agent. Files still uncovered after the retry make the audit
@@ -232,9 +241,13 @@ READ-ONLY: do not edit, create or delete files, and do not run mutating
 commands. Do not run clawpm commands. By-design behaviour, do NOT report:
 <ledger>
 BUDGET: about <turns> tool turns. Read the files, then answer; if the budget runs
-low, return the findings you have so far rather than nothing.
-Your FINAL message is ONLY the JSON list of findings, no prose, no code fence.
-`[]` is a valid answer; never pad. Each finding has exactly these keys:
+low, return the findings you have so far rather than nothing, and list the
+assigned files you did not read on the COVERAGE line.
+Your FINAL message is the JSON list of findings (no code fence), then ONE last
+line, exactly: COVERAGE: <n_read>/<n_assigned> files; unread: <comma-separated
+paths, or none>
+Every assigned file must be counted as read or listed unread. `[]` is a valid
+answer only with full coverage; never pad. Each finding has exactly these keys:
   {"dimension": "<dimension>", "file": "<repo-relative path>", "line": <positive
    integer or null>, "title": "<short defect statement>",
    "severity": "critical|high|medium|low|info", "evidence": "<file:line and the
