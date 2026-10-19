@@ -183,6 +183,46 @@ class TestCanonicalPath:
             strict=True
         )
 
+    @pytest.mark.parametrize("name", ["LONGDI~1", "longdi~1", "PROGRA~12", "FILE~1.TXT", "a~1.c"])
+    def test_short_name_shape_matches(self, name):
+        from clawpm.sessions import _SHORT_NAME_RE
+
+        assert _SHORT_NAME_RE.match(name)
+
+    @pytest.mark.parametrize(
+        "name", ["LONGDIR", "a~b", "file~name.txt", "abc~1x", "toolong7~1", "a b~1", "~1"]
+    )
+    def test_short_name_shape_does_not_false_positive(self, name):
+        from clawpm.sessions import _SHORT_NAME_RE
+
+        assert not _SHORT_NAME_RE.match(name)
+
+    @pytest.mark.skipif(os.name != "nt", reason="8.3 short names are a Windows volume feature")
+    @pytest.mark.parametrize("name", ["LONGDI~1", "longdi~1", "FILE~1.TXT"])
+    def test_windows_missing_short_name_component_refuses(self, tmp_path, name):
+        with pytest.raises(FileNotFoundError, match="8.3"):
+            canonical_path(tmp_path / name)
+        with pytest.raises(FileNotFoundError, match="8.3"):
+            canonical_path(tmp_path / name / "child")
+
+    @pytest.mark.skipif(os.name != "nt", reason="8.3 short names are a Windows volume feature")
+    def test_windows_existing_short_name_component_is_resolved(self, tmp_path):
+        (tmp_path / "LongDirectory").mkdir()
+        # Generation may be disabled on the volume; only assert when a short
+        # spelling resolves to the long directory.
+        import ctypes
+
+        buf = ctypes.create_unicode_buffer(260)
+        n = ctypes.windll.kernel32.GetShortPathNameW(str(tmp_path / "LongDirectory"), buf, 260)
+        if not n or Path(buf.value).name.lower() == "longdirectory":
+            pytest.skip("8.3 generation disabled on this volume")
+        assert canonical_path(Path(buf.value)) == (tmp_path / "LongDirectory").resolve(strict=True)
+
+    @pytest.mark.skipif(os.name != "nt", reason="exercises the Windows branch")
+    def test_windows_normal_missing_name_still_resolves(self, tmp_path):
+        for name in ["LONGDIR", "a~b", "file~name.txt", "abc~1x"]:
+            assert canonical_path(tmp_path / name) == tmp_path.resolve(strict=True) / name
+
     def test_dotdot_under_a_missing_directory_never_guesses(self, tmp_path):
         """POSIX cannot step through a missing directory: refuse. Windows
         normalises ``..`` lexically, so the stat sees the real parent."""

@@ -70,6 +70,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import stat
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -280,6 +281,9 @@ def canonical_path(path: Path, *, known_canonical: bool = False) -> Path:
         raise OSError(f"{exc}") from exc
 
 
+_SHORT_NAME_RE = re.compile(r"^[^.~\s]{1,6}~[0-9]+(\.[^.]{0,3})?$", re.IGNORECASE)
+
+
 def _canonical_absent(path: Path) -> Path:
     """Canonical identity of a path that does not exist yet (CLAWP-162).
 
@@ -291,11 +295,12 @@ def _canonical_absent(path: Path) -> Path:
       link's target is the unavailable part);
     * a ``..`` in the missing tail, which cannot be applied lexically;
     * Windows only: a component ending in ``.`` or a space, which Win32 strips
-      on creation.
+      on creation;
+    * Windows only: a component shaped like an 8.3 short name (``LONGDI~1``),
+      which resolves to the long name once that directory exists.
 
     Not refused: case on a case-insensitive volume (the creating spelling
-    wins, and the ancestor is resolved strictly) and 8.3 short names (a missing
-    short spelling cannot be told apart from a literal name).
+    wins, and the ancestor is resolved strictly; the lock key normcases).
     """
     absolute = path if path.is_absolute() else Path.cwd() / path
     tail: list[str] = []
@@ -326,6 +331,11 @@ def _canonical_absent(path: Path) -> Path:
                 raise FileNotFoundError(
                     f"{path} has a missing component {name!r} with a trailing "
                     f"dot or space, which Windows strips on creation"
+                )
+            if _SHORT_NAME_RE.match(name):
+                raise FileNotFoundError(
+                    f"{path} has a missing component {name!r} shaped like an 8.3 "
+                    f"short name, which may resolve to a long name once created"
                 )
     return probe.resolve(strict=True).joinpath(*reversed(tail))
 
