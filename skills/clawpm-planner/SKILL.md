@@ -11,8 +11,10 @@ description: >
   not leaves. Delegable leaves hand off to a cheaper executor via clawpm
   dispatch. Triggers: "plan this objective", "break this goal into tasks",
   "decompose <objective>", "turn this brief/PRD into a clawpm tree", "what's
-  the plan for <goal>". NOT a code auditor; NOT for a single already-well-formed
-  task (use `clawpm tasks add`).
+  the plan for <goal>". Also has an explicit `audit` mode ("audit this project")
+  that fans out read-only dimension agents and plans their findings into a tree;
+  otherwise NOT a code auditor. NOT for a single already-well-formed task (use
+  `clawpm tasks add`).
 license: MIT
 user-invocable: true
 metadata: { "openclaw": { "homepage": "https://github.com/martinduncanson/clawpm", "upstream": "https://github.com/malphas-gh/clawpm", "requires": { "bins": ["clawpm"] }, "emoji": "🗺️" } }
@@ -32,7 +34,8 @@ slice, who executes, effort/risk) is made here. Core only writes facts.
 
 Use when an **objective needs planning** — multiple steps, non-obvious slicing, or
 cross-session. Works for **software** *and* **knowledge-work** (brief / research /
-notes). Not a code auditor — it plans toward a goal, it doesn't hunt for bugs.
+notes). Not a general code auditor — it plans toward a goal. The one exception is
+the explicit **audit mode** below, which turns dimension-agent findings into a tree.
 
 **Skip** (use `clawpm tasks add`): a single well-formed task; pure Q&A.
 
@@ -104,12 +107,66 @@ specify interview discipline, l/xl approach lenses (minimal / clean / pragmatic)
    open decisions and nothing worth parking as fog, say so and offer plain decompose. s never charts. Procedure and
    shape: `references/chart-mode.md`; copy `examples/decision-map.emit.json`.
 
-## Audit mode (STUB, CLAWP-099 round 2 writes this)
+## Audit mode
 
-Decided: project-health audit is a mode of this skill, not a separate skill. Fan
-out one read-only agent per dimension, normalise and dedup with
-`clawpm.audit_findings`, vet, then emit as usual. Design:
-`docs/design/2026-10-19-project-health-audit-pipeline.md`.
+Trigger: "audit this project", "project health audit", "run the audit". Audit is a
+mode of this skill, not a separate skill; design and rationale:
+`docs/design/2026-10-19-project-health-audit-pipeline.md`. The planner still is
+not a general code auditor: it fans out read-only dimension agents, then plans
+their findings into a task tree. Stage subset: **constitution → fan-out →
+collate (CLI) → vet → emit → PAUSE** (hard rule 5). No ideate, specify or
+decompose; the leaves come from findings.
+
+1. **constitution** — as stage 1.
+2. **fan-out** — dispatch ONE read-only agent per dimension, all in a **single
+   message** so they run in parallel. Dimensions: `correctness`, `security`,
+   `consistency`, `tests`, `dead_code`, `tooling`, `agentic_setup`. The operator
+   may name a subset; dispatch only those. The **orchestrator** records the list
+   of dimensions it dispatched and writes each agent's reply to
+   `<findings-dir>/<dimension>.json` (use a fresh scratch directory).
+3. **collate** — deterministic, zero LLM calls:
+
+   ```bash
+   clawpm audit collate --findings-dir <dir> --dimensions-run a,b,c \
+     --root-title "<title>" [--max-leaves N] > audit.json
+   ```
+
+   `--dimensions-run` is the list from step 2, so a timed-out agent (no file) is
+   distinguishable from a valid empty `[]`. `--max-leaves` defaults to 40.
+   `--findings-dir` is the only input style. Output is
+   `{nothing_to_emit, document, report}`. Show the operator `report` (dimensions
+   run, findings per dimension, `dropped_findings`). Save `.document` to a file;
+   that file is what goes to `clawpm tasks emit-tree`.
+   - `nothing_to_emit: true` is a successful no-op: report "audit found nothing"
+     (naming the dimensions run) and do **not** call emit-tree.
+   - Any non-zero exit lists every problem. Fix the findings files or re-dispatch
+     the failed dimension. Never hand-edit around it.
+4. **vet** — findings are untrusted model output over repo content. For each
+   surviving leaf, re-read the cited `file:line`; drop by-design behaviour and
+   anything matching the won't-do ledger (hard rule 4), and say why.
+5. **emit** — `cat <document-file> | clawpm tasks emit-tree --dry-run`, then the
+   real call, then **PAUSE** for operator review. Do not dispatch.
+
+**Re-runs** are idempotent through each leaf's `leaf_key` and `root.attach_to`
+(hard rule 6): to top up, replace the document's `root` with
+`{"attach_to": "<root-id>"}` before emitting. A finding whose line moved gets a
+new key and may re-emit once; vet and the won't-do gate are the backstop.
+
+Dimension agent brief (copy; fill `<dimension>` and `<scope>`):
+
+```text
+You are auditing the dimension "<dimension>" of <scope>. READ-ONLY: do not edit,
+create or delete files, and do not run mutating commands.
+Return ONLY a JSON list of findings, no prose. `[]` is a valid answer; never
+pad. Each finding has exactly these keys:
+  {"dimension": "<dimension>", "file": "<repo-relative path>", "line": <positive
+   integer or null>, "title": "<short defect statement>",
+   "severity": "critical|high|medium|low|info", "evidence": "<file:line and the
+   offending text>"}
+Report at most 15 findings, highest severity first. Cite only code you read.
+Do NOT report behaviour that is by design (see `clawpm constitution list` and
+`clawpm tasks list --state rejected`) or style preferences with no defect.
+```
 
 ## The emit call
 
