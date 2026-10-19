@@ -8,7 +8,8 @@ ledger) stay in ``emit_tree``.
 
 Dedup key, within one normalised file path: title token sets (stopwords
 dropped) with Jaccard >= ``TITLE_JACCARD`` -> same defect, on any line. A shared
-line alone is NOT identity: unrelated defects can sit on one line.
+line alone is NOT identity: unrelated defects can sit on one line. A title with
+no tokens merges only with an identical normalised title.
 Design: docs/design/2026-10-19-project-health-audit-pipeline.md
 """
 
@@ -79,6 +80,10 @@ def _tokens(title: str) -> frozenset[str]:
     return frozenset(w for w in words if w not in _STOPWORDS and len(w) > 1)
 
 
+def _norm_title(title: str) -> str:
+    return " ".join(title.casefold().split())
+
+
 def parse_findings(by_dimension: dict[str, Any]) -> list[Finding]:
     """Validate ``{dimension: [finding, ...]}``; raise with EVERY problem listed."""
     problems: list[str] = []
@@ -100,7 +105,8 @@ def parse_findings(by_dimension: dict[str, Any]) -> list[Finding]:
             before = len(problems)
             unknown = set(raw) - ALLOWED_FINDING_KEYS
             if unknown:
-                problems.append(f"{where}: unknown keys {sorted(unknown)!r}")
+                # key=repr: keys of mixed types (non-JSON callers) cannot be ordered.
+                problems.append(f"{where}: unknown keys {sorted(unknown, key=repr)!r}")
             if raw.get("dimension") != dim:
                 problems.append(
                     f"{where}: dimension {raw.get('dimension')!r} does not match its group {dim!r}"
@@ -109,10 +115,10 @@ def parse_findings(by_dimension: dict[str, Any]) -> list[Finding]:
                 v = raw.get(key)
                 if not isinstance(v, str) or not v.strip():
                     problems.append(f"{where}: {key} must be a non-empty string")
-            if raw.get("severity") not in _SEV_RANK:
-                problems.append(
-                    f"{where}: severity {raw.get('severity')!r} not in {list(SEVERITIES)}"
-                )
+            severity = raw.get("severity")
+            # isinstance first: an unhashable value would raise in the dict test.
+            if not isinstance(severity, str) or severity not in _SEV_RANK:
+                problems.append(f"{where}: severity {severity!r} not in {list(SEVERITIES)}")
             line = raw.get("line")
             if line is not None and (
                 isinstance(line, bool) or not isinstance(line, int) or line < 1
@@ -138,6 +144,8 @@ def _same_defect(a: Finding, b: Finding) -> bool:
     if a.file != b.file:
         return False
     ta, tb = _tokens(a.title), _tokens(b.title)
+    if not ta and not tb:  # no Latin tokens (e.g. "X", CJK): identical titles only
+        return _norm_title(a.title) == _norm_title(b.title)
     if not ta or not tb:
         return False
     return len(ta & tb) / len(ta | tb) >= TITLE_JACCARD
@@ -176,7 +184,10 @@ def dedup_findings(findings: list[Finding]) -> list[MergedFinding]:
 
 
 def _leaf_key(m: MergedFinding) -> str:
-    basis = f"{m.file}|{m.line}|{' '.join(sorted(_tokens(m.title)))}"
+    tokens = _tokens(m.title)
+    # Empty token set: key on the normalised title, or distinct findings collide.
+    ident = " ".join(sorted(tokens)) if tokens else "title:" + _norm_title(m.title)
+    basis = f"{m.file}|{m.line}|{ident}"
     return "audit-" + hashlib.sha1(basis.encode("utf-8")).hexdigest()[:12]
 
 

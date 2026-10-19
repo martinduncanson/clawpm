@@ -38,6 +38,8 @@ Constitution load (stage 1), the vet stage (re-read cited ground, reject by-desi
 
 Within one normalised path (backslashes to `/`, leading `./` stripped), title token sets (lowercase alphanumerics, stopwords dropped) with Jaccard >= 0.6 merge, on the same line or a different one. A shared line alone never merges: unrelated defects (a locking bug and a token-logging bug) can sit on one line, and merging them would hide one with no dropped marker.
 
+A title with no tokens at all (single characters such as `X`, or non-Latin scripts) cannot use Jaccard. Two such titles merge only when their normalised full titles (casefolded, whitespace collapsed) are equal; an empty-token title never merges with a token-bearing one.
+
 The first match wins, over input sorted by every field (file, line, dimension, title, severity, evidence), so the result, including which evidence survives the 300-char truncation, does not depend on agent return order. A merged finding keeps the highest severity, the union of dimensions, and all distinct evidence. Corroboration by several dimensions is signal and sorts earlier. The fuzzy stage is deliberately conservative: a missed merge costs one duplicate leaf that vet catches; a false merge hides a defect.
 
 ## emit-tree mapping
@@ -48,7 +50,7 @@ One new root (`root.title`), flat leaves ordered by severity, then corroboration
 |---|---|
 | `ref` | `f001`... in sorted order |
 | `title` | finding title, unprefixed so the exact-title won't-do match can fire |
-| `leaf_key` | `audit-` + sha1 prefix of file, line and sorted title tokens; stable across runs |
+| `leaf_key` | `audit-` + sha1 prefix of file, line and sorted title tokens (the normalised full title when there are no tokens); stable across runs |
 | `success_criteria` | one WHEN/THEN criterion; `gradeable_signal` is the evidence (truncated to 300 chars) |
 | `scope` | `[file]` |
 | `delegability` | `either` |

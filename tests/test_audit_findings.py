@@ -7,6 +7,7 @@ emit-tree document. Model judgment (what to report, vetting) stays in the skill.
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -187,3 +188,99 @@ def test_leaf_keys_are_stable_across_runs_and_input_order():
                                 root_title="R")
     assert [lf["leaf_key"] for lf in d1["leaves"]] == [lf["leaf_key"] for lf in d2["leaves"]]
     assert [lf["ref"] for lf in d1["leaves"]] == [lf["ref"] for lf in d2["leaves"]]
+
+
+# --- wrong-typed field values: AuditFindingError, never TypeError/AttributeError ---
+
+_BAD_TYPES = {
+    "list": [], "dict": {}, "none": None, "bool": True, "float": 1.5,
+    "int": 7, "nested_list": ["x"],
+}
+
+
+@pytest.mark.parametrize("field", ["dimension", "file", "title", "severity", "evidence"])
+@pytest.mark.parametrize("kind", sorted(_BAD_TYPES))
+def test_wrong_typed_string_field_is_an_audit_error_not_a_crash(field, kind):
+    bad = _f()
+    bad[field] = _BAD_TYPES[kind]
+    with pytest.raises(AuditFindingError) as exc:
+        parse_findings({"correctness": [bad]})
+    assert field in str(exc.value)
+
+
+@pytest.mark.parametrize("kind", ["list", "dict", "float", "bool", "nested_list"])
+def test_wrong_typed_line_is_an_audit_error_not_a_crash(kind):
+    bad = _f()
+    bad["line"] = _BAD_TYPES[kind]
+    with pytest.raises(AuditFindingError) as exc:
+        parse_findings({"correctness": [bad]})
+    assert "line" in str(exc.value)
+
+
+@pytest.mark.parametrize("kind", ["list", "dict", "float", "bool"])
+def test_wrong_typed_values_still_accumulate_later_problems(kind):
+    bad = _f()
+    bad.update(severity=_BAD_TYPES[kind], file=_BAD_TYPES[kind], title=_BAD_TYPES[kind],
+               evidence=_BAD_TYPES[kind], line=_BAD_TYPES[kind])
+    later = _f(evidence="")
+    with pytest.raises(AuditFindingError) as exc:
+        parse_findings({"correctness": [bad, later]})
+    msg = str(exc.value)
+    for field in ("severity", "file", "title", "evidence", "line"):
+        assert f"correctness[0]: {field}" in msg
+    assert "correctness[1]: evidence" in msg
+
+
+def test_non_string_unknown_keys_do_not_crash_the_error_report():
+    bad = _f()
+    bad[1] = "x"
+    bad["extra"] = "y"
+    with pytest.raises(AuditFindingError, match="unknown keys"):
+        parse_findings({"correctness": [bad, _f(severity=[])]})
+
+
+# --- leaf keys and merging for titles with no Latin tokens ---
+
+def _leaf_keys(*findings):
+    doc, _ = build_emit_document(
+        parse_findings({"correctness": list(findings)}), root_title="R")
+    return [lf["leaf_key"] for lf in doc["leaves"]]
+
+
+def test_single_char_titles_at_the_same_location_get_distinct_leaf_keys():
+    keys = _leaf_keys(_f(title="X"), _f(title="Y"))
+    assert len(keys) == 2 and len(set(keys)) == 2
+
+
+def test_non_latin_titles_at_the_same_location_get_distinct_leaf_keys():
+    keys = _leaf_keys(_f(title="ロックが早く解放される"), _f(title="トークンが平文で記録される"))
+    assert len(keys) == 2 and len(set(keys)) == 2
+
+
+def test_empty_token_title_key_ignores_case_and_spacing():
+    a = _leaf_keys(_f(title="\u00c9  \u00df"))  # no [a-z0-9]+ run at all
+    b = _leaf_keys(_f(title="  \u00e9 \u00df "))
+    assert _leaf_keys(_f(title="X")) == _leaf_keys(_f(title="  x "))
+    assert a == b
+
+
+def test_token_bearing_title_keys_are_unchanged_by_the_fallback():
+    # Pinned: existing keys must not shift for titles that tokenise.
+    basis = b"src/clawpm/tasks.py|10|completes lock released write"
+    assert _leaf_keys(_f()) == ["audit-" + hashlib.sha1(basis).hexdigest()[:12]]
+
+
+def test_empty_token_titles_merge_only_when_normalised_titles_equal():
+    same = dedup_findings(parse_findings({"correctness": [
+        _f(title="X", line=1), _f("correctness", title="  x ", line=2,
+                                  evidence="other evidence")]}))
+    assert len(same) == 1
+    different = dedup_findings(parse_findings({"correctness": [
+        _f(title="X", line=1), _f(title="Y", line=1)]}))
+    assert len(different) == 2
+
+
+def test_empty_token_title_never_merges_with_a_token_bearing_one():
+    merged = dedup_findings(parse_findings({"correctness": [
+        _f(title="X"), _f()]}))
+    assert len(merged) == 2
