@@ -8,7 +8,7 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 
 ### Changed
 
-- clawpm-planner SKILL.md: real `audit` mode prose (fan-out brief, `clawpm audit collate`, vet, emit, pause) replacing the stub, and the "not a code auditor" lines reconciled (CLAWP-099 round 2b) (#PR, CLAWP-099).
+- clawpm-planner SKILL.md: real `audit` mode prose (fan-out brief, `clawpm audit collate`, vet, emit, pause) replacing the stub, and the "not a code auditor" lines reconciled (CLAWP-099 round 2b) (#133, CLAWP-099).
 
 ### Added
 
