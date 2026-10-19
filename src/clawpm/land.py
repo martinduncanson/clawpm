@@ -471,7 +471,20 @@ def land_task(
     # 1. Where are we? Must be the main checkout, on `main`.
     toplevel = Path(_out(["rev-parse", "--show-toplevel"], cwd)).resolve()
     git_dir, common_dir = (_out(["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"], cwd).splitlines() + ["", ""])[:2]
-    if Path(git_dir).resolve() != Path(common_dir).resolve():
+    # CLAWP-162: this comparison gates the landing; an unresolvable side
+    # refuses instead of comparing unresolved spellings.
+    from clawpm.sessions import canonical_path
+
+    try:
+        _in_linked_worktree = canonical_path(Path(git_dir)) != canonical_path(Path(common_dir))
+    except OSError as exc:
+        raise LandError(
+            "path_unresolvable",
+            f"Could not resolve {git_dir} or {common_dir} ({type(exc).__name__}: {exc}); "
+            "refusing to land without knowing whether this is the main checkout",
+            {"toplevel": str(toplevel)},
+        ) from exc
+    if _in_linked_worktree:
         raise LandError(
             "inside_worktree",
             f"{toplevel} is a linked worktree (a dispatched worker's checkout, CLAWP-098); "

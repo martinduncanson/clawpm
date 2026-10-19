@@ -168,6 +168,7 @@ class TestSessionLedgerResolves:
     ):
         root = tmp_path / "portfolio"
         root.mkdir()
+        (tmp_path / "unavailable-volume").mkdir()  # CLAWP-162: must exist to be resolved
         fail_resolve(monkeypatch, _named("unavailable-volume"), exc=exc)
         # RuntimeError is Python 3.11's symlink-loop signal; callers of
         # register_session catch OSError, so it must arrive as one.

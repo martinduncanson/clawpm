@@ -8,6 +8,7 @@ from clawpm.concurrency import LockTimeout
 from clawpm.models import ResearchStatus, ResearchType
 from clawpm.output import output_error, output_research_list, output_success
 from clawpm.research import add_research, link_research_session, scan_research
+from clawpm.sessions import IdentityResolveError
 from clawpm.cli.base import main, get_format, require_portfolio, require_project
 
 # ============================================================================
@@ -144,6 +145,10 @@ def research_add(
             f"Could not acquire the research lock (another session may be busy): {exc}",
             fmt=fmt,
         )
+        sys.exit(1)
+    except IdentityResolveError as exc:
+        # CLAWP-162: the research lock is keyed by the resolved directory.
+        output_error("research_dir_unresolvable", str(exc), fmt=fmt)
         sys.exit(1)
 
     if not item:

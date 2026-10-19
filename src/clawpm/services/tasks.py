@@ -131,13 +131,22 @@ def transition(
             [f"{c['id']} [{c['state']}]" for c in _status["incomplete"]]
             + [f"{m} [missing]" for m in _status["missing"]]
         )
+        try:
+            _destination = gather_done_destination(config, project_id, pre_transition_task)
+        except ValueError as exc:
+            # CLAWP-162: the destination identity could not be resolved
+            # (IdentityResolveError); refuse before the mutator runs.
+            return {
+                "ok": False, "task_id": task_id,
+                "error": "state_change_failed", "message": str(exc),
+            }
         _refusal = validate_done_transition(
             task_id,
             pre_transition_task.kind,
             resolution,
             force,
             _status,
-            gather_done_destination(config, project_id, pre_transition_task),
+            _destination,
         )
         if _refusal is not None:
             return {

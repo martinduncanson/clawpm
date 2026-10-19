@@ -14,6 +14,7 @@ from .sessions import (
     Scope,
     _suppress_session_resolution,
     active_sessions,
+    canonical_path,
     find_session_for_cwd,
     resolve_path_or_none,
     scope_cwd,
@@ -663,7 +664,9 @@ def _session_scoped_repo_path(
     try:
         # CLAWP-118: the PROJECT root inside the checkout (the checkout root
         # for a root-level project), matching repo_path semantics.
-        root = session.project_root.resolve()
+        # CLAWP-162: strict (canonical_path), so an unresolvable root takes
+        # the logged fall-through below instead of keying a junction spelling.
+        root = canonical_path(session.project_root)
     except OSError as exc:
         logger.error(
             "Failed to resolve session worktree %s: %s. Falling through to "
@@ -734,7 +737,7 @@ def _session_scoped_project_dir(
         # "never raises"; before this guard, resolve() could break that
         # promise for exactly the class of caller (tasks list/next/reflect)
         # that must never hard-fail on a rare filesystem hiccup.
-        candidate = session.project_root.resolve() / ".project"
+        candidate = canonical_path(session.project_root) / ".project"  # CLAWP-162: strict
     except OSError as exc:
         logger.error(
             "Failed to resolve session worktree %s: %s. Falling through to "

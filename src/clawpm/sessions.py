@@ -70,6 +70,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import stat
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -254,13 +255,112 @@ def canonical_path(path: Path, *, known_canonical: bool = False) -> Path:
     :class:`OSError` (a symlink loop's ``RuntimeError`` on Python 3.11 is
     converted) so callers need one handler. Contrast
     :func:`resolve_path_or_none`, for paths that are only informational.
+
+    CLAWP-162: non-strict ``Path.resolve()`` swallows winerror 3 (not found)
+    and 5 (access denied) on Windows and hands back the unresolved spelling,
+    so the refusal above never fired. The path is therefore stat'ed first
+    (``os.stat``, not ``Path.exists()``, which swallows ``OSError``):
+
+    * it exists -> ``resolve(strict=True)``; any ``OSError`` propagates;
+    * ``FileNotFoundError`` and not a dangling link -> genuinely absent (a
+      dispatch target not created yet): the nearest existing ancestor is
+      resolved strictly and the missing tail re-appended, so the identity is
+      the same one the path has once it exists;
+    * any other ``OSError`` (access denied, unavailable volume) propagates.
     """
     if known_canonical:
         return Path(path)
     try:
-        return Path(path).resolve()
+        target = Path(path)
+        try:
+            os.stat(target)
+        except FileNotFoundError:
+            return _canonical_absent(target)
+        return target.resolve(strict=True)
     except RuntimeError as exc:
         raise OSError(f"{exc}") from exc
+
+
+_SHORT_NAME_RE = re.compile(r"^[^.~\s]{1,6}~[0-9]+(\.[^.]{0,3})?$", re.IGNORECASE)
+
+
+def _canonical_absent(path: Path) -> Path:
+    """Canonical identity of a path that does not exist yet (CLAWP-162).
+
+    The identity must not change once the path is created, so every way a
+    missing component's spelling could differ from its created spelling is
+    refused with ``FileNotFoundError``:
+
+    * a dangling link at ANY depth (``lstat`` works but ``stat`` did not: the
+      link's target is the unavailable part);
+    * a ``..`` in the missing tail, which cannot be applied lexically;
+    * Windows only: a component ending in ``.`` or a space, which Win32 strips
+      on creation;
+    * Windows only: a component shaped like an 8.3 short name (``LONGDI~1``),
+      which resolves to the long name once that directory exists.
+
+    Not refused: case on a case-insensitive volume (the creating spelling
+    wins, and the ancestor is resolved strictly; the lock key normcases).
+    """
+    absolute = path if path.is_absolute() else Path.cwd() / path
+    tail: list[str] = []
+    probe = absolute
+    while True:
+        try:
+            os.stat(probe)
+        except FileNotFoundError:
+            try:
+                os.lstat(probe)
+            except FileNotFoundError:
+                pass
+            else:
+                raise FileNotFoundError(
+                    f"{probe} is a link whose target does not exist"
+                ) from None
+            if probe.parent == probe:
+                raise
+            tail.append(probe.name)
+            probe = probe.parent
+            continue
+        break
+    if ".." in tail:
+        raise FileNotFoundError(f"{path} has a '..' beneath a missing directory")
+    if os.name == "nt":
+        for name in tail:
+            if name.endswith((".", " ")):
+                raise FileNotFoundError(
+                    f"{path} has a missing component {name!r} with a trailing "
+                    f"dot or space, which Windows strips on creation"
+                )
+            if _SHORT_NAME_RE.match(name):
+                raise FileNotFoundError(
+                    f"{path} has a missing component {name!r} shaped like an 8.3 "
+                    f"short name, which may resolve to a long name once created"
+                )
+    return probe.resolve(strict=True).joinpath(*reversed(tail))
+
+
+class IdentityResolveError(ValueError):
+    """A path used as a lock/compare identity could not be canonicalised.
+
+    A ``ValueError`` so the task-mutation CLI contract
+    (``cli.base._mutation_errors``) turns it into a structured refusal.
+    """
+
+
+def canonical_identity(path: Path, role: str) -> Path:
+    """:func:`canonical_path` that refuses with :class:`IdentityResolveError`.
+
+    For library sites whose caller cannot be expected to handle a bare
+    ``OSError``: *role* names what the path keys (a lock, a comparison).
+    """
+    try:
+        return canonical_path(path)
+    except OSError as exc:
+        raise IdentityResolveError(
+            f"Could not resolve {path} for {role} ({type(exc).__name__}: {exc}). "
+            f"Refusing rather than using an unresolved spelling."
+        ) from exc
 
 
 _REGISTERED = "registered"
@@ -795,7 +895,9 @@ def find_session_for_cwd(
         if project_id is not None and record.project_id != project_id:
             continue
         try:
-            wt = record.worktree_path.resolve()
+            # CLAWP-162: strict, so an unresolvable candidate is skipped
+            # (below) rather than compared by its unresolved spelling.
+            wt = canonical_path(record.worktree_path)
         except OSError as exc:
             # grok review, PR #55 (round 5): log at ERROR — same fail-open
             # class as every other guard in this module, just triggered by

@@ -39,7 +39,7 @@ from .discovery import (
     find_project_dir_fallback,
     get_project_dir,
 )
-from .sessions import Scope
+from .sessions import Scope, canonical_identity
 from .id_reservations import record_reservation, record_task_id, reserved_high_water
 
 
@@ -1397,7 +1397,7 @@ def change_task_state(
                 #     here too: step (a) only checked task_dir.exists(), so a
                 #     concurrent session removing just _task.md must surface the
                 #     friendly message, not a raw FileNotFoundError (Codex/Grok).
-                if task_dir.resolve() == new_dir.resolve():
+                if canonical_identity(task_dir, "a task-move check") == canonical_identity(new_dir, "a task-move check"):
                     _task_md = task_dir / "_task.md"
                     if not _task_md.exists():
                         raise FileNotFoundError(
@@ -1495,7 +1495,7 @@ def change_task_state(
 
             # (b) Already in correct location — skip the MOVE only; the gate (c) and
             #     metadata write (d) above have already run. Reload for a fresh view.
-            if current_path.resolve() == new_path.resolve():
+            if canonical_identity(current_path, "a task-move check") == canonical_identity(new_path, "a task-move check"):
                 return retry_transient(Task.from_file, current_path)
 
             # (e) Move (retry transient Windows sharing/access faults — CLAWP-051)
@@ -2215,7 +2215,7 @@ def gather_done_destination(
     return DestinationFacts(
         done_dir=done_kind,
         leaf=_lstat_kind(leaf) if done_kind == "dir" else "absent",
-        leaf_is_current=current.resolve() == leaf.resolve(),
+        leaf_is_current=canonical_identity(current, "the done-destination comparison") == canonical_identity(leaf, "the done-destination comparison"),
         done_path=done_dir.as_posix(),
         leaf_path=leaf.as_posix(),
     )
@@ -3125,7 +3125,7 @@ def _portfolio_prefix_lock_path(portfolio_root: Path) -> Path:
     ``add_task`` call in such a configuration would fail outright, not just
     under contention.
     """
-    return portfolio_root.resolve() / "locks" / "prefix-allocation.lock"
+    return canonical_identity(portfolio_root, "the prefix-allocation lock") / "locks" / "prefix-allocation.lock"
 
 
 @contextmanager
