@@ -8,6 +8,7 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 
 ### Added
 
+- `clawpm audit collate`: deterministic CLI door to the audit core (CLAWP-099 round 2a). Reads one `<dimension>.json` per dispatched dimension, fails loudly on a missing, extra or malformed file, and prints the `emit-tree` document plus the dedup/cap report; no LLM calls, read-only (#132, CLAWP-099).
 - `clawpm.audit_findings`: deterministic half of the project-health audit pipeline (CLAWP-099 round 1). Validates findings from the seven dimension agents (loud `AuditFindingError`, every problem listed), dedups by file plus title similarity, caps volume with a named drop report, and maps to an `emit-tree` document; design and the decision to make audit a clawpm-planner mode in `docs/design/2026-10-19-project-health-audit-pipeline.md` (#131, CLAWP-099).
 - MCP `tasks_state` takes `question` / `options` / `recommendation` (block on a human) and `answer` (unblock with the answer), and `tasks_list` takes `needs_human`; the CLI `block --question` / `unblock` and MCP now share one write path, `services.tasks.block_with_question` / `unblock_task` (#126, CLAWP-157).
 - Awaiting-human decisions: `block --question/--option/--recommend`, `unblock --answer` and `tasks list --needs-human` record and list the decision a blocked task waits on (#122, CLAWP-154).

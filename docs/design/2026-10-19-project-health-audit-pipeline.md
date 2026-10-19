@@ -5,7 +5,7 @@
 ## Alternatives
 
 - **Separate `clawpm-audit` skill.** Rejected. It would copy the constitution load, the won't-do diff, the emit contract and the idempotent re-emit rules. The task pitfall names this exactly: a parallel system with its own maintenance burden, run rarely, drifting from the planner.
-- **New CLI command that runs the agents.** Rejected. Core makes zero LLM calls (planner seam: the skill decides, core persists). Fan-out is harness work (the Agent tool), so it belongs in skill prose.
+- **New CLI command that runs the agents.** Rejected. Core makes zero LLM calls (planner seam: the skill decides, core persists). Fan-out is harness work (the Agent tool), so it belongs in skill prose. A collate-only CLI (`clawpm audit collate`: reads the findings the agents already wrote, validates, dedups, caps and prints the emit-tree document and report; no agents, no LLM, read-only) is allowed, because it is the same deterministic core behind a stable door.
 - **Mode (chosen).** The planner already has modes by rule (chart mode, hard rule 7). Audit follows the same shape: a trigger, a stage subset, an exit.
 
 ## What it reuses
