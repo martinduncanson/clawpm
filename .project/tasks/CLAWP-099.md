@@ -26,7 +26,7 @@ predictions:
     without operator hand-orchestration
   - Decision recorded on whether this is a clawpm-planner mode or a separate skill
 priority: 6
-updated: '2026-07-06'
+updated: '2026-10-19'
 ---
 # Formalize project-health audit as a repeatable clawpm-planner pipeline (Turbo /audit pattern)
 
