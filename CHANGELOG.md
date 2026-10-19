@@ -6,6 +6,10 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 
 ## [Unreleased]
 
+### Changed
+
+- clawpm-planner SKILL.md: real `audit` mode prose (fan-out brief, `clawpm audit collate`, vet with per-leaf contract completion, emit, pause) replacing the stub, and the "not a code auditor" lines reconciled (CLAWP-099 round 2b) (#133, CLAWP-099).
+
 ### Added
 
 - `clawpm audit collate`: deterministic CLI door to the audit core (CLAWP-099 round 2a). Reads one `<dimension>.json` per dispatched dimension, fails loudly on a missing, extra or malformed file, and prints the `emit-tree` document plus the dedup/cap report; no LLM calls, read-only (#132, CLAWP-099).
