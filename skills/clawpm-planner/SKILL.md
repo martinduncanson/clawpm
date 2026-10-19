@@ -119,12 +119,63 @@ ideate or specify. There is no decompose stage: the leaves come from findings,
 but collate cannot know a leaf's contract, so vet completes it (step 4).
 
 1. **constitution** — as stage 1.
-2. **fan-out** — dispatch ONE read-only agent per dimension, all in a **single
-   message** so they run in parallel. Dimensions: `correctness`, `security`,
-   `consistency`, `tests`, `dead_code`, `tooling`, `agentic_setup`. The operator
-   may name a subset; dispatch only those. The **orchestrator** records the list
-   of dimensions it dispatched and writes each agent's reply to
-   `<findings-dir>/<dimension>.json` (use a fresh scratch directory).
+2. **fan-out** — dispatch ONE agent per dimension, all in a **single message**
+   so they run in parallel. Dimensions: `correctness`, `security`, `consistency`,
+   `tests`, `dead_code`, `tooling`, `agentic_setup`. The operator may name a
+   subset; dispatch only those. A full audit is 7 dimensions but many more agent
+   runs once each is scoped to the limits below (29 on this repo): compute the
+   real count from the scoping step, say it before dispatching, and offer the
+   subset.
+   - **Agent type: `auditor`** (or `general-purpose` where `auditor` is not in the
+     roster). Never `Explore`: observed 2026-10-20, Explore agents stop at a
+     15-turn limit and deliver no report at all, silently.
+   - **The orchestrator scopes each dimension** to an explicit file list, never
+     "the whole project". Build it from `git ls-files`, filtered per dimension,
+     at most about 40 files AND 8,000 non-empty lines per agent. Split a bigger
+     dimension repeatedly (by directory or package, then by file chunks in path
+     order) until EVERY agent's scope is within BOTH limits, and merge the JSON
+     lists of the agents on one dimension into one `<dimension>.json`. Count
+     with `git ls-files -- <pathspecs>` and, per file, non-empty lines
+     (`Get-Content $f | Where-Object { $_.Trim() }`). Measured on this repo
+     (2026-10-20; source = `src/**`, shared by four dimensions): `tests` 127
+     files / 47,421 lines needs 7 agents; source 77 files / 32,398 lines needs 5
+     agents per dimension; `tooling` (6 files, 194 lines) and `agentic_setup`
+     (35 files, 2,850 lines) need 1 each. Total for the 7 dimensions: 29 agents,
+     not 7. Worked example of the file sets:
+     `tests` = the test tree (`tests/**`); `tooling` = CI workflows, lint/format
+     config, `pyproject.toml`/`package.json`, scripts; `agentic_setup` =
+     `CLAUDE.md`/`AGENTS.md`, `.claude/**`, skills, hooks, `.project/SPEC.md`;
+     `dead_code` = source files plus the list of their imports/callers from the
+     graph where available; `correctness`, `security` and `consistency` = the
+     source tree, split by package.
+   - **The orchestrator pastes the won't-do ledger and constitution text into
+     each brief** (`clawpm constitution list`, `clawpm tasks list --state
+     rejected`, run once from the main checkout, not a worktree). Agents must not
+     run those commands themselves.
+   - The orchestrator records the dimensions it dispatched and writes each
+     agent's JSON list (without the `COVERAGE:` line) to
+     `<findings-dir>/<dimension>.json` (use a fresh scratch directory).
+   - **Accept a reply as covering its scope only if all three hold**: the JSON
+     list parses, a `COVERAGE:` line is present, and every file the orchestrator
+     assigned to that agent (the scoped file list it built above) is accounted
+     for, either read or named in `unread:`. A reply with valid JSON but no
+     `COVERAGE:` line is incomplete, not a success; `[]` plus full coverage is
+     the only way to say "nothing found". Files named in `unread:` are treated
+     exactly like a failed agent's scope, below. The coverage line is the agent's
+     own claim and core cannot verify it, so the vet stage spot-checks.
+   - **An agent that returns nothing, malformed JSON, no `COVERAGE:` line, or
+     unread files**: a retry must preserve its ORIGINAL scope. Re-dispatch ONCE
+     as several narrower agents that together cover ALL of the failed agent's
+     files (for unread files, exactly the unread files). A valid reply on a narrower
+     list does not make the dimension covered by itself: a dimension counts as
+     covered only when every file in its original scope was covered by a
+     successful agent. Files still uncovered after the retry make the audit
+     INCOMPLETE: report "dimension X: files A..B not covered" (name the files or
+     path range) in the report and in the PAUSE summary, or stop and ask the
+     operator. Never drop files silently and never present a partial audit as
+     complete. If a dimension has NO successful agent at all, drop it from
+     `--dimensions-run` too; if only part of it is covered, keep it in
+     `--dimensions-run` (it did produce a file) and rely on the stated gap.
 3. **collate** — deterministic, zero LLM calls:
 
    ```bash
@@ -132,8 +183,10 @@ but collate cannot know a leaf's contract, so vet completes it (step 4).
      --root-title "<title>" [--max-leaves N] > audit.json
    ```
 
-   `--dimensions-run` is the list from step 2, so a timed-out agent (no file) is
-   distinguishable from a valid empty `[]`. `--max-leaves` defaults to 40.
+   `--dimensions-run` is the list of dimensions that actually produced a file in
+   step 2, so a missing file for a dispatched dimension fails loudly (by design)
+   and is distinguishable from a valid empty `[]`. A dimension with no successful
+   agent after the retry has no file and is not in the list. `--max-leaves` defaults to 40.
    `--findings-dir` is the only input style. Output is
    `{nothing_to_emit, document, report}`. Show the operator `report` (dimensions
    run, findings per dimension, `dropped_findings`). Save `.document` to a file;
@@ -170,27 +223,37 @@ but collate cannot know a leaf's contract, so vet completes it (step 4).
    Do not edit `ref`, `leaf_key` or `success_criteria`: the keys carry
    idempotency (below) and the rubric already matches the finding.
 5. **emit** — `cat <document-file> | clawpm tasks emit-tree --dry-run`, then the
-   real call, then **PAUSE** for operator review. Do not dispatch.
+   real call, then **PAUSE** for operator review. Do not dispatch. The PAUSE
+   summary repeats every "dimension X: files A..B not covered" gap from step 2.
 
 **Re-runs** are idempotent through each leaf's `leaf_key` and `root.attach_to`
 (hard rule 6): to top up, replace the document's `root` with
 `{"attach_to": "<root-id>"}` before emitting. A finding whose line moved gets a
 new key and may re-emit once; vet and the won't-do gate are the backstop.
 
-Dimension agent brief (copy; fill `<dimension>` and `<scope>`):
+Dimension agent brief (copy; fill `<dimension>`, `<files>`, `<cap>` (default 15),
+`<ledger>` and `<turns>` (default 25)):
 
 ```text
-You are auditing the dimension "<dimension>" of <scope>. READ-ONLY: do not edit,
-create or delete files, and do not run mutating commands.
-Return ONLY a JSON list of findings, no prose. `[]` is a valid answer; never
-pad. Each finding has exactly these keys:
+You are auditing the dimension "<dimension>". Audit ONLY these files:
+<files>
+READ-ONLY: do not edit, create or delete files, and do not run mutating
+commands. Do not run clawpm commands. By-design behaviour, do NOT report:
+<ledger>
+BUDGET: about <turns> tool turns. Read the files, then answer; if the budget runs
+low, return the findings you have so far rather than nothing, and list the
+assigned files you did not read on the COVERAGE line.
+Your FINAL message is the JSON list of findings (no code fence), then ONE last
+line, exactly: COVERAGE: <n_read>/<n_assigned> files; unread: <comma-separated
+paths, or none>
+Every assigned file must be counted as read or listed unread. `[]` is a valid
+answer only with full coverage; never pad. Each finding has exactly these keys:
   {"dimension": "<dimension>", "file": "<repo-relative path>", "line": <positive
    integer or null>, "title": "<short defect statement>",
    "severity": "critical|high|medium|low|info", "evidence": "<file:line and the
    offending text>"}
-Report at most 15 findings, highest severity first. Cite only code you read.
-Do NOT report behaviour that is by design (see `clawpm constitution list` and
-`clawpm tasks list --state rejected`) or style preferences with no defect.
+Report at most <cap> findings, highest severity first. Cite only code you read.
+Do NOT report style preferences with no defect.
 ```
 
 ## The emit call

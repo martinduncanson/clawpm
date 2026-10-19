@@ -8,6 +8,7 @@ Every merged feature or fix PR adds one line under `## [Unreleased]`. See "Relea
 
 ### Changed
 
+- clawpm-planner audit mode fan-out: dimension agents are `auditor` (never `Explore`), the orchestrator scopes each to a file list (split until every agent is within 40 files and 8,000 lines) and pastes the won't-do ledger in, the brief carries a turn budget, a JSON reply plus a `COVERAGE:` line naming unread files, and a failed or partial agent is retried on its full original scope, with any uncovered files reported instead of a silent partial audit (CLAWP-099 round 3a) (#134, CLAWP-099).
 - clawpm-planner SKILL.md: real `audit` mode prose (fan-out brief, `clawpm audit collate`, vet with per-leaf contract completion, emit, pause) replacing the stub, and the "not a code auditor" lines reconciled (CLAWP-099 round 2b) (#133, CLAWP-099).
 
 ### Added
