@@ -2134,14 +2134,15 @@ def _tasks_dispatch_impl(
                     fmt=fmt,
                 )
                 sys.exit(1)
+            from clawpm.sessions import canonical_path
             _wt_differs = False
             if _branch_wt is not None:
                 # CLAWP-161: an identity comparison; an unresolvable side
                 # refuses rather than assuming the two are the same.
                 try:
                     _wt_differs = _os.path.normcase(
-                        str(_branch_wt.resolve())
-                    ) != _os.path.normcase(str(_existing_wt.resolve()))
+                        str(canonical_path(_branch_wt))
+                    ) != _os.path.normcase(str(canonical_path(_existing_wt)))
                 except (OSError, RuntimeError) as exc:
                     output_error(
                         "branch_worktree_unresolvable",

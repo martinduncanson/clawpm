@@ -10,6 +10,7 @@ from pathlib import Path
 import yaml
 
 from .concurrency import file_lock
+from .sessions import canonical_identity
 from .frontmatter import FrontmatterError, parse_frontmatter, split_frontmatter
 from .models import (
     Research,
@@ -240,7 +241,7 @@ def add_research(
     # file_lock, reentrant per-thread): two writers must not both scan the same
     # ids and mint the same one. file_lock needs an absolute path; LockTimeout
     # propagates (as in tasks.py). The sentinel is not *.md so scans ignore it.
-    with file_lock(research_dir.resolve() / ".clawpm-research.lock"):
+    with file_lock(canonical_identity(research_dir, "the research lock") / ".clawpm-research.lock"):
         today = date.today().isoformat()
 
         # Generate research ID if not provided
