@@ -23,7 +23,7 @@ predictions:
     the edit path wholesale-replaces blocks. Every leaf that adds a field must add
     a round-trip test through all three paths.
 priority: 5
-updated: '2026-09-02'
+updated: '2026-10-19'
 ---
 # Decision maps: wayfinder-shaped decide-before-build inside clawpm (ADR-2026-09-02)
 

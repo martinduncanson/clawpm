@@ -22,7 +22,10 @@ predictions:
     exact clawpm commands/fields consumed, and a decision on whether it''s worth building
     at all'
 priority: 7
-updated: '2026-07-06'
+rationale: 'Operator 2026-10-19: drop the cron Slack standup digest. Pre-mortem was
+  ''a digest nobody reads''; any Slack post also needs per-post operator approval.
+  Revisit only if the operator asks for a digest.'
+updated: '2026-10-19'
 ---
 # Explore: cron-driven cross-project standup digest using clawpm's own JSON output
 
