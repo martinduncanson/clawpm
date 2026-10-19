@@ -36,7 +36,7 @@ Constitution load (stage 1), the vet stage (re-read cited ground, reject by-desi
 
 ## Dedup key
 
-Within one normalised path (backslashes to `/`, leading `./` stripped), title token sets (lowercase alphanumerics, stopwords dropped) with Jaccard >= 0.6 merge, on the same line or a different one. A shared line alone never merges: unrelated defects (a locking bug and a token-logging bug) can sit on one line, and merging them would hide one with no dropped marker.
+Within one normalised path (backslashes to `/`, leading `./` stripped, compared casefolded because the project is Windows-first; the emitted text keeps the kept finding's own spelling), title token sets (lowercase alphanumerics, stopwords dropped) with Jaccard >= 0.6 merge, on the same line or a different one. A shared line alone never merges: unrelated defects (a locking bug and a token-logging bug) can sit on one line, and merging them would hide one with no dropped marker.
 
 A title with no tokens at all (single characters such as `X`, or non-Latin scripts) cannot use Jaccard. Two such titles merge only when their normalised full titles (casefolded, whitespace collapsed) are equal; an empty-token title never merges with a token-bearing one.
 

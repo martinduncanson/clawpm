@@ -89,6 +89,45 @@ def test_path_spelling_is_normalised_for_the_key():
     assert merged[0].file == "src/clawpm/tasks.py"
 
 
+def _doc(*findings):
+    doc, _ = build_emit_document(
+        parse_findings({"correctness": list(findings)}), root_title="R")
+    return doc
+
+
+def test_paths_differing_only_in_case_are_one_file():
+    a = _f(file="SRC/clawpm/tasks.py")
+    b = _f(file="src/clawpm/tasks.py", evidence="second reading")
+    doc = _doc(a, b)
+    assert len(doc["leaves"]) == 1
+    assert _doc(a)["leaves"][0]["leaf_key"] == _doc(b)["leaves"][0]["leaf_key"]
+
+
+def test_paths_differing_in_separator_and_case_are_one_file():
+    a = _f(file="SRC\\clawpm\\Tasks.py")
+    b = _f(file="./src/clawpm/tasks.py", evidence="second reading")
+    assert len(_doc(a, b)["leaves"]) == 1
+
+
+def test_case_variant_paths_are_independent_of_input_order():
+    a = _f(file="SRC/clawpm/tasks.py")
+    b = _f(file="src/clawpm/tasks.py", evidence="second reading")
+    forward, backward = _doc(a, b), _doc(b, a)
+    assert json.dumps(forward, sort_keys=True) == json.dumps(backward, sort_keys=True)
+    # Displayed spelling is the first finding's in the total sort order (b's
+    # evidence sorts before a's), not the first one supplied.
+    assert forward["leaves"][0]["scope"] == ["src/clawpm/tasks.py"]
+    # With every other field equal, the spelling tiebreak is the path itself.
+    same_a, same_b = _f(file="SRC/clawpm/tasks.py"), _f(file="src/clawpm/tasks.py")
+    assert _doc(same_a, same_b) == _doc(same_b, same_a)
+    assert _doc(same_a, same_b)["leaves"][0]["scope"] == ["SRC/clawpm/tasks.py"]
+
+
+def test_different_files_stay_separate_despite_case_folding():
+    doc = _doc(_f(file="src/clawpm/tasks.py"), _f(file="src/clawpm/Other.py"))
+    assert len(doc["leaves"]) == 2
+
+
 def test_empty_dimension_is_fine_and_all_empty_gives_no_findings():
     assert dedup_findings(parse_findings({"security": []})) == []
     assert dedup_findings(parse_findings({})) == []

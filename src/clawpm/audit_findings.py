@@ -75,6 +75,12 @@ def _norm_path(path: str) -> str:
     return re.sub(r"/{2,}", "/", p)
 
 
+def _path_key(path: str) -> str:
+    # Comparison/key material only: Windows-first, so case-variant spellings are
+    # one file. The emitted text keeps the kept finding's own spelling.
+    return path.casefold()
+
+
 def _tokens(title: str) -> frozenset[str]:
     words = re.findall(r"[a-z0-9]+", title.lower())
     return frozenset(w for w in words if w not in _STOPWORDS and len(w) > 1)
@@ -141,7 +147,7 @@ def parse_findings(by_dimension: dict[str, Any]) -> list[Finding]:
 
 
 def _same_defect(a: Finding, b: Finding) -> bool:
-    if a.file != b.file:
+    if _path_key(a.file) != _path_key(b.file):
         return False
     ta, tb = _tokens(a.title), _tokens(b.title)
     if not ta and not tb:  # no Latin tokens (e.g. "X", CJK): identical titles only
@@ -154,8 +160,8 @@ def _same_defect(a: Finding, b: Finding) -> bool:
 def _sort_key(f: Finding) -> tuple:
     # Covers every field, so the order (and the evidence merged in that order)
     # cannot depend on how the agents returned their findings.
-    return (f.file, f.line or 0, _DIM_RANK[f.dimension], f.title,
-            _SEV_RANK[f.severity], f.evidence)
+    return (_path_key(f.file), f.line or 0, _DIM_RANK[f.dimension], f.title,
+            _SEV_RANK[f.severity], f.evidence, f.file)
 
 
 def dedup_findings(findings: list[Finding]) -> list[MergedFinding]:
@@ -179,7 +185,7 @@ def dedup_findings(findings: list[Finding]) -> list[MergedFinding]:
             severity=rep.severity, evidence=evidence,
         ))
     merged.sort(key=lambda m: (_SEV_RANK[m.severity], -len(m.dimensions),
-                               m.file, m.line or 0, m.title))
+                               _path_key(m.file), m.line or 0, m.title, m.file))
     return merged
 
 
@@ -187,7 +193,7 @@ def _leaf_key(m: MergedFinding) -> str:
     tokens = _tokens(m.title)
     # Empty token set: key on the normalised title, or distinct findings collide.
     ident = " ".join(sorted(tokens)) if tokens else "title:" + _norm_title(m.title)
-    basis = f"{m.file}|{m.line}|{ident}"
+    basis = f"{_path_key(m.file)}|{m.line}|{ident}"
     return "audit-" + hashlib.sha1(basis.encode("utf-8")).hexdigest()[:12]
 
 
