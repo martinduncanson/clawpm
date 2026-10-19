@@ -104,6 +104,13 @@ specify interview discipline, l/xl approach lenses (minimal / clean / pragmatic)
    open decisions and nothing worth parking as fog, say so and offer plain decompose. s never charts. Procedure and
    shape: `references/chart-mode.md`; copy `examples/decision-map.emit.json`.
 
+## Audit mode (STUB, CLAWP-099 round 2 writes this)
+
+Decided: project-health audit is a mode of this skill, not a separate skill. Fan
+out one read-only agent per dimension, normalise and dedup with
+`clawpm.audit_findings`, vet, then emit as usual. Design:
+`docs/design/2026-10-19-project-health-audit-pipeline.md`.
+
 ## The emit call
 
 The emit stage builds one JSON document and pipes it to the CLI on stdin:
