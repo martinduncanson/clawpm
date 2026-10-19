@@ -144,6 +144,45 @@ class TestCanonicalPath:
         with pytest.raises(FileNotFoundError):
             canonical_path(alias)
 
+    def test_dangling_link_ancestor_of_a_missing_child_refuses(self, tmp_path):
+        """``alias/child`` with a dangling ``alias``: restoring the target would
+        change the identity, so it must refuse rather than return the spelling."""
+        gone = tmp_path / "gone"
+        gone.mkdir()
+        alias = make_alias(tmp_path, gone)
+        gone.rmdir()
+        with pytest.raises(FileNotFoundError):
+            canonical_path(alias / "child")
+        with pytest.raises(FileNotFoundError):
+            canonical_path(alias / "child" / "grandchild")
+
+    def test_dangling_link_ancestor_resolves_once_target_returns(self, tmp_path):
+        gone = tmp_path / "gone"
+        gone.mkdir()
+        alias = make_alias(tmp_path, gone)
+        gone.rmdir()
+        with pytest.raises(FileNotFoundError):
+            canonical_path(alias / "child")
+        gone.mkdir()
+        assert canonical_path(alias / "child") == gone.resolve(strict=True) / "child"
+
+    @pytest.mark.skipif(os.name != "nt", reason="Win32 strips trailing dots and spaces")
+    @pytest.mark.parametrize("name", ["new.", "new ", "new..", "new. "])
+    def test_windows_trailing_dot_or_space_in_a_missing_component_refuses(
+        self, tmp_path, name
+    ):
+        with pytest.raises(FileNotFoundError, match="trailing"):
+            canonical_path(tmp_path / name)
+        with pytest.raises(FileNotFoundError, match="trailing"):
+            canonical_path(tmp_path / name / "child")
+
+    @pytest.mark.skipif(os.name != "nt", reason="Win32 strips trailing dots and spaces")
+    def test_windows_trailing_dot_on_an_existing_component_is_resolved(self, tmp_path):
+        (tmp_path / "there").mkdir()
+        assert canonical_path(tmp_path / "there.") == (tmp_path / "there").resolve(
+            strict=True
+        )
+
     def test_dotdot_under_a_missing_directory_never_guesses(self, tmp_path):
         """POSIX cannot step through a missing directory: refuse. Windows
         normalises ``..`` lexically, so the stat sees the real parent."""

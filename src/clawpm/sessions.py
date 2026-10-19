@@ -283,16 +283,20 @@ def canonical_path(path: Path, *, known_canonical: bool = False) -> Path:
 def _canonical_absent(path: Path) -> Path:
     """Canonical identity of a path that does not exist yet (CLAWP-162).
 
-    Re-raises the ``FileNotFoundError`` for a dangling link (``lstat`` works
-    but ``stat`` did not: the link's target is the unavailable part) and for a
-    ``..`` in the missing tail, which cannot be applied lexically.
+    The identity must not change once the path is created, so every way a
+    missing component's spelling could differ from its created spelling is
+    refused with ``FileNotFoundError``:
+
+    * a dangling link at ANY depth (``lstat`` works but ``stat`` did not: the
+      link's target is the unavailable part);
+    * a ``..`` in the missing tail, which cannot be applied lexically;
+    * Windows only: a component ending in ``.`` or a space, which Win32 strips
+      on creation.
+
+    Not refused: case on a case-insensitive volume (the creating spelling
+    wins, and the ancestor is resolved strictly) and 8.3 short names (a missing
+    short spelling cannot be told apart from a literal name).
     """
-    try:
-        os.lstat(path)
-    except FileNotFoundError:
-        pass
-    else:
-        raise FileNotFoundError(f"{path} is a link whose target does not exist")
     absolute = path if path.is_absolute() else Path.cwd() / path
     tail: list[str] = []
     probe = absolute
@@ -300,6 +304,14 @@ def _canonical_absent(path: Path) -> Path:
         try:
             os.stat(probe)
         except FileNotFoundError:
+            try:
+                os.lstat(probe)
+            except FileNotFoundError:
+                pass
+            else:
+                raise FileNotFoundError(
+                    f"{probe} is a link whose target does not exist"
+                ) from None
             if probe.parent == probe:
                 raise
             tail.append(probe.name)
@@ -308,6 +320,13 @@ def _canonical_absent(path: Path) -> Path:
         break
     if ".." in tail:
         raise FileNotFoundError(f"{path} has a '..' beneath a missing directory")
+    if os.name == "nt":
+        for name in tail:
+            if name.endswith((".", " ")):
+                raise FileNotFoundError(
+                    f"{path} has a missing component {name!r} with a trailing "
+                    f"dot or space, which Windows strips on creation"
+                )
     return probe.resolve(strict=True).joinpath(*reversed(tail))
 
 

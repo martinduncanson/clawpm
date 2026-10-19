@@ -372,6 +372,7 @@ class TestTargetDirResolveGuardEverySite:
 
         task = add_task(fx["config"], "test", "lease me")
         bad = fx["elsewhere"] / "unavailable-volume"
+        bad.mkdir()  # CLAWP-162: a missing path no longer reaches the strict resolve
         self._patch(monkeypatch, None)
         result = CliRunner().invoke(
             main,
@@ -475,6 +476,7 @@ class TestTargetDirResolveGuardEverySite:
         real = fx["elsewhere"] / "real-target"
         real.mkdir()
         alias = fx["elsewhere"] / "alias-spelling"
+        alias.mkdir()  # stands in for the junction: must exist to be resolved
         real_resolve = Path.resolve
 
         def junction(self, *a, **kw):
@@ -502,6 +504,7 @@ class TestTargetDirResolveGuardEverySite:
         from clawpm.dispatch import dispatch_lock_path
 
         bad = fx["elsewhere"] / "unavailable-volume"
+        bad.mkdir()  # CLAWP-162: a missing path no longer reaches the strict resolve
         self._patch(monkeypatch, None)
         with pytest.raises(OSError):
             dispatch_lock_path(fx["root"], bad)
@@ -517,6 +520,7 @@ class TestTargetDirResolveGuardEverySite:
                 raise RuntimeError("Symlink loop from 'symlink-loop'")
             return real_resolve(self, *a, **kw)
 
+        (fx["elsewhere"] / "symlink-loop").mkdir()  # must exist to be resolved strictly
         monkeypatch.setattr(Path, "resolve", loop)
         with pytest.raises(OSError, match="Symlink loop"):
             canonical_path(fx["elsewhere"] / "symlink-loop")
@@ -612,6 +616,7 @@ class TestTargetDirResolveGuardEverySite:
         from clawpm.dispatch import teardown_dispatch_settings
 
         bad = fx["elsewhere"] / "unavailable-volume"
+        bad.mkdir()  # CLAWP-162: a missing path no longer reaches the strict resolve
         self._patch(monkeypatch, None)
         with pytest.raises(OSError):
             teardown_dispatch_settings(bad, portfolio_root=fx["root"])
@@ -627,6 +632,7 @@ class TestTargetDirResolveGuardEverySite:
 
     def test_teardown_target_unresolvable_is_a_clean_error(self, fx, monkeypatch):
         bad = fx["elsewhere"] / "unavailable-volume"
+        bad.mkdir()  # CLAWP-162: a missing path no longer reaches the strict resolve
         self._patch(monkeypatch, None)
         result = CliRunner().invoke(
             main,
