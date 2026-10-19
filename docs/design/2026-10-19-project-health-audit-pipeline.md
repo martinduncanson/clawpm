@@ -36,12 +36,9 @@ Constitution load (stage 1), the vet stage (re-read cited ground, reject by-desi
 
 ## Dedup key
 
-Within one normalised path (backslashes to `/`, leading `./` stripped):
+Within one normalised path (backslashes to `/`, leading `./` stripped), title token sets (lowercase alphanumerics, stopwords dropped) with Jaccard >= 0.6 merge, on the same line or a different one. A shared line alone never merges: unrelated defects (a locking bug and a token-logging bug) can sit on one line, and merging them would hide one with no dropped marker.
 
-1. same non-null `line` merges, whatever the wording;
-2. title token sets (lowercase alphanumerics, stopwords dropped) with Jaccard >= 0.6 merge, even on different lines.
-
-The first match wins, over input sorted by (file, line, dimension, title), so the result does not depend on agent return order. A merged finding keeps the highest severity, the union of dimensions, and all distinct evidence. Corroboration by several dimensions is signal and sorts earlier. The fuzzy stage is deliberately conservative: a missed merge costs one duplicate leaf that vet catches; a false merge hides a defect.
+The first match wins, over input sorted by every field (file, line, dimension, title, severity, evidence), so the result, including which evidence survives the 300-char truncation, does not depend on agent return order. A merged finding keeps the highest severity, the union of dimensions, and all distinct evidence. Corroboration by several dimensions is signal and sorts earlier. The fuzzy stage is deliberately conservative: a missed merge costs one duplicate leaf that vet catches; a false merge hides a defect.
 
 ## emit-tree mapping
 
@@ -66,6 +63,7 @@ Re-running the audit against the same root with `attach_to` skips leaves whose `
 
 - **Agent returns malformed JSON or a bad field:** whole batch rejected with every problem listed; the skill re-asks that one dimension, never hand-patches.
 - **Dimension agent times out or returns nothing:** indistinguishable from "no findings" in the data, so the skill must state which dimensions ran. Round 2 prose requires that line in the audit summary.
+- **Audit finds nothing:** a successful no-op. `build_emit_document` returns `doc = None` and `report["nothing_to_emit"] = true`; the skill reports "0 findings, nothing to emit" and does not call emit-tree, whose parser rejects an empty `leaves` list.
 - **Two agents describe one defect in unrelated words:** survives as two leaves; vet catches it.
 - **Cap drops a real finding:** visible in the report, not silent.
 - **Audit run rarely, rots:** mitigated by there being almost no new surface (one module, one skill section).

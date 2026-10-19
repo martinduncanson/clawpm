@@ -7,6 +7,8 @@ emit-tree document. Model judgment (what to report, vetting) stays in the skill.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from clawpm.audit_findings import (
@@ -35,10 +37,10 @@ def test_dimensions_cover_the_seven_audit_lenses():
     }
 
 
-def test_same_file_line_from_two_dimensions_merges_to_one():
+def test_same_file_line_same_defect_from_two_dimensions_merges_to_one():
     found = parse_findings({
         "correctness": [_f("correctness", severity="medium")],
-        "security": [_f("security", title="Unlocked write allows torn state",
+        "security": [_f("security", title="Lock released before the write completes",
                         severity="high")],
     })
     merged = dedup_findings(found)
@@ -64,6 +66,18 @@ def test_different_defects_in_same_file_stay_separate():
            dimension="dead_code")
     merged = dedup_findings(parse_findings({"correctness": [a], "dead_code": [b]}))
     assert len(merged) == 2
+
+
+def test_different_defects_on_the_same_file_and_line_stay_separate():
+    a = _f("correctness", line=10, title="Lock released before write completes")
+    b = _f("security", line=10, title="Token logged in plaintext",
+           severity="critical", evidence="tasks.py:10 logs the bearer token")
+    merged = dedup_findings(parse_findings({"correctness": [a], "security": [b]}))
+    assert len(merged) == 2
+    assert {m.title for m in merged} == {a["title"], b["title"]}
+    keys = [lf["leaf_key"] for lf in build_emit_document(
+        parse_findings({"correctness": [a], "security": [b]}), root_title="R")[0]["leaves"]]
+    assert len(set(keys)) == 2
 
 
 def test_path_spelling_is_normalised_for_the_key():
@@ -132,6 +146,36 @@ def test_emit_document_validates_against_emit_tree_schema():
     assert report["dropped"] == 0
     assert all(lf.scope for lf in parsed.leaves)
     assert all(lf.success_criteria for lf in parsed.leaves)
+
+
+def test_identical_location_and_title_output_is_independent_of_input_order():
+    # Same file/line/dimension/title/severity, different evidence: the
+    # emitted gradeable_signal is truncated, so order must not pick the winner.
+    items = [
+        _f(evidence="evidence-A " + "a" * 400),
+        _f(evidence="evidence-B " + "b" * 400),
+        _f(evidence="evidence-C " + "c" * 400),
+    ]
+    forward, _ = build_emit_document(
+        parse_findings({"correctness": items}), root_title="R")
+    backward, _ = build_emit_document(
+        parse_findings({"correctness": list(reversed(items))}), root_title="R")
+    assert json.dumps(forward, sort_keys=True) == json.dumps(backward, sort_keys=True)
+    assert json.dumps(forward) == json.dumps(backward)  # key order too
+
+
+def test_zero_findings_is_an_explicit_noop_not_an_invalid_document():
+    doc, report = build_emit_document(parse_findings({"security": []}), root_title="R")
+    assert doc is None
+    assert report["input"] == 0 and report["kept"] == 0
+    assert report["nothing_to_emit"] is True
+
+
+def test_non_empty_result_reports_something_to_emit_and_parses():
+    doc, report = build_emit_document(parse_findings({"correctness": [_f()]}),
+                                      root_title="R")
+    assert report["nothing_to_emit"] is False
+    parse_emit_document(doc)  # real parser accepts it
 
 
 def test_leaf_keys_are_stable_across_runs_and_input_order():

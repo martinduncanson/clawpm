@@ -6,10 +6,9 @@ dedup by a stable key, severity ordering, a volume cap, and the mapping to an
 emit-tree document. ZERO LLM calls; the vetting gates (constitution, won't-do
 ledger) stay in ``emit_tree``.
 
-Dedup key, two stages within one normalised file path:
-  1. same ``line`` (both non-null) -> same finding, whatever the wording;
-  2. title token sets (stopwords dropped) with Jaccard >= ``TITLE_JACCARD``
-     -> same defect, even on a different line.
+Dedup key, within one normalised file path: title token sets (stopwords
+dropped) with Jaccard >= ``TITLE_JACCARD`` -> same defect, on any line. A shared
+line alone is NOT identity: unrelated defects can sit on one line.
 Design: docs/design/2026-10-19-project-health-audit-pipeline.md
 """
 
@@ -138,8 +137,6 @@ def parse_findings(by_dimension: dict[str, Any]) -> list[Finding]:
 def _same_defect(a: Finding, b: Finding) -> bool:
     if a.file != b.file:
         return False
-    if a.line is not None and a.line == b.line:
-        return True
     ta, tb = _tokens(a.title), _tokens(b.title)
     if not ta or not tb:
         return False
@@ -147,7 +144,10 @@ def _same_defect(a: Finding, b: Finding) -> bool:
 
 
 def _sort_key(f: Finding) -> tuple:
-    return (f.file, f.line or 0, _DIM_RANK[f.dimension], f.title)
+    # Covers every field, so the order (and the evidence merged in that order)
+    # cannot depend on how the agents returned their findings.
+    return (f.file, f.line or 0, _DIM_RANK[f.dimension], f.title,
+            _SEV_RANK[f.severity], f.evidence)
 
 
 def dedup_findings(findings: list[Finding]) -> list[MergedFinding]:
@@ -184,10 +184,13 @@ def build_emit_document(
     findings: list[Finding],
     root_title: str,
     max_findings: int = DEFAULT_MAX_FINDINGS,
-) -> tuple[dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Dedup, cap and map to an emit-tree document. Returns ``(doc, report)``.
 
-    The report names every dropped finding so the cap is never silent.
+    The report names every dropped finding so the cap is never silent. A clean
+    audit (no findings) is a successful no-op: ``doc`` is ``None`` and
+    ``report["nothing_to_emit"]`` is true, because ``parse_emit_document``
+    rejects an empty ``leaves`` list.
     """
     if max_findings < 1:
         raise ValueError("max_findings must be >= 1")
@@ -212,8 +215,12 @@ def build_emit_document(
             "scope": [m.file],
             "delegability": "either",
         })
-    doc = {"schema_version": 1, "root": {"title": root_title}, "leaves": leaves}
+    doc = (
+        {"schema_version": 1, "root": {"title": root_title}, "leaves": leaves}
+        if leaves else None
+    )
     report = {
+        "nothing_to_emit": doc is None,
         "input": len(findings),
         "merged": len(merged),
         "kept": len(kept),
