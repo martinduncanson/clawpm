@@ -36,7 +36,7 @@ Constitution load (stage 1), the vet stage (re-read cited ground, reject by-desi
 
 ## Dedup key
 
-Within one normalised path (backslashes to `/`, leading `./` stripped, compared casefolded because the project is Windows-first; the emitted text keeps the kept finding's own spelling), title token sets (lowercase alphanumerics, stopwords dropped) with Jaccard >= 0.6 merge, on the same line or a different one. A shared line alone never merges: unrelated defects (a locking bug and a token-logging bug) can sit on one line, and merging them would hide one with no dropped marker.
+Within one normalised path (backslashes to `/`, leading `./` stripped, compared with `.lower()` because the project is Windows-first; the emitted text keeps the kept finding's own spelling), title token sets (lowercase alphanumerics, stopwords dropped) with Jaccard >= 0.6 merge, on the same line or a different one. A shared line alone never merges: unrelated defects (a locking bug and a token-logging bug) can sit on one line, and merging them would hide one with no dropped marker.
 
 A title with no tokens at all (single characters such as `X`, or non-Latin scripts) cannot use Jaccard. Two such titles merge only when their normalised full titles (casefolded, whitespace collapsed) are equal; an empty-token title never merges with a token-bearing one.
 
@@ -66,6 +66,7 @@ Re-running the audit against the same root with `attach_to` skips leaves whose `
 - **Agent returns malformed JSON or a bad field:** whole batch rejected with every problem listed; the skill re-asks that one dimension, never hand-patches.
 - **Dimension agent times out or returns nothing:** indistinguishable from "no findings" in the data, so the skill must state which dimensions ran. Round 2 prose requires that line in the audit summary.
 - **Audit finds nothing:** a successful no-op. `build_emit_document` returns `doc = None` and `report["nothing_to_emit"] = true`; the skill reports "0 findings, nothing to emit" and does not call emit-tree, whose parser rejects an empty `leaves` list.
+- **Path comparison is ASCII-case-insensitive via `.lower()`:** on POSIX, two files that differ only by case merge into one leaf. Full Windows filename identity (Unicode upcase tables, 8.3 short names) is deliberately out of scope for this scaffold. `.lower()` is used over `casefold()` because casefold folds the sharp s to `ss`, which would merge `src/straße.py` and `src/strasse.py`, files Windows keeps distinct.
 - **Two agents describe one defect in unrelated words:** survives as two leaves; vet catches it.
 - **Cap drops a real finding:** visible in the report, not silent.
 - **Audit run rarely, rots:** mitigated by there being almost no new surface (one module, one skill section).

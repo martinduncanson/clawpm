@@ -128,6 +128,26 @@ def test_different_files_stay_separate_despite_case_folding():
     assert len(doc["leaves"]) == 2
 
 
+def test_non_ascii_case_folding_does_not_merge_distinct_files():
+    # casefold() maps ss <-> the sharp s; Windows treats these as distinct files.
+    a, b = _f(file="src/straße.py"), _f(file="src/strasse.py")
+    doc = _doc(a, b)
+    assert len(doc["leaves"]) == 2
+    assert len({leaf["leaf_key"] for leaf in doc["leaves"]}) == 2
+    assert sorted(leaf["scope"][0] for leaf in doc["leaves"]) == [
+        "src/strasse.py", "src/straße.py"]
+
+
+def test_lowercase_non_ascii_path_key_is_unchanged_from_the_pre_normalisation_head():
+    # Pinned by running audit_findings.py at 4cd4f0df on this input.
+    assert _doc(_f(file="src/straße.py"))["leaves"][0]["leaf_key"] == "audit-2bcbd572a271"
+
+
+def test_non_ascii_distinct_files_are_independent_of_input_order():
+    a, b = _f(file="src/straße.py"), _f(file="src/strasse.py", evidence="other")
+    assert json.dumps(_doc(a, b), sort_keys=True) == json.dumps(_doc(b, a), sort_keys=True)
+
+
 def test_empty_dimension_is_fine_and_all_empty_gives_no_findings():
     assert dedup_findings(parse_findings({"security": []})) == []
     assert dedup_findings(parse_findings({})) == []

@@ -76,9 +76,11 @@ def _norm_path(path: str) -> str:
 
 
 def _path_key(path: str) -> str:
-    # Comparison/key material only: Windows-first, so case-variant spellings are
-    # one file. The emitted text keeps the kept finding's own spelling.
-    return path.casefold()
+    # Comparison/key material only: Windows-first, so ASCII case-variant
+    # spellings are one file. lower(), not casefold(): casefold maps the sharp s
+    # to "ss", merging files Windows keeps distinct. The emitted text keeps the
+    # kept finding's own spelling.
+    return path.lower()
 
 
 def _tokens(title: str) -> frozenset[str]:
