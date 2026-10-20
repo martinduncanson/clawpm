@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+import os
+import subprocess
+from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 
 import pytest
@@ -67,3 +69,71 @@ def isolated_portfolio(tmp_path: Path, monkeypatch) -> SimpleNamespace:
         project_dir=project_dir,
         tasks_dir=tasks_dir,
     )
+
+
+# ---------------------------------------------------------------------------
+# CLAUD-094: no test may spawn a real `claude` process.
+#
+# Tests patched `_default_judge_invoker` after `evaluate_stop_condition` had
+# moved to `make_judge_invoker()`, so the patch did nothing and the suite
+# launched real `claude --print` judges (1,189 sessions in two weeks). The
+# guard makes any such spawn fail the test loudly. It wraps `Popen.__init__`
+# (which `subprocess.run` goes through), raises `pytest.fail` (a
+# BaseException, so `except Exception` handlers cannot swallow it) and also
+# records the attempt, so a swallowed failure still fails the test at
+# teardown. A test that provokes the guard on purpose drains
+# `claude_spawn_attempts`.
+# ---------------------------------------------------------------------------
+
+_CLAUDE_SPAWN_ATTEMPTS: list = []
+
+
+def _is_claude_spawn(args) -> bool:
+    if isinstance(args, (str, bytes)):
+        first = os.fsdecode(args).strip().split(" ")[0]
+    elif isinstance(args, os.PathLike):
+        first = os.fsdecode(args)
+    else:
+        try:
+            first = os.fsdecode(next(iter(args)))
+        except (StopIteration, TypeError):
+            return False
+    # PureWindowsPath splits on both separators on every OS; plain Path on
+    # POSIX keeps `C:\tools\claude.cmd` as one name, so the guard missed it.
+    return PureWindowsPath(first.strip("\"'")).stem.lower() == "claude"
+
+
+@pytest.fixture
+def claude_spawn_attempts() -> list:
+    """The recorded spawn attempts; clear it when a test provokes the guard."""
+    return _CLAUDE_SPAWN_ATTEMPTS
+
+
+@pytest.fixture(autouse=True)
+def _no_real_claude_spawn():
+    real_init = subprocess.Popen.__init__
+
+    def guarded_init(self, args, *a, **k):
+        if _is_claude_spawn(args):
+            _CLAUDE_SPAWN_ATTEMPTS.append(args)
+            pytest.fail(
+                f"test tried to spawn a real `claude` process: {args!r}. "
+                "Patch stop_condition.make_judge_invoker, or set "
+                "CLAWPM_JUDGE_CMD / CLAWPM_RESUME_CMD to a stub.",
+                pytrace=False,
+            )
+        return real_init(self, args, *a, **k)
+
+    # Not `monkeypatch`: requesting it here would set it up before every other
+    # fixture and tear it down after them, so a test's `monkeypatch.chdir` would
+    # outlive a tmp-dir fixture and block its rmtree on Windows.
+    subprocess.Popen.__init__ = guarded_init
+    _CLAUDE_SPAWN_ATTEMPTS.clear()
+    try:
+        yield
+    finally:
+        subprocess.Popen.__init__ = real_init
+    if _CLAUDE_SPAWN_ATTEMPTS:
+        attempts = list(_CLAUDE_SPAWN_ATTEMPTS)
+        _CLAUDE_SPAWN_ATTEMPTS.clear()
+        pytest.fail(f"real `claude` spawn attempted during test: {attempts!r}")
