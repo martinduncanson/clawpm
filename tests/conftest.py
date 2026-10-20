@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 
 import pytest
@@ -98,7 +98,9 @@ def _is_claude_spawn(args) -> bool:
             first = os.fsdecode(next(iter(args)))
         except (StopIteration, TypeError):
             return False
-    return Path(first.strip("\"'")).stem.lower() == "claude"
+    # PureWindowsPath splits on both separators on every OS; plain Path on
+    # POSIX keeps `C:\tools\claude.cmd` as one name, so the guard missed it.
+    return PureWindowsPath(first.strip("\"'")).stem.lower() == "claude"
 
 
 @pytest.fixture

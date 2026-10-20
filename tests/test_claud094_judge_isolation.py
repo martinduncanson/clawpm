@@ -58,10 +58,17 @@ class TestGuard:
         claude_spawn_attempts.clear()  # provoked on purpose; keep teardown quiet
 
     def test_guard_matches_exe_and_full_path(self, claude_spawn_attempts):
-        for args in (["claude.exe", "-p"], [r"C:\tools\claude.cmd"], "claude --print"):
+        # Every form is matched by name before the real Popen runs, on any OS.
+        forms = (
+            ["claude.exe", "-p"],
+            [r"C:\tools\claude.cmd"],
+            ["/usr/local/bin/claude", "-p"],
+            "claude --print",
+        )
+        for args in forms:
             with pytest.raises(pytest.fail.Exception):
                 subprocess.Popen(args)
-        assert len(claude_spawn_attempts) == 3
+        assert len(claude_spawn_attempts) == len(forms)
         claude_spawn_attempts.clear()
 
     def test_guard_ignores_other_commands(self):
