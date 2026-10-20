@@ -108,7 +108,7 @@ def claude_spawn_attempts() -> list:
 
 
 @pytest.fixture(autouse=True)
-def _no_real_claude_spawn(monkeypatch):
+def _no_real_claude_spawn():
     real_init = subprocess.Popen.__init__
 
     def guarded_init(self, args, *a, **k):
@@ -122,9 +122,15 @@ def _no_real_claude_spawn(monkeypatch):
             )
         return real_init(self, args, *a, **k)
 
-    monkeypatch.setattr(subprocess.Popen, "__init__", guarded_init)
+    # Not `monkeypatch`: requesting it here would set it up before every other
+    # fixture and tear it down after them, so a test's `monkeypatch.chdir` would
+    # outlive a tmp-dir fixture and block its rmtree on Windows.
+    subprocess.Popen.__init__ = guarded_init
     _CLAUDE_SPAWN_ATTEMPTS.clear()
-    yield
+    try:
+        yield
+    finally:
+        subprocess.Popen.__init__ = real_init
     if _CLAUDE_SPAWN_ATTEMPTS:
         attempts = list(_CLAUDE_SPAWN_ATTEMPTS)
         _CLAUDE_SPAWN_ATTEMPTS.clear()
