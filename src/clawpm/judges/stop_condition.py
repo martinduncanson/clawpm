@@ -30,6 +30,7 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -54,6 +55,31 @@ except (AttributeError, ValueError, OSError) as _stdio_exc:  # pragma: no cover
 # print mode. Override via env CLAWPM_JUDGE_CMD when you want a different
 # model (e.g. set to `claude --model claude-haiku-4-5 -p`) or a stub for tests.
 DEFAULT_JUDGE_CMD = ["claude", "--print", "--model", "claude-haiku-4-5"]
+
+# Slim profile for PURE grading calls (CLAUD-094). A judge needs no tools, MCP
+# servers, settings, skills or session record: with the user's full harness a
+# judge launch costs ~48.6k first-request tokens against ~4.4k slim, and the
+# global Stop hooks fire inside it. Not `--bare` (needs an API key). Not for
+# the agent-dispatch SUBAGENT runner, which must keep its tools and hooks.
+SLIM_JUDGE_FLAGS = [
+    "--tools", "",
+    "--strict-mcp-config",
+    "--setting-sources", "",
+    "--disable-slash-commands",
+    "--no-session-persistence",
+]
+DEFAULT_JUDGE_CMD_SLIM = DEFAULT_JUDGE_CMD + SLIM_JUDGE_FLAGS
+
+
+def run_in_neutral_dir(run: Callable[[Path], str]) -> str:
+    """Call ``run(cwd)`` with an empty temp directory as the working dir.
+
+    The slim judge must not start in a repo or worktree: ``--setting-sources
+    local`` would reload that tree's ``.claude/settings.local.json`` (the
+    clawpm dispatch Stop hook). An empty directory has no settings to load.
+    """
+    with tempfile.TemporaryDirectory(prefix="clawpm-judge-") as tmp:
+        return run(Path(tmp))
 
 # Fallback judge — a LOCAL model, tried when the primary judge is unavailable
 # (not installed, or exits non-zero, e.g. auth/quota failure). Keeps grading
@@ -276,11 +302,14 @@ def _run_judge_cmd(
 
 def _resolve_judge_cmds(
     judge_cmd_override: str | None = None,
+    slim: bool = False,
 ) -> tuple[list[str], list[str] | None]:
     """Resolve ``(primary_cmd, fallback_cmd_or_None)``.
 
     Primary resolution (highest priority first): ``judge_cmd_override`` →
-    ``CLAWPM_JUDGE_CMD`` env → ``DEFAULT_JUDGE_CMD`` (claude --print).
+    ``CLAWPM_JUDGE_CMD`` env → ``DEFAULT_JUDGE_CMD`` (claude --print), or
+    ``DEFAULT_JUDGE_CMD_SLIM`` when ``slim`` (an explicit command is never
+    rewritten).
 
     Fallback: ``CLAWPM_JUDGE_FALLBACK_CMD`` env → ``DEFAULT_JUDGE_FALLBACK_CMD``
     (local model). Setting the env var to the empty string DISABLES the
@@ -290,7 +319,11 @@ def _resolve_judge_cmds(
         primary = shlex.split(judge_cmd_override)
     else:
         env_cmd = os.environ.get("CLAWPM_JUDGE_CMD")
-        primary = shlex.split(env_cmd) if env_cmd else list(DEFAULT_JUDGE_CMD)
+        primary = (
+            shlex.split(env_cmd)
+            if env_cmd
+            else list(DEFAULT_JUDGE_CMD_SLIM if slim else DEFAULT_JUDGE_CMD)
+        )
 
     fb_env = os.environ.get("CLAWPM_JUDGE_FALLBACK_CMD")
     if fb_env is not None:
@@ -305,6 +338,7 @@ def make_judge_invoker(
     judge_cmd_override: str | None = None,
     cwd: Path | None = None,
     enable_fallback: bool = True,
+    slim: bool = True,
 ) -> JudgeInvoker:
     """Build a judge invoker: primary judge (``claude -p`` by default), with a
     local-model fallback when the primary is UNAVAILABLE (not installed, or
@@ -324,14 +358,28 @@ def make_judge_invoker(
     *performs the work* (its output becomes the transcript) instead of a real
     Claude Code agent honoring the worktree `.claude` hooks. Fallback is a
     JUDGE concept (grade with whatever's available), never an execution one.
+
+    ``slim=True`` (default; CLAUD-094) launches the DEFAULT primary with
+    ``SLIM_JUDGE_FLAGS`` from an empty temp directory, ignoring ``cwd``.
+    It applies only when neither an override nor ``CLAWPM_JUDGE_CMD`` names
+    the command. Callers that run real work through the invoker (the
+    agent-dispatch subagent) pass ``slim=False``.
     """
-    primary, fallback = _resolve_judge_cmds(judge_cmd_override)
+    primary, fallback = _resolve_judge_cmds(judge_cmd_override, slim=slim)
     if not enable_fallback:
         fallback = None
+    run_slim = primary == DEFAULT_JUDGE_CMD_SLIM
+
+    def _run_primary(prompt: str) -> str:
+        if run_slim:
+            return run_in_neutral_dir(
+                lambda neutral: _run_judge_cmd(primary, prompt, cwd=neutral)
+            )
+        return _run_judge_cmd(primary, prompt, cwd=cwd)
 
     def _invoke(prompt: str) -> str:
         try:
-            return _run_judge_cmd(primary, prompt, cwd=cwd)
+            return _run_primary(prompt)
         except JudgeTimeout:
             # Slow primary — surface, do not double the budget via fallback.
             raise

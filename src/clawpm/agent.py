@@ -383,7 +383,8 @@ def _make_default_invoker(
     from .judges.stop_condition import make_judge_invoker
 
     return make_judge_invoker(
-        judge_cmd_override=judge_cmd_override, cwd=cwd, enable_fallback=False
+        judge_cmd_override=judge_cmd_override, cwd=cwd, enable_fallback=False,
+        slim=False,
     )
 
 

@@ -317,7 +317,9 @@ class TestEvalStopWritesIteration:
         def fake_invoker(prompt: str) -> str:
             return '{"ok": false, "reason": "evidence missing"}'
 
-        monkeypatch.setattr(sc_mod, "_default_judge_invoker", fake_invoker)
+        monkeypatch.setattr(
+            sc_mod, "make_judge_invoker", lambda *a, **k: fake_invoker
+        )
 
         config = temp_portfolio["config"]
         task = add_task(
@@ -363,7 +365,9 @@ class TestDoneWithIterationsActual:
         def fake_invoker(prompt: str) -> str:
             return '{"ok": false, "reason": "still working"}'
 
-        monkeypatch.setattr(sc_mod, "_default_judge_invoker", fake_invoker)
+        monkeypatch.setattr(
+            sc_mod, "make_judge_invoker", lambda *a, **k: fake_invoker
+        )
 
         config = temp_portfolio["config"]
         task = add_task(
@@ -446,7 +450,9 @@ class TestEndToEndDispatchSpine:
         def fake_invoker(prompt: str) -> str:
             return next(verdicts)
 
-        monkeypatch.setattr(sc_mod, "_default_judge_invoker", fake_invoker)
+        monkeypatch.setattr(
+            sc_mod, "make_judge_invoker", lambda *a, **k: fake_invoker
+        )
 
         # 1. Add a task with predicted_iterations=1 (we'll observe 3)
         task = add_task(

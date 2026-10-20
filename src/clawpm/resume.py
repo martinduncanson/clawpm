@@ -237,23 +237,30 @@ def _default_resume_invoker(prompt: str) -> str:
     binary is missing — callers handle the graceful-degrade path.
     """
     # Mirror the stop_condition default so the same `claude` install is reused.
-    from .judges.stop_condition import DEFAULT_JUDGE_CMD
+    from .judges.stop_condition import DEFAULT_JUDGE_CMD_SLIM, run_in_neutral_dir
 
     cmd_str = os.environ.get(RESUME_CMD_ENV)
     if cmd_str:
         cmd = shlex.split(cmd_str)
     else:
-        cmd = list(DEFAULT_JUDGE_CMD)
+        cmd = list(DEFAULT_JUDGE_CMD_SLIM)
 
-    try:
-        result = subprocess.run(
+    def _run(cwd: Path) -> "subprocess.CompletedProcess[str]":
+        # Pure text briefing: slim profile from an empty dir (CLAUD-094), the
+        # same launch the Stop-hook judge uses. An explicit CLAWPM_RESUME_CMD
+        # also runs from the empty dir; it names its own flags.
+        return subprocess.run(
             cmd,
             input=prompt,
             capture_output=True,
             text=True,
             encoding="utf-8",
             timeout=60,
+            cwd=str(cwd),
         )
+
+    try:
+        result = run_in_neutral_dir(_run)
     except FileNotFoundError:
         # Re-raise so the caller can decide whether to degrade or fail.
         raise
