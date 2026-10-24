@@ -35,3 +35,9 @@ Two real clones against one bare remote (plus an optional GitHub-backed run behi
 1. ADR note under `docs/design/` (decision, alternatives, why, what it reverses).
 2. `clawpm tasks emit-tree` leaves with success criteria, vertical slices, each independently shippable; the first slice should be the smallest experiment that proves the atomic primitive on the real remote.
 3. Close CLAWP-147-004 with the ADR as its resolution; reconcile CLAWP-052 / 061.
+
+## Operator answers (Martin, 2026-10-24) -- both NO
+- Q1 = NO: a machine never needs to mint task ids offline. Mint = atomic reserve on the remote (compare-and-swap); offline mint fails loudly. No per-machine id blocks.
+- Q2 = NO: two machines never work the SAME task at the same time. Leases stay machine-local; no remote-arbitrated lease, expiry or fencing token. Cross-machine safety = unique ids + a merge discipline for task files + a loud failure if a second machine claims a task the first holds (detect, do not arbitrate).
+- Still in force: Martin wants a real multi-machine MULTIPLE-WRITER setup (not the single-allocator interim as end state). The no/no answers shrink the build, they do not change that goal.
+- Planner run: start in a fresh session, advisor at spec stage, experiment-verify the git-ref CAS on a real bare remote AND GitHub before the ADR commits to it. Reconcile 052/061 in the ADR (their trigger has fired).
