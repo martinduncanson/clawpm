@@ -3,7 +3,10 @@ baseline_ref: '8216581'
 created: '2026-10-19'
 id: CLAWP-163
 priority: 6
-updated: '2026-10-19'
+resolution: 'Part 1: cognition-layer PR #5 merged 2026-11-12 (Martin). Part 2: CLAUDE.md
+  calibration subsection merged in #137 (0937392).'
+resolved_at: '2026-11-12'
+updated: '2026-11-12'
 ---
 # 112 follow-ups: COGNI-007 cross-reference to calibration spec 2.1-2.3/2.8, and CLAUDE.md task-discipline text (core-config PROPOSAL, operator agrees first)
 

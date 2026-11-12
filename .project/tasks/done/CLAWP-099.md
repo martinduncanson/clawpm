@@ -26,7 +26,11 @@ predictions:
     without operator hand-orchestration
   - Decision recorded on whether this is a clawpm-planner mode or a separate skill
 priority: 6
-updated: '2026-10-19'
+resolution: 'Canary 2026-11-12: one auditor on the tooling dimension returned valid
+  JSON + COVERAGE 6/6; collate kept 7/7; 7 findings verified real (none above medium).
+  Full 29-agent audit remains a separate operator decision.'
+resolved_at: '2026-11-12'
+updated: '2026-11-12'
 ---
 # Formalize project-health audit as a repeatable clawpm-planner pipeline (Turbo /audit pattern)
 
