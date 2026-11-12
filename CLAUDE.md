@@ -44,6 +44,12 @@ For recurring iteration patterns, see the dispatch playbooks under `docs/playboo
 
 When a new recurring iteration pattern emerges (e.g. encoding-scan zero-finding loop, dependency-bump compatibility loop), capture it as a sibling playbook so the rubric + invocation are reusable.
 
+### Closing a task honestly (calibration)
+
+- Close with `clawpm tasks state <id> done` and, when the outcome differed from the prediction, add `--miss-category <wrong_signal|wrong_weight|missed_variable|operator_override|noise|structural>` (pick one; `noise` is a valid answer), `--actual-complexity <s|m|l|xl>` and `--resolution "<one line>"`. `done` nudges (never blocks) when a missed prediction has no category.
+- Read the scorecard with `clawpm reflect scorecard`; every cell with n<20 reports insufficient data, so do not tune predictions from it. Definitions: `docs/design/calibration-metrics-spec.md` (2.1-2.4).
+- Use `clawpm tasks list --frontier <root-id>` to see what is startable under a decision map.
+
 ## Release discipline
 
 - Every merged feature or fix PR adds one line under `## [Unreleased]` in `CHANGELOG.md` (Added / Changed / Fixed, cite `(#NN)` and the task id). Add it in the same PR.
