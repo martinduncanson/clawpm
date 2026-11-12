@@ -24,7 +24,10 @@ predictions:
     proves to be noise against held - that is a valid finding, not a failure; report
     it, don''t tune the map to hide it.'
 priority: 5
-updated: '2026-09-02'
+resolution: 'All 112 criteria met: 112-006 closed by CLAWP-163 (CLAUDE.md #137, cognition-layer
+  COGNI-007 #5). Scorecard n<20 gate stays; do not tune from it.'
+resolved_at: '2026-11-12'
+updated: '2026-11-12'
 ---
 # Calibration layer: miss categories, real metrics, pre-registered predictions, honest actuals (calibration-metrics-spec 2026-09-02)
 
